@@ -11,7 +11,6 @@ from train_util import *
 from c2c.train import (
     PastKeyValues,
     ModelSpec,
-    compute_gate_temperature,
     extract_top_layer_blocks,
     blocks_to_partial_past_key_values,
 )
@@ -38,14 +37,10 @@ class TrainConfig:
     log_every: int
     seed: int
     shuffle_buffer: int
-    top_layers_to_fuse: int
-    fuser_dim: int
-    fuser_heads: int
-    fuser_depth: int
-    fuser_mlp_ratio: int
-    gate_temperature_start: float
-    gate_temperature_end: float
-    hard_gate_eval: bool
+    top_layers_to_project: int
+    projector_dim: int
+    projector_depth: int
+    projector_mlp_ratio: int
     device: str
     dtype: str
 
@@ -55,11 +50,30 @@ class TrainConfig:
         initialize_train_output_paths(self)
 
 
+# def normalize_legacy_train_config(config_dict: Dict) -> Dict:
+#     normalized = dict(config_dict)
+#     legacy_to_new = {
+#         "top_layers_to_fuse": "top_layers_to_project",
+#         "fuser_dim": "projector_dim",
+#         "fuser_depth": "projector_depth",
+#         "fuser_mlp_ratio": "projector_mlp_ratio",
+#     }
+#     for legacy_key, new_key in legacy_to_new.items():
+#         if new_key not in normalized and legacy_key in normalized:
+#             normalized[new_key] = normalized[legacy_key]
+
+#     normalized.pop("fuser_heads", None)
+#     normalized.pop("gate_temperature_start", None)
+#     normalized.pop("gate_temperature_end", None)
+#     normalized.pop("hard_gate_eval", None)
+#     return normalized
+
+
 class ProjectionMLP(nn.Module):
     """
     Projection-only cache adapter for the C2C ablation in Table 8 ("Project").
-    It discards the receiver cache and directly maps the sharer's top-layer KV cache
-    into the receiver hidden space, then replaces the receiver top layers.
+    It directly maps the sharer's top-layer KV cache into the receiver hidden space
+    and replaces the receiver top layers.
     """
 
     def __init__(
@@ -90,18 +104,18 @@ class ProjectionMLP(nn.Module):
         return self.net(x)
 
 
-class DirectionalProjector(nn.Module):
+class DirectionalCacheProjector(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
         dst_hidden_size: int,
-        top_layers_to_fuse: int,
+        top_layers_to_project: int,
         hidden_dim: int,
         depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.top_layers_to_fuse = top_layers_to_fuse
+        self.top_layers_to_project = top_layers_to_project
         self.key_projector = ProjectionMLP(
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
@@ -120,12 +134,6 @@ class DirectionalProjector(nn.Module):
     def mean_gate_probability(self) -> float:
         return 1.0
 
-    def set_temperature(self, temperature: float) -> None:
-        _ = temperature
-
-    def set_hard_gate_eval(self, enabled: bool) -> None:
-        _ = enabled
-
     def forward(
         self,
         sharer_key_block: torch.Tensor,
@@ -139,20 +147,20 @@ class C2CProjectorPool(nn.Module):
         self,
         model_specs: Dict[str, ModelSpec],
         edges: List[Edge],
-        top_layers_to_fuse: int,
-        fuser_dim: int,
-        fuser_depth: int,
+        top_layers_to_project: int,
+        projector_dim: int,
+        projector_depth: int,
         mlp_ratio: int,
         active_directions: List[str],
     ) -> None:
         super().__init__()
-        if top_layers_to_fuse < 1:
-            raise ValueError('top_layers_to_fuse must be >= 1')
+        if top_layers_to_project < 1:
+            raise ValueError('top_layers_to_project must be >= 1')
         if not active_directions:
             raise ValueError('active_directions must contain at least one direction')
 
         self.model_specs = model_specs
-        self.top_layers_to_fuse = top_layers_to_fuse
+        self.top_layers_to_project = top_layers_to_project
         self.active_directions = tuple(active_directions)
         self.edges_by_id = build_edge_map(edges)
 
@@ -164,28 +172,20 @@ class C2CProjectorPool(nn.Module):
             src_spec = model_specs[edge.src_id]
             dst_spec = model_specs[edge.dst_id]
             max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
-            if top_layers_to_fuse > max_allowed:
+            if top_layers_to_project > max_allowed:
                 raise ValueError(
-                    f'top_layers_to_fuse={top_layers_to_fuse} exceeds min layer count {max_allowed} '
+                    f'top_layers_to_project={top_layers_to_project} exceeds min layer count {max_allowed} '
                     f'for direction {direction}.'
                 )
-            adapters[direction] = DirectionalProjector(
+            adapters[direction] = DirectionalCacheProjector(
                 src_hidden_size=src_spec.hidden_size,
                 dst_hidden_size=dst_spec.hidden_size,
-                top_layers_to_fuse=top_layers_to_fuse,
-                hidden_dim=fuser_dim,
-                depth=fuser_depth,
+                top_layers_to_project=top_layers_to_project,
+                hidden_dim=projector_dim,
+                depth=projector_depth,
                 mlp_ratio=mlp_ratio,
             )
         self.adapters = nn.ModuleDict(adapters)
-
-    def set_temperature(self, temperature: float) -> None:
-        for module in self.adapters.values():
-            module.set_temperature(temperature)
-
-    def set_hard_gate_eval(self, enabled: bool) -> None:
-        for module in self.adapters.values():
-            module.set_hard_gate_eval(enabled)
 
     def mean_gate_probability(self) -> float:
         if not self.adapters:
@@ -207,7 +207,7 @@ class C2CProjectorPool(nn.Module):
             )
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
-            top_layers_to_fuse=self.top_layers_to_fuse,
+            top_layers_to_fuse=self.top_layers_to_project,
         )
         projected_key, projected_value = self.adapters[adapter_name](
             sharer_key_block=sharer_key_block,
@@ -219,23 +219,6 @@ class C2CProjectorPool(nn.Module):
             num_heads=dst_spec.num_heads,
             head_dim=dst_spec.head_dim,
         )
-
-    def fuse_top_layers(
-        self,
-        sharer_past_key_values: PastKeyValues,
-        receiver_past_key_values: PastKeyValues,
-        src_name: str,
-        dst_name: str,
-        dst_spec: ModelSpec,
-    ) -> PastKeyValues:
-        _ = receiver_past_key_values
-        return self.project_top_layers(
-            sharer_past_key_values=sharer_past_key_values,
-            src_name=src_name,
-            dst_name=dst_name,
-            dst_spec=dst_spec,
-        )
-
 
 
 def build_translator_pool(
@@ -254,10 +237,10 @@ def build_translator_pool(
     translator_pool = C2CProjectorPool(
         model_specs=model_specs,
         edges=edges,
-        top_layers_to_fuse=config.top_layers_to_fuse,
-        fuser_dim=config.fuser_dim,
-        fuser_depth=config.fuser_depth,
-        mlp_ratio=config.fuser_mlp_ratio,
+        top_layers_to_project=config.top_layers_to_project,
+        projector_dim=config.projector_dim,
+        projector_depth=config.projector_depth,
+        mlp_ratio=config.projector_mlp_ratio,
         active_directions=active_directions,
     )
     translator_pool.to(config.device)
@@ -333,7 +316,7 @@ def run_train(config: TrainConfig) -> Path:
             spec.hidden_size,
             spec.num_heads,
         )
-    logger.info('[Setup] top_layers_to_fuse = %d', config.top_layers_to_fuse)
+    logger.info('[Setup] top_layers_to_project = %d', config.top_layers_to_project)
     logger.info('[Setup] trainable C2C-Project params = %s', f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, config)
@@ -355,9 +338,6 @@ def run_train(config: TrainConfig) -> Path:
     progress_bar = tqdm(range(1, config.max_steps + 1), desc='Training')
 
     for step in progress_bar:
-        projection_temperature = compute_gate_temperature(config, step)
-        translator_pool.set_temperature(projection_temperature)
-
         optimizer.zero_grad(set_to_none=True)
         step_loss_value = 0.0
 
@@ -383,13 +363,13 @@ def run_train(config: TrainConfig) -> Path:
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
-                mixed_target_past = replace_top_layers(
+                projected_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
                     translated_top_past_key_values=projected_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
                     target_model=models[edge.dst_id],
-                    past_key_values=mixed_target_past,
+                    past_key_values=projected_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 )
@@ -414,11 +394,10 @@ def run_train(config: TrainConfig) -> Path:
             )
             gpu_memory = gpu_memory_tracker.summary()
             logger.info(
-                '[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | proj_temp=%.4f | gpu_mem_avg=%s | gpu_mem_peak=%s',
+                '[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s',
                 step,
                 avg_loss,
                 scheduler.lr,
-                projection_temperature,
                 gpu_memory['avg_allocated_pretty'],
                 gpu_memory['peak_allocated_pretty'],
             )
@@ -435,7 +414,7 @@ def run_train(config: TrainConfig) -> Path:
         extra={
             'note': 'Final checkpoint trained with C2C projection-only suffix LM loss.',
             'model_ids': config.model_ids,
-            'top_layers_to_fuse': config.top_layers_to_fuse,
+            'top_layers_to_project': config.top_layers_to_project,
             'model_directions': config.model_directions,
         },
     )

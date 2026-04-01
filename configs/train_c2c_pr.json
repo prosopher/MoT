@@ -16,14 +16,10 @@
   "log_every": 25,
   "seed": 42,
   "shuffle_buffer": 50000,
-  "top_layers_to_fuse": 6,
-  "fuser_dim": 1024,
-  "fuser_heads": 16,
-  "fuser_depth": 2,
-  "fuser_mlp_ratio": 4,
-  "gate_temperature_start": 1.0,
-  "gate_temperature_end": 0.1,
-  "hard_gate_eval": true,
   "device": "auto",
-  "dtype": "float32"
+  "dtype": "float32",
+  "top_layers_to_project": 6,
+  "projector_dim": 1024,
+  "projector_depth": 2,
+  "projector_mlp_ratio": 4
 }
