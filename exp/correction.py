@@ -48,10 +48,6 @@ class CorrectionConfig:
     translator_depth: int
     translator_mlp_ratio: int
 
-    enable_principal_rotation: bool
-    principal_rotation_streams: str
-    principal_rotation_calibration_steps: int
-
     device: str
     dtype: str
 
@@ -81,12 +77,6 @@ class CorrectionConfig:
             raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
-        normalized_streams = "".join(sorted(set(str(self.principal_rotation_streams).lower())))
-        if normalized_streams not in {"", "k", "v", "kv"}:
-            raise ValueError("principal_rotation_streams must be one of {'k', 'v', 'kv'}")
-        self.principal_rotation_streams = normalized_streams or "kv"
-        if self.enable_principal_rotation and self.principal_rotation_calibration_steps < 1:
-            raise ValueError("principal_rotation_calibration_steps must be >= 1 when principal rotation is enabled")
         if self.correction_max_analysis_tokens < 1:
             raise ValueError("correction_max_analysis_tokens must be >= 1")
 
@@ -1037,9 +1027,6 @@ def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionCon
         translator_heads=config.translator_heads,
         translator_depth=config.translator_depth,
         translator_mlp_ratio=config.translator_mlp_ratio,
-        enable_principal_rotation=config.enable_principal_rotation,
-        principal_rotation_streams=config.principal_rotation_streams,
-        principal_rotation_calibration_steps=config.principal_rotation_calibration_steps,
         device=config.device,
         dtype=config.dtype,
         eval_batch_size=config.eval_batch_size,
@@ -1082,10 +1069,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translator-heads", type=int, default=16)
     parser.add_argument("--translator-depth", type=int, default=2)
     parser.add_argument("--translator-mlp-ratio", type=int, default=4)
-    parser.add_argument("--disable-principal-rotation", action="store_true")
-    parser.add_argument("--principal-rotation-streams", choices=["k", "v", "kv"], default="kv")
-    parser.add_argument("--principal-rotation-calibration-steps", type=int, default=512)
-
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="float32")
 
@@ -1129,9 +1112,6 @@ def main() -> None:
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,
         translator_mlp_ratio=args.translator_mlp_ratio,
-        enable_principal_rotation=not args.disable_principal_rotation,
-        principal_rotation_streams=args.principal_rotation_streams,
-        principal_rotation_calibration_steps=args.principal_rotation_calibration_steps,
         device=args.device,
         dtype=args.dtype,
         eval_batch_size=args.eval_batch_size,
