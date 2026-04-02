@@ -71,6 +71,7 @@ class LayerPositionConfig:
     eval_shuffle_stream: bool
     benchmark_mode: str
     generation_max_new_tokens: int
+    kv_similarity_token_groups: int
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -84,6 +85,14 @@ class LayerPositionConfig:
             raise ValueError("position_layer_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
+        if self.kv_similarity_token_groups < 1:
+            raise ValueError("kv_similarity_token_groups must be >= 1")
+        effective_prefix_cache_len = self.prefix_tokens - 1
+        if self.kv_similarity_token_groups > effective_prefix_cache_len:
+            raise ValueError(
+                "kv_similarity_token_groups must be <= prefix_tokens - 1 because the KV cache is built from "
+                "input_ids[:, :prefix_tokens - 1] in exact next-token loss mode"
+            )
         if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
             raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
@@ -609,6 +618,135 @@ def build_control_window_variants(
         "mag_only": (mag_only_key, mag_only_value),
         "full_mix": (translated_key_block, translated_value_block),
     }
+
+
+@dataclass(frozen=True)
+class TokenGroupRange:
+    group_idx: int
+    start_token_idx: int
+    end_token_idx_exclusive: int
+
+    @property
+    def label(self) -> str:
+        end_inclusive = self.end_token_idx_exclusive - 1
+        return f"{self.start_token_idx}-{end_inclusive}"
+
+
+def build_token_group_ranges(seq_len: int, num_groups: int) -> List[TokenGroupRange]:
+    if seq_len < 1:
+        raise ValueError("seq_len must be >= 1")
+    if num_groups < 1:
+        raise ValueError("num_groups must be >= 1")
+    if num_groups > seq_len:
+        raise ValueError("num_groups must be <= seq_len so each group receives at least one token")
+
+    base_width = seq_len // num_groups
+    remainder = seq_len % num_groups
+    start_idx = 0
+    ranges: List[TokenGroupRange] = []
+    for group_idx in range(num_groups):
+        width = base_width + (1 if group_idx < remainder else 0)
+        end_idx = start_idx + width
+        ranges.append(
+            TokenGroupRange(
+                group_idx=group_idx,
+                start_token_idx=start_idx,
+                end_token_idx_exclusive=end_idx,
+            )
+        )
+        start_idx = end_idx
+    return ranges
+
+
+def compute_full_mix_vs_native_kv_cosine_by_layer_and_group(
+    native_past_key_values: PastKeyValues,
+    full_mix_past_key_values: PastKeyValues,
+    token_group_ranges: List[TokenGroupRange],
+) -> torch.Tensor:
+    native_key_block, native_value_block = past_key_values_to_blocks(native_past_key_values)
+    full_mix_key_block, full_mix_value_block = past_key_values_to_blocks(full_mix_past_key_values)
+    if native_key_block.shape != full_mix_key_block.shape or native_value_block.shape != full_mix_value_block.shape:
+        raise ValueError(
+            "Native and Full-Mix cache blocks must have matching shapes, "
+            f"got native key/value {tuple(native_key_block.shape)} / {tuple(native_value_block.shape)} "
+            f"vs full-mix key/value {tuple(full_mix_key_block.shape)} / {tuple(full_mix_value_block.shape)}"
+        )
+
+    native_kv = torch.cat([native_key_block, native_value_block], dim=-1).permute(0, 2, 1, 3).contiguous().float()
+    full_mix_kv = torch.cat([full_mix_key_block, full_mix_value_block], dim=-1).permute(0, 2, 1, 3).contiguous().float()
+    batch_size, num_layers, seq_len, _ = native_kv.shape
+
+    cosine_by_group = []
+    for token_group in token_group_ranges:
+        if not (0 <= token_group.start_token_idx < token_group.end_token_idx_exclusive <= seq_len):
+            raise ValueError(
+                "Token group is out of bounds for KV cache sequence length, "
+                f"got range [{token_group.start_token_idx}, {token_group.end_token_idx_exclusive}) for seq_len={seq_len}"
+            )
+        native_slice = native_kv[:, :, token_group.start_token_idx:token_group.end_token_idx_exclusive, :].reshape(batch_size, num_layers, -1)
+        full_mix_slice = full_mix_kv[:, :, token_group.start_token_idx:token_group.end_token_idx_exclusive, :].reshape(batch_size, num_layers, -1)
+        cosine = F.cosine_similarity(native_slice, full_mix_slice, dim=-1, eps=1e-8)
+        cosine_by_group.append(cosine.unsqueeze(-1))
+
+    return torch.cat(cosine_by_group, dim=-1)
+
+
+class KVSimilarityHeatmapAccumulator:
+    def __init__(self, num_layers: int, seq_len: int, num_token_groups: int) -> None:
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        self.num_layers = num_layers
+        self.seq_len = seq_len
+        self.token_group_ranges = build_token_group_ranges(seq_len=seq_len, num_groups=num_token_groups)
+        self.cosine_sum = torch.zeros(num_layers, len(self.token_group_ranges), dtype=torch.float64)
+        self.count = 0
+
+    def update(self, native_past_key_values: PastKeyValues, full_mix_past_key_values: PastKeyValues) -> None:
+        cosine_per_example = compute_full_mix_vs_native_kv_cosine_by_layer_and_group(
+            native_past_key_values=native_past_key_values,
+            full_mix_past_key_values=full_mix_past_key_values,
+            token_group_ranges=self.token_group_ranges,
+        )
+        if cosine_per_example.shape[1] != self.num_layers:
+            raise ValueError(
+                f"Expected {self.num_layers} layers in the similarity grid, got {cosine_per_example.shape[1]}"
+            )
+        self.cosine_sum += cosine_per_example.sum(dim=0).cpu().double()
+        self.count += int(cosine_per_example.shape[0])
+
+    def summary(self) -> Dict[str, Any]:
+        if self.count == 0:
+            average_matrix = torch.full_like(self.cosine_sum, float("nan"))
+        else:
+            average_matrix = self.cosine_sum / float(self.count)
+        finite_values = average_matrix[torch.isfinite(average_matrix)]
+        if finite_values.numel() > 0:
+            mean_value = float(finite_values.mean().item())
+            min_value = float(finite_values.min().item())
+            max_value = float(finite_values.max().item())
+        else:
+            mean_value = float("nan")
+            min_value = float("nan")
+            max_value = float("nan")
+        return {
+            "count": int(self.count),
+            "num_layers": int(self.num_layers),
+            "seq_len": int(self.seq_len),
+            "num_token_groups": int(len(self.token_group_ranges)),
+            "token_group_ranges": [
+                {
+                    "group_idx": int(token_group.group_idx),
+                    "start_token_idx": int(token_group.start_token_idx),
+                    "end_token_idx_exclusive": int(token_group.end_token_idx_exclusive),
+                    "label": token_group.label,
+                }
+                for token_group in self.token_group_ranges
+            ],
+            "average_kv_cosine_heatmap": average_matrix.tolist(),
+            "mean_kv_cosine": mean_value,
+            "min_kv_cosine": min_value,
+            "max_kv_cosine": max_value,
+        }
 
 
 def require_gpt2_transformer(model: PreTrainedModel):
@@ -1455,6 +1593,7 @@ def compute_openwebtext_native_and_full_mix_losses(
     translator_pool: LayerWindowTranslatorPool,
     model_specs: Dict[str, ModelSpec],
     models: Dict[str, PreTrainedModel],
+    kv_similarity_accumulator: Optional[KVSimilarityHeatmapAccumulator] = None,
 ) -> Dict[str, float]:
     translated_key, translated_value, mapping = translator_pool.translate_layer_window(
         past_key_values=past_by_node_id[edge.src_id],
@@ -1492,6 +1631,11 @@ def compute_openwebtext_native_and_full_mix_losses(
             lm_labels=lm_labels,
         ).item()
     )
+    if kv_similarity_accumulator is not None:
+        kv_similarity_accumulator.update(
+            native_past_key_values=native_target_past,
+            full_mix_past_key_values=full_mix_past,
+        )
     return {
         "native": native_loss,
         "full_mix": full_mix_loss,
@@ -1702,6 +1846,61 @@ def build_openwebtext_loss_chart_path(study_dir: Path) -> Path:
     return study_dir / "layer_idx_vs_openwebtext_validation_loss.png"
 
 
+def build_kv_similarity_manifest_path(run_dir: Path) -> Path:
+    return run_dir / "full_mix_vs_native_kv_similarity.json"
+
+
+def build_kv_similarity_heatmap_path(run_dir: Path, direction: str) -> Path:
+    return run_dir / f"full_mix_vs_native_kv_similarity_{sanitize_slug(direction)}.png"
+
+
+def save_kv_similarity_artifacts(
+    run_dir: Path,
+    kv_similarity_by_direction: Dict[str, Dict[str, Any]],
+    layer_mappings: Dict[str, LayerMapping],
+) -> Tuple[Path, Dict[str, Path]]:
+    manifest_payload = {
+        "directions": kv_similarity_by_direction,
+    }
+    manifest_path = build_kv_similarity_manifest_path(run_dir)
+    write_json(str(manifest_path), manifest_payload)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    heatmap_paths: Dict[str, Path] = {}
+    for direction, summary in kv_similarity_by_direction.items():
+        matrix = np.asarray(summary.get("average_kv_cosine_heatmap", []), dtype=float)
+        if matrix.ndim != 2 or matrix.size == 0:
+            continue
+        token_group_labels = [item.get("label", str(idx)) for idx, item in enumerate(summary.get("token_group_ranges", []))]
+        fig = plt.figure(figsize=(max(7.5, 0.8 * len(token_group_labels) + 3.0), max(5.0, 0.35 * matrix.shape[0] + 2.5)))
+        ax = fig.add_subplot(111)
+        image = ax.imshow(matrix, origin="lower", aspect="auto", vmin=-1.0, vmax=1.0, cmap="viridis")
+        ax.set_xlabel("Token group")
+        ax.set_ylabel("Target layer index")
+        ax.set_title(f"Full-Mix vs Native KV cosine heatmap ({direction})")
+        ax.set_xticks(list(range(len(token_group_labels))))
+        ax.set_xticklabels(token_group_labels, rotation=45, ha="right", fontsize=8)
+        y_ticks = list(range(matrix.shape[0]))
+        if len(y_ticks) > 16:
+            step = max(1, len(y_ticks) // 16)
+            y_ticks = y_ticks[::step]
+        ax.set_yticks(y_ticks)
+        mapping = layer_mappings.get(direction)
+        if mapping is not None:
+            ax.axhline(mapping.dst_layer_idx - 0.5, linestyle="--", linewidth=1.0, alpha=0.8)
+            ax.axhline(mapping.dst_layer_end_idx + 0.5, linestyle="--", linewidth=1.0, alpha=0.8)
+        colorbar = fig.colorbar(image, ax=ax)
+        colorbar.set_label("Cosine similarity")
+        fig.tight_layout()
+        heatmap_path = build_kv_similarity_heatmap_path(run_dir, direction)
+        fig.savefig(heatmap_path, dpi=200)
+        plt.close(fig)
+        heatmap_paths[direction] = heatmap_path
+    return manifest_path, heatmap_paths
+
+
 def plot_metric_controls_summary(summary_path: Path) -> Path:
     rows = read_summary_rows(summary_path)
     if not rows:
@@ -1876,6 +2075,15 @@ def run_eval(
     dataset_logit_kl_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     logger.info("Preparing validation dataloader for OpenWebText/validation")
+    edge_map = build_edge_map(edges)
+    kv_similarity_collectors = {
+        direction: KVSimilarityHeatmapAccumulator(
+            num_layers=model_specs[edge_map[direction].dst_id].num_layers,
+            seq_len=config.prefix_tokens - 1,
+            num_token_groups=config.kv_similarity_token_groups,
+        )
+        for direction in active_directions
+    }
 
     def evaluate_openwebtext_control_losses(
         *,
@@ -1895,6 +2103,7 @@ def run_eval(
             translator_pool=translator_pool,
             model_specs=model_specs,
             models=models,
+            kv_similarity_accumulator=kv_similarity_collectors[direction],
         )
 
     openwebtext_loss_by_direction = evaluate_openwebtext_validation_loss_metrics(
@@ -2049,6 +2258,20 @@ def run_eval(
         average_native_loss,
         average_full_mix_loss,
     )
+    kv_similarity_by_direction = {
+        direction: collector.summary()
+        for direction, collector in kv_similarity_collectors.items()
+    }
+    for direction, summary in kv_similarity_by_direction.items():
+        logger.info(
+            "[Summary] Full-Mix vs Native KV cosine | %s | mean=%.6f | min=%.6f | max=%.6f | groups=%d | count=%d",
+            direction,
+            float(summary.get("mean_kv_cosine", float("nan"))),
+            float(summary.get("min_kv_cosine", float("nan"))),
+            float(summary.get("max_kv_cosine", float("nan"))),
+            int(summary.get("num_token_groups", 0)),
+            int(summary.get("count", 0)),
+        )
     return {
         "benchmark_mode": config.benchmark_mode,
         "metric_name": metric_name,
@@ -2063,6 +2286,7 @@ def run_eval(
         "average_delta_mag_only": average_delta_mag_only,
         "average_delta_full_mix": average_delta_full_mix,
         "openwebtext_validation_loss": openwebtext_loss_by_direction,
+        "full_mix_vs_native_kv_similarity": kv_similarity_by_direction,
         "average_native_loss": average_native_loss,
         "average_full_mix_loss": average_full_mix_loss,
         f"average_{metric_name}": average_full_mix_metric,
@@ -2117,6 +2341,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="logit_qa")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
+    parser.add_argument("--kv-similarity-token-groups", type=int, default=8, help="Number of contiguous token groups used on the OpenWebText prefix axis when averaging Full-Mix vs Native KV-cache cosine similarities into an L x G heatmap.")
     return parser.parse_args()
 
 
@@ -2159,6 +2384,7 @@ def main() -> None:
         eval_shuffle_stream=args.eval_shuffle_stream,
         benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
+        kv_similarity_token_groups=args.kv_similarity_token_groups,
     )
 
     if config.position_layer_idx is None:
@@ -2206,6 +2432,11 @@ def main() -> None:
         eval_metrics=eval_metrics,
         combined_metrics=combined_metrics,
     )
+    kv_similarity_manifest_path, kv_similarity_heatmap_paths = save_kv_similarity_artifacts(
+        run_dir=run_dir,
+        kv_similarity_by_direction=combined_metrics.get("full_mix_vs_native_kv_similarity", {}),
+        layer_mappings=layer_mappings,
+    )
     analysis_metrics_path = save_analysis_artifacts(run_dir=run_dir, metrics=analysis_metrics)
 
     print(f"Run directory: {run_dir}")
@@ -2215,6 +2446,9 @@ def main() -> None:
     print(f"Control analysis metrics: {analysis_metrics_path}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
     print(f"OpenWebText validation Loss chart: {openwebtext_loss_chart_path}")
+    print(f"KV similarity manifest: {kv_similarity_manifest_path}")
+    for direction, heatmap_path in kv_similarity_heatmap_paths.items():
+        print(f"KV similarity heatmap [{direction}]: {heatmap_path}")
 
 
 if __name__ == "__main__":
