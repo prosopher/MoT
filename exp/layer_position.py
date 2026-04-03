@@ -2085,7 +2085,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--position-layer-idx", type=int, default=None, help="Reference target layer index to use as the anchor layer for translation/injection sweeps.")
-    parser.add_argument("--injection-window-size", type=int, default=1, help="Total number of consecutive layers to translate and inject, starting from the anchor layer selected by --position-layer-idx. For example, 1 injects only the anchor layer, and 3 injects the anchor layer plus the next two upper layers.")
+    parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers to translate and inject, starting from the anchor layer selected by --position-layer-idx. For example, 1 injects only the anchor layer, and 3 injects the anchor layer plus the next two upper layers.")
     parser.add_argument("--print-target-num-layers", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/layer_position")
@@ -2115,7 +2115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="logit_qa")
+    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="gen_qa")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
     return parser.parse_args()
 

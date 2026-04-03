@@ -1046,7 +1046,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--position-layer-idx", type=int, default=None)
-    parser.add_argument("--injection-window-size", type=int, default=1)
+    parser.add_argument("--injection-window-size", type=int, default=5)
     parser.add_argument("--print-target-num-layers", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/correction")
@@ -1076,7 +1076,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="logit_qa")
+    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="gen_qa")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
     parser.add_argument("--correction-max-analysis-tokens", type=int, default=4)
     parser.add_argument("--disable-random-control", action="store_true")

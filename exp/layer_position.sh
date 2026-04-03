@@ -9,8 +9,8 @@ STUDY_ID=${STUDY_ID:-$(date +%Y%m%d_%H%M%S)}
 OUTPUT_ROOT=${OUTPUT_ROOT:-outputs/layer_position}
 COMMON_ARGS=("$@")
 
-INJECTION_WINDOW_SIZE=1
-BENCHMARK_MODE=logit_qa
+INJECTION_WINDOW_SIZE=5
+BENCHMARK_MODE=gen_qa
 for ((i=1; i<=$#; i++)); do
   arg="${!i}"
   if [[ "${arg}" == --injection-window-size ]]; then
