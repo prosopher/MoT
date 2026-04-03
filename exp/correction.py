@@ -94,6 +94,7 @@ class CorrectionSummaryRow:
     num_samples: int
     num_tokens: int
     average_initial_shift_norm: float
+    average_window_input_norm: float
     average_final_shift_norm: float
     average_final_shrink_ratio: float
     median_final_shrink_ratio: float
@@ -379,6 +380,7 @@ class TrajectoryAccumulator:
 class MetricCollector:
     def __init__(self) -> None:
         self.initial_shift_norms: List[float] = []
+        self.window_input_norms: List[float] = []
         self.final_shift_norms: List[float] = []
         self.final_shrink_ratios: List[float] = []
         self.final_alphas: List[float] = []
@@ -390,8 +392,9 @@ class MetricCollector:
         self.final_mlp_alpha_over_initial: List[float] = []
         self.final_shrink_flags: List[bool] = []
 
-    def update(self, *, initial_shift_norm: float, final_shift_norm: float, final_shrink_ratio: float, final_alpha: float, final_alpha_over_initial: float, final_beta: float, final_beta_over_initial: float, final_correction_cosine: float, final_attn_alpha_over_initial: float, final_mlp_alpha_over_initial: float) -> None:
+    def update(self, *, initial_shift_norm: float, window_input_norm: float, final_shift_norm: float, final_shrink_ratio: float, final_alpha: float, final_alpha_over_initial: float, final_beta: float, final_beta_over_initial: float, final_correction_cosine: float, final_attn_alpha_over_initial: float, final_mlp_alpha_over_initial: float) -> None:
         self.initial_shift_norms.append(float(initial_shift_norm))
+        self.window_input_norms.append(float(window_input_norm))
         self.final_shift_norms.append(float(final_shift_norm))
         self.final_shrink_ratios.append(float(final_shrink_ratio))
         self.final_alphas.append(float(final_alpha))
@@ -407,6 +410,7 @@ class MetricCollector:
         return {
             "num_tokens": len(self.initial_shift_norms),
             "average_initial_shift_norm": _nanmean(self.initial_shift_norms),
+            "average_window_input_norm": _nanmean(self.window_input_norms),
             "average_final_shift_norm": _nanmean(self.final_shift_norms),
             "average_final_shrink_ratio": _nanmean(self.final_shrink_ratios),
             "median_final_shrink_ratio": _nanmedian(self.final_shrink_ratios),
@@ -431,12 +435,15 @@ def compute_correction_metrics_from_traces(
     mlp_delta = mixed_trace["mlp_additions"] - native_trace["mlp_additions"]
 
     source_idx = int(mapping.dst_layer_end_idx) + 1
+    window_input_idx = int(mapping.dst_layer_idx)
     initial_shift = hidden_delta[source_idx]
     initial_shift_norm = float(initial_shift.norm().item())
+    window_input_norm = float(native_trace["hidden_states"][window_input_idx].norm().item())
     if initial_shift_norm < 1e-12:
         return {
             "valid": False,
             "source_idx": source_idx,
+            "window_input_idx": window_input_idx,
         }
 
     u = initial_shift / initial_shift_norm
@@ -473,7 +480,9 @@ def compute_correction_metrics_from_traces(
     return {
         "valid": True,
         "source_idx": source_idx,
+        "window_input_idx": window_input_idx,
         "initial_shift_norm": initial_shift_norm,
+        "window_input_norm": window_input_norm,
         "final_shift_norm": float(hidden_delta[-1].norm().item()),
         "final_shrink_ratio": rho_values[-1],
         "final_alpha": alpha_values[-1],
@@ -624,6 +633,7 @@ def evaluate_correction(
                         if correction_metrics.get("valid", False):
                             fullmix_collector.update(
                                 initial_shift_norm=correction_metrics["initial_shift_norm"],
+                                window_input_norm=correction_metrics["window_input_norm"],
                                 final_shift_norm=correction_metrics["final_shift_norm"],
                                 final_shrink_ratio=correction_metrics["final_shrink_ratio"],
                                 final_alpha=correction_metrics["final_alpha"],
@@ -646,6 +656,7 @@ def evaluate_correction(
                             if random_metrics.get("valid", False):
                                 random_collector.update(
                                     initial_shift_norm=random_metrics["initial_shift_norm"],
+                                    window_input_norm=random_metrics["window_input_norm"],
                                     final_shift_norm=random_metrics["final_shift_norm"],
                                     final_shrink_ratio=random_metrics["final_shrink_ratio"],
                                     final_alpha=random_metrics["final_alpha"],
@@ -740,6 +751,7 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
                 num_samples=int(raw_row["num_samples"]),
                 num_tokens=int(raw_row["num_tokens"]),
                 average_initial_shift_norm=float(raw_row["average_initial_shift_norm"]),
+                average_window_input_norm=float(raw_row.get("average_window_input_norm", float("nan"))),
                 average_final_shift_norm=float(raw_row["average_final_shift_norm"]),
                 average_final_shrink_ratio=float(raw_row["average_final_shrink_ratio"]),
                 median_final_shrink_ratio=float(raw_row["median_final_shrink_ratio"]),
@@ -783,6 +795,7 @@ def update_summary(config: CorrectionConfig, run_dir: Path, metrics: Dict[str, A
         num_samples=int(metrics.get("processed_examples", config.eval_max_examples_per_dataset)),
         num_tokens=int(full_mix["num_tokens"]),
         average_initial_shift_norm=float(full_mix["average_initial_shift_norm"]),
+        average_window_input_norm=float(full_mix["average_window_input_norm"]),
         average_final_shift_norm=float(full_mix["average_final_shift_norm"]),
         average_final_shrink_ratio=float(full_mix["average_final_shrink_ratio"]),
         median_final_shrink_ratio=float(full_mix["median_final_shrink_ratio"]),
@@ -908,7 +921,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax.axhline(1.0, linestyle="--", linewidth=1)
     _annotate_ranges(ax, rows, avg_shrink)
     ax.set_xlabel("Reference target layer start index")
-    ax.set_ylabel("Final ||Δh_L|| / ||s_t||")
+    ax.set_ylabel("Final ||Δh_L|| / ||s_{t+w-1}||")
     ax.set_title("Final post-window shrink ratio vs injected-window start index")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -919,8 +932,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
 
     fig = plt.figure(figsize=(9.5, 5.6))
     ax = fig.add_subplot(111)
-    ax.plot(x_values, alpha, marker="o", label="Total α_L / ||s_t||")
-    ax.plot(x_values, beta, marker="^", label="Total β_L / ||s_t||")
+    ax.plot(x_values, alpha, marker="o", label="Total α_L / ||s_{t+w-1}||")
+    ax.plot(x_values, beta, marker="^", label="Total β_L / ||s_{t+w-1}||")
     ax.plot(x_values, attn_alpha, marker="s", label="Attention α contribution")
     ax.plot(x_values, mlp_alpha, marker="d", label="MLP α contribution")
     ax.plot(x_values, beta_minus_alpha, marker="x", label="β - α")
@@ -940,9 +953,22 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax = fig.add_subplot(111)
     raw_alpha = [row.average_final_alpha for row in rows]
     raw_beta = [row.average_final_beta for row in rows]
-    ax.scatter(raw_beta, raw_alpha, s=[max(40.0, 12.0 * v) for v in initial_shift], marker="o")
-    for row, x, y, s_norm in zip(rows, raw_beta, raw_alpha, initial_shift):
-        ax.annotate(f"L{row.position_layer_idx} (||s_t||={s_norm:.2f})", (x, y), textcoords="offset points", xytext=(5, 4), fontsize=8)
+    phase_sizes = [max(40.0, 8.0 * max(v, 1.0)) for v in initial_shift]
+    window_input_norms = [row.average_window_input_norm for row in rows]
+    ax.scatter(raw_beta, raw_alpha, s=phase_sizes, marker="o")
+    for row, x, y, s_norm, x_in_norm in zip(rows, raw_beta, raw_alpha, initial_shift, window_input_norms):
+        if row.target_layer_idx == row.target_layer_end_idx:
+            shift_symbol = f"s_{row.target_layer_idx}"
+        else:
+            shift_symbol = f"s_{row.target_layer_end_idx+1}"
+        input_symbol = f"X_{row.target_layer_idx}"
+        ax.annotate(
+            f"L{row.position_layer_idx}\n||{shift_symbol}||={s_norm:.2f}\n||{input_symbol}||={x_in_norm:.2f}",
+            (x, y),
+            textcoords="offset points",
+            xytext=(5, 4),
+            fontsize=8,
+        )
     ax.set_xlabel("Total β_L")
     ax.set_ylabel("Total α_L")
     ax.set_title("Correction phase scatter: error correction")
@@ -976,7 +1002,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
 
     fig = plt.figure(figsize=(10, 6.0))
     ax1 = fig.add_subplot(211)
-    ax1.plot(x_values, initial_shift, marker="o", label="Initial shift norm ||s_t||")
+    ax1.plot(x_values, initial_shift, marker="o", label="Initial shift norm ||s_{t+w-1}||")
     ax1.plot(x_values, final_shift, marker="s", label="Final shift norm ||Δh_L||")
     _annotate_ranges(ax1, rows, final_shift)
     ax1.set_ylabel("Average norm")
