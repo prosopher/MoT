@@ -938,18 +938,15 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
 
     fig = plt.figure(figsize=(10, 6.2))
     ax = fig.add_subplot(111)
-    ax.scatter(alpha, beta, s=[max(40.0, 12.0 * v) for v in avg_shrink], marker="o")
-    finite_pairs = [(x, y) for x, y in zip(alpha, beta) if math.isfinite(x) and math.isfinite(y)]
-    if finite_pairs:
-        max_xy = max(max(x for x, _ in finite_pairs), max(y for _, y in finite_pairs), 1.0)
-        ax.plot([0.0, max_xy], [0.0, max_xy], linestyle="--", linewidth=1, label="β = α")
-    for row, x, y, ratio in zip(rows, alpha, beta, avg_shrink):
-        ax.annotate(f"L{row.position_layer_idx} (ρ={ratio:.2f})", (x, y), textcoords="offset points", xytext=(5, 4), fontsize=8)
-    ax.set_xlabel("Total α_L / ||s_t||")
-    ax.set_ylabel("Total β_L / ||s_t||")
-    ax.set_title("Correction phase scatter: anti-alignment vs orthogonal error")
+    raw_alpha = [row.average_final_alpha for row in rows]
+    raw_beta = [row.average_final_beta for row in rows]
+    ax.scatter(raw_beta, raw_alpha, s=[max(40.0, 12.0 * v) for v in initial_shift], marker="o")
+    for row, x, y, s_norm in zip(rows, raw_beta, raw_alpha, initial_shift):
+        ax.annotate(f"L{row.position_layer_idx} (||s_t||={s_norm:.2f})", (x, y), textcoords="offset points", xytext=(5, 4), fontsize=8)
+    ax.set_xlabel("Total β_L")
+    ax.set_ylabel("Total α_L")
+    ax.set_title("Correction phase scatter: error correction")
     ax.grid(True, alpha=0.3)
-    ax.legend()
     fig.tight_layout()
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
     fig.savefig(outputs["phase"], dpi=200)
