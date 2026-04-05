@@ -1,5 +1,4 @@
 {
-  "outputs_path": "outputs",
   "timestamp": null,
   "output_path": null,
   "model_ids": "gpt2-medium,gpt2",

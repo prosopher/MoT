@@ -53,7 +53,7 @@ esac
 
 NUM_LAYERS=$(python exp/layer_position.py \
   --print-target-num-layers \
-  --output-root "${OUTPUT_ROOT}" \
+  --output-path "${OUTPUT_ROOT}" \
   --study-id "${STUDY_ID}" \
   --injection-window-size "${INJECTION_WINDOW_SIZE}" \
   "${COMMON_ARGS[@]}")
@@ -64,7 +64,7 @@ if ! [[ "${NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "[LayerPosition] study_id=${STUDY_ID}"
-echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
+echo "[LayerPosition] output_path=${OUTPUT_ROOT}"
 echo "[LayerPosition] injection_window_size=${INJECTION_WINDOW_SIZE}"
 echo "[LayerPosition] target_num_layers=${NUM_LAYERS}"
 
@@ -79,7 +79,7 @@ for ((layer_idx=0; layer_idx<=MAX_START_LAYER_IDX; layer_idx++)); do
   echo "[LayerPosition] ===== injection target layer start idx ${layer_idx} ====="
   python exp/layer_position.py \
     --injection-layer-start-idx "${layer_idx}" \
-    --output-root "${OUTPUT_ROOT}" \
+    --output-path "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
     --injection-window-size "${INJECTION_WINDOW_SIZE}" \
     "${COMMON_ARGS[@]}"

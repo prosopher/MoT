@@ -30,35 +30,10 @@ class LayerMapping:
 
 
 @dataclass
-class LayerPositionConfig:
-    model_ids: str
-    model_directions: str
+class LayerPositionConfig(TrainConfig):
     injection_layer_start_idx: Optional[int]
     injection_window_size: int
-
-    output_root: str
     study_id: Optional[str]
-
-    max_steps: int
-    batch_size: int
-    grad_accum_steps: int
-    total_tokens: int
-    prefix_tokens: int
-    learning_rate: float
-    weight_decay: float
-    warmup_steps: int
-    grad_clip_norm: float
-    log_every: int
-    seed: int
-    shuffle_buffer: int
-
-    translator_dim: int
-    translator_heads: int
-    translator_depth: int
-    translator_mlp_ratio: int
-
-    device: str
-    dtype: str
 
     eval_batch_size: int
     eval_num_workers: int
@@ -68,7 +43,7 @@ class LayerPositionConfig:
     generation_max_new_tokens: int
 
     def __post_init__(self) -> None:
-        self.device = resolve_device(self.device)
+        super().__post_init__()
         if self.max_steps < 1:
             raise ValueError("max_steps must be >= 1")
         if self.grad_accum_steps < 1:
@@ -79,6 +54,8 @@ class LayerPositionConfig:
             raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
+        if self.top_layers_to_translate != self.injection_window_size:
+            raise ValueError("top_layers_to_translate must match injection_window_size")
         if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
             raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
@@ -764,7 +741,7 @@ def replay_target_prefill_with_injected_window(
 
 def build_study_dir(config: LayerPositionConfig) -> Path:
     study_id = config.study_id or f"run_{sanitize_slug(config.model_directions)}"
-    return Path(config.output_root) / study_id
+    return Path(config.output_path) / study_id
 
 
 def build_run_output_dir(config: LayerPositionConfig) -> Path:
@@ -2073,7 +2050,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers to translate and inject, starting from --injection-layer-start-idx. For example, 1 injects only that layer, and 3 injects that layer plus the next two upper layers.")
     parser.add_argument("--print-target-num-layers", action="store_true")
 
-    parser.add_argument("--output-root", default="outputs/layer_position")
+    parser.add_argument("--alg", default="layer_position")
+    parser.add_argument("--timestamp", default=None)
+    parser.add_argument("--output-path", default="outputs/layer_position")
     parser.add_argument("--study-id", default=None)
 
     parser.add_argument("--max-steps", type=int, default=500)
@@ -2113,12 +2092,11 @@ def main() -> None:
         return
 
     config = LayerPositionConfig(
+        alg=args.alg,
+        timestamp=args.timestamp,
+        output_path=args.output_path,
         model_ids=args.model_ids,
         model_directions=args.model_directions,
-        injection_layer_start_idx=args.injection_layer_start_idx,
-        injection_window_size=args.injection_window_size,
-        output_root=args.output_root,
-        study_id=args.study_id,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
@@ -2131,12 +2109,16 @@ def main() -> None:
         log_every=args.log_every,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
+        top_layers_to_translate=args.injection_window_size,
         translator_dim=args.translator_dim,
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,
         translator_mlp_ratio=args.translator_mlp_ratio,
         device=args.device,
         dtype=args.dtype,
+        injection_layer_start_idx=args.injection_layer_start_idx,
+        injection_window_size=args.injection_window_size,
+        study_id=args.study_id,
         eval_batch_size=args.eval_batch_size,
         eval_num_workers=args.eval_num_workers,
         eval_max_examples_per_dataset=args.eval_max_examples_per_dataset,

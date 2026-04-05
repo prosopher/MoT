@@ -52,7 +52,7 @@ esac
 
 NUM_LAYERS=$(python exp/correction.py \
   --print-target-num-layers \
-  --output-root "${OUTPUT_ROOT}" \
+  --output-path "${OUTPUT_ROOT}" \
   --study-id "${STUDY_ID}" \
   --injection-window-size "${INJECTION_WINDOW_SIZE}" \
   "${COMMON_ARGS[@]}")
@@ -63,7 +63,7 @@ if ! [[ "${NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
 fi
 
 echo "[Correction] study_id=${STUDY_ID}"
-echo "[Correction] output_root=${OUTPUT_ROOT}"
+echo "[Correction] output_path=${OUTPUT_ROOT}"
 echo "[Correction] benchmark_mode=${BENCHMARK_MODE}"
 echo "[Correction] injection_window_size=${INJECTION_WINDOW_SIZE}"
 echo "[Correction] target_num_layers=${NUM_LAYERS}"
@@ -74,7 +74,7 @@ for ((layer_idx=0; layer_idx<=MAX_START_LAYER_IDX; layer_idx++)); do
   echo "[Correction] ===== injection target layer start idx ${layer_idx} ====="
   python exp/correction.py \
     --injection-layer-start-idx "${layer_idx}" \
-    --output-root "${OUTPUT_ROOT}" \
+    --output-path "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
     --injection-window-size "${INJECTION_WINDOW_SIZE}" \
     "${COMMON_ARGS[@]}"

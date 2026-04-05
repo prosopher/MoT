@@ -36,5 +36,5 @@ for benchmark_mode in "${BENCHMARK_MODES[@]}"; do
 done
 
 echo "[LayerPositionSweep] done"
-echo "[LayerPositionSweep] output_root=${OUTPUT_ROOT}"
+echo "[LayerPositionSweep] output_path=${OUTPUT_ROOT}"
 echo "[LayerPositionSweep] sweep_id=${SWEEP_ID}"

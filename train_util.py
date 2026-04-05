@@ -112,7 +112,6 @@ def get_train_checkpoint_path(output_path: Union[str, Path]) -> Path:
 def initialize_train_output_paths(config) -> None:
     alg = getattr(config, "alg", "")
     output_path = getattr(config, "output_path", None)
-    outputs_path = getattr(config, "outputs_path", "outputs")
     timestamp = getattr(config, "timestamp", None)
 
     if output_path is None:
@@ -123,7 +122,6 @@ def initialize_train_output_paths(config) -> None:
             setattr(config, "timestamp", timestamp)
         output_path_obj = build_timestamped_output_path(
             alg=alg,
-            outputs_path=outputs_path,
             timestamp=timestamp,
         )
     else:
