@@ -19,8 +19,8 @@ for ((i=1; i<=$#; i++)); do
   esac
 done
 
-BENCHMARK_MODES=(gen_qa logit_qa)
-INJECTION_WINDOW_SIZES=(5 3)
+BENCHMARK_MODES=(gen_qa)
+INJECTION_WINDOW_SIZES=(5)
 
 for benchmark_mode in "${BENCHMARK_MODES[@]}"; do
   for injection_window_size in "${INJECTION_WINDOW_SIZES[@]}"; do

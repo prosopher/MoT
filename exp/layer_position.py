@@ -21,12 +21,9 @@ class LayerMapping:
     reference_direction: str
     reference_target_node_id: str
     reference_target_num_layers: int
-    reference_target_layer_idx: int
-    reference_target_layer_end_idx: int
-    relative_depth: float
-    src_layer_idx: int
+    src_layer_start_idx: int
     src_layer_end_idx: int
-    dst_layer_idx: int
+    dst_layer_start_idx: int
     dst_layer_end_idx: int
     translated_num_layers: int
     src_num_layers: int
@@ -38,7 +35,7 @@ class LayerPositionConfig:
     model_ids: str
     model_directions: str
     reference_direction: Optional[str]
-    position_layer_idx: Optional[int]
+    injection_layer_start_idx: Optional[int]
     injection_window_size: int
 
     output_root: str
@@ -80,8 +77,8 @@ class LayerPositionConfig:
             raise ValueError("grad_accum_steps must be >= 1")
         if self.prefix_tokens < 2 or self.prefix_tokens >= self.total_tokens:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
-        if self.position_layer_idx is not None and self.position_layer_idx < 0:
-            raise ValueError("position_layer_idx must be >= 0")
+        if self.injection_layer_start_idx is not None and self.injection_layer_start_idx < 0:
+            raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
         if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
@@ -191,7 +188,7 @@ class LayerWindowTranslatorPool(nn.Module):
         mapping = self.layer_mappings[direction]
         key_block, value_block = extract_layer_window_blocks(
             past_key_values=past_key_values,
-            start_layer_idx=mapping.src_layer_idx,
+            start_layer_idx=mapping.src_layer_start_idx,
             num_layers=mapping.translated_num_layers,
         )
         translated_key, translated_value = self.adapters[direction](key_block, value_block)
@@ -454,38 +451,19 @@ def resolve_reference_direction_metadata(
     return nodes, edges, active_directions, edge_map[chosen_direction]
 
 
-def relative_depth_from_layer_index(layer_idx: int, num_layers: int) -> float:
-    if num_layers < 1:
-        raise ValueError("num_layers must be >= 1")
-    if not (0 <= layer_idx < num_layers):
-        raise ValueError(f"layer_idx={layer_idx} must be in [0, {num_layers - 1}]")
-    if num_layers == 1:
-        return 0.0
-    return float(layer_idx) / float(num_layers - 1)
-
-
-def relative_depth_to_layer_index(relative_depth: float, num_layers: int) -> int:
-    if num_layers < 1:
-        raise ValueError("num_layers must be >= 1")
-    if num_layers == 1:
-        return 0
-    clamped = min(1.0, max(0.0, float(relative_depth)))
-    return int(round(clamped * (num_layers - 1)))
-
-
-def resolve_reference_target_layer_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
+def resolve_injection_layer_start_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
     if reference_target_num_layers < 1:
         raise ValueError("reference_target_num_layers must be >= 1")
-    layer_idx = int(config.position_layer_idx)
+    layer_idx = int(config.injection_layer_start_idx)
     if not (0 <= layer_idx < reference_target_num_layers):
         raise ValueError(
-            f"position_layer_idx={layer_idx} must be in [0, {reference_target_num_layers - 1}] for the reference target"
+            f"injection_layer_start_idx={layer_idx} must be in [0, {reference_target_num_layers - 1}] for the reference target"
         )
     return layer_idx
 
 
 def resolve_run_position_label(config: LayerPositionConfig) -> str:
-    return f"layer_idx_{int(config.position_layer_idx):03d}"
+    return f"injection_layer_start_idx_{int(config.injection_layer_start_idx):03d}"
 
 
 def resolve_target_num_layers(
@@ -513,16 +491,14 @@ def build_layer_mappings(
     reference_target_spec = model_specs[reference_edge.dst_id]
     requested_window_size = int(config.injection_window_size)
 
-    reference_target_layer_idx = resolve_reference_target_layer_idx(config, reference_target_spec.num_layers)
-    reference_target_layer_end_idx = reference_target_layer_idx + requested_window_size - 1
-    if reference_target_layer_end_idx >= reference_target_spec.num_layers:
+    injection_layer_start_idx = resolve_injection_layer_start_idx(config, reference_target_spec.num_layers)
+    injection_layer_end_idx = injection_layer_start_idx + requested_window_size - 1
+    if injection_layer_end_idx >= reference_target_spec.num_layers:
         raise ValueError(
-            "position_layer_idx with the requested injection_window_size would exceed the reference target stack: "
-            f"start={reference_target_layer_idx}, end={reference_target_layer_end_idx}, "
+            "injection_layer_start_idx with the requested injection_window_size would exceed the reference target stack: "
+            f"start={injection_layer_start_idx}, end={injection_layer_end_idx}, "
             f"last_layer={reference_target_spec.num_layers - 1}"
         )
-
-    relative_depth = relative_depth_from_layer_index(reference_target_layer_idx, reference_target_spec.num_layers)
 
     edge_map = build_edge_map(edges)
     mappings: Dict[str, LayerMapping] = {}
@@ -530,25 +506,40 @@ def build_layer_mappings(
         edge = edge_map[direction]
         src_spec = model_specs[edge.src_id]
         dst_spec = model_specs[edge.dst_id]
-        src_layer_idx = relative_depth_to_layer_index(relative_depth, src_spec.num_layers)
-        dst_layer_idx = relative_depth_to_layer_index(relative_depth, dst_spec.num_layers)
-        available_upper_layers = min(
-            src_spec.num_layers - 1 - src_layer_idx,
-            dst_spec.num_layers - 1 - dst_layer_idx,
-        )
-        translated_num_layers = min(requested_window_size, 1 + available_upper_layers)
+
+        dst_layer_start_idx = injection_layer_start_idx
+        dst_layer_end_idx = dst_layer_start_idx + requested_window_size - 1
+        if dst_layer_end_idx >= dst_spec.num_layers:
+            raise ValueError(
+                f"direction={direction} cannot use injection_layer_start_idx={dst_layer_start_idx} "
+                f"with injection_window_size={requested_window_size}: target end layer {dst_layer_end_idx} exceeds "
+                f"target last layer {dst_spec.num_layers - 1}"
+            )
+
+        dst_depth_from_top = dst_spec.num_layers - 1 - dst_layer_start_idx
+        src_layer_start_idx = src_spec.num_layers - 1 - dst_depth_from_top
+        if not (0 <= src_layer_start_idx < src_spec.num_layers):
+            raise ValueError(
+                f"direction={direction} cannot align source window to target top-depth {dst_depth_from_top}: "
+                f"computed src_layer_start_idx={src_layer_start_idx} is outside [0, {src_spec.num_layers - 1}]"
+            )
+
+        src_layer_end_idx = src_layer_start_idx + requested_window_size - 1
+        if src_layer_end_idx >= src_spec.num_layers:
+            raise ValueError(
+                f"direction={direction} cannot use injection_window_size={requested_window_size} after top-depth alignment: "
+                f"source end layer {src_layer_end_idx} exceeds source last layer {src_spec.num_layers - 1}"
+            )
+
         mappings[direction] = LayerMapping(
             reference_direction=reference_edge.id,
             reference_target_node_id=reference_edge.dst_id,
             reference_target_num_layers=reference_target_spec.num_layers,
-            reference_target_layer_idx=reference_target_layer_idx,
-            reference_target_layer_end_idx=reference_target_layer_end_idx,
-            relative_depth=relative_depth,
-            src_layer_idx=src_layer_idx,
-            src_layer_end_idx=src_layer_idx + translated_num_layers - 1,
-            dst_layer_idx=dst_layer_idx,
-            dst_layer_end_idx=dst_layer_idx + translated_num_layers - 1,
-            translated_num_layers=translated_num_layers,
+            src_layer_start_idx=src_layer_start_idx,
+            src_layer_end_idx=src_layer_end_idx,
+            dst_layer_start_idx=dst_layer_start_idx,
+            dst_layer_end_idx=dst_layer_end_idx,
+            translated_num_layers=requested_window_size,
             src_num_layers=src_spec.num_layers,
             dst_num_layers=dst_spec.num_layers,
         )
@@ -833,27 +824,33 @@ def log_layer_mappings(
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     node_map = build_node_map(nodes)
-    logger.info("[LayerMapping] reference direction = %s", next(iter(layer_mappings.values())).reference_direction)
+    reference_direction = next(iter(layer_mappings.values())).reference_direction
+    reference_mapping = layer_mappings[reference_direction]
+    logger.info("[LayerMapping] reference direction = %s", reference_direction)
+    logger.info(
+        "[LayerMapping] reference target window = L%d-%d/%d",
+        reference_mapping.dst_layer_start_idx,
+        reference_mapping.dst_layer_end_idx,
+        reference_mapping.reference_target_num_layers - 1,
+    )
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
+        dst_depth_from_top = model_specs[dst_id].num_layers - 1 - mapping.dst_layer_start_idx
         logger.info(
-            "[LayerMapping] %s | ref_target=L%d-%d/%d | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | relative_depth=%.4f",
+            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | dst_depth_from_top=%d",
             direction,
-            mapping.reference_target_layer_idx,
-            mapping.reference_target_layer_end_idx,
-            mapping.reference_target_num_layers - 1,
             src_id,
             node_map[src_id].model_id,
-            mapping.src_layer_idx,
+            mapping.src_layer_start_idx,
             mapping.src_layer_end_idx,
             model_specs[src_id].num_layers - 1,
             dst_id,
             node_map[dst_id].model_id,
-            mapping.dst_layer_idx,
+            mapping.dst_layer_start_idx,
             mapping.dst_layer_end_idx,
             model_specs[dst_id].num_layers - 1,
             mapping.translated_num_layers,
-            mapping.relative_depth,
+            dst_depth_from_top,
         )
 
 
@@ -989,13 +986,13 @@ def run_train(
                 )
                 native_target_key_block, native_target_value_block = extract_layer_window_blocks(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    start_layer_idx=mapping.dst_layer_idx,
+                    start_layer_idx=mapping.dst_layer_start_idx,
                     num_layers=mapping.translated_num_layers,
                 )
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_cache_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
@@ -1006,7 +1003,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.dst_id],
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                 )
 
             loss = total_direction_loss / config.grad_accum_steps
@@ -1095,7 +1092,7 @@ def evaluate_logit_dataset(
                 native_target_past = past_by_node_id[edge.dst_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
-                    start_layer_idx=mapping.dst_layer_idx,
+                    start_layer_idx=mapping.dst_layer_start_idx,
                     num_layers=mapping.translated_num_layers,
                 )
                 control_windows = build_control_window_variants(
@@ -1107,7 +1104,7 @@ def evaluate_logit_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     dst_spec=model_specs[edge.dst_id],
@@ -1115,7 +1112,7 @@ def evaluate_logit_dataset(
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     dst_spec=model_specs[edge.dst_id],
@@ -1123,7 +1120,7 @@ def evaluate_logit_dataset(
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     dst_spec=model_specs[edge.dst_id],
@@ -1304,7 +1301,7 @@ def evaluate_generation_dataset(
                 native_target_past = past_by_node_id[edge.dst_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
-                    start_layer_idx=mapping.dst_layer_idx,
+                    start_layer_idx=mapping.dst_layer_start_idx,
                     num_layers=mapping.translated_num_layers,
                 )
                 control_windows = build_control_window_variants(
@@ -1316,7 +1313,7 @@ def evaluate_generation_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     dst_spec=model_specs[edge.dst_id],
@@ -1324,7 +1321,7 @@ def evaluate_generation_dataset(
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     dst_spec=model_specs[edge.dst_id],
@@ -1332,7 +1329,7 @@ def evaluate_generation_dataset(
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     dst_spec=model_specs[edge.dst_id],
@@ -1464,13 +1461,13 @@ def compute_openwebtext_native_and_full_mix_losses(
     native_target_past = past_by_node_id[edge.dst_id]
     native_key_block, native_value_block = extract_layer_window_blocks(
         past_key_values=native_target_past,
-        start_layer_idx=mapping.dst_layer_idx,
+        start_layer_idx=mapping.dst_layer_start_idx,
         num_layers=mapping.translated_num_layers,
     )
     full_mix_past = replay_target_prefill_with_injected_window(
         target_model=models[edge.dst_id],
         prefix_input_ids=prefix_cache_ids,
-        target_start_layer_idx=mapping.dst_layer_idx,
+        target_start_layer_idx=mapping.dst_layer_start_idx,
         injected_key_block=translated_key,
         injected_value_block=translated_value,
         dst_spec=model_specs[edge.dst_id],
@@ -1518,11 +1515,11 @@ class SummaryRow:
     study_id: str
     benchmark_mode: str
     metric_name: str
-    position_layer_idx: int
+    injection_layer_start_idx: int
     translated_num_layers: int
-    source_layer_idx: int
+    source_layer_start_idx: int
     source_layer_end_idx: int
-    target_layer_idx: int
+    target_layer_start_idx: int
     target_layer_end_idx: int
     average_metric: float
     average_native_metric: float
@@ -1599,11 +1596,11 @@ def build_summary_row(
         study_id=config.study_id or "",
         benchmark_mode=str(metrics["benchmark_mode"]),
         metric_name=str(metrics["metric_name"]),
-        position_layer_idx=int(reference_mapping["reference_target_layer_idx"]),
+        injection_layer_start_idx=int(config.injection_layer_start_idx),
         translated_num_layers=int(reference_mapping["translated_num_layers"]),
-        source_layer_idx=int(reference_mapping["src_layer_idx"]),
+        source_layer_start_idx=int(reference_mapping["src_layer_start_idx"]),
         source_layer_end_idx=int(reference_mapping["src_layer_end_idx"]),
-        target_layer_idx=int(reference_mapping["dst_layer_idx"]),
+        target_layer_start_idx=int(reference_mapping["dst_layer_start_idx"]),
         target_layer_end_idx=int(reference_mapping["dst_layer_end_idx"]),
         average_metric=float(metrics["average_metric"]),
         average_native_metric=float(metrics["average_native_metric"]),
@@ -1647,7 +1644,7 @@ def read_summary_rows(summary_path: Path) -> List[SummaryRow]:
 
 def write_summary(study_dir: Path, rows: List[SummaryRow]) -> Path:
     summary_path = build_summary_csv_path(study_dir)
-    rows = sorted(rows, key=lambda row: row.position_layer_idx)
+    rows = sorted(rows, key=lambda row: row.injection_layer_start_idx)
     fieldnames = list(SummaryRow.__dataclass_fields__.keys())
     with summary_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
@@ -1667,17 +1664,17 @@ def update_summary(
     summary_path = build_summary_csv_path(study_dir)
     row = build_summary_row(config, run_dir, metrics)
 
-    rows = [existing for existing in read_summary_rows(summary_path) if existing.position_layer_idx != row.position_layer_idx]
+    rows = [existing for existing in read_summary_rows(summary_path) if existing.injection_layer_start_idx != row.injection_layer_start_idx]
     rows.append(row)
-    rows.sort(key=lambda item: item.position_layer_idx)
+    rows.sort(key=lambda item: item.injection_layer_start_idx)
     return write_summary(study_dir, rows)
 
 
 def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
     for row in rows:
-        x_value = float(row.position_layer_idx)
+        x_value = float(row.injection_layer_start_idx)
         ax.annotate(
-            format_layer_range(int(row.target_layer_idx), int(row.target_layer_end_idx)),
+            format_layer_range(int(row.target_layer_start_idx), int(row.target_layer_end_idx)),
             (x_value, float(y_getter(row))),
             textcoords="offset points",
             xytext=(0, 7),
@@ -1707,8 +1704,8 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
 
-    rows.sort(key=lambda row: row.position_layer_idx)
-    x_values = [row.position_layer_idx for row in rows]
+    rows.sort(key=lambda row: row.injection_layer_start_idx)
+    x_values = [row.injection_layer_start_idx for row in rows]
     metric_name = rows[0].metric_name or "metric"
     metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
     window_title = format_window_title(rows[0].translated_num_layers)
@@ -1723,9 +1720,9 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     ax.plot(x_values, [row.average_mag_only_metric for row in rows], marker="^", label=f"Mag-only {metric_label}")
     ax.plot(x_values, [row.average_full_mix_metric for row in rows], marker="D", label=f"Full-mix {metric_label}")
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
-    ax.set_xlabel("Reference target layer index")
+    ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} decomposition vs layer index ({window_title})")
+    ax.set_title(f"{metric_label} decomposition vs injection target layer start index ({window_title})")
     ax.set_xticks(x_values)
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -1742,8 +1739,8 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
 
-    rows.sort(key=lambda row: row.position_layer_idx)
-    x_values = [row.position_layer_idx for row in rows]
+    rows.sort(key=lambda row: row.injection_layer_start_idx)
+    x_values = [row.injection_layer_start_idx for row in rows]
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
@@ -1756,7 +1753,7 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     ax.plot(x_values, [row.average_native_to_full_mix_logit_kl for row in rows], marker="^", label="KL(native || full-mix)")
     ax.plot(x_values, [row.average_full_mix_to_dir_only_logit_kl for row in rows], marker="x", label="KL(full-mix || dir-only)")
     ax.plot(x_values, [row.average_full_mix_to_mag_only_logit_kl for row in rows], marker="d", label="KL(full-mix || mag-only)")
-    ax.set_xlabel("Reference target layer index")
+    ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("KL divergence")
     ax.set_title(f"Logit KL comparison vs layer index ({window_title})")
     ax.set_xticks(x_values)
@@ -1775,8 +1772,8 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
 
-    rows.sort(key=lambda row: row.position_layer_idx)
-    x_values = [row.position_layer_idx for row in rows]
+    rows.sort(key=lambda row: row.injection_layer_start_idx)
+    x_values = [row.injection_layer_start_idx for row in rows]
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
@@ -1787,7 +1784,7 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
     ax.plot(x_values, [row.average_native_loss for row in rows], marker="o", label="Native Loss")
     ax.plot(x_values, [row.average_full_mix_loss for row in rows], marker="D", label="Full-mix Loss")
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
-    ax.set_xlabel("Reference target layer index")
+    ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("OpenWebText validation Loss")
     ax.set_title(f"OpenWebText validation Loss vs layer index ({window_title})")
     ax.set_xticks(x_values)
@@ -2079,13 +2076,13 @@ def run_eval(
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Task decomposition and logit-KL comparison are run automatically as part of the same execution."
+        description="Train and evaluate a translated layer window anchored at a chosen injection target-layer start index by replaying target prefill below the window, injecting the translated window, and continuing above it. Task decomposition and logit-KL comparison are run automatically as part of the same execution."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
-    parser.add_argument("--position-layer-idx", type=int, default=None, help="Reference target layer index to use as the anchor layer for translation/injection sweeps.")
-    parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers to translate and inject, starting from the anchor layer selected by --position-layer-idx. For example, 1 injects only the anchor layer, and 3 injects the anchor layer plus the next two upper layers.")
+    parser.add_argument("--injection-layer-start-idx", type=int, default=None, help="Target-model layer index where the injected window starts.")
+    parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers to translate and inject, starting from --injection-layer-start-idx. For example, 1 injects only that layer, and 3 injects that layer plus the next two upper layers.")
     parser.add_argument("--print-target-num-layers", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/layer_position")
@@ -2131,7 +2128,7 @@ def main() -> None:
         model_ids=args.model_ids,
         model_directions=args.model_directions,
         reference_direction=args.reference_direction,
-        position_layer_idx=args.position_layer_idx,
+        injection_layer_start_idx=args.injection_layer_start_idx,
         injection_window_size=args.injection_window_size,
         output_root=args.output_root,
         study_id=args.study_id,
@@ -2161,8 +2158,8 @@ def main() -> None:
         generation_max_new_tokens=args.generation_max_new_tokens,
     )
 
-    if config.position_layer_idx is None:
-        raise SystemExit("--position-layer-idx is required unless --print-target-num-layers is used.")
+    if config.injection_layer_start_idx is None:
+        raise SystemExit("--injection-layer-start-idx is required unless --print-target-num-layers is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)

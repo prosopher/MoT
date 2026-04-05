@@ -31,8 +31,8 @@ for ((i=1; i<=$#; i++)); do
     BENCHMARK_MODE="${!next_index}"
   elif [[ "${arg}" == --benchmark-mode=* ]]; then
     BENCHMARK_MODE="${arg#*=}"
-  elif [[ "${arg}" == --position-layer-idx || "${arg}" == --position-layer-idx=* ]]; then
-    echo "layer_position.sh sweeps positions automatically; do not pass --position-layer-idx" >&2
+  elif [[ "${arg}" == --injection-layer-start-idx || "${arg}" == --injection-layer-start-idx=* ]]; then
+    echo "layer_position.sh sweeps positions automatically; do not pass --injection-layer-start-idx" >&2
     exit 1
   fi
 done
@@ -74,11 +74,11 @@ if (( MAX_START_LAYER_IDX < 0 )); then
   exit 1
 fi
 
-echo "[LayerPosition] sweeping reference target layer indices 0..${MAX_START_LAYER_IDX}"
+echo "[LayerPosition] sweeping injection target layer start indices 0..${MAX_START_LAYER_IDX}"
 for ((layer_idx=0; layer_idx<=MAX_START_LAYER_IDX; layer_idx++)); do
-  echo "[LayerPosition] ===== reference target layer idx ${layer_idx} ====="
+  echo "[LayerPosition] ===== injection target layer start idx ${layer_idx} ====="
   python exp/layer_position.py \
-    --position-layer-idx "${layer_idx}" \
+    --injection-layer-start-idx "${layer_idx}" \
     --output-root "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
     --injection-window-size "${INJECTION_WINDOW_SIZE}" \

@@ -31,8 +31,8 @@ for ((i=1; i<=$#; i++)); do
     BENCHMARK_MODE="${!next_index}"
   elif [[ "${arg}" == --benchmark-mode=* ]]; then
     BENCHMARK_MODE="${arg#*=}"
-  elif [[ "${arg}" == --position-layer-idx || "${arg}" == --position-layer-idx=* ]]; then
-    echo "correction.sh sweeps positions automatically; do not pass --position-layer-idx" >&2
+  elif [[ "${arg}" == --injection-layer-start-idx || "${arg}" == --injection-layer-start-idx=* ]]; then
+    echo "correction.sh sweeps positions automatically; do not pass --injection-layer-start-idx" >&2
     exit 1
   fi
 done
@@ -69,11 +69,11 @@ echo "[Correction] injection_window_size=${INJECTION_WINDOW_SIZE}"
 echo "[Correction] target_num_layers=${NUM_LAYERS}"
 
 MAX_START_LAYER_IDX=$((NUM_LAYERS - INJECTION_WINDOW_SIZE))
-echo "[Correction] sweeping reference target layer indices 0..${MAX_START_LAYER_IDX}"
+echo "[Correction] sweeping injection target layer start indices 0..${MAX_START_LAYER_IDX}"
 for ((layer_idx=0; layer_idx<=MAX_START_LAYER_IDX; layer_idx++)); do
-  echo "[Correction] ===== reference target layer idx ${layer_idx} ====="
+  echo "[Correction] ===== injection target layer start idx ${layer_idx} ====="
   python exp/correction.py \
-    --position-layer-idx "${layer_idx}" \
+    --injection-layer-start-idx "${layer_idx}" \
     --output-root "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
     --injection-window-size "${INJECTION_WINDOW_SIZE}" \

@@ -24,7 +24,7 @@ class CorrectionConfig:
     model_ids: str
     model_directions: str
     reference_direction: Optional[str]
-    position_layer_idx: Optional[int]
+    injection_layer_start_idx: Optional[int]
     injection_window_size: int
 
     output_root: str
@@ -69,8 +69,8 @@ class CorrectionConfig:
             raise ValueError("grad_accum_steps must be >= 1")
         if self.prefix_tokens < 2 or self.prefix_tokens >= self.total_tokens:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
-        if self.position_layer_idx is not None and self.position_layer_idx < 0:
-            raise ValueError("position_layer_idx must be >= 0")
+        if self.injection_layer_start_idx is not None and self.injection_layer_start_idx < 0:
+            raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
         if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
@@ -85,11 +85,11 @@ class CorrectionConfig:
 class CorrectionSummaryRow:
     study_id: str
     benchmark_mode: str
-    position_layer_idx: int
+    injection_layer_start_idx: int
     translated_num_layers: int
-    source_layer_idx: int
+    source_layer_start_idx: int
     source_layer_end_idx: int
-    target_layer_idx: int
+    target_layer_start_idx: int
     target_layer_end_idx: int
     num_samples: int
     num_tokens: int
@@ -122,8 +122,8 @@ def build_study_dir(config: CorrectionConfig) -> Path:
 
 def build_run_output_dir(config: CorrectionConfig) -> Path:
     study_dir = build_study_dir(config)
-    position_label = f"layer_idx_{int(config.position_layer_idx):03d}"
-    return study_dir / position_label
+    run_label = f"injection_layer_start_idx_{int(config.injection_layer_start_idx):03d}"
+    return study_dir / run_label
 
 
 def build_train_log_path(run_dir: Path) -> Path:
@@ -435,7 +435,7 @@ def compute_correction_metrics_from_traces(
     mlp_delta = mixed_trace["mlp_additions"] - native_trace["mlp_additions"]
 
     source_idx = int(mapping.dst_layer_end_idx) + 1
-    window_input_idx = int(mapping.dst_layer_idx)
+    window_input_idx = int(mapping.dst_layer_start_idx)
     initial_shift = hidden_delta[source_idx]
     initial_shift_norm = float(initial_shift.norm().item())
     window_input_norm = float(native_trace["hidden_states"][window_input_idx].norm().item())
@@ -587,13 +587,13 @@ def evaluate_correction(
                     native_target_past = past_by_node_id[edge.dst_id]
                     native_key_block, native_value_block = lp.extract_layer_window_blocks(
                         past_key_values=native_target_past,
-                        start_layer_idx=mapping.dst_layer_idx,
+                        start_layer_idx=mapping.dst_layer_start_idx,
                         num_layers=mapping.translated_num_layers,
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=models[edge.dst_id],
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=mapping.dst_layer_idx,
+                        target_start_layer_idx=mapping.dst_layer_start_idx,
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
                         dst_spec=model_specs[edge.dst_id],
@@ -609,7 +609,7 @@ def evaluate_correction(
                         random_past = lp.replay_target_prefill_with_injected_window(
                             target_model=models[edge.dst_id],
                             prefix_input_ids=cache_input_ids,
-                            target_start_layer_idx=mapping.dst_layer_idx,
+                            target_start_layer_idx=mapping.dst_layer_start_idx,
                             injected_key_block=random_key_block,
                             injected_value_block=random_value_block,
                             dst_spec=model_specs[edge.dst_id],
@@ -737,21 +737,19 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
         reader = csv.DictReader(handle)
         rows = []
         for raw_row in reader:
-            post_window_boundary_idx = int(raw_row.get("post_window_boundary_idx", int(raw_row["target_layer_end_idx"]) + 1))
-            num_upper_layers = int(raw_row.get("num_upper_layers", raw_row.get("remaining_correction_layers", 0)))
             rows.append(CorrectionSummaryRow(
                 study_id=raw_row["study_id"],
                 benchmark_mode=raw_row["benchmark_mode"],
-                position_layer_idx=int(raw_row["position_layer_idx"]),
+                injection_layer_start_idx=int(raw_row["injection_layer_start_idx"]),
                 translated_num_layers=int(raw_row["translated_num_layers"]),
-                source_layer_idx=int(raw_row["source_layer_idx"]),
+                source_layer_start_idx=int(raw_row["source_layer_start_idx"]),
                 source_layer_end_idx=int(raw_row["source_layer_end_idx"]),
-                target_layer_idx=int(raw_row["target_layer_idx"]),
+                target_layer_start_idx=int(raw_row["target_layer_start_idx"]),
                 target_layer_end_idx=int(raw_row["target_layer_end_idx"]),
                 num_samples=int(raw_row["num_samples"]),
                 num_tokens=int(raw_row["num_tokens"]),
                 average_initial_shift_norm=float(raw_row["average_initial_shift_norm"]),
-                average_window_input_norm=float(raw_row.get("average_window_input_norm", float("nan"))),
+                average_window_input_norm=float(raw_row["average_window_input_norm"]),
                 average_final_shift_norm=float(raw_row["average_final_shift_norm"]),
                 average_final_shrink_ratio=float(raw_row["average_final_shrink_ratio"]),
                 median_final_shrink_ratio=float(raw_row["median_final_shrink_ratio"]),
@@ -767,9 +765,9 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
                 average_random_shrink_fraction=float(raw_row["average_random_shrink_fraction"]),
                 average_random_final_correction_cosine=float(raw_row["average_random_final_correction_cosine"]),
                 run_dir=raw_row["run_dir"],
-                post_window_boundary_idx=post_window_boundary_idx,
-                num_upper_layers=num_upper_layers,
-                remaining_correction_layers=num_upper_layers,
+                post_window_boundary_idx=int(raw_row["post_window_boundary_idx"]),
+                num_upper_layers=int(raw_row["num_upper_layers"]),
+                remaining_correction_layers=int(raw_row["remaining_correction_layers"]),
             ))
         return rows
 
@@ -786,11 +784,11 @@ def update_summary(config: CorrectionConfig, run_dir: Path, metrics: Dict[str, A
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
-        position_layer_idx=int(config.position_layer_idx),
+        injection_layer_start_idx=int(config.injection_layer_start_idx),
         translated_num_layers=int(mapping.translated_num_layers),
-        source_layer_idx=int(mapping.src_layer_idx),
+        source_layer_start_idx=int(mapping.src_layer_start_idx),
         source_layer_end_idx=int(mapping.src_layer_end_idx),
-        target_layer_idx=int(mapping.dst_layer_idx),
+        target_layer_start_idx=int(mapping.dst_layer_start_idx),
         target_layer_end_idx=int(mapping.dst_layer_end_idx),
         num_samples=int(metrics.get("processed_examples", config.eval_max_examples_per_dataset)),
         num_tokens=int(full_mix["num_tokens"]),
@@ -815,9 +813,9 @@ def update_summary(config: CorrectionConfig, run_dir: Path, metrics: Dict[str, A
         num_upper_layers=num_upper_layers,
         remaining_correction_layers=num_upper_layers,
     )
-    rows = [existing for existing in rows if existing.position_layer_idx != row.position_layer_idx]
+    rows = [existing for existing in rows if existing.injection_layer_start_idx != row.injection_layer_start_idx]
     rows.append(row)
-    rows.sort(key=lambda item: item.position_layer_idx)
+    rows.sort(key=lambda item: item.injection_layer_start_idx)
     fieldnames = list(asdict(row).keys())
     with summary_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -831,8 +829,8 @@ def plot_run_trajectories(run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path,
     import matplotlib.pyplot as plt
 
     source_idx = int(metrics["trajectory"]["source_idx"])
-    mapping = next(iter(metrics.get("layer_mappings", {}).values()), {})
-    injected_window_label = format_layer_range(int(mapping.get("dst_layer_idx", 0)), int(mapping.get("dst_layer_end_idx", 0)))
+    mapping = next(iter(metrics["layer_mappings"].values()))
+    injected_window_label = format_layer_range(int(mapping["dst_layer_start_idx"]), int(mapping["dst_layer_end_idx"]))
     token_00 = metrics["trajectory"]["token_trajectories"].get("token_00", {})
     full = token_00.get("full_mix", {})
     rand = token_00.get("random", {})
@@ -877,8 +875,8 @@ def plot_run_trajectories(run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path,
 def _annotate_ranges(ax, rows: List[CorrectionSummaryRow], y_values: List[float]) -> None:
     for row, y in zip(rows, y_values):
         ax.annotate(
-            format_layer_range(row.target_layer_idx, row.target_layer_end_idx),
-            (float(row.position_layer_idx), float(y)),
+            format_layer_range(row.target_layer_start_idx, row.target_layer_end_idx),
+            (float(row.injection_layer_start_idx), float(y)),
             textcoords="offset points",
             xytext=(0, 7),
             ha="center",
@@ -891,8 +889,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     rows = read_summary_rows(summary_path)
     if not rows:
         raise ValueError(f"No rows found in {summary_path}")
-    rows.sort(key=lambda row: row.position_layer_idx)
-    x_values = [row.position_layer_idx for row in rows]
+    rows.sort(key=lambda row: row.injection_layer_start_idx)
+    x_values = [row.injection_layer_start_idx for row in rows]
     study_dir = summary_path.parent
 
     outputs: Dict[str, Path] = {}
@@ -920,7 +918,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax.plot(x_values, random_shrink, marker="s", label="Random control avg final shrink ratio")
     ax.axhline(1.0, linestyle="--", linewidth=1)
     _annotate_ranges(ax, rows, avg_shrink)
-    ax.set_xlabel("Reference target layer start index")
+    ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Final ||Δh_L|| / ||s_{t+w-1}||")
     ax.set_title("Final post-window shrink ratio vs injected-window start index")
     ax.grid(True, alpha=0.3)
@@ -939,9 +937,9 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax.plot(x_values, beta_minus_alpha, marker="x", label="β - α")
     _annotate_ranges(ax, rows, beta)
     ax.axhline(0.0, linestyle="--", linewidth=1)
-    ax.set_xlabel("Reference target layer start index")
+    ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Initial-shift-normalized magnitude")
-    ax.set_title("Correction decomposition vs injected-window start index")
+    ax.set_title("Correction decomposition vs injection target layer start index")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -957,13 +955,13 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     window_input_norms = [row.average_window_input_norm for row in rows]
     ax.scatter(raw_beta, raw_alpha, s=phase_sizes, marker="o")
     for row, x, y, s_norm, x_in_norm in zip(rows, raw_beta, raw_alpha, initial_shift, window_input_norms):
-        if row.target_layer_idx == row.target_layer_end_idx:
-            shift_symbol = f"s_{row.target_layer_idx}"
+        if row.target_layer_start_idx == row.target_layer_end_idx:
+            shift_symbol = f"s_{row.target_layer_start_idx}"
         else:
             shift_symbol = f"s_{row.target_layer_end_idx+1}"
-        input_symbol = f"X_{row.target_layer_idx}"
+        input_symbol = f"X_{row.target_layer_start_idx}"
         ax.annotate(
-            f"L{row.position_layer_idx}\n||{shift_symbol}||={s_norm:.2f}\n||{input_symbol}||={x_in_norm:.2f}",
+            f"L{row.injection_layer_start_idx}\n||{shift_symbol}||={s_norm:.2f}\n||{input_symbol}||={x_in_norm:.2f}",
             (x, y),
             textcoords="offset points",
             xytext=(5, 4),
@@ -991,7 +989,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax2 = fig.add_subplot(212)
     ax2.plot(x_values, structural_cosine_advantage, marker="s", label="Full-Mix - Random correction cosine")
     ax2.axhline(0.0, linestyle="--", linewidth=1)
-    ax2.set_xlabel("Reference target layer start index")
+    ax2.set_xlabel("Injection target layer start index")
     ax2.set_ylabel("Positive is better")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
@@ -1013,7 +1011,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax2 = fig.add_subplot(212)
     ax2.plot(x_values, beta_over_alpha, marker="^", label="β / α")
     ax2.axhline(1.0, linestyle="--", linewidth=1)
-    ax2.set_xlabel("Reference target layer start index")
+    ax2.set_xlabel("Injection target layer start index")
     ax2.set_ylabel("Orthogonal-to-correction ratio")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
@@ -1030,7 +1028,7 @@ def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionCon
         model_ids=config.model_ids,
         model_directions=config.model_directions,
         reference_direction=config.reference_direction,
-        position_layer_idx=config.position_layer_idx,
+        injection_layer_start_idx=config.injection_layer_start_idx,
         injection_window_size=config.injection_window_size,
         output_root=config.output_root,
         study_id=config.study_id,
@@ -1068,8 +1066,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
-    parser.add_argument("--position-layer-idx", type=int, default=None)
-    parser.add_argument("--injection-window-size", type=int, default=5)
+    parser.add_argument("--injection-layer-start-idx", type=int, default=None, help="Target-model layer index where the injected window starts.")
+    parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers in the injected window.")
     parser.add_argument("--print-target-num-layers", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/correction")
@@ -1115,7 +1113,7 @@ def main() -> None:
         model_ids=args.model_ids,
         model_directions=args.model_directions,
         reference_direction=args.reference_direction,
-        position_layer_idx=args.position_layer_idx,
+        injection_layer_start_idx=args.injection_layer_start_idx,
         injection_window_size=args.injection_window_size,
         output_root=args.output_root,
         study_id=args.study_id,
@@ -1146,8 +1144,8 @@ def main() -> None:
         correction_max_analysis_tokens=args.correction_max_analysis_tokens,
         correction_include_random_control=not args.disable_random_control,
     )
-    if config.position_layer_idx is None:
-        raise SystemExit("--position-layer-idx is required unless --print-target-num-layers is used.")
+    if config.injection_layer_start_idx is None:
+        raise SystemExit("--injection-layer-start-idx is required unless --print-target-num-layers is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)
