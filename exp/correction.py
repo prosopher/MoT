@@ -23,7 +23,6 @@ import exp.layer_position as lp
 class CorrectionConfig:
     model_ids: str
     model_directions: str
-    reference_direction: Optional[str]
     injection_layer_start_idx: Optional[int]
     injection_window_size: int
 
@@ -1027,7 +1026,6 @@ def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionCon
     return lp.LayerPositionConfig(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
-        reference_direction=config.reference_direction,
         injection_layer_start_idx=config.injection_layer_start_idx,
         injection_window_size=config.injection_window_size,
         output_root=config.output_root,
@@ -1065,7 +1063,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
-    parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--injection-layer-start-idx", type=int, default=None, help="Target-model layer index where the injected window starts.")
     parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers in the injected window.")
     parser.add_argument("--print-target-num-layers", action="store_true")
@@ -1107,12 +1104,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.print_target_num_layers:
-        print(lp.resolve_target_num_layers(args.model_ids, args.model_directions, args.reference_direction))
+        print(lp.resolve_target_num_layers(args.model_ids, args.model_directions))
         return
     config = CorrectionConfig(
         model_ids=args.model_ids,
         model_directions=args.model_directions,
-        reference_direction=args.reference_direction,
         injection_layer_start_idx=args.injection_layer_start_idx,
         injection_window_size=args.injection_window_size,
         output_root=args.output_root,
@@ -1151,10 +1147,9 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions, reference_edge = lp.resolve_reference_direction_metadata(
+    nodes, edges, active_directions, reference_edge = lp.resolve_direction_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
-        reference_direction=config.reference_direction,
     )
     layer_position_config = build_layer_position_config(config)
     models, tokenizer, _, _ = lp.build_models_for_experiment(layer_position_config)

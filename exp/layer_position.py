@@ -18,7 +18,6 @@ from transformers import AutoConfig
 
 @dataclass(frozen=True)
 class LayerMapping:
-    reference_direction: str
     reference_target_node_id: str
     reference_target_num_layers: int
     src_layer_start_idx: int
@@ -34,7 +33,6 @@ class LayerMapping:
 class LayerPositionConfig:
     model_ids: str
     model_directions: str
-    reference_direction: Optional[str]
     injection_layer_start_idx: Optional[int]
     injection_window_size: int
 
@@ -433,22 +431,16 @@ def load_model_spec_from_pretrained_config(model_id: str) -> ModelSpec:
     )
 
 
-def resolve_reference_direction_metadata(
+def resolve_direction_metadata(
     model_ids: str,
     model_directions: str,
-    reference_direction: Optional[str],
 ) -> Tuple[List[Node], List[Edge], List[str], Edge]:
     nodes, edges = build_nodes_and_edges(model_ids, model_directions)
     active_directions = [edge.id for edge in edges]
     if not active_directions:
         raise ValueError("No active directions were resolved from model_directions")
-    chosen_direction = reference_direction or active_directions[0]
     edge_map = build_edge_map(edges)
-    if chosen_direction not in edge_map:
-        raise ValueError(
-            f"reference_direction={chosen_direction!r} is not available. Choices: {sorted(edge_map)}"
-        )
-    return nodes, edges, active_directions, edge_map[chosen_direction]
+    return nodes, edges, active_directions, edge_map[active_directions[0]]
 
 
 def resolve_injection_layer_start_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
@@ -469,12 +461,10 @@ def resolve_run_position_label(config: LayerPositionConfig) -> str:
 def resolve_target_num_layers(
     model_ids: str,
     model_directions: str,
-    reference_direction: Optional[str],
 ) -> int:
-    nodes, _, _, reference_edge = resolve_reference_direction_metadata(
+    nodes, _, _, reference_edge = resolve_direction_metadata(
         model_ids=model_ids,
         model_directions=model_directions,
-        reference_direction=reference_direction,
     )
     node_map = build_node_map(nodes)
     target_model_id = node_map[reference_edge.dst_id].model_id
@@ -532,7 +522,6 @@ def build_layer_mappings(
             )
 
         mappings[direction] = LayerMapping(
-            reference_direction=reference_edge.id,
             reference_target_node_id=reference_edge.dst_id,
             reference_target_num_layers=reference_target_spec.num_layers,
             src_layer_start_idx=src_layer_start_idx,
@@ -824,14 +813,14 @@ def log_layer_mappings(
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     node_map = build_node_map(nodes)
-    reference_direction = next(iter(layer_mappings.values())).reference_direction
-    reference_mapping = layer_mappings[reference_direction]
-    logger.info("[LayerMapping] reference direction = %s", reference_direction)
+    anchor_direction = next(iter(layer_mappings))
+    anchor_mapping = layer_mappings[anchor_direction]
+    logger.info("[LayerMapping] anchor direction = %s", anchor_direction)
     logger.info(
-        "[LayerMapping] reference target window = L%d-%d/%d",
-        reference_mapping.dst_layer_start_idx,
-        reference_mapping.dst_layer_end_idx,
-        reference_mapping.reference_target_num_layers - 1,
+        "[LayerMapping] anchor target window = L%d-%d/%d",
+        anchor_mapping.dst_layer_start_idx,
+        anchor_mapping.dst_layer_end_idx,
+        anchor_mapping.reference_target_num_layers - 1,
     )
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
@@ -2080,7 +2069,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
-    parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--injection-layer-start-idx", type=int, default=None, help="Target-model layer index where the injected window starts.")
     parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers to translate and inject, starting from --injection-layer-start-idx. For example, 1 injects only that layer, and 3 injects that layer plus the next two upper layers.")
     parser.add_argument("--print-target-num-layers", action="store_true")
@@ -2121,13 +2109,12 @@ def main() -> None:
     args = parse_args()
 
     if args.print_target_num_layers:
-        print(resolve_target_num_layers(args.model_ids, args.model_directions, args.reference_direction))
+        print(resolve_target_num_layers(args.model_ids, args.model_directions))
         return
 
     config = LayerPositionConfig(
         model_ids=args.model_ids,
         model_directions=args.model_directions,
-        reference_direction=args.reference_direction,
         injection_layer_start_idx=args.injection_layer_start_idx,
         injection_window_size=args.injection_window_size,
         output_root=args.output_root,
@@ -2165,10 +2152,9 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions, reference_edge = resolve_reference_direction_metadata(
+    nodes, edges, active_directions, reference_edge = resolve_direction_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
-        reference_direction=config.reference_direction,
     )
     models, tokenizer, _, _ = build_models_for_experiment(config)
     translator_pool, model_specs, layer_mappings = run_train(
