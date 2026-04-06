@@ -64,8 +64,8 @@ class TrainConfig:
             raise ValueError("injection_window_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
-        if self.translator not in {"single", "mot"}:
-            raise ValueError("translator must be one of {'single', 'mot'}")
+        if self.translator not in {"single", "mot", "mot-r"}:
+            raise ValueError("translator must be one of {'single', 'mot', 'mot-r'}")
         if self.mot_num_translators < 1:
             raise ValueError("mot_num_translators must be >= 1")
         if self.mot_top_k < 1:
@@ -236,6 +236,115 @@ class MixtureOfTranslators(nn.Module):
         return (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
 
 
+class ResidualTranslatorExpert(nn.Module):
+    def __init__(
+        self,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        num_layers: int,
+        translator_dim: int,
+        translator_heads: int,
+        translator_depth: int,
+        mlp_ratio: int,
+    ) -> None:
+        super().__init__()
+        self.translator = CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.residual_scale) * self.translator(layer_window_cache)
+
+
+class ResidualMixtureOfTranslators(nn.Module):
+    def __init__(
+        self,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        num_layers: int,
+        translator_dim: int,
+        translator_heads: int,
+        translator_depth: int,
+        mlp_ratio: int,
+        num_translators: int,
+        top_k: int,
+    ) -> None:
+        super().__init__()
+        if num_translators < 1:
+            raise ValueError("num_translators must be >= 1")
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        if top_k > num_translators:
+            raise ValueError("top_k must be <= num_translators")
+        self.num_translators = num_translators
+        self.top_k = top_k
+        self.base_translator = CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
+        )
+        self.residual_experts = nn.ModuleList(
+            [
+                ResidualTranslatorExpert(
+                    src_hidden_size=src_hidden_size,
+                    dst_hidden_size=dst_hidden_size,
+                    num_layers=num_layers,
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(max(0, num_translators - 1))
+            ]
+        )
+        router_input_dim = num_layers * src_hidden_size
+        router_hidden_dim = max(64, min(translator_dim, router_input_dim))
+        self.router = None
+        if len(self.residual_experts) > 0:
+            self.router = nn.Sequential(
+                nn.LayerNorm(router_input_dim),
+                nn.Linear(router_input_dim, router_hidden_dim),
+                nn.GELU(),
+                nn.Linear(router_hidden_dim, len(self.residual_experts)),
+            )
+            final_linear = self.router[-1]
+            nn.init.zeros_(final_linear.weight)
+            nn.init.zeros_(final_linear.bias)
+
+    def _compute_mixture_weights(self, layer_window_cache: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.router is None:
+            return None
+        router_input = layer_window_cache.reshape(layer_window_cache.shape[0], layer_window_cache.shape[1], -1)
+        router_logits = self.router(router_input)
+        if (not self.training) and self.top_k < len(self.residual_experts):
+            topk_indices = torch.topk(router_logits, k=self.top_k, dim=-1).indices
+            topk_mask = torch.zeros_like(router_logits, dtype=torch.bool)
+            topk_mask.scatter_(-1, topk_indices, True)
+            router_logits = router_logits.masked_fill(~topk_mask, float("-inf"))
+        return torch.softmax(router_logits, dim=-1)
+
+    def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
+        base_output = self.base_translator(layer_window_cache)
+        if len(self.residual_experts) == 0:
+            return base_output
+        mixture_weights = self._compute_mixture_weights(layer_window_cache)
+        residual_outputs = [expert(layer_window_cache) for expert in self.residual_experts]
+        stacked_outputs = torch.stack(residual_outputs, dim=2)
+        residual = (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+        return base_output + residual
+
+
 def build_window_translator(
     *,
     translator: str,
@@ -261,6 +370,18 @@ def build_window_translator(
         )
     if translator == "mot":
         return MixtureOfTranslators(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
+            num_translators=mot_num_translators,
+            top_k=mot_top_k,
+        )
+    if translator == "mot-r":
+        return ResidualMixtureOfTranslators(
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
             num_layers=num_layers,
