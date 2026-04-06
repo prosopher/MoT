@@ -816,6 +816,18 @@ def add_dataclass_arguments(
             continue
 
         option_name = f"--{field_info.name.replace('_', '-')}"
+        resolved_type = _unwrap_optional_type(field_info.type)
+        if resolved_type is bool:
+            parser.add_argument(
+                option_name,
+                dest=field_info.name,
+                nargs="?",
+                const=True,
+                type=parse_bool_arg,
+                default=argparse.SUPPRESS,
+            )
+            continue
+
         parser.add_argument(
             option_name,
             dest=field_info.name,

@@ -18,7 +18,7 @@ from transformers import AutoConfig
 
 @dataclass
 class LayerPositionConfig(TrainConfig):
-    injection_layer_start_idx: Optional[int]
+    injection_layer_start_idx: int
     injection_window_size: int
     study_id: Optional[str]
 
@@ -37,7 +37,7 @@ class LayerPositionConfig(TrainConfig):
             raise ValueError("grad_accum_steps must be >= 1")
         if self.prefix_tokens < 2 or self.prefix_tokens >= self.total_tokens:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
-        if self.injection_layer_start_idx is not None and self.injection_layer_start_idx < 0:
+        if self.injection_layer_start_idx < 0:
             raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
@@ -1607,95 +1607,50 @@ def run_eval(
     }
 
 
-def parse_args() -> argparse.Namespace:
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a translated layer window anchored at a chosen injection target-layer start index by replaying target prefill below the window, injecting the translated window, and continuing above it. Task decomposition and logit-KL comparison are run automatically as part of the same execution."
+        description=(
+            "Sweep the injection target-layer start index for the layer-window translator and evaluate \
+cache injection quality on benchmark tasks."
+        )
     )
-    parser.add_argument("--model-ids", default="gpt2,gpt2")
-    parser.add_argument("--model-directions", default="A_to_B")
-    parser.add_argument("--injection-layer-start-idx", type=int, default=None, help="Target-model layer index where the injected window starts.")
-    parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers to translate and inject, starting from --injection-layer-start-idx. For example, 1 injects only that layer, and 3 injects that layer plus the next two upper layers.")
-    parser.add_argument("--print-target-num-layers", action="store_true")
-
     parser.add_argument("--alg", default="layer_position")
-    parser.add_argument("--timestamp", default=None)
-    parser.add_argument("--output-path", default="outputs/layer_position")
-    parser.add_argument("--study-id", default=None)
+    parser.add_argument(
+        "--default-config-path",
+        dest="default_config_path",
+        default="configs/layer_position.json",
+    )
+    parser.add_argument("--print-target-num-layers", action="store_true")
+    add_dataclass_arguments(
+        parser,
+        LayerPositionConfig,
+        exclude_fields={"alg"},
+    )
+    return parser
 
-    parser.add_argument("--max-steps", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum-steps", type=int, default=4)
-    parser.add_argument("--total-tokens", type=int, default=128)
-    parser.add_argument("--prefix-tokens", type=int, default=64)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--warmup-steps", type=int, default=50)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--shuffle-buffer", type=int, default=50_000)
 
-    parser.add_argument("--translator-dim", type=int, default=1024)
-    parser.add_argument("--translator-heads", type=int, default=16)
-    parser.add_argument("--translator-depth", type=int, default=2)
-    parser.add_argument("--translator-mlp-ratio", type=int, default=4)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", default="float32")
-
-    parser.add_argument("--eval-batch-size", type=int, default=4)
-    parser.add_argument("--eval-num-workers", type=int, default=0)
-    parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
-    parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="gen_qa")
-    parser.add_argument("--generation-max-new-tokens", type=int, default=64)
-    return parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    config_kwargs = build_dataclass_kwargs_from_json_and_namespace(
+        config_cls=LayerPositionConfig,
+        default_config_path=args.default_config_path,
+        args=args,
+        exclude_fields={"alg"},
+    )
 
     if args.print_target_num_layers:
-        print(resolve_target_num_layers(args.model_ids, args.model_directions))
+        print(resolve_target_num_layers(config_kwargs["model_ids"], config_kwargs["model_directions"]))
         return
 
     config = LayerPositionConfig(
         alg=args.alg,
-        timestamp=args.timestamp,
-        output_path=args.output_path,
-        model_ids=args.model_ids,
-        model_directions=args.model_directions,
-        max_steps=args.max_steps,
-        batch_size=args.batch_size,
-        grad_accum_steps=args.grad_accum_steps,
-        total_tokens=args.total_tokens,
-        prefix_tokens=args.prefix_tokens,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        grad_clip_norm=args.grad_clip_norm,
-        log_every=args.log_every,
-        seed=args.seed,
-        shuffle_buffer=args.shuffle_buffer,
-        translator_dim=args.translator_dim,
-        translator_heads=args.translator_heads,
-        translator_depth=args.translator_depth,
-        translator_mlp_ratio=args.translator_mlp_ratio,
-        device=args.device,
-        dtype=args.dtype,
-        injection_layer_start_idx=args.injection_layer_start_idx,
-        injection_window_size=args.injection_window_size,
-        study_id=args.study_id,
-        eval_batch_size=args.eval_batch_size,
-        eval_num_workers=args.eval_num_workers,
-        eval_max_examples_per_dataset=args.eval_max_examples_per_dataset,
-        eval_shuffle_stream=args.eval_shuffle_stream,
-        benchmark_mode=args.benchmark_mode,
-        generation_max_new_tokens=args.generation_max_new_tokens,
+        **config_kwargs,
     )
 
-    if config.injection_layer_start_idx is None:
-        raise SystemExit("--injection-layer-start-idx is required unless --print-target-num-layers is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)

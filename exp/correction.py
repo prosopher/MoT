@@ -22,7 +22,7 @@ import exp.layer_position as lp
 
 @dataclass
 class CorrectionConfig(TrainConfig):
-    injection_layer_start_idx: Optional[int]
+    injection_layer_start_idx: int
     injection_window_size: int
     study_id: Optional[str]
 
@@ -34,7 +34,6 @@ class CorrectionConfig(TrainConfig):
     generation_max_new_tokens: int
 
     correction_max_analysis_tokens: int
-    correction_include_random_control: bool
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -44,7 +43,7 @@ class CorrectionConfig(TrainConfig):
             raise ValueError("grad_accum_steps must be >= 1")
         if self.prefix_tokens < 2 or self.prefix_tokens >= self.total_tokens:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
-        if self.injection_layer_start_idx is not None and self.injection_layer_start_idx < 0:
+        if self.injection_layer_start_idx < 0:
             raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
@@ -573,32 +572,28 @@ def evaluate_correction(
                         injected_value_block=translated_value,
                         dst_spec=model_specs[edge.dst_id],
                     )
-                    random_past = None
-                    if config.correction_include_random_control:
-                        random_key_block, random_value_block = build_random_matched_window(
-                            native_key_block=native_key_block,
-                            native_value_block=native_value_block,
-                            translated_key_block=translated_key,
-                            translated_value_block=translated_value,
-                        )
-                        random_past = lp.replay_target_prefill_with_injected_window(
-                            target_model=models[edge.dst_id],
-                            prefix_input_ids=cache_input_ids,
-                            target_start_layer_idx=mapping.dst_layer_start_idx,
-                            injected_key_block=random_key_block,
-                            injected_value_block=random_value_block,
-                            dst_spec=model_specs[edge.dst_id],
-                        )
+                    random_key_block, random_value_block = build_random_matched_window(
+                        native_key_block=native_key_block,
+                        native_value_block=native_value_block,
+                        translated_key_block=translated_key,
+                        translated_value_block=translated_value,
+                    )
+                    random_past = lp.replay_target_prefill_with_injected_window(
+                        target_model=models[edge.dst_id],
+                        prefix_input_ids=cache_input_ids,
+                        target_start_layer_idx=mapping.dst_layer_start_idx,
+                        injected_key_block=random_key_block,
+                        injected_value_block=random_value_block,
+                        dst_spec=model_specs[edge.dst_id],
+                    )
 
                     target_model = models[edge.dst_id]
                     native_past = maybe_append_input_ids(target_model, native_target_past, question_cache_ids)
                     fullmix_past = maybe_append_input_ids(target_model, full_mix_past, question_cache_ids)
-                    if random_past is not None:
-                        random_past = maybe_append_input_ids(target_model, random_past, question_cache_ids)
+                    random_past = maybe_append_input_ids(target_model, random_past, question_cache_ids)
                     native_past = maybe_append_input_ids(target_model, native_past, seed_token)
                     fullmix_past = maybe_append_input_ids(target_model, fullmix_past, seed_token)
-                    if random_past is not None:
-                        random_past = maybe_append_input_ids(target_model, random_past, seed_token)
+                    random_past = maybe_append_input_ids(target_model, random_past, seed_token)
 
                     for token_idx in range(int(answer_token_ids.shape[0])):
                         current_input_ids = answer_token_ids[token_idx : token_idx + 1].view(1, 1)
@@ -625,33 +620,31 @@ def evaluate_correction(
                                 beta_over_initial=correction_metrics["trajectory"]["beta_over_initial"],
                                 correction_cosine=correction_metrics["trajectory"]["correction_cosine"],
                             )
-                        if random_past is not None:
-                            random_trace = trace_single_token_with_past(target_model, random_past, current_input_ids)
-                            random_metrics = compute_correction_metrics_from_traces(native_trace, random_trace, mapping)
-                            if random_metrics.get("valid", False):
-                                random_collector.update(
-                                    initial_shift_norm=random_metrics["initial_shift_norm"],
-                                    window_input_norm=random_metrics["window_input_norm"],
-                                    final_shift_norm=random_metrics["final_shift_norm"],
-                                    final_shrink_ratio=random_metrics["final_shrink_ratio"],
-                                    final_alpha=random_metrics["final_alpha"],
-                                    final_alpha_over_initial=random_metrics["final_alpha_over_initial"],
-                                    final_beta=random_metrics["final_beta"],
-                                    final_beta_over_initial=random_metrics["final_beta_over_initial"],
-                                    final_correction_cosine=random_metrics["final_correction_cosine"],
-                                    final_attn_alpha_over_initial=random_metrics["final_attn_alpha_over_initial"],
-                                    final_mlp_alpha_over_initial=random_metrics["final_mlp_alpha_over_initial"],
-                                )
-                                random_trajectory_by_token[token_idx].update(
-                                    rho=random_metrics["trajectory"]["rho"],
-                                    alpha_over_initial=random_metrics["trajectory"]["alpha_over_initial"],
-                                    beta_over_initial=random_metrics["trajectory"]["beta_over_initial"],
-                                    correction_cosine=random_metrics["trajectory"]["correction_cosine"],
-                                )
+                        random_trace = trace_single_token_with_past(target_model, random_past, current_input_ids)
+                        random_metrics = compute_correction_metrics_from_traces(native_trace, random_trace, mapping)
+                        if random_metrics.get("valid", False):
+                            random_collector.update(
+                                initial_shift_norm=random_metrics["initial_shift_norm"],
+                                window_input_norm=random_metrics["window_input_norm"],
+                                final_shift_norm=random_metrics["final_shift_norm"],
+                                final_shrink_ratio=random_metrics["final_shrink_ratio"],
+                                final_alpha=random_metrics["final_alpha"],
+                                final_alpha_over_initial=random_metrics["final_alpha_over_initial"],
+                                final_beta=random_metrics["final_beta"],
+                                final_beta_over_initial=random_metrics["final_beta_over_initial"],
+                                final_correction_cosine=random_metrics["final_correction_cosine"],
+                                final_attn_alpha_over_initial=random_metrics["final_attn_alpha_over_initial"],
+                                final_mlp_alpha_over_initial=random_metrics["final_mlp_alpha_over_initial"],
+                            )
+                            random_trajectory_by_token[token_idx].update(
+                                rho=random_metrics["trajectory"]["rho"],
+                                alpha_over_initial=random_metrics["trajectory"]["alpha_over_initial"],
+                                beta_over_initial=random_metrics["trajectory"]["beta_over_initial"],
+                                correction_cosine=random_metrics["trajectory"]["correction_cosine"],
+                            )
                         native_past = native_trace["past_key_values"]
                         fullmix_past = fullmix_trace["past_key_values"]
-                        if random_past is not None:
-                            random_past = random_trace["past_key_values"]
+                        random_past = random_trace["past_key_values"]
 
                 processed_examples += 1
                 if processed_examples % 10 == 0:
@@ -663,17 +656,13 @@ def evaluate_correction(
                     )
 
     fullmix_summary = fullmix_collector.summary()
-    random_summary = random_collector.summary() if config.correction_include_random_control else {
-        "average_final_shrink_ratio": float("nan"),
-        "shrink_fraction": float("nan"),
-        "average_final_correction_cosine": float("nan"),
-    }
+    random_summary = random_collector.summary()
 
     trajectory_summary = {
         "token_trajectories": {
             f"token_{token_idx:02d}": {
                 "full_mix": fullmix_trajectory_by_token[token_idx].summarize(),
-                "random": random_trajectory_by_token[token_idx].summarize() if config.correction_include_random_control else {},
+                "random": random_trajectory_by_token[token_idx].summarize(),
             }
             for token_idx in range(config.correction_max_analysis_tokens)
         },
@@ -1035,95 +1024,51 @@ def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionCon
     )
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the layer-window translator as in exp/layer_position.py, then run a teacher-forced correction analysis on benchmark tasks. The correction experiment measures how much the final hidden-state shift contracts relative to the first hidden-state shift after the entire injected window, and whether upper-layer residual updates anti-align with that post-window initial shift."
+        description=(
+            "Train the layer-window translator as in exp/layer_position.py, then run a teacher-forced \
+correction analysis on benchmark tasks. The correction experiment measures how much the final hidden-state \
+shift contracts relative to the first hidden-state shift after the entire injected window, and whether \
+upper-layer residual updates anti-align with that post-window initial shift."
+        )
     )
-    parser.add_argument("--model-ids", default="gpt2,gpt2")
-    parser.add_argument("--model-directions", default="A_to_B")
-    parser.add_argument("--injection-layer-start-idx", type=int, default=None, help="Target-model layer index where the injected window starts.")
-    parser.add_argument("--injection-window-size", type=int, default=5, help="Total number of consecutive layers in the injected window.")
-    parser.add_argument("--print-target-num-layers", action="store_true")
-
     parser.add_argument("--alg", default="correction")
-    parser.add_argument("--timestamp", default=None)
-    parser.add_argument("--output-path", default="outputs/correction")
-    parser.add_argument("--study-id", default=None)
+    parser.add_argument(
+        "--default-config-path",
+        dest="default_config_path",
+        default="configs/correction.json",
+    )
+    parser.add_argument("--print-target-num-layers", action="store_true")
+    add_dataclass_arguments(
+        parser,
+        CorrectionConfig,
+        exclude_fields={"alg"},
+    )
+    return parser
 
-    parser.add_argument("--max-steps", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum-steps", type=int, default=4)
-    parser.add_argument("--total-tokens", type=int, default=128)
-    parser.add_argument("--prefix-tokens", type=int, default=64)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--warmup-steps", type=int, default=50)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--shuffle-buffer", type=int, default=50_000)
 
-    parser.add_argument("--translator-dim", type=int, default=1024)
-    parser.add_argument("--translator-heads", type=int, default=16)
-    parser.add_argument("--translator-depth", type=int, default=2)
-    parser.add_argument("--translator-mlp-ratio", type=int, default=4)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", default="float32")
-
-    parser.add_argument("--eval-batch-size", type=int, default=4)
-    parser.add_argument("--eval-num-workers", type=int, default=0)
-    parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
-    parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="gen_qa")
-    parser.add_argument("--generation-max-new-tokens", type=int, default=64)
-    parser.add_argument("--correction-max-analysis-tokens", type=int, default=4)
-    parser.add_argument("--disable-random-control", action="store_true")
-    return parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    config_kwargs = build_dataclass_kwargs_from_json_and_namespace(
+        config_cls=CorrectionConfig,
+        default_config_path=args.default_config_path,
+        args=args,
+        exclude_fields={"alg"},
+    )
+
     if args.print_target_num_layers:
-        print(lp.resolve_target_num_layers(args.model_ids, args.model_directions))
+        print(lp.resolve_target_num_layers(config_kwargs["model_ids"], config_kwargs["model_directions"]))
         return
+
     config = CorrectionConfig(
         alg=args.alg,
-        timestamp=args.timestamp,
-        output_path=args.output_path,
-        model_ids=args.model_ids,
-        model_directions=args.model_directions,
-        max_steps=args.max_steps,
-        batch_size=args.batch_size,
-        grad_accum_steps=args.grad_accum_steps,
-        total_tokens=args.total_tokens,
-        prefix_tokens=args.prefix_tokens,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        grad_clip_norm=args.grad_clip_norm,
-        log_every=args.log_every,
-        seed=args.seed,
-        shuffle_buffer=args.shuffle_buffer,
-        translator_dim=args.translator_dim,
-        translator_heads=args.translator_heads,
-        translator_depth=args.translator_depth,
-        translator_mlp_ratio=args.translator_mlp_ratio,
-        device=args.device,
-        dtype=args.dtype,
-        injection_layer_start_idx=args.injection_layer_start_idx,
-        injection_window_size=args.injection_window_size,
-        study_id=args.study_id,
-        eval_batch_size=args.eval_batch_size,
-        eval_num_workers=args.eval_num_workers,
-        eval_max_examples_per_dataset=args.eval_max_examples_per_dataset,
-        eval_shuffle_stream=args.eval_shuffle_stream,
-        benchmark_mode=args.benchmark_mode,
-        generation_max_new_tokens=args.generation_max_new_tokens,
-        correction_max_analysis_tokens=args.correction_max_analysis_tokens,
-        correction_include_random_control=not args.disable_random_control,
+        **config_kwargs,
     )
-    if config.injection_layer_start_idx is None:
-        raise SystemExit("--injection-layer-start-idx is required unless --print-target-num-layers is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)
