@@ -425,52 +425,185 @@ def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Ten
     return key_block, value_block
 
 
-def slice_top_layers(
-    past_key_values: PastKeyValues,
-    top_layers_to_translate: int,
-) -> PastKeyValues:
-    if top_layers_to_translate < 1:
-        raise ValueError("top_layers_to_translate must be >= 1")
-    if top_layers_to_translate > len(past_key_values):
-        raise ValueError(
-            f"Cannot slice {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
-        )
-    return tuple(past_key_values[-top_layers_to_translate:])
 
 
-def replace_top_layers(
-    base_past_key_values: PastKeyValues,
-    translated_top_past_key_values: PastKeyValues,
-) -> PastKeyValues:
-    num_replace = len(translated_top_past_key_values)
-    if num_replace < 1:
-        raise ValueError("translated_top_past_key_values must contain at least one layer.")
-    if num_replace > len(base_past_key_values):
-        raise ValueError(
-            f"Cannot replace {num_replace} layers in cache with only {len(base_past_key_values)} layers."
-        )
+def get_model_spec(model: PreTrainedModel) -> ModelSpec:
+    config = model.config
+    num_heads = getattr(config, "n_head", None)
+    hidden_size = getattr(config, "n_embd", None)
+    num_layers = getattr(config, "n_layer", None)
+    if num_heads is None or hidden_size is None or num_layers is None:
+        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.")
+    if hidden_size % num_heads != 0:
+        raise ValueError("hidden_size must be divisible by num_heads.")
+    return ModelSpec(
+        model_id=getattr(config, "_name_or_path", "unknown"),
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        head_dim=hidden_size // num_heads,
+    )
 
-    base_list = list(base_past_key_values)
-    start_idx = len(base_list) - num_replace
 
-    for offset, translated_layer in enumerate(translated_top_past_key_values):
-        base_key, base_value = base_list[start_idx + offset]
-        translated_key, translated_value = translated_layer
+@torch.no_grad()
+def extract_past_key_values(model: PreTrainedModel, input_ids: torch.Tensor) -> PastKeyValues:
+    outputs = model(input_ids=input_ids, use_cache=True)
+    return outputs.past_key_values
 
-        if base_key.shape != translated_key.shape:
-            raise ValueError(
-                f"Key shape mismatch at replaced layer {offset}: "
-                f"base={tuple(base_key.shape)} vs translated={tuple(translated_key.shape)}"
-            )
-        if base_value.shape != translated_value.shape:
-            raise ValueError(
-                f"Value shape mismatch at replaced layer {offset}: "
-                f"base={tuple(base_value.shape)} vs translated={tuple(translated_value.shape)}"
-            )
 
-        base_list[start_idx + offset] = (translated_key, translated_value)
+def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Tensor, torch.Tensor]:
+    key_layers = []
+    value_layers = []
+    for key, value in past_key_values:
+        batch_size, num_heads, seq_len, head_dim = key.shape
+        key_flat = key.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+        value_flat = value.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+        key_layers.append(key_flat)
+        value_layers.append(value_flat)
+    key_block = torch.stack(key_layers, dim=2)
+    value_block = torch.stack(value_layers, dim=2)
+    return key_block, value_block
 
-    return tuple(base_list)
+
+def build_nodes_and_edges(
+    model_ids: str,
+    model_directions: Optional[str] = None,
+) -> Tuple[List[Node], List[Edge]]:
+    nodes = build_nodes_from_model_ids(model_ids)
+    if model_directions is None:
+        edges = build_all_edges_from_nodes(nodes)
+    else:
+        edges = build_edges_from_nodes(nodes, model_directions)
+    return nodes, edges
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(device: str) -> str:
+    normalized = str(device).strip().lower()
+    if normalized == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def get_torch_dtype(dtype_name: str) -> torch.dtype:
+    mapping = {
+        "float32": torch.float32,
+        "float": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    key = dtype_name.lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dtype: {dtype_name}")
+    return mapping[key]
+
+
+def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    return tokenizer
+
+
+def freeze_model(model: PreTrainedModel) -> None:
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+
+def load_frozen_model(model_id: str, device: str, dtype: str = "float32") -> PreTrainedModel:
+    torch_dtype = get_torch_dtype(dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+    model.to(device)
+    freeze_model(model)
+    return model
+
+
+def get_model_spec(model: PreTrainedModel) -> ModelSpec:
+    config = model.config
+    num_heads = getattr(config, "n_head", None)
+    hidden_size = getattr(config, "n_embd", None)
+    num_layers = getattr(config, "n_layer", None)
+    if num_heads is None or hidden_size is None or num_layers is None:
+        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.")
+    if hidden_size % num_heads != 0:
+        raise ValueError("hidden_size must be divisible by num_heads.")
+    return ModelSpec(
+        model_id=getattr(config, "_name_or_path", "unknown"),
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        head_dim=hidden_size // num_heads,
+    )
+
+
+@torch.no_grad()
+def extract_past_key_values(model: PreTrainedModel, input_ids: torch.Tensor) -> PastKeyValues:
+    outputs = model(input_ids=input_ids, use_cache=True)
+    return outputs.past_key_values
+
+
+def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Tensor, torch.Tensor]:
+    key_layers = []
+    value_layers = []
+    for key, value in past_key_values:
+        batch_size, num_heads, seq_len, head_dim = key.shape
+        key_flat = key.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+        value_flat = value.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+        key_layers.append(key_flat)
+        value_layers.append(value_flat)
+    key_block = torch.stack(key_layers, dim=2)
+    value_block = torch.stack(value_layers, dim=2)
+    return key_block, value_block
+
+
+
+
+def get_model_spec(model: PreTrainedModel) -> ModelSpec:
+    config = model.config
+    num_heads = getattr(config, "n_head", None)
+    hidden_size = getattr(config, "n_embd", None)
+    num_layers = getattr(config, "n_layer", None)
+    if num_heads is None or hidden_size is None or num_layers is None:
+        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.")
+    if hidden_size % num_heads != 0:
+        raise ValueError("hidden_size must be divisible by num_heads.")
+    return ModelSpec(
+        model_id=getattr(config, "_name_or_path", "unknown"),
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        head_dim=hidden_size // num_heads,
+    )
+
+
+@torch.no_grad()
+def extract_past_key_values(model: PreTrainedModel, input_ids: torch.Tensor) -> PastKeyValues:
+    outputs = model(input_ids=input_ids, use_cache=True)
+    return outputs.past_key_values
+
+
+def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Tensor, torch.Tensor]:
+    key_layers = []
+    value_layers = []
+    for key, value in past_key_values:
+        batch_size, num_heads, seq_len, head_dim = key.shape
+        key_flat = key.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+        value_flat = value.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+        key_layers.append(key_flat)
+        value_layers.append(value_flat)
+    key_block = torch.stack(key_layers, dim=2)
+    value_block = torch.stack(value_layers, dim=2)
+    return key_block, value_block
 
 
 def flatten_past_key_values(past_key_values: PastKeyValues) -> torch.Tensor:

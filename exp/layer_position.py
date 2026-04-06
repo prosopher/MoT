@@ -16,19 +16,6 @@ from transformers import AutoConfig
 
 
 
-@dataclass(frozen=True)
-class LayerMapping:
-    reference_target_node_id: str
-    reference_target_num_layers: int
-    src_layer_start_idx: int
-    src_layer_end_idx: int
-    dst_layer_start_idx: int
-    dst_layer_end_idx: int
-    translated_num_layers: int
-    src_num_layers: int
-    dst_num_layers: int
-
-
 @dataclass
 class LayerPositionConfig(TrainConfig):
     injection_layer_start_idx: Optional[int]
@@ -54,120 +41,10 @@ class LayerPositionConfig(TrainConfig):
             raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
-        if self.top_layers_to_translate != self.injection_window_size:
-            raise ValueError("top_layers_to_translate must match injection_window_size")
         if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
             raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
-
-
-class LayerWindowDirectionalTranslator(nn.Module):
-    def __init__(
-        self,
-        src_hidden_size: int,
-        dst_hidden_size: int,
-        translated_num_layers: int,
-        translator_dim: int,
-        translator_heads: int,
-        translator_depth: int,
-        mlp_ratio: int,
-    ) -> None:
-        super().__init__()
-        if translated_num_layers < 1:
-            raise ValueError("translated_num_layers must be >= 1")
-        self.translated_num_layers = translated_num_layers
-        self.src_hidden_size = src_hidden_size
-        self.dst_hidden_size = dst_hidden_size
-        self.key_translator = CrossLayerWindowTranslator(
-            src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
-            num_layers=translated_num_layers,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            translator_depth=translator_depth,
-            mlp_ratio=mlp_ratio,
-        )
-        self.value_translator = CrossLayerWindowTranslator(
-            src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
-            num_layers=translated_num_layers,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            translator_depth=translator_depth,
-            mlp_ratio=mlp_ratio,
-        )
-
-
-    def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if key_block.shape != value_block.shape:
-            raise ValueError(
-                "Layer-window key/value shapes must match, "
-                f"got {tuple(key_block.shape)} vs {tuple(value_block.shape)}"
-            )
-        if key_block.ndim != 4:
-            raise ValueError(
-                "Layer-window tensors must have shape [batch, seq, num_layers, hidden], "
-                f"got {tuple(key_block.shape)}"
-            )
-        if key_block.shape[2] != self.translated_num_layers:
-            raise ValueError(
-                f"Expected {self.translated_num_layers} layers in the translation window, got {key_block.shape[2]}"
-            )
-
-        translated_key = self.key_translator(key_block)
-        translated_value = self.value_translator(value_block)
-        return translated_key, translated_value
-
-
-class LayerWindowTranslatorPool(nn.Module):
-    def __init__(
-        self,
-        model_specs: Dict[str, ModelSpec],
-        edges: List[Edge],
-        layer_mappings: Dict[str, LayerMapping],
-        translator_dim: int,
-        translator_heads: int,
-        translator_depth: int,
-        mlp_ratio: int,
-        active_directions: List[str],
-    ) -> None:
-        super().__init__()
-        self.model_specs = model_specs
-        self.layer_mappings = layer_mappings
-        self.active_directions = tuple(active_directions)
-        self.edges_by_id = build_edge_map(edges)
-
-        adapters = {}
-        for direction in self.active_directions:
-            mapping = self.layer_mappings[direction]
-            adapters[direction] = LayerWindowDirectionalTranslator(
-                src_hidden_size=model_specs[self.edges_by_id[direction].src_id].hidden_size,
-                dst_hidden_size=model_specs[self.edges_by_id[direction].dst_id].hidden_size,
-                translated_num_layers=mapping.translated_num_layers,
-                translator_dim=translator_dim,
-                translator_heads=translator_heads,
-                translator_depth=translator_depth,
-                mlp_ratio=mlp_ratio,
-            )
-        self.adapters = nn.ModuleDict(adapters)
-
-
-    def translate_layer_window(
-        self,
-        past_key_values: PastKeyValues,
-        src_name: str,
-        dst_name: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, LayerMapping]:
-        direction = f"{src_name}_to_{dst_name}"
-        mapping = self.layer_mappings[direction]
-        key_block, value_block = extract_layer_window_blocks(
-            past_key_values=past_key_values,
-            start_layer_idx=mapping.src_layer_start_idx,
-            num_layers=mapping.translated_num_layers,
-        )
-        translated_key, translated_value = self.adapters[direction](key_block, value_block)
-        return translated_key, translated_value, mapping
 
 
 class AccuracyMeter:
@@ -381,11 +258,6 @@ def compute_logit_kl(reference_log_probs: torch.Tensor, candidate_log_probs: tor
     return float(kl.mean().item())
 
 
-class SimpleNamespaceConfig:
-    def __init__(self, **kwargs: Any) -> None:
-        self.__dict__.update(kwargs)
-
-
 def sanitize_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "default"
 
@@ -406,18 +278,6 @@ def load_model_spec_from_pretrained_config(model_id: str) -> ModelSpec:
         num_heads=num_heads,
         head_dim=hidden_size // num_heads,
     )
-
-
-def resolve_direction_metadata(
-    model_ids: str,
-    model_directions: str,
-) -> Tuple[List[Node], List[Edge], List[str], Edge]:
-    nodes, edges = build_nodes_and_edges(model_ids, model_directions)
-    active_directions = [edge.id for edge in edges]
-    if not active_directions:
-        raise ValueError("No active directions were resolved from model_directions")
-    edge_map = build_edge_map(edges)
-    return nodes, edges, active_directions, edge_map[active_directions[0]]
 
 
 def resolve_injection_layer_start_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
@@ -448,101 +308,6 @@ def resolve_target_num_layers(
     return load_model_spec_from_pretrained_config(target_model_id).num_layers
 
 
-def build_layer_mappings(
-    config: LayerPositionConfig,
-    model_specs: Dict[str, ModelSpec],
-    edges: List[Edge],
-    active_directions: List[str],
-    reference_edge: Edge,
-) -> Dict[str, LayerMapping]:
-    reference_target_spec = model_specs[reference_edge.dst_id]
-    requested_window_size = int(config.injection_window_size)
-
-    injection_layer_start_idx = resolve_injection_layer_start_idx(config, reference_target_spec.num_layers)
-    injection_layer_end_idx = injection_layer_start_idx + requested_window_size - 1
-    if injection_layer_end_idx >= reference_target_spec.num_layers:
-        raise ValueError(
-            "injection_layer_start_idx with the requested injection_window_size would exceed the reference target stack: "
-            f"start={injection_layer_start_idx}, end={injection_layer_end_idx}, "
-            f"last_layer={reference_target_spec.num_layers - 1}"
-        )
-
-    edge_map = build_edge_map(edges)
-    mappings: Dict[str, LayerMapping] = {}
-    for direction in active_directions:
-        edge = edge_map[direction]
-        src_spec = model_specs[edge.src_id]
-        dst_spec = model_specs[edge.dst_id]
-
-        dst_layer_start_idx = injection_layer_start_idx
-        dst_layer_end_idx = dst_layer_start_idx + requested_window_size - 1
-        if dst_layer_end_idx >= dst_spec.num_layers:
-            raise ValueError(
-                f"direction={direction} cannot use injection_layer_start_idx={dst_layer_start_idx} "
-                f"with injection_window_size={requested_window_size}: target end layer {dst_layer_end_idx} exceeds "
-                f"target last layer {dst_spec.num_layers - 1}"
-            )
-
-        dst_depth_from_top = dst_spec.num_layers - 1 - dst_layer_start_idx
-        src_layer_start_idx = src_spec.num_layers - 1 - dst_depth_from_top
-        if not (0 <= src_layer_start_idx < src_spec.num_layers):
-            raise ValueError(
-                f"direction={direction} cannot align source window to target top-depth {dst_depth_from_top}: "
-                f"computed src_layer_start_idx={src_layer_start_idx} is outside [0, {src_spec.num_layers - 1}]"
-            )
-
-        src_layer_end_idx = src_layer_start_idx + requested_window_size - 1
-        if src_layer_end_idx >= src_spec.num_layers:
-            raise ValueError(
-                f"direction={direction} cannot use injection_window_size={requested_window_size} after top-depth alignment: "
-                f"source end layer {src_layer_end_idx} exceeds source last layer {src_spec.num_layers - 1}"
-            )
-
-        mappings[direction] = LayerMapping(
-            reference_target_node_id=reference_edge.dst_id,
-            reference_target_num_layers=reference_target_spec.num_layers,
-            src_layer_start_idx=src_layer_start_idx,
-            src_layer_end_idx=src_layer_end_idx,
-            dst_layer_start_idx=dst_layer_start_idx,
-            dst_layer_end_idx=dst_layer_end_idx,
-            translated_num_layers=requested_window_size,
-            src_num_layers=src_spec.num_layers,
-            dst_num_layers=dst_spec.num_layers,
-        )
-    return mappings
-
-
-def extract_layer_window_blocks(
-    past_key_values: PastKeyValues,
-    start_layer_idx: int,
-    num_layers: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if num_layers < 1:
-        raise ValueError("num_layers must be >= 1")
-    end_layer_idx = start_layer_idx + num_layers
-    if not (0 <= start_layer_idx < len(past_key_values)):
-        raise ValueError(f"start_layer_idx={start_layer_idx} must be in [0, {len(past_key_values) - 1}]")
-    if end_layer_idx > len(past_key_values):
-        raise ValueError(
-            f"Cannot extract layers [{start_layer_idx}, {end_layer_idx - 1}] from cache with {len(past_key_values)} layers"
-        )
-    return past_key_values_to_blocks(past_key_values[start_layer_idx:end_layer_idx])
-
-
-def layer_window_blocks_to_past(
-    key_block: torch.Tensor,
-    value_block: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-) -> PastKeyValues:
-    return blocks_to_partial_past_key_values(
-        key_block=key_block,
-        value_block=value_block,
-        num_heads=num_heads,
-        head_dim=head_dim,
-    )
-
-
 def build_control_window_variants(
     native_key_block: torch.Tensor,
     native_value_block: torch.Tensor,
@@ -566,177 +331,6 @@ def build_control_window_variants(
         "mag_only": (mag_only_key, mag_only_value),
         "full_mix": (translated_key_block, translated_value_block),
     }
-
-
-def require_gpt2_transformer(model: PreTrainedModel):
-    transformer = getattr(model, "transformer", None)
-    if transformer is None or not hasattr(transformer, "h"):
-        raise ValueError(
-            "layer_position.py currently supports GPT-2 style decoder stacks only "
-            "(expected model.transformer.h to exist)."
-        )
-    return transformer
-
-
-def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
-    transformer = require_gpt2_transformer(model)
-    if input_ids.ndim != 2:
-        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    hidden_states = transformer.wte(input_ids) + transformer.wpe(position_ids)
-    drop = getattr(transformer, "drop", None)
-    if drop is not None:
-        hidden_states = drop(hidden_states)
-    return hidden_states
-
-
-def unpack_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if isinstance(outputs, tuple):
-        if len(outputs) < 2:
-            raise ValueError("Expected GPT-2 block outputs to include present key/value cache.")
-        hidden_states = outputs[0]
-        present = outputs[1]
-    else:
-        hidden_states = getattr(outputs, "last_hidden_state", None)
-        if hidden_states is None:
-            hidden_states = getattr(outputs, "hidden_states", None)
-        present = getattr(outputs, "past_key_value", None)
-        if hidden_states is None or present is None:
-            raise ValueError("Unsupported block output type for GPT-2 layer replay.")
-    if not isinstance(present, tuple) or len(present) != 2:
-        raise ValueError("Expected present cache to be a (key, value) tuple.")
-    return hidden_states, present
-
-
-def run_gpt2_block_with_cache(block: nn.Module, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    outputs = block(
-        hidden_states,
-        layer_past=None,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        use_cache=True,
-        output_attentions=False,
-    )
-    return unpack_block_outputs(outputs)
-
-
-def run_gpt2_block_with_injected_layer(
-    block: nn.Module,
-    hidden_states: torch.Tensor,
-    injected_key: torch.Tensor,
-    injected_value: torch.Tensor,
-) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if injected_key.shape != injected_value.shape:
-        raise ValueError(
-            "Injected key/value must have identical shapes, "
-            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
-        )
-
-    attn = block.attn
-    residual = hidden_states
-    attn_input = block.ln_1(hidden_states)
-
-    qkv = attn.c_attn(attn_input)
-    split_size = getattr(attn, "split_size", qkv.shape[-1] // 3)
-    query, _, _ = qkv.split(split_size, dim=2)
-
-    batch_size, seq_len, _ = query.shape
-    num_heads = attn.num_heads
-    head_dim = attn.head_dim
-    expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
-    if tuple(injected_key.shape) != expected_cache_shape:
-        raise ValueError(
-            "Injected cache shape mismatch for GPT-2 layer replay: "
-            f"expected {expected_cache_shape}, got {tuple(injected_key.shape)}"
-        )
-
-    query = query.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-
-    if getattr(attn, "reorder_and_upcast_attn", False) and hasattr(attn, "_upcast_and_reordered_attn"):
-        attn_output, _ = attn._upcast_and_reordered_attn(
-            query,
-            injected_key,
-            injected_value,
-            attention_mask=None,
-            head_mask=None,
-        )
-    else:
-        attn_output, _ = attn._attn(
-            query,
-            injected_key,
-            injected_value,
-            attention_mask=None,
-            head_mask=None,
-        )
-
-    attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-    attn_output = attn.c_proj(attn_output)
-    attn_output = attn.resid_dropout(attn_output)
-    hidden_states = residual + attn_output
-
-    residual = hidden_states
-    hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
-    return hidden_states, (injected_key, injected_value)
-
-
-def replay_target_prefill_with_injected_window(
-    target_model: PreTrainedModel,
-    prefix_input_ids: torch.Tensor,
-    target_start_layer_idx: int,
-    injected_key_block: torch.Tensor,
-    injected_value_block: torch.Tensor,
-    dst_spec: ModelSpec,
-) -> PastKeyValues:
-    injected_window = layer_window_blocks_to_past(
-        injected_key_block,
-        injected_value_block,
-        dst_spec.num_heads,
-        dst_spec.head_dim,
-    )
-    translated_num_layers = len(injected_window)
-
-    transformer = require_gpt2_transformer(target_model)
-    target_end_layer_idx = target_start_layer_idx + translated_num_layers - 1
-    if not (0 <= target_start_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(transformer.h) - 1}]")
-    if target_end_layer_idx >= len(transformer.h):
-        raise ValueError(
-            f"Injected window ending at layer {target_end_layer_idx} exceeds target stack with {len(transformer.h)} layers"
-        )
-
-    rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
-    if torch.is_grad_enabled():
-        with torch.no_grad():
-            hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-            for lower_idx in range(target_start_layer_idx):
-                hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
-                rebuilt_past.append((present[0].detach(), present[1].detach()))
-        hidden_states = hidden_states.detach()
-    else:
-        hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-        for lower_idx in range(target_start_layer_idx):
-            hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
-            rebuilt_past.append(present)
-
-    for offset, injected_present in enumerate(injected_window):
-        layer_idx = target_start_layer_idx + offset
-        hidden_states, present = run_gpt2_block_with_injected_layer(
-            transformer.h[layer_idx],
-            hidden_states,
-            injected_present[0],
-            injected_present[1],
-        )
-        rebuilt_past.append(present)
-
-    for upper_idx in range(target_end_layer_idx + 1, len(transformer.h)):
-        hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
-        rebuilt_past.append(present)
-
-    return tuple(rebuilt_past)
 
 
 def build_study_dir(config: LayerPositionConfig) -> Path:
@@ -856,29 +450,6 @@ def build_models_for_experiment(
     )
 
 
-def build_translator_pool(
-    models: Dict[str, PreTrainedModel],
-    config: LayerPositionConfig,
-    active_directions: List[str],
-    edges: List[Edge],
-    reference_edge: Edge,
-) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
-    model_specs = {node_id: get_model_spec(model) for node_id, model in models.items()}
-    layer_mappings = build_layer_mappings(config, model_specs, edges, active_directions, reference_edge)
-    translator_pool = LayerWindowTranslatorPool(
-        model_specs=model_specs,
-        edges=edges,
-        layer_mappings=layer_mappings,
-        translator_dim=config.translator_dim,
-        translator_heads=config.translator_heads,
-        translator_depth=config.translator_depth,
-        mlp_ratio=config.translator_mlp_ratio,
-        active_directions=active_directions,
-    )
-    translator_pool.to(config.device)
-    return translator_pool, model_specs, layer_mappings
-
-
 def run_train(
     config: LayerPositionConfig,
     run_dir: Path,
@@ -893,12 +464,9 @@ def run_train(
     logger.info("Starting layer-window position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
 
-    translator_pool, model_specs, layer_mappings = build_translator_pool(
+    translator_pool, model_specs, _, _, layer_mappings = build_translator_pool(
         models=models,
         config=config,
-        active_directions=active_directions,
-        edges=edges,
-        reference_edge=reference_edge,
     )
     translator_pool.train()
     log_layer_mappings(logger, nodes, model_specs, layer_mappings)
@@ -2109,7 +1677,6 @@ def main() -> None:
         log_every=args.log_every,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
-        top_layers_to_translate=args.injection_window_size,
         translator_dim=args.translator_dim,
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,

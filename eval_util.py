@@ -373,15 +373,13 @@ def evaluate_openwebtext_validation_loss(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Dict[str, float]:
-        translated_top_past = translator_pool.translate_top_layers(
-            past_key_values=past_by_node_id[edge.src_id],
+        mixed_target_past, _, _ = translator_pool.build_replayed_target_past(
+            source_past_key_values=past_by_node_id[edge.src_id],
+            prefix_input_ids=prefix_cache_ids,
+            target_model=models[edge.dst_id],
             src_name=edge.src_id,
             dst_name=edge.dst_id,
             dst_spec=dst_model_specs[edge.dst_id],
-        )
-        mixed_target_past = replace_top_layers(
-            base_past_key_values=past_by_node_id[edge.dst_id],
-            translated_top_past_key_values=translated_top_past,
         )
         translated_loss = float(
             compute_suffix_lm_loss(

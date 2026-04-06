@@ -48,8 +48,6 @@ class CorrectionConfig(TrainConfig):
             raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
-        if self.top_layers_to_translate != self.injection_window_size:
-            raise ValueError("top_layers_to_translate must match injection_window_size")
         if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
             raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
@@ -1019,7 +1017,6 @@ def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionCon
         log_every=config.log_every,
         seed=config.seed,
         shuffle_buffer=config.shuffle_buffer,
-        top_layers_to_translate=config.top_layers_to_translate,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
         translator_depth=config.translator_depth,
@@ -1107,7 +1104,6 @@ def main() -> None:
         log_every=args.log_every,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
-        top_layers_to_translate=args.injection_window_size,
         translator_dim=args.translator_dim,
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,

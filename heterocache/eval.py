@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from eval_util import *
-from heterocache.train import load_translator_pool_from_checkpoint
+from heterocache.train import extract_layer_window_blocks, load_translator_pool_from_checkpoint
 
 
 @torch.inference_mode()
@@ -62,23 +62,25 @@ def evaluate_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_top_past = translator_pool.translate_top_layers(
-                    past_key_values=past_by_node_id[edge.src_id],
+                mixed_target_past, translated_window_past, mapping = translator_pool.build_replayed_target_past(
+                    source_past_key_values=past_by_node_id[edge.src_id],
+                    prefix_input_ids=cache_input_ids,
+                    target_model=models[edge.dst_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
 
-                target_top = slice_top_layers(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=train_config.top_layers_to_translate,
+                native_target_window = blocks_to_partial_past_key_values(
+                    *extract_layer_window_blocks(
+                        past_key_values=past_by_node_id[edge.dst_id],
+                        start_layer_idx=mapping.dst_layer_start_idx,
+                        num_layers=mapping.translated_num_layers,
+                    ),
+                    num_heads=model_specs[edge.dst_id].num_heads,
+                    head_dim=model_specs[edge.dst_id].head_dim,
                 )
-                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
-
-                mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=translated_top_past,
-                )
+                cosine_value = cosine_similarity_between_past(translated_window_past, native_target_window)
 
                 translated_scoring_past = prepare_answer_scoring_past(
                     model=models[edge.dst_id],
@@ -197,23 +199,25 @@ def evaluate_generation_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_top_past = translator_pool.translate_top_layers(
-                    past_key_values=past_by_node_id[edge.src_id],
+                mixed_target_past, translated_window_past, mapping = translator_pool.build_replayed_target_past(
+                    source_past_key_values=past_by_node_id[edge.src_id],
+                    prefix_input_ids=cache_input_ids,
+                    target_model=models[edge.dst_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
 
-                target_top = slice_top_layers(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=train_config.top_layers_to_translate,
+                native_target_window = blocks_to_partial_past_key_values(
+                    *extract_layer_window_blocks(
+                        past_key_values=past_by_node_id[edge.dst_id],
+                        start_layer_idx=mapping.dst_layer_start_idx,
+                        num_layers=mapping.translated_num_layers,
+                    ),
+                    num_heads=model_specs[edge.dst_id].num_heads,
+                    head_dim=model_specs[edge.dst_id].head_dim,
                 )
-                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
-
-                mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=translated_top_past,
-                )
+                cosine_value = cosine_similarity_between_past(translated_window_past, native_target_window)
 
                 translated_answer = predict_generation_task_answer(
                     model=models[edge.dst_id],
@@ -284,6 +288,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
         tokenizer,
         nodes,
         edges,
+        layer_mappings,
     ) = load_translator_pool_from_checkpoint(
         checkpoint_path=str(checkpoint_path),
         device_override=eval_config.device,
@@ -300,9 +305,11 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("top_layers_to_translate=%d", train_config.top_layers_to_translate)
+    logger.info("injection_layer_start_idx=%d", train_config.injection_layer_start_idx)
+    logger.info("injection_window_size=%d", train_config.injection_window_size)
+    logger.info("layer_mappings=%s", {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
     logger.info("active_directions=%s", active_directions)
-    logger.info("translation_mode=replace_top_layers_after_target_forward")
+    logger.info("translation_mode=translate_window_and_replay_target_prefill")
     logger.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
