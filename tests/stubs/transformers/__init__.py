@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PreTrainedTokenizerBase:
@@ -20,11 +22,10 @@ class TinyTokenizer(PreTrainedTokenizerBase):
         self.pad_token_id = 0
         self.eos_token_id = 1
         self.padding_side = "right"
-        self.model_max_length = 128
+        self.model_max_length = 2048
         self._vocab_size = 128
 
     def _encode_text(self, text: str) -> List[int]:
-        # Simple byte-ish tokenizer: stable, fast, and guaranteed to emit >=1 token.
         if not text:
             return [self.eos_token_id]
         return [2 + (ord(ch) % (self._vocab_size - 2)) for ch in text]
@@ -86,6 +87,149 @@ class TinyConfig:
     n_embd: int = 8
     n_layer: int = 2
     vocab_size: int = 128
+    n_positions: int = 2048
+
+
+class TinyGPT2Attention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.split_size = hidden_size
+        self.reorder_and_upcast_attn = False
+        self.c_attn = nn.Linear(hidden_size, 3 * hidden_size)
+        self.c_proj = nn.Linear(hidden_size, hidden_size)
+        self.resid_dropout = nn.Identity()
+
+    def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, hidden_size = tensor.shape
+        return tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, seq_len, head_dim = tensor.shape
+        return tensor.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+
+    def _attn(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask=None,
+        head_mask=None,
+    ):
+        del attention_mask, head_mask
+        scale = 1.0 / math.sqrt(float(self.head_dim))
+        attn_scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_output = torch.matmul(attn_weights, value)
+        return attn_output, attn_weights
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        layer_past=None,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        use_cache: bool = True,
+        output_attentions: bool = False,
+    ):
+        del encoder_hidden_states, encoder_attention_mask
+        qkv = self.c_attn(hidden_states)
+        query, key, value = qkv.split(self.split_size, dim=2)
+        query = self._split_heads(query)
+        key = self._split_heads(key)
+        value = self._split_heads(value)
+
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            key = torch.cat([past_key, key], dim=2)
+            value = torch.cat([past_value, value], dim=2)
+
+        attn_output, attn_weights = self._attn(
+            query,
+            key,
+            value,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+        )
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.c_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+
+        outputs = (attn_output,)
+        if use_cache:
+            outputs = outputs + ((key, value),)
+        if output_attentions:
+            outputs = outputs + (attn_weights,)
+        return outputs
+
+
+class TinyGPT2MLP(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.fc_in = nn.Linear(hidden_size, 4 * hidden_size)
+        self.fc_out = nn.Linear(4 * hidden_size, hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.fc_out(F.gelu(self.fc_in(hidden_states)))
+
+
+class TinyGPT2Block(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(hidden_size)
+        self.attn = TinyGPT2Attention(hidden_size, num_heads)
+        self.ln_2 = nn.LayerNorm(hidden_size)
+        self.mlp = TinyGPT2MLP(hidden_size)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        layer_past=None,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        use_cache: bool = True,
+        output_attentions: bool = False,
+    ):
+        residual = hidden_states
+        attn_outputs = self.attn(
+            self.ln_1(hidden_states),
+            layer_past=layer_past,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+        )
+        attn_output = attn_outputs[0]
+        hidden_states = residual + attn_output
+        hidden_states = hidden_states + self.mlp(self.ln_2(hidden_states))
+
+        outputs = (hidden_states,)
+        if use_cache:
+            outputs = outputs + (attn_outputs[1],)
+            if output_attentions and len(attn_outputs) > 2:
+                outputs = outputs + (attn_outputs[2],)
+        elif output_attentions and len(attn_outputs) > 1:
+            outputs = outputs + (attn_outputs[1],)
+        return outputs
+
+
+class TinyTransformer(nn.Module):
+    def __init__(self, config: TinyConfig) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe = nn.Embedding(config.n_positions, config.n_embd)
+        self.drop = nn.Identity()
+        self.h = nn.ModuleList([TinyGPT2Block(config.n_embd, config.n_head) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
 
 
 class TinyCausalLM(PreTrainedModel):
@@ -93,52 +237,53 @@ class TinyCausalLM(PreTrainedModel):
         super().__init__()
         self.config = TinyConfig(_name_or_path=model_id)
 
-        # Make weights deterministic per model id.
         seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(model_id)) % 10_000
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed)
-            self.embed = nn.Embedding(self.config.vocab_size, self.config.n_embd)
-            self.layers = nn.ModuleList(
-                [nn.Linear(self.config.n_embd, self.config.n_embd) for _ in range(self.config.n_layer)]
-            )
-            self.cache_projs = nn.ModuleList(
-                [nn.Linear(self.config.n_embd, self.config.n_embd) for _ in range(self.config.n_layer)]
-            )
+            self.transformer = TinyTransformer(self.config)
             self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
 
         self.to(dtype=torch_dtype)
 
     def forward(self, input_ids: torch.Tensor, past_key_values=None, use_cache: bool = True):
-        hidden = self.embed(input_ids)
-        batch_size, seq_len, hidden_size = hidden.shape
-        num_heads = self.config.n_head
-        head_dim = hidden_size // num_heads
+        batch_size, seq_len = input_ids.shape
+        past_length = 0
+        if past_key_values is not None and len(past_key_values) > 0:
+            past_length = int(past_key_values[0][0].shape[2])
 
-        new_past = []
-        for layer_idx in range(self.config.n_layer):
-            layer_hidden = torch.tanh(self.layers[layer_idx](hidden))
+        position_ids = torch.arange(
+            past_length,
+            past_length + seq_len,
+            device=input_ids.device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(batch_size, -1)
+        hidden_states = self.transformer.wte(input_ids) + self.transformer.wpe(position_ids)
+        hidden_states = self.transformer.drop(hidden_states)
 
-            if past_key_values is not None:
-                past_key, past_value = past_key_values[layer_idx]
-                past_flat = past_value.permute(0, 2, 1, 3).contiguous().view(batch_size, -1, hidden_size)
-                past_summary = past_flat.mean(dim=1, keepdim=True)
-                layer_hidden = layer_hidden + 0.1 * self.cache_projs[layer_idx](past_summary)
+        presents = []
+        for layer_idx, block in enumerate(self.transformer.h):
+            layer_past = None if past_key_values is None else past_key_values[layer_idx]
+            block_outputs = block(
+                hidden_states,
+                layer_past=layer_past,
+                attention_mask=None,
+                head_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                use_cache=use_cache,
+                output_attentions=False,
+            )
+            hidden_states = block_outputs[0]
+            if use_cache:
+                presents.append(block_outputs[1])
 
-            key_flat = layer_hidden
-            value_flat = layer_hidden + 0.01 * (layer_idx + 1)
-            key = key_flat.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-            value = value_flat.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-
-            if past_key_values is not None:
-                prev_key, prev_value = past_key_values[layer_idx]
-                key = torch.cat([prev_key, key], dim=2)
-                value = torch.cat([prev_value, value], dim=2)
-
-            new_past.append((key, value))
-            hidden = layer_hidden
-
-        logits = self.lm_head(hidden)
-        return SimpleNamespace(logits=logits, past_key_values=tuple(new_past))
+        hidden_states = self.transformer.ln_f(hidden_states)
+        logits = self.lm_head(hidden_states)
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=tuple(presents) if use_cache else None,
+            last_hidden_state=hidden_states,
+        )
 
 
 class AutoModelForCausalLM:

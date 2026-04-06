@@ -5,7 +5,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from eval_util import *
-from heterocache.train import extract_layer_window_blocks, load_translator_pool_from_checkpoint
+from heterocache.train import (
+    blocks_to_partial_past_key_values,
+    extract_layer_window_blocks,
+    load_translator_pool_from_checkpoint,
+)
 
 
 @torch.inference_mode()
