@@ -13,7 +13,6 @@ from train_util import *
 @dataclass
 class TrainConfig:
     alg: str
-    outputs_path: str
     timestamp: Optional[str]
     output_path: Optional[str]
 

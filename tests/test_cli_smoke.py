@@ -27,12 +27,14 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
     env["OMP_NUM_THREADS"] = "1"
     env["MKL_NUM_THREADS"] = "1"
 
-    outputs_dir = tmp_path / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
+    outputs_path = tmp_path / "outputs"
+    outputs_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = f"pytest_{alg}"
     train_config_path = CONFIGS_PATH / train_config_name
     eval_config_path = CONFIGS_PATH / "eval_smoke.json"
+
+    output_path = outputs_path / f"{alg}_{timestamp}"
 
     train_cmd = [
         sys.executable,
@@ -40,8 +42,8 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         alg,
         "--default-config-path",
         str(train_config_path),
-        "--outputs-path",
-        str(outputs_dir),
+        "--output-path",
+        str(output_path),
         "--timestamp",
         timestamp,
         "--device",
@@ -58,9 +60,8 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         text=True,
     )
 
-    run_dir = outputs_dir / f"{alg}_{timestamp}"
-    checkpoint_path = run_dir / "final_checkpoint_path.pt"
-    train_log_path = run_dir / "train.log"
+    checkpoint_path = output_path / "final_checkpoint_path.pt"
+    train_log_path = output_path / "train.log"
 
     assert checkpoint_path.exists(), f"missing checkpoint for {alg}: {checkpoint_path}"
     assert train_log_path.exists(), f"missing train.log for {alg}: {train_log_path}"
@@ -72,8 +73,8 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         alg,
         "--default-config-path",
         str(eval_config_path),
-        "--outputs-path",
-        str(outputs_dir),
+        "--output-path",
+        str(output_path),
         "--checkpoint-path",
         str(checkpoint_path),
         "--device",
@@ -88,7 +89,7 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         text=True,
     )
 
-    eval_log_path = run_dir / "eval.log"
+    eval_log_path = output_path / "eval.log"
     assert eval_log_path.exists(), f"missing eval.log for {alg}: {eval_log_path}"
     assert "Evaluation log:" in eval_result.stdout
 
