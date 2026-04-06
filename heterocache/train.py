@@ -54,6 +54,10 @@ class TrainConfig:
     translator: str
     mot_num_translators: int
     mot_top_k: int
+    orthogonal_damping_rank: int
+    orthogonal_damping_min_eta: float
+    orthogonal_damping_max_eta: float
+    orthogonal_damping_max_start_fraction: float
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -64,14 +68,24 @@ class TrainConfig:
             raise ValueError("injection_window_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
-        if self.translator not in {"single", "mot", "mot-r"}:
-            raise ValueError("translator must be one of {'single', 'mot', 'mot-r'}")
+        if self.translator not in {"single", "mot", "mot-r", "mot-rod"}:
+            raise ValueError("translator must be one of {'single', 'mot', 'mot-r', 'mot-rod'}")
         if self.mot_num_translators < 1:
             raise ValueError("mot_num_translators must be >= 1")
         if self.mot_top_k < 1:
             raise ValueError("mot_top_k must be >= 1")
         if self.mot_top_k > self.mot_num_translators:
             raise ValueError("mot_top_k must be <= mot_num_translators")
+        if self.orthogonal_damping_rank < 0:
+            raise ValueError("orthogonal_damping_rank must be >= 0")
+        if not (0.0 <= self.orthogonal_damping_min_eta <= 1.0):
+            raise ValueError("orthogonal_damping_min_eta must be in [0, 1]")
+        if not (0.0 <= self.orthogonal_damping_max_eta <= 1.0):
+            raise ValueError("orthogonal_damping_max_eta must be in [0, 1]")
+        if self.orthogonal_damping_min_eta > self.orthogonal_damping_max_eta:
+            raise ValueError("orthogonal_damping_min_eta must be <= orthogonal_damping_max_eta")
+        if not (0.0 <= self.orthogonal_damping_max_start_fraction <= 1.0):
+            raise ValueError("orthogonal_damping_max_start_fraction must be in [0, 1]")
         initialize_train_output_paths(self)
 
 
@@ -275,6 +289,12 @@ class ResidualMixtureOfTranslators(nn.Module):
         mlp_ratio: int,
         num_translators: int,
         top_k: int,
+        orthogonal_damping_rank: int = 0,
+        orthogonal_damping_min_eta: float = 1.0,
+        orthogonal_damping_max_eta: float = 1.0,
+        orthogonal_damping_max_start_fraction: float = 0.3,
+        dst_start_layer_idx: int = 0,
+        dst_total_num_layers: int = 1,
     ) -> None:
         super().__init__()
         if num_translators < 1:
@@ -285,6 +305,30 @@ class ResidualMixtureOfTranslators(nn.Module):
             raise ValueError("top_k must be <= num_translators")
         self.num_translators = num_translators
         self.top_k = top_k
+        self.num_layers = num_layers
+        self.dst_hidden_size = dst_hidden_size
+        self.orthogonal_damping_rank = orthogonal_damping_rank
+        start_fraction = 0.0 if dst_total_num_layers <= 0 else float(dst_start_layer_idx) / float(dst_total_num_layers)
+        self.orthogonal_damping_enabled = (
+            orthogonal_damping_rank > 0
+            and (orthogonal_damping_min_eta < 1.0 or orthogonal_damping_max_eta < 1.0)
+            and start_fraction <= float(orthogonal_damping_max_start_fraction)
+        )
+        if not self.orthogonal_damping_enabled:
+            layer_eta = torch.ones((num_layers,), dtype=torch.float32)
+        elif dst_total_num_layers <= 1:
+            layer_eta = torch.full((num_layers,), float(orthogonal_damping_max_eta), dtype=torch.float32)
+        else:
+            eta_values = []
+            for local_layer_idx in range(num_layers):
+                global_layer_idx = dst_start_layer_idx + local_layer_idx
+                progress = float(global_layer_idx) / float(dst_total_num_layers - 1)
+                eta_values.append(
+                    float(orthogonal_damping_min_eta)
+                    + (float(orthogonal_damping_max_eta) - float(orthogonal_damping_min_eta)) * progress
+                )
+            layer_eta = torch.tensor(eta_values, dtype=torch.float32)
+        self.register_buffer("orthogonal_damping_eta", layer_eta, persistent=False)
         self.base_translator = CrossLayerWindowTranslator(
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
@@ -334,6 +378,45 @@ class ResidualMixtureOfTranslators(nn.Module):
             router_logits = router_logits.masked_fill(~topk_mask, float("-inf"))
         return torch.softmax(router_logits, dim=-1)
 
+    def _compute_principal_basis(self, features: torch.Tensor, rank: int) -> Optional[torch.Tensor]:
+        if rank <= 0:
+            return None
+        flattened = features.reshape(-1, features.shape[-1]).detach().to(dtype=torch.float32)
+        if flattened.shape[0] < 2 or flattened.shape[1] < 1:
+            return None
+        q = min(rank, flattened.shape[0], flattened.shape[1])
+        if q < 1:
+            return None
+        centered = flattened - flattened.mean(dim=0, keepdim=True)
+        if torch.count_nonzero(centered).item() == 0:
+            return None
+        with torch.no_grad():
+            try:
+                _, _, basis = torch.pca_lowrank(centered, q=q, center=False)
+            except RuntimeError:
+                return None
+        return basis[:, :q].to(device=features.device, dtype=features.dtype)
+
+    def _apply_orthogonal_damping(self, base_output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        if not self.orthogonal_damping_enabled:
+            return residual
+        damped_layers: List[torch.Tensor] = []
+        for local_layer_idx in range(self.num_layers):
+            layer_eta = float(self.orthogonal_damping_eta[local_layer_idx].item())
+            if layer_eta >= 1.0:
+                damped_layers.append(residual[:, :, local_layer_idx, :])
+                continue
+            basis = self._compute_principal_basis(base_output[:, :, local_layer_idx, :], self.orthogonal_damping_rank)
+            layer_residual = residual[:, :, local_layer_idx, :]
+            if basis is None:
+                damped_layers.append(layer_residual)
+                continue
+            coeff = torch.einsum('bsd,dq->bsq', layer_residual, basis)
+            parallel = torch.einsum('bsq,dq->bsd', coeff, basis)
+            orthogonal = layer_residual - parallel
+            damped_layers.append(parallel + (layer_eta * orthogonal))
+        return torch.stack(damped_layers, dim=2)
+
     def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         base_output = self.base_translator(layer_window_cache)
         if len(self.residual_experts) == 0:
@@ -342,6 +425,7 @@ class ResidualMixtureOfTranslators(nn.Module):
         residual_outputs = [expert(layer_window_cache) for expert in self.residual_experts]
         stacked_outputs = torch.stack(residual_outputs, dim=2)
         residual = (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+        residual = self._apply_orthogonal_damping(base_output, residual)
         return base_output + residual
 
 
@@ -357,6 +441,12 @@ def build_window_translator(
     mlp_ratio: int,
     mot_num_translators: int,
     mot_top_k: int,
+    orthogonal_damping_rank: int,
+    orthogonal_damping_min_eta: float,
+    orthogonal_damping_max_eta: float,
+    orthogonal_damping_max_start_fraction: float,
+    dst_start_layer_idx: int,
+    dst_total_num_layers: int,
 ) -> nn.Module:
     if translator == "single":
         return CrossLayerWindowTranslator(
@@ -380,7 +470,13 @@ def build_window_translator(
             num_translators=mot_num_translators,
             top_k=mot_top_k,
         )
-    if translator == "mot-r":
+    if translator in {"mot-r", "mot-rod"}:
+        damping_rank = orthogonal_damping_rank if translator == "mot-rod" else 0
+        damping_min_eta = orthogonal_damping_min_eta if translator == "mot-rod" else 1.0
+        damping_max_eta = orthogonal_damping_max_eta if translator == "mot-rod" else 1.0
+        damping_max_start_fraction = (
+            orthogonal_damping_max_start_fraction if translator == "mot-rod" else 0.0
+        )
         return ResidualMixtureOfTranslators(
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
@@ -391,6 +487,12 @@ def build_window_translator(
             mlp_ratio=mlp_ratio,
             num_translators=mot_num_translators,
             top_k=mot_top_k,
+            orthogonal_damping_rank=damping_rank,
+            orthogonal_damping_min_eta=damping_min_eta,
+            orthogonal_damping_max_eta=damping_max_eta,
+            orthogonal_damping_max_start_fraction=damping_max_start_fraction,
+            dst_start_layer_idx=dst_start_layer_idx,
+            dst_total_num_layers=dst_total_num_layers,
         )
     raise ValueError(f"Unsupported translator type: {translator}")
 
@@ -408,6 +510,12 @@ class LayerWindowDirectionalTranslator(nn.Module):
         translator: str,
         mot_num_translators: int,
         mot_top_k: int,
+        orthogonal_damping_rank: int,
+        orthogonal_damping_min_eta: float,
+        orthogonal_damping_max_eta: float,
+        orthogonal_damping_max_start_fraction: float,
+        dst_start_layer_idx: int,
+        dst_total_num_layers: int,
     ) -> None:
         super().__init__()
         if translated_num_layers < 1:
@@ -425,6 +533,12 @@ class LayerWindowDirectionalTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            orthogonal_damping_rank=orthogonal_damping_rank,
+            orthogonal_damping_min_eta=orthogonal_damping_min_eta,
+            orthogonal_damping_max_eta=orthogonal_damping_max_eta,
+            orthogonal_damping_max_start_fraction=orthogonal_damping_max_start_fraction,
+            dst_start_layer_idx=dst_start_layer_idx,
+            dst_total_num_layers=dst_total_num_layers,
         )
         self.value_translator = build_window_translator(
             translator=translator,
@@ -437,6 +551,12 @@ class LayerWindowDirectionalTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            orthogonal_damping_rank=orthogonal_damping_rank,
+            orthogonal_damping_min_eta=orthogonal_damping_min_eta,
+            orthogonal_damping_max_eta=orthogonal_damping_max_eta,
+            orthogonal_damping_max_start_fraction=orthogonal_damping_max_start_fraction,
+            dst_start_layer_idx=dst_start_layer_idx,
+            dst_total_num_layers=dst_total_num_layers,
         )
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -473,6 +593,10 @@ class LayerWindowTranslatorPool(nn.Module):
         translator: str,
         mot_num_translators: int,
         mot_top_k: int,
+        orthogonal_damping_rank: int,
+        orthogonal_damping_min_eta: float,
+        orthogonal_damping_max_eta: float,
+        orthogonal_damping_max_start_fraction: float,
     ) -> None:
         super().__init__()
         if not active_directions:
@@ -500,6 +624,12 @@ class LayerWindowTranslatorPool(nn.Module):
                 translator=translator,
                 mot_num_translators=mot_num_translators,
                 mot_top_k=mot_top_k,
+                orthogonal_damping_rank=orthogonal_damping_rank,
+                orthogonal_damping_min_eta=orthogonal_damping_min_eta,
+                orthogonal_damping_max_eta=orthogonal_damping_max_eta,
+                orthogonal_damping_max_start_fraction=orthogonal_damping_max_start_fraction,
+                dst_start_layer_idx=mapping.dst_layer_start_idx,
+                dst_total_num_layers=mapping.dst_num_layers,
             )
         self.adapters = nn.ModuleDict(adapters)
 
@@ -872,6 +1002,10 @@ def build_translator_pool(
         translator=config.translator,
         mot_num_translators=config.mot_num_translators,
         mot_top_k=config.mot_top_k,
+        orthogonal_damping_rank=config.orthogonal_damping_rank,
+        orthogonal_damping_min_eta=config.orthogonal_damping_min_eta,
+        orthogonal_damping_max_eta=config.orthogonal_damping_max_eta,
+        orthogonal_damping_max_start_fraction=config.orthogonal_damping_max_start_fraction,
     )
     translator_pool.to(config.device)
     return translator_pool, model_specs, nodes, edges, layer_mappings
