@@ -29,5 +29,8 @@
   "eval_max_examples_per_dataset": 100,
   "eval_shuffle_stream": false,
   "benchmark_mode": "gen_qa",
-  "generation_max_new_tokens": 64
+  "generation_max_new_tokens": 64,
+  "translator": "single",
+  "mot_num_translators": 4,
+  "mot_top_k": 2
 }

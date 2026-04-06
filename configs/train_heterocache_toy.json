@@ -22,5 +22,8 @@
   "translator_depth": 2,
   "translator_mlp_ratio": 2,
   "device": "auto",
-  "dtype": "float32"
+  "dtype": "float32",
+  "translator": "single",
+  "mot_num_translators": 4,
+  "mot_top_k": 2
 }

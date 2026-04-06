@@ -30,5 +30,8 @@
   "eval_shuffle_stream": false,
   "benchmark_mode": "gen_qa",
   "generation_max_new_tokens": 64,
-  "correction_max_analysis_tokens": 4
+  "correction_max_analysis_tokens": 4,
+  "translator": "single",
+  "mot_num_translators": 4,
+  "mot_top_k": 2
 }

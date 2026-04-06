@@ -8,16 +8,16 @@ cd "${REPO_ROOT}"
 COMMON_ARGS=("$@")
 TOP_K_VALUES=(2)
 NUM_TRANSLATORS_VALUES=(4)
-OUTPUT_ROOT=outputs/layer_position
+OUTPUT_ROOT=outputs/correction
 
 for top_k in "${TOP_K_VALUES[@]}"; do
   for num_translators in "${NUM_TRANSLATORS_VALUES[@]}"; do
     if (( top_k >= num_translators )); then
-      echo "[LayerPositionSweep] skipping TopK=${top_k} NumT=${num_translators} because TopK must be < NumT"
+      echo "[CorrectionSweep] skipping TopK=${top_k} NumT=${num_translators} because TopK must be < NumT"
       continue
     fi
     study_id="TopK=${top_k}_NumT=${num_translators}"
-    echo "[LayerPositionSweep] running OUTPUT_ROOT=${OUTPUT_ROOT} STUDY_ID=${study_id}"
-    OUTPUT_ROOT="${OUTPUT_ROOT}"       STUDY_ID="${study_id}"       bash exp/layer_position.sh         --mot-top-k "${top_k}"         --mot-num-translators "${num_translators}"         "${COMMON_ARGS[@]}"
+    echo "[CorrectionSweep] running OUTPUT_ROOT=${OUTPUT_ROOT} STUDY_ID=${study_id}"
+    OUTPUT_ROOT="${OUTPUT_ROOT}"       STUDY_ID="${study_id}"       bash exp/correction.sh         --mot-top-k "${top_k}"         --mot-num-translators "${num_translators}"         "${COMMON_ARGS[@]}"
   done
 done

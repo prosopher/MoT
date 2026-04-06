@@ -51,6 +51,9 @@ class TrainConfig:
     translator_mlp_ratio: int
     device: str
     dtype: str
+    translator: str
+    mot_num_translators: int
+    mot_top_k: int
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -61,6 +64,14 @@ class TrainConfig:
             raise ValueError("injection_window_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
+        if self.translator not in {"single", "mot"}:
+            raise ValueError("translator must be one of {'single', 'mot'}")
+        if self.mot_num_translators < 1:
+            raise ValueError("mot_num_translators must be >= 1")
+        if self.mot_top_k < 1:
+            raise ValueError("mot_top_k must be >= 1")
+        if self.mot_top_k > self.mot_num_translators:
+            raise ValueError("mot_top_k must be <= mot_num_translators")
         initialize_train_output_paths(self)
 
 
@@ -161,6 +172,108 @@ class CrossLayerWindowTranslator(nn.Module):
         return translated.view(batch_size, seq_len, self.num_layers, -1)
 
 
+class MixtureOfTranslators(nn.Module):
+    def __init__(
+        self,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        num_layers: int,
+        translator_dim: int,
+        translator_heads: int,
+        translator_depth: int,
+        mlp_ratio: int,
+        num_translators: int,
+        top_k: int,
+    ) -> None:
+        super().__init__()
+        if num_translators < 1:
+            raise ValueError("num_translators must be >= 1")
+        if top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        if top_k > num_translators:
+            raise ValueError("top_k must be <= num_translators")
+        self.num_translators = num_translators
+        self.top_k = top_k
+        self.translators = nn.ModuleList(
+            [
+                CrossLayerWindowTranslator(
+                    src_hidden_size=src_hidden_size,
+                    dst_hidden_size=dst_hidden_size,
+                    num_layers=num_layers,
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(num_translators)
+            ]
+        )
+        router_input_dim = num_layers * src_hidden_size
+        router_hidden_dim = max(64, min(translator_dim, router_input_dim))
+        self.router = nn.Sequential(
+            nn.LayerNorm(router_input_dim),
+            nn.Linear(router_input_dim, router_hidden_dim),
+            nn.GELU(),
+            nn.Linear(router_hidden_dim, num_translators),
+        )
+
+    def _compute_mixture_weights(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
+        router_input = layer_window_cache.reshape(layer_window_cache.shape[0], layer_window_cache.shape[1], -1)
+        router_logits = self.router(router_input)
+        if self.top_k < self.num_translators:
+            topk_indices = torch.topk(router_logits, k=self.top_k, dim=-1).indices
+            topk_mask = torch.zeros_like(router_logits, dtype=torch.bool)
+            topk_mask.scatter_(-1, topk_indices, True)
+            router_logits = router_logits.masked_fill(~topk_mask, float("-inf"))
+        return torch.softmax(router_logits, dim=-1)
+
+    def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
+        expert_outputs = [translator(layer_window_cache) for translator in self.translators]
+        if len(expert_outputs) == 1:
+            return expert_outputs[0]
+        mixture_weights = self._compute_mixture_weights(layer_window_cache)
+        stacked_outputs = torch.stack(expert_outputs, dim=2)
+        return (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+
+
+def build_window_translator(
+    *,
+    translator: str,
+    src_hidden_size: int,
+    dst_hidden_size: int,
+    num_layers: int,
+    translator_dim: int,
+    translator_heads: int,
+    translator_depth: int,
+    mlp_ratio: int,
+    mot_num_translators: int,
+    mot_top_k: int,
+) -> nn.Module:
+    if translator == "single":
+        return CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
+        )
+    if translator == "mot":
+        return MixtureOfTranslators(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
+            num_translators=mot_num_translators,
+            top_k=mot_top_k,
+        )
+    raise ValueError(f"Unsupported translator type: {translator}")
+
+
 class LayerWindowDirectionalTranslator(nn.Module):
     def __init__(
         self,
@@ -171,12 +284,17 @@ class LayerWindowDirectionalTranslator(nn.Module):
         translator_heads: int,
         translator_depth: int,
         mlp_ratio: int,
+        translator: str,
+        mot_num_translators: int,
+        mot_top_k: int,
     ) -> None:
         super().__init__()
         if translated_num_layers < 1:
             raise ValueError("translated_num_layers must be >= 1")
         self.translated_num_layers = translated_num_layers
-        self.key_translator = CrossLayerWindowTranslator(
+        self.translator = translator
+        self.key_translator = build_window_translator(
+            translator=translator,
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
             num_layers=translated_num_layers,
@@ -184,8 +302,11 @@ class LayerWindowDirectionalTranslator(nn.Module):
             translator_heads=translator_heads,
             translator_depth=translator_depth,
             mlp_ratio=mlp_ratio,
+            mot_num_translators=mot_num_translators,
+            mot_top_k=mot_top_k,
         )
-        self.value_translator = CrossLayerWindowTranslator(
+        self.value_translator = build_window_translator(
+            translator=translator,
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
             num_layers=translated_num_layers,
@@ -193,6 +314,8 @@ class LayerWindowDirectionalTranslator(nn.Module):
             translator_heads=translator_heads,
             translator_depth=translator_depth,
             mlp_ratio=mlp_ratio,
+            mot_num_translators=mot_num_translators,
+            mot_top_k=mot_top_k,
         )
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -226,6 +349,9 @@ class LayerWindowTranslatorPool(nn.Module):
         translator_depth: int,
         mlp_ratio: int,
         active_directions: List[str],
+        translator: str,
+        mot_num_translators: int,
+        mot_top_k: int,
     ) -> None:
         super().__init__()
         if not active_directions:
@@ -250,6 +376,9 @@ class LayerWindowTranslatorPool(nn.Module):
                 translator_heads=translator_heads,
                 translator_depth=translator_depth,
                 mlp_ratio=mlp_ratio,
+                translator=translator,
+                mot_num_translators=mot_num_translators,
+                mot_top_k=mot_top_k,
             )
         self.adapters = nn.ModuleDict(adapters)
 
@@ -619,6 +748,9 @@ def build_translator_pool(
         translator_depth=config.translator_depth,
         mlp_ratio=config.translator_mlp_ratio,
         active_directions=active_directions,
+        translator=config.translator,
+        mot_num_translators=config.mot_num_translators,
+        mot_top_k=config.mot_top_k,
     )
     translator_pool.to(config.device)
     return translator_pool, model_specs, nodes, edges, layer_mappings
