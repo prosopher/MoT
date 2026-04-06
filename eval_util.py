@@ -352,7 +352,86 @@ def evaluate_openwebtext_validation_loss_metrics(
 
 
 @torch.inference_mode()
-def evaluate_openwebtext_validation_loss(
+def evaluate_openwebtext_validation_loss_top_layers(
+    tokenizer,
+    train_config,
+    eval_config: EvalConfig,
+    translator_pool,
+    dst_model_specs: Dict[str, ModelSpec],
+    models,
+    nodes,
+    edges,
+    active_directions,
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, float]]:
+    def evaluate_direction_losses_fn(
+        *,
+        direction: str,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        lm_input_ids: torch.Tensor,
+        lm_labels: torch.Tensor,
+        past_by_node_id,
+    ) -> Dict[str, float]:
+        translated_top_past = translator_pool.translate_top_layers(
+            past_key_values=past_by_node_id[edge.src_id],
+            src_name=edge.src_id,
+            dst_name=edge.dst_id,
+            dst_spec=dst_model_specs[edge.dst_id],
+        )
+        mixed_target_past = replace_top_layers(
+            base_past_key_values=past_by_node_id[edge.dst_id],
+            translated_top_past_key_values=translated_top_past,
+        )
+        translated_loss = float(
+            compute_suffix_lm_loss(
+                target_model=models[edge.dst_id],
+                past_key_values=mixed_target_past,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        native_loss = float(
+            compute_suffix_lm_loss(
+                target_model=models[edge.dst_id],
+                past_key_values=past_by_node_id[edge.dst_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        return {
+            "translated": translated_loss,
+            "native": native_loss,
+        }
+
+    return evaluate_openwebtext_validation_loss_metrics(
+        tokenizer=tokenizer,
+        config=train_config,
+        batch_size=eval_config.batch_size,
+        num_workers=eval_config.num_workers,
+        shuffle=eval_config.shuffle_eval_stream,
+        seed=eval_config.seed,
+        shuffle_buffer=eval_config.shuffle_buffer,
+        max_examples=eval_config.max_examples_per_dataset,
+        models=models,
+        nodes=nodes,
+        edges=edges,
+        active_directions=active_directions,
+        logger=logger,
+        evaluate_direction_losses_fn=evaluate_direction_losses_fn,
+        summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
+            average_losses,
+            count,
+            primary_name="translated",
+            loss_field_by_name={
+                "native": "native_loss",
+            },
+        ),
+    )
+
+
+@torch.inference_mode()
+def evaluate_openwebtext_validation_loss_replay(
     tokenizer,
     train_config,
     eval_config: EvalConfig,
@@ -425,6 +504,46 @@ def evaluate_openwebtext_validation_loss(
                 "native": "native_loss",
             },
         ),
+    )
+
+
+@torch.inference_mode()
+def evaluate_openwebtext_validation_loss(
+    tokenizer,
+    train_config,
+    eval_config: EvalConfig,
+    translator_pool,
+    dst_model_specs: Dict[str, ModelSpec],
+    models,
+    nodes,
+    edges,
+    active_directions,
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, float]]:
+    if eval_config.alg == "heterocache":
+        return evaluate_openwebtext_validation_loss_replay(
+            tokenizer=tokenizer,
+            train_config=train_config,
+            eval_config=eval_config,
+            translator_pool=translator_pool,
+            dst_model_specs=dst_model_specs,
+            models=models,
+            nodes=nodes,
+            edges=edges,
+            active_directions=active_directions,
+            logger=logger,
+        )
+    return evaluate_openwebtext_validation_loss_top_layers(
+        tokenizer=tokenizer,
+        train_config=train_config,
+        eval_config=eval_config,
+        translator_pool=translator_pool,
+        dst_model_specs=dst_model_specs,
+        models=models,
+        nodes=nodes,
+        edges=edges,
+        active_directions=active_directions,
+        logger=logger,
     )
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
