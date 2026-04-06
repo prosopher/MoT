@@ -606,6 +606,54 @@ def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Ten
     return key_block, value_block
 
 
+def slice_top_layers(
+    past_key_values: PastKeyValues,
+    top_layers_to_translate: int,
+) -> PastKeyValues:
+    if top_layers_to_translate < 1:
+        raise ValueError("top_layers_to_translate must be >= 1")
+    if top_layers_to_translate > len(past_key_values):
+        raise ValueError(
+            f"Cannot slice {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
+        )
+    return tuple(past_key_values[-top_layers_to_translate:])
+
+
+def replace_top_layers(
+    base_past_key_values: PastKeyValues,
+    translated_top_past_key_values: PastKeyValues,
+) -> PastKeyValues:
+    num_replace = len(translated_top_past_key_values)
+    if num_replace < 1:
+        raise ValueError("translated_top_past_key_values must contain at least one layer.")
+    if num_replace > len(base_past_key_values):
+        raise ValueError(
+            f"Cannot replace {num_replace} layers in cache with only {len(base_past_key_values)} layers."
+        )
+
+    base_list = list(base_past_key_values)
+    start_idx = len(base_list) - num_replace
+
+    for offset, translated_layer in enumerate(translated_top_past_key_values):
+        base_key, base_value = base_list[start_idx + offset]
+        translated_key, translated_value = translated_layer
+
+        if base_key.shape != translated_key.shape:
+            raise ValueError(
+                f"Key shape mismatch at replaced layer {offset}: "
+                f"base={tuple(base_key.shape)} vs translated={tuple(translated_key.shape)}"
+            )
+        if base_value.shape != translated_value.shape:
+            raise ValueError(
+                f"Value shape mismatch at replaced layer {offset}: "
+                f"base={tuple(base_value.shape)} vs translated={tuple(translated_value.shape)}"
+            )
+
+        base_list[start_idx + offset] = (translated_key, translated_value)
+
+    return tuple(base_list)
+
+
 def flatten_past_key_values(past_key_values: PastKeyValues) -> torch.Tensor:
     flat_parts = []
     for key, value in past_key_values:
