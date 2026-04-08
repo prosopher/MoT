@@ -1,1 +1,4 @@
 transformers==4.35.2
+matplotlib
+torch
+datasets
