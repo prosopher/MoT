@@ -1,4 +1,5 @@
-transformers==4.35.2
-matplotlib
-torch
 datasets
+matplotlib
+numpy<2
+transformers==4.35.2
+torch==2.1.0
