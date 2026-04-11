@@ -25,9 +25,5 @@
   "dtype": "float32",
   "variant": "mot",
   "mot_num_translators": 4,
-  "mot_top_k": 2,
-  "orthogonal_damping_rank": 8,
-  "orthogonal_damping_min_eta": 0.0,
-  "orthogonal_damping_max_eta": 1.0,
-  "orthogonal_damping_max_start_fraction": 0.3
+  "mot_top_k": 2
 }
