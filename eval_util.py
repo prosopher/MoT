@@ -406,7 +406,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
         batch_examples = int(input_ids.shape[0])
         for edge in edges:
-            edge_losses, edge_profiles = evaluate_direction_losses_fn(
+            edge_eval_result = evaluate_direction_losses_fn(
                 edge_id=edge.id,
                 edge=edge,
                 prefix_cache_ids=prefix_cache_ids,
@@ -414,6 +414,12 @@ def evaluate_openwebtext_validation_loss_metrics(
                 lm_labels=lm_labels,
                 past_by_node_id=past_by_node_id,
             )
+            if isinstance(edge_eval_result, tuple):
+                edge_losses, edge_profiles = edge_eval_result
+            else:
+                edge_losses = edge_eval_result
+                edge_profiles = {}
+
             if not edge_losses:
                 continue
             for metric_name, loss_value in edge_losses.items():
@@ -455,7 +461,10 @@ def evaluate_openwebtext_validation_loss_metrics(
             metric_name: accumulator.summary()
             for metric_name, accumulator in profile_accumulators[edge.id].items()
         }
-        summaries[edge.id] = summarize_direction_fn(average_losses, count, profile_summaries)
+        try:
+            summaries[edge.id] = summarize_direction_fn(average_losses, count, profile_summaries)
+        except TypeError:
+            summaries[edge.id] = summarize_direction_fn(average_losses, count)
 
     return summaries
 
