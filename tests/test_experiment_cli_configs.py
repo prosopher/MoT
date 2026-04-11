@@ -31,7 +31,7 @@ def _build_env() -> dict[str, str]:
 )
 def test_experiment_scripts_use_default_config_for_target_layer_lookup(script_path: str) -> None:
     result = subprocess.run(
-        [sys.executable, script_path],
+        [sys.executable, script_path, "--print-target-num-layers"],
         cwd=REPO_ROOT,
         env=_build_env(),
         check=True,

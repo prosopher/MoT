@@ -51,6 +51,7 @@ case "${BENCHMARK_MODE}" in
 esac
 
 NUM_LAYERS=$(python exp/correction.py \
+  --print-target-num-layers \
   --output-path "${OUTPUT_ROOT}" \
   --study-id "${STUDY_ID}" \
   --injection-window-size "${INJECTION_WINDOW_SIZE}" \
