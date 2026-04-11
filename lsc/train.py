@@ -72,28 +72,6 @@ def build_translated_model_specs(
     return translated_specs
 
 
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 2) -> None:
-        super().__init__()
-        self.query_norm = nn.LayerNorm(dim)
-        self.context_norm = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
-        self.ffn_norm = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio),
-            nn.GELU(),
-            nn.Linear(dim * mlp_ratio, dim),
-        )
-
-    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        q = self.query_norm(hidden)
-        kv = self.context_norm(context)
-        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
-        hidden = hidden + attn_out
-        hidden = hidden + self.ffn(self.ffn_norm(hidden))
-        return hidden
-
-
 class LocalToSharedTranslator(nn.Module):
     """
     Input:  [batch, seq, local_layers, local_hidden]
