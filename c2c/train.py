@@ -636,13 +636,6 @@ class C2CProjectorPool(nn.Module):
                 mlp_ratio=mlp_ratio,
             )
         self.adapters = nn.ModuleDict(adapters)
-
-    def set_temperature(self, temperature: float) -> None:
-        return None
-
-    def set_hard_gate_eval(self, enabled: bool) -> None:
-        return None
-
     def mean_gate_probability(self) -> float:
         if not self.adapters:
             return float("nan")

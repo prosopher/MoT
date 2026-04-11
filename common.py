@@ -548,13 +548,6 @@ class GPUMemoryTracker:
         }
 
 
-def move_past_to_device(past_key_values: PastKeyValues, device: str) -> PastKeyValues:
-    moved = []
-    for key, value in past_key_values:
-        moved.append((key.to(device), value.to(device)))
-    return tuple(moved)
-
-
 def read_json(path: Union[str, Path]) -> Dict[str, Any]:
     path_obj = Path(path)
     with path_obj.open("r", encoding="utf-8") as fp:

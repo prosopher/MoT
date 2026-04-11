@@ -92,11 +92,6 @@ def save_checkpoint(
     torch.save(payload, output_path)
 
 
-def load_train_config_from_checkpoint(checkpoint_path: str, config_cls):
-    payload = torch.load(checkpoint_path, map_location="cpu")
-    return config_cls(**payload["train_config"])
-
-
 def get_train_config_path(output_path: Union[str, Path]) -> Path:
     return Path(output_path) / "train_config.json"
 
