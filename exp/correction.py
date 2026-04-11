@@ -1012,7 +1012,7 @@ def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionCon
         translator_mlp_ratio=config.translator_mlp_ratio,
         device=config.device,
         dtype=config.dtype,
-        translator=config.translator,
+        variant=config.variant,
         mot_num_translators=config.mot_num_translators,
         mot_top_k=config.mot_top_k,
         orthogonal_damping_rank=config.orthogonal_damping_rank,

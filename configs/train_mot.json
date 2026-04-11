@@ -23,7 +23,7 @@
   "translator_mlp_ratio": 4,
   "device": "auto",
   "dtype": "float32",
-  "translator": "mot",
+  "variant": "mot",
   "mot_num_translators": 4,
   "mot_top_k": 2,
   "orthogonal_damping_rank": 8,

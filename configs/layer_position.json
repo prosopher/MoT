@@ -30,7 +30,7 @@
   "eval_shuffle_stream": false,
   "benchmark_mode": "gen_qa",
   "generation_max_new_tokens": 64,
-  "translator": "single",
+  "variant": "mot",
   "mot_num_translators": 4,
   "mot_top_k": 2,
   "orthogonal_damping_rank": 8,

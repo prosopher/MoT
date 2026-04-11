@@ -10,6 +10,9 @@ from tqdm.auto import tqdm
 from train_util import *
 
 
+MOT_VARIANTS = {"single", "mot", "mot-r", "mot-rod"}
+
+
 @dataclass(frozen=True)
 class LayerMapping:
     reference_target_node_id: str
@@ -51,7 +54,7 @@ class TrainConfig:
     translator_mlp_ratio: int
     device: str
     dtype: str
-    translator: str
+    variant: str
     mot_num_translators: int
     mot_top_k: int
     orthogonal_damping_rank: int
@@ -68,8 +71,8 @@ class TrainConfig:
             raise ValueError("injection_window_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
-        if self.translator not in {"single", "mot", "mot-r", "mot-rod"}:
-            raise ValueError("translator must be one of {'single', 'mot', 'mot-r', 'mot-rod'}")
+        if self.variant not in MOT_VARIANTS:
+            raise ValueError(f"variant must be one of {sorted(MOT_VARIANTS)}")
         if self.mot_num_translators < 1:
             raise ValueError("mot_num_translators must be >= 1")
         if self.mot_top_k < 1:
@@ -409,7 +412,7 @@ class ResidualMixtureOfTranslators(nn.Module):
 
 def build_window_translator(
     *,
-    translator: str,
+    variant: str,
     src_hidden_size: int,
     dst_hidden_size: int,
     num_layers: int,
@@ -426,7 +429,7 @@ def build_window_translator(
     dst_start_layer_idx: int,
     dst_total_num_layers: int,
 ) -> nn.Module:
-    if translator == "single":
+    if variant == "single":
         return CrossLayerWindowTranslator(
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
@@ -436,7 +439,7 @@ def build_window_translator(
             translator_depth=translator_depth,
             mlp_ratio=mlp_ratio,
         )
-    if translator == "mot":
+    if variant == "mot":
         return MixtureOfTranslators(
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
@@ -448,12 +451,12 @@ def build_window_translator(
             num_translators=mot_num_translators,
             top_k=mot_top_k,
         )
-    if translator in {"mot-r", "mot-rod"}:
-        damping_rank = orthogonal_damping_rank if translator == "mot-rod" else 0
-        damping_min_eta = orthogonal_damping_min_eta if translator == "mot-rod" else 1.0
-        damping_max_eta = orthogonal_damping_max_eta if translator == "mot-rod" else 1.0
+    if variant in {"mot-r", "mot-rod"}:
+        damping_rank = orthogonal_damping_rank if variant == "mot-rod" else 0
+        damping_min_eta = orthogonal_damping_min_eta if variant == "mot-rod" else 1.0
+        damping_max_eta = orthogonal_damping_max_eta if variant == "mot-rod" else 1.0
         damping_max_start_fraction = (
-            orthogonal_damping_max_start_fraction if translator == "mot-rod" else 0.0
+            orthogonal_damping_max_start_fraction if variant == "mot-rod" else 0.0
         )
         return ResidualMixtureOfTranslators(
             src_hidden_size=src_hidden_size,
@@ -472,7 +475,7 @@ def build_window_translator(
             dst_start_layer_idx=dst_start_layer_idx,
             dst_total_num_layers=dst_total_num_layers,
         )
-    raise ValueError(f"Unsupported translator type: {translator}")
+    raise ValueError(f"Unsupported MOT variant: {variant}")
 
 
 class LayerWindowDirectionalTranslator(nn.Module):
@@ -485,7 +488,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
         translator_heads: int,
         translator_depth: int,
         mlp_ratio: int,
-        translator: str,
+        variant: str,
         mot_num_translators: int,
         mot_top_k: int,
         orthogonal_damping_rank: int,
@@ -499,9 +502,9 @@ class LayerWindowDirectionalTranslator(nn.Module):
         if translated_num_layers < 1:
             raise ValueError("translated_num_layers must be >= 1")
         self.translated_num_layers = translated_num_layers
-        self.translator = translator
+        self.variant = variant
         self.key_translator = build_window_translator(
-            translator=translator,
+            variant=variant,
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
             num_layers=translated_num_layers,
@@ -519,7 +522,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             dst_total_num_layers=dst_total_num_layers,
         )
         self.value_translator = build_window_translator(
-            translator=translator,
+            variant=variant,
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
             num_layers=translated_num_layers,
@@ -568,7 +571,7 @@ class LayerWindowTranslatorPool(nn.Module):
         translator_depth: int,
         mlp_ratio: int,
         active_directions: List[str],
-        translator: str,
+        variant: str,
         mot_num_translators: int,
         mot_top_k: int,
         orthogonal_damping_rank: int,
@@ -599,7 +602,7 @@ class LayerWindowTranslatorPool(nn.Module):
                 translator_heads=translator_heads,
                 translator_depth=translator_depth,
                 mlp_ratio=mlp_ratio,
-                translator=translator,
+                variant=variant,
                 mot_num_translators=mot_num_translators,
                 mot_top_k=mot_top_k,
                 orthogonal_damping_rank=orthogonal_damping_rank,
@@ -955,7 +958,7 @@ def build_translator_pool(
         translator_depth=config.translator_depth,
         mlp_ratio=config.translator_mlp_ratio,
         active_directions=active_directions,
-        translator=config.translator,
+        variant=config.variant,
         mot_num_translators=config.mot_num_translators,
         mot_top_k=config.mot_top_k,
         orthogonal_damping_rank=config.orthogonal_damping_rank,

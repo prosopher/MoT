@@ -31,7 +31,7 @@
   "benchmark_mode": "gen_qa",
   "generation_max_new_tokens": 64,
   "correction_max_analysis_tokens": 4,
-  "translator": "single",
+  "variant": "mot",
   "mot_num_translators": 4,
   "mot_top_k": 2,
   "orthogonal_damping_rank": 8,

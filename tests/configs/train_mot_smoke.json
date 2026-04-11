@@ -23,7 +23,7 @@
   "translator_mlp_ratio": 1,
   "device": "cpu",
   "dtype": "float32",
-  "translator": "single",
+  "variant": "single",
   "mot_num_translators": 4,
   "mot_top_k": 2,
   "orthogonal_damping_rank": 8,
