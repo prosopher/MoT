@@ -361,16 +361,6 @@ def log_layer_mappings(
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     node_map = build_node_map(nodes)
-    anchor_direction = next(iter(layer_mappings))
-    anchor_mapping = layer_mappings[anchor_direction]
-    logger.info("[LayerMapping] anchor direction = %s", anchor_direction)
-    _, anchor_dst_id = anchor_direction.split("_to_")
-    logger.info(
-        "[LayerMapping] anchor target window = L%d-%d/%d",
-        anchor_mapping.dst_layer_start_idx,
-        anchor_mapping.dst_layer_end_idx,
-        model_specs[anchor_dst_id].num_layers - 1,
-    )
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
         dst_depth_from_top = model_specs[dst_id].num_layers - 1 - mapping.dst_layer_start_idx
