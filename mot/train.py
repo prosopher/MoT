@@ -761,28 +761,6 @@ def extract_layer_window_blocks(
     return past_key_values_to_blocks(past_key_values[start_layer_idx:end_layer_idx])
 
 
-def blocks_to_partial_past_key_values(
-    key_block: torch.Tensor,
-    value_block: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-) -> PastKeyValues:
-    batch_size, seq_len, num_layers, hidden_size = key_block.shape
-    expected_hidden = num_heads * head_dim
-    if hidden_size != expected_hidden:
-        raise ValueError(f"Hidden mismatch: block has {hidden_size}, expected {expected_hidden}.")
-
-    past_key_values = []
-    for layer_idx in range(num_layers):
-        key_layer = key_block[:, :, layer_idx, :]
-        value_layer = value_block[:, :, layer_idx, :]
-        key_layer = key_layer.view(batch_size, seq_len, num_heads, head_dim)
-        value_layer = value_layer.view(batch_size, seq_len, num_heads, head_dim)
-        key_layer = key_layer.permute(0, 2, 1, 3).contiguous()
-        value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
-        past_key_values.append((key_layer, value_layer))
-    return tuple(past_key_values)
-
 
 def require_gpt2_transformer(model: PreTrainedModel):
     transformer = getattr(model, "transformer", None)
