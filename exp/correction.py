@@ -1042,7 +1042,6 @@ upper-layer residual updates anti-align with that post-window initial shift."
         dest="default_config_path",
         default="configs/correction.json",
     )
-    parser.add_argument("--print-target-num-layers", action="store_true")
     add_dataclass_arguments(
         parser,
         CorrectionConfig,
@@ -1063,10 +1062,6 @@ def main() -> None:
         args=args,
         exclude_fields={"alg"},
     )
-
-    if args.print_target_num_layers:
-        print(lp.resolve_target_num_layers(config_kwargs["model_ids"], config_kwargs["model_directions"]))
-        return
 
     config = CorrectionConfig(
         alg=args.alg,

@@ -285,21 +285,6 @@ def resolve_run_position_label(config: LayerPositionConfig) -> str:
     return f"injection_layer_start_idx_{int(config.injection_layer_start_idx):03d}"
 
 
-def resolve_target_num_layers(
-    model_ids: str,
-    model_directions: str,
-) -> int:
-    nodes, edges, active_directions = resolve_direction_metadata(
-        model_ids=model_ids,
-        model_directions=model_directions,
-    )
-    node_map = build_node_map(nodes)
-    edge_map = build_edge_map(edges)
-    anchor_edge = edge_map[active_directions[0]]
-    target_model_id = node_map[anchor_edge.dst_id].model_id
-    return load_model_spec_from_pretrained_config(target_model_id).num_layers
-
-
 def build_control_window_variants(
     native_key_block: torch.Tensor,
     native_value_block: torch.Tensor,
@@ -1612,7 +1597,6 @@ cache injection quality on benchmark tasks."
         dest="default_config_path",
         default="configs/layer_position.json",
     )
-    parser.add_argument("--print-target-num-layers", action="store_true")
     add_dataclass_arguments(
         parser,
         LayerPositionConfig,
@@ -1633,10 +1617,6 @@ def main() -> None:
         args=args,
         exclude_fields={"alg"},
     )
-
-    if args.print_target_num_layers:
-        print(resolve_target_num_layers(config_kwargs["model_ids"], config_kwargs["model_directions"]))
-        return
 
     config = LayerPositionConfig(
         alg=args.alg,
