@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from train_util import *
+
+
+C2C_VARIANTS = {"c2c", "c2c-pr"}
 
 
 @dataclass
@@ -38,13 +41,97 @@ class TrainConfig:
     gate_temperature_start: float
     gate_temperature_end: float
     hard_gate_eval: bool
+    top_layers_to_project: int
+    projector_dim: int
+    projector_depth: int
+    projector_mlp_ratio: int
     device: str
     dtype: str
+    variant: str
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
+        self.variant = validate_c2c_variant(self.variant)
         parse_model_ids_csv(self.model_ids)
         initialize_train_output_paths(self)
+
+
+def validate_c2c_variant(variant: str) -> str:
+    normalized = str(variant).strip().lower()
+    if normalized not in C2C_VARIANTS:
+        raise ValueError(f"Unsupported c2c variant: {variant}. Expected one of {sorted(C2C_VARIANTS)}")
+    return normalized
+
+
+def is_projection_only_variant(variant_or_config: Union[str, TrainConfig]) -> bool:
+    variant = variant_or_config.variant if isinstance(variant_or_config, TrainConfig) else variant_or_config
+    return validate_c2c_variant(variant) == "c2c-pr"
+
+
+def get_top_layers_to_translate(config: TrainConfig) -> int:
+    return config.top_layers_to_project if is_projection_only_variant(config) else config.top_layers_to_fuse
+
+
+def get_translation_loss_name(config: TrainConfig) -> str:
+    return "projected" if is_projection_only_variant(config) else "fused"
+
+
+def get_translation_mode_name(config: TrainConfig) -> str:
+    if is_projection_only_variant(config):
+        return "project_top_layers_and_replace_target_top_layers"
+    return "fuse_top_layers_after_target_forward"
+
+
+def get_trainable_module_label(config: TrainConfig) -> str:
+    return "C2C-Project" if is_projection_only_variant(config) else "C2C"
+
+
+def build_checkpoint_extra(config: TrainConfig) -> Dict[str, Any]:
+    extra = {
+        "model_ids": config.model_ids,
+        "model_directions": config.model_directions,
+        "variant": config.variant,
+    }
+    if is_projection_only_variant(config):
+        extra.update(
+            {
+                "note": "Final checkpoint trained with C2C projection-only suffix LM loss.",
+                "top_layers_to_project": config.top_layers_to_project,
+            }
+        )
+    else:
+        extra.update(
+            {
+                "note": "Final checkpoint trained with C2C-style suffix LM loss.",
+                "top_layers_to_fuse": config.top_layers_to_fuse,
+            }
+        )
+    return extra
+
+
+def translate_top_layers(
+    translator_pool,
+    train_config: TrainConfig,
+    sharer_past_key_values: PastKeyValues,
+    receiver_past_key_values: PastKeyValues,
+    src_name: str,
+    dst_name: str,
+    dst_spec: ModelSpec,
+) -> PastKeyValues:
+    if is_projection_only_variant(train_config):
+        return translator_pool.project_top_layers(
+            sharer_past_key_values=sharer_past_key_values,
+            src_name=src_name,
+            dst_name=dst_name,
+            dst_spec=dst_spec,
+        )
+    return translator_pool.fuse_top_layers(
+        sharer_past_key_values=sharer_past_key_values,
+        receiver_past_key_values=receiver_past_key_values,
+        src_name=src_name,
+        dst_name=dst_name,
+        dst_spec=dst_spec,
+    )
 
 
 class CrossAttentionBlock(nn.Module):
@@ -162,14 +249,7 @@ class ResidualCacheFuser(nn.Module):
             soft_gate = torch.sigmoid((self.gate_logits + logistic_noise) / self.temperature)
             return soft_gate
         if self.hard_gate_eval:
-            hard_gate = (probs >= 0.5).to(probs.dtype)
-            # Avoid an exact all-zero hard gate at eval time. That makes fusion a strict
-            # identity map, which is exactly the failure mode behind cosine=1.0 and
-            # baseline-identical metrics. In that case we fall back to the learned soft
-            # probabilities instead of silently disabling the whole C2C path.
-            if float(hard_gate.sum().item()) == 0.0:
-                return probs
-            return hard_gate
+            return (probs >= 0.5).to(probs.dtype)
         return probs
 
     def forward(self, receiver_block: torch.Tensor, sharer_block: torch.Tensor) -> torch.Tensor:
@@ -438,10 +518,169 @@ def blocks_to_partial_past_key_values(
 
 
 
+
+class ProjectionMLP(nn.Module):
+    """
+    Projection-only cache adapter for the C2C ablation in Table 8 ("Project").
+    It directly maps the sharer's top-layer KV cache into the receiver hidden space
+    and replaces the receiver top layers.
+    """
+
+    def __init__(
+        self,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        hidden_dim: int,
+        depth: int,
+        mlp_ratio: int,
+    ) -> None:
+        super().__init__()
+        if depth < 1:
+            raise ValueError("depth must be >= 1")
+        layers: List[nn.Module] = [nn.LayerNorm(src_hidden_size)]
+        in_dim = src_hidden_size
+        inner_dim = max(hidden_dim, dst_hidden_size)
+        for _ in range(max(depth - 1, 0)):
+            layers.extend([
+                nn.Linear(in_dim, inner_dim),
+                nn.GELU(),
+            ])
+            in_dim = inner_dim
+            inner_dim = max(inner_dim, dst_hidden_size * max(1, mlp_ratio))
+        layers.append(nn.Linear(in_dim, dst_hidden_size))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DirectionalCacheProjector(nn.Module):
+    def __init__(
+        self,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        top_layers_to_project: int,
+        hidden_dim: int,
+        depth: int,
+        mlp_ratio: int,
+    ) -> None:
+        super().__init__()
+        self.top_layers_to_project = top_layers_to_project
+        self.key_projector = ProjectionMLP(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            mlp_ratio=mlp_ratio,
+        )
+        self.value_projector = ProjectionMLP(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            mlp_ratio=mlp_ratio,
+        )
+
+    def mean_gate_probability(self) -> float:
+        return 1.0
+
+    def forward(
+        self,
+        sharer_key_block: torch.Tensor,
+        sharer_value_block: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.key_projector(sharer_key_block), self.value_projector(sharer_value_block)
+
+
+class C2CProjectorPool(nn.Module):
+    def __init__(
+        self,
+        model_specs: Dict[str, ModelSpec],
+        edges: List[Edge],
+        top_layers_to_project: int,
+        projector_dim: int,
+        projector_depth: int,
+        mlp_ratio: int,
+        active_directions: List[str],
+    ) -> None:
+        super().__init__()
+        if top_layers_to_project < 1:
+            raise ValueError("top_layers_to_project must be >= 1")
+        if not active_directions:
+            raise ValueError("active_directions must contain at least one direction")
+
+        self.model_specs = model_specs
+        self.top_layers_to_project = top_layers_to_project
+        self.active_directions = tuple(active_directions)
+        self.edges_by_id = build_edge_map(edges)
+
+        adapters = {}
+        for direction in self.active_directions:
+            if direction not in self.edges_by_id:
+                raise ValueError(f"Unknown direction: {direction}")
+            edge = self.edges_by_id[direction]
+            src_spec = model_specs[edge.src_id]
+            dst_spec = model_specs[edge.dst_id]
+            max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
+            if top_layers_to_project > max_allowed:
+                raise ValueError(
+                    f"top_layers_to_project={top_layers_to_project} exceeds min layer count {max_allowed} "
+                    f"for direction {direction}."
+                )
+            adapters[direction] = DirectionalCacheProjector(
+                src_hidden_size=src_spec.hidden_size,
+                dst_hidden_size=dst_spec.hidden_size,
+                top_layers_to_project=top_layers_to_project,
+                hidden_dim=projector_dim,
+                depth=projector_depth,
+                mlp_ratio=mlp_ratio,
+            )
+        self.adapters = nn.ModuleDict(adapters)
+
+    def set_temperature(self, temperature: float) -> None:
+        return None
+
+    def set_hard_gate_eval(self, enabled: bool) -> None:
+        return None
+
+    def mean_gate_probability(self) -> float:
+        if not self.adapters:
+            return float("nan")
+        return float(sum(module.mean_gate_probability() for module in self.adapters.values()) / len(self.adapters))
+
+    def project_top_layers(
+        self,
+        sharer_past_key_values: PastKeyValues,
+        src_name: str,
+        dst_name: str,
+        dst_spec: ModelSpec,
+    ) -> PastKeyValues:
+        adapter_name = f"{src_name}_to_{dst_name}"
+        if adapter_name not in self.adapters:
+            raise ValueError(
+                f"C2C-Project direction {adapter_name} is not available. "
+                f"Active directions: {list(self.active_directions)}"
+            )
+        sharer_key_block, sharer_value_block = extract_top_layer_blocks(
+            past_key_values=sharer_past_key_values,
+            top_layers_to_fuse=self.top_layers_to_project,
+        )
+        projected_key, projected_value = self.adapters[adapter_name](
+            sharer_key_block=sharer_key_block,
+            sharer_value_block=sharer_value_block,
+        )
+        return blocks_to_partial_past_key_values(
+            key_block=projected_key,
+            value_block=projected_value,
+            num_heads=dst_spec.num_heads,
+            head_dim=dst_spec.head_dim,
+        )
+
+
 def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: TrainConfig,
-) -> Tuple[C2CFuserPool, Dict[str, ModelSpec], List[Node], List[Edge]]:
+) -> Tuple[Union[C2CFuserPool, C2CProjectorPool], Dict[str, ModelSpec], List[Node], List[Edge]]:
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     model_specs = {
         node.id: get_model_spec(models[node.id])
@@ -451,18 +690,29 @@ def build_translator_pool(
         config.model_directions,
         allowed_directions=[edge.id for edge in edges],
     )
-    translator_pool = C2CFuserPool(
-        model_specs=model_specs,
-        edges=edges,
-        top_layers_to_fuse=config.top_layers_to_fuse,
-        fuser_dim=config.fuser_dim,
-        fuser_heads=config.fuser_heads,
-        fuser_depth=config.fuser_depth,
-        mlp_ratio=config.fuser_mlp_ratio,
-        gate_temperature_start=config.gate_temperature_start,
-        hard_gate_eval=config.hard_gate_eval,
-        active_directions=active_directions,
-    )
+    if is_projection_only_variant(config):
+        translator_pool = C2CProjectorPool(
+            model_specs=model_specs,
+            edges=edges,
+            top_layers_to_project=config.top_layers_to_project,
+            projector_dim=config.projector_dim,
+            projector_depth=config.projector_depth,
+            mlp_ratio=config.projector_mlp_ratio,
+            active_directions=active_directions,
+        )
+    else:
+        translator_pool = C2CFuserPool(
+            model_specs=model_specs,
+            edges=edges,
+            top_layers_to_fuse=config.top_layers_to_fuse,
+            fuser_dim=config.fuser_dim,
+            fuser_heads=config.fuser_heads,
+            fuser_depth=config.fuser_depth,
+            mlp_ratio=config.fuser_mlp_ratio,
+            gate_temperature_start=config.gate_temperature_start,
+            hard_gate_eval=config.hard_gate_eval,
+            active_directions=active_directions,
+        )
     translator_pool.to(config.device)
     return translator_pool, model_specs, nodes, edges
 
@@ -473,7 +723,7 @@ def load_translator_pool_from_checkpoint(
     device_override: Optional[str] = None,
 ) -> Tuple[
     TrainConfig,
-    C2CFuserPool,
+    Union[C2CFuserPool, C2CProjectorPool],
     Dict[str, ModelSpec],
     Dict[str, PreTrainedModel],
     PreTrainedTokenizerBase,
@@ -548,8 +798,12 @@ def run_train(config: TrainConfig) -> Path:
             spec.hidden_size,
             spec.num_heads,
         )
-    logger.info("[Setup] top_layers_to_fuse = %d", config.top_layers_to_fuse)
-    logger.info("[Setup] trainable C2C params = %s", f"{count_trainable_parameters(translator_pool):,}")
+    logger.info("[Setup] variant = %s", config.variant)
+    if is_projection_only_variant(config):
+        logger.info("[Setup] top_layers_to_project = %d", config.top_layers_to_project)
+    else:
+        logger.info("[Setup] top_layers_to_fuse = %d", config.top_layers_to_fuse)
+    logger.info("[Setup] trainable %s params = %s", get_trainable_module_label(config), f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, config)
 
@@ -570,8 +824,10 @@ def run_train(config: TrainConfig) -> Path:
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
     for step in progress_bar:
-        gate_temperature = compute_gate_temperature(config, step)
-        translator_pool.set_temperature(gate_temperature)
+        gate_temperature = None
+        if not is_projection_only_variant(config):
+            gate_temperature = compute_gate_temperature(config, step)
+            translator_pool.set_temperature(gate_temperature)
 
         optimizer.zero_grad(set_to_none=True)
         step_loss_value = 0.0
@@ -592,20 +848,22 @@ def run_train(config: TrainConfig) -> Path:
             total_direction_loss = 0.0
             for direction in model_directions:
                 edge = edge_map[direction]
-                fused_top_past = translator_pool.fuse_top_layers(
+                translated_top_past = translate_top_layers(
+                    translator_pool=translator_pool,
+                    train_config=config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
                     receiver_past_key_values=past_by_node_id[edge.dst_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
-                mixed_target_past = replace_top_layers(
+                translated_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=fused_top_past,
+                    translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
                     target_model=models[edge.dst_id],
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 )
@@ -623,22 +881,37 @@ def run_train(config: TrainConfig) -> Path:
         running_loss += step_loss_value
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
-            progress_bar.set_postfix(
-                loss=f"{avg_loss:.4f}",
-                lr=f"{scheduler.lr:.2e}",
-                gate=f"{translator_pool.mean_gate_probability():.3f}",
-            )
+            postfix = {
+                "loss": f"{avg_loss:.4f}",
+                "lr": f"{scheduler.lr:.2e}",
+            }
+            if is_projection_only_variant(config):
+                postfix["proj"] = "1.000"
+            else:
+                postfix["gate"] = f"{translator_pool.mean_gate_probability():.3f}"
+            progress_bar.set_postfix(**postfix)
+
             gpu_memory = gpu_memory_tracker.summary()
-            logger.info(
-                "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gate_temp=%.4f | mean_gate_prob=%.4f | gpu_mem_avg=%s | gpu_mem_peak=%s",
-                step,
-                avg_loss,
-                scheduler.lr,
-                gate_temperature,
-                translator_pool.mean_gate_probability(),
-                gpu_memory["avg_allocated_pretty"],
-                gpu_memory["peak_allocated_pretty"],
-            )
+            if is_projection_only_variant(config):
+                logger.info(
+                    "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                    step,
+                    avg_loss,
+                    scheduler.lr,
+                    gpu_memory["avg_allocated_pretty"],
+                    gpu_memory["peak_allocated_pretty"],
+                )
+            else:
+                logger.info(
+                    "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gate_temp=%.4f | mean_gate_prob=%.4f | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                    step,
+                    avg_loss,
+                    scheduler.lr,
+                    gate_temperature,
+                    translator_pool.mean_gate_probability(),
+                    gpu_memory["avg_allocated_pretty"],
+                    gpu_memory["peak_allocated_pretty"],
+                )
             running_loss = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
@@ -649,12 +922,7 @@ def run_train(config: TrainConfig) -> Path:
         scheduler=scheduler,
         train_config=config,
         step=config.max_steps,
-        extra={
-            "note": "Final checkpoint trained with C2C-style suffix LM loss.",
-            "model_ids": config.model_ids,
-            "top_layers_to_fuse": config.top_layers_to_fuse,
-            "model_directions": config.model_directions,
-        },
+        extra=build_checkpoint_extra(config),
     )
     final_gpu_memory = gpu_memory_tracker.summary()
     logger.info(

@@ -7,7 +7,13 @@ from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 
 from eval_util import *
-from c2c.train import load_translator_pool_from_checkpoint
+from c2c.train import (
+    get_top_layers_to_translate,
+    get_translation_loss_name,
+    get_translation_mode_name,
+    load_translator_pool_from_checkpoint,
+    translate_top_layers,
+)
 
 
 MMLU_CHOICE_LABELS = ["A", "B", "C", "D"]
@@ -244,7 +250,9 @@ def evaluate_dataset(
             for direction in active_directions:
                 edge = edge_map[direction]
 
-                fused_top_past = translator_pool.fuse_top_layers(
+                translated_top_past = translate_top_layers(
+                    translator_pool=translator_pool,
+                    train_config=train_config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
                     receiver_past_key_values=past_by_node_id[edge.dst_id],
                     src_name=edge.src_id,
@@ -254,18 +262,18 @@ def evaluate_dataset(
 
                 target_top = slice_top_layers(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=train_config.top_layers_to_fuse,
+                    top_layers_to_translate=get_top_layers_to_translate(train_config),
                 )
-                cosine_value = cosine_similarity_between_past(fused_top_past, target_top)
+                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
-                mixed_target_past = replace_top_layers(
+                translated_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=fused_top_past,
+                    translated_top_past_key_values=translated_top_past,
                 )
 
                 translated_scoring_past = prepare_answer_scoring_past(
                     model=models[edge.dst_id],
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 native_scoring_past = prepare_answer_scoring_past(
@@ -381,7 +389,9 @@ def evaluate_generation_dataset(
             for direction in active_directions:
                 edge = edge_map[direction]
 
-                fused_top_past = translator_pool.fuse_top_layers(
+                translated_top_past = translate_top_layers(
+                    translator_pool=translator_pool,
+                    train_config=train_config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
                     receiver_past_key_values=past_by_node_id[edge.dst_id],
                     src_name=edge.src_id,
@@ -391,19 +401,19 @@ def evaluate_generation_dataset(
 
                 target_top = slice_top_layers(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=train_config.top_layers_to_fuse,
+                    top_layers_to_translate=get_top_layers_to_translate(train_config),
                 )
-                cosine_value = cosine_similarity_between_past(fused_top_past, target_top)
+                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
-                mixed_target_past = replace_top_layers(
+                translated_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=fused_top_past,
+                    translated_top_past_key_values=translated_top_past,
                 )
 
                 translated_answer = predict_generation_task_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_target_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     question_cache_ids=question_cache_ids,
@@ -462,21 +472,23 @@ def evaluate_openwebtext_validation_loss(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Dict[str, float]:
-        fused_top_past = translator_pool.fuse_top_layers(
+        translated_top_past = translate_top_layers(
+            translator_pool=translator_pool,
+            train_config=train_config,
             sharer_past_key_values=past_by_node_id[edge.src_id],
             receiver_past_key_values=past_by_node_id[edge.dst_id],
             src_name=edge.src_id,
             dst_name=edge.dst_id,
             dst_spec=model_specs[edge.dst_id],
         )
-        mixed_target_past = replace_top_layers(
+        translated_target_past = replace_top_layers(
             base_past_key_values=past_by_node_id[edge.dst_id],
-            translated_top_past_key_values=fused_top_past,
+            translated_top_past_key_values=translated_top_past,
         )
-        fused_loss = float(
+        translated_loss = float(
             compute_suffix_lm_loss(
                 target_model=models[edge.dst_id],
-                past_key_values=mixed_target_past,
+                past_key_values=translated_target_past,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
             ).item()
@@ -490,7 +502,7 @@ def evaluate_openwebtext_validation_loss(
             ).item()
         )
         return {
-            "fused": fused_loss,
+            get_translation_loss_name(train_config): translated_loss,
             "native": native_loss,
         }
 
@@ -512,7 +524,7 @@ def evaluate_openwebtext_validation_loss(
         summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
             average_losses,
             count,
-            primary_name="fused",
+            primary_name=get_translation_loss_name(train_config),
             loss_field_by_name={
                 "native": "native_loss",
             },
@@ -566,9 +578,9 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("top_layers_to_fuse=%d", train_config.top_layers_to_fuse)
+    logger.info("top_layers_to_translate=%d", get_top_layers_to_translate(train_config))
     logger.info("active_directions=%s", active_directions)
-    logger.info("translation_mode=fuse_top_layers_after_target_forward")
+    logger.info("translation_mode=%s", get_translation_mode_name(train_config))
     logger.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
@@ -590,9 +602,10 @@ def run_eval(eval_config: EvalConfig) -> Path:
     for direction in active_directions:
         row = openwebtext_loss_results[direction]
         logger.info(
-            "[OpenWebText/validation] %s | native_loss=%.6f | fused_loss=%.6f | count=%d",
+            "[OpenWebText/validation] %s | native_loss=%.6f | %s_loss=%.6f | count=%d",
             direction,
             row["native_loss"],
+            get_translation_loss_name(train_config),
             row["loss"],
             int(row["count"]),
         )

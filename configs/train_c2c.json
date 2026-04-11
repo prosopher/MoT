@@ -24,5 +24,10 @@
   "gate_temperature_end": 0.1,
   "hard_gate_eval": true,
   "device": "auto",
-  "dtype": "float32"
+  "dtype": "float32",
+  "variant": "c2c",
+  "top_layers_to_project": 6,
+  "projector_dim": 1024,
+  "projector_depth": 2,
+  "projector_mlp_ratio": 4
 }
