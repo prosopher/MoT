@@ -452,7 +452,7 @@ def evaluate_openwebtext_validation_loss_replay(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Dict[str, float]:
-        mixed_target_past, _, _ = translator_pool.build_replayed_target_past(
+        mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
             target_model=models[edge.dst_id],
@@ -461,11 +461,13 @@ def evaluate_openwebtext_validation_loss_replay(
             dst_spec=dst_model_specs[edge.dst_id],
         )
         translated_loss = float(
-            compute_suffix_lm_loss(
+            compute_prefix_correction_and_suffix_lm_loss(
                 target_model=models[edge.dst_id],
                 past_key_values=mixed_target_past,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
+                native_target_past_key_values=past_by_node_id[edge.dst_id],
+                target_start_layer_idx=mapping.dst_layer_start_idx,
             ).item()
         )
         native_loss = float(
