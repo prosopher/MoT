@@ -440,15 +440,6 @@ def build_layer_mappings(
     injection_layer_start_idx = int(config.injection_layer_start_idx)
 
     edge_map = build_edge_map(edges)
-    anchor_edge = edge_map[active_directions[0]]
-    anchor_target_spec = model_specs[anchor_edge.dst_id]
-    injection_layer_end_idx = injection_layer_start_idx + requested_window_size - 1
-    if injection_layer_end_idx >= anchor_target_spec.num_layers:
-        raise ValueError(
-            "injection_layer_start_idx with the requested injection_window_size would exceed the anchor target stack: "
-            f"start={injection_layer_start_idx}, end={injection_layer_end_idx}, "
-            f"last_layer={anchor_target_spec.num_layers - 1}"
-        )
 
     mappings: Dict[str, LayerMapping] = {}
     for direction in active_directions:
@@ -777,14 +768,6 @@ def run_train(config: TrainConfig) -> Path:
             spec.hidden_size,
             spec.num_heads,
         )
-    anchor_direction = active_directions[0]
-    anchor_mapping = layer_mappings[anchor_direction]
-    logger.info(
-        "[Setup] injection_window = L%d-%d on target depth anchored to %s",
-        anchor_mapping.dst_layer_start_idx,
-        anchor_mapping.dst_layer_end_idx,
-        anchor_direction,
-    )
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, config)
