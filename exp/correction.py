@@ -519,7 +519,7 @@ def evaluate_correction(
     edge_map = build_edge_map(edges)
 
     reference_mapping = layer_mappings[active_directions[0]]
-    num_layers = model_specs[reference_mapping.reference_target_node_id].num_layers
+    num_layers = int(reference_mapping.dst_num_layers)
     source_idx = int(reference_mapping.dst_layer_end_idx) + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
@@ -744,7 +744,7 @@ def update_summary(config: CorrectionConfig, run_dir: Path, metrics: Dict[str, A
     full_mix = metrics["full_mix"]
     random_control = metrics["random_control"]
     post_window_boundary_idx = int(mapping.dst_layer_end_idx) + 1
-    num_upper_layers = max(0, int(model_specs[mapping.reference_target_node_id].num_layers) - post_window_boundary_idx)
+    num_upper_layers = max(0, int(mapping.dst_num_layers) - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
@@ -1077,7 +1077,7 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions, reference_edge = lp.resolve_direction_metadata(
+    nodes, edges, active_directions = lp.resolve_direction_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
     )
@@ -1091,7 +1091,6 @@ def main() -> None:
         nodes=nodes,
         edges=edges,
         active_directions=active_directions,
-        reference_edge=reference_edge,
     )
     metrics = evaluate_correction(
         config=config,

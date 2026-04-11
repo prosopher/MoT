@@ -15,8 +15,6 @@ MOT_VARIANTS = {"single", "mot"}
 
 @dataclass(frozen=True)
 class LayerMapping:
-    reference_target_node_id: str
-    reference_target_num_layers: int
     src_layer_start_idx: int
     src_layer_end_idx: int
     dst_layer_start_idx: int
@@ -424,13 +422,12 @@ class SimpleNamespaceConfig:
 def resolve_direction_metadata(
     model_ids: str,
     model_directions: str,
-) -> Tuple[List[Node], List[Edge], List[str], Edge]:
+) -> Tuple[List[Node], List[Edge], List[str]]:
     nodes, edges = build_nodes_and_edges(model_ids, model_directions)
     active_directions = [edge.id for edge in edges]
     if not active_directions:
         raise ValueError("No active directions were resolved from model_directions")
-    edge_map = build_edge_map(edges)
-    return nodes, edges, active_directions, edge_map[active_directions[0]]
+    return nodes, edges, active_directions
 
 
 def build_layer_mappings(
@@ -438,20 +435,21 @@ def build_layer_mappings(
     model_specs: Dict[str, ModelSpec],
     edges: List[Edge],
     active_directions: List[str],
-    reference_edge: Edge,
 ) -> Dict[str, LayerMapping]:
-    reference_target_spec = model_specs[reference_edge.dst_id]
     requested_window_size = int(config.injection_window_size)
     injection_layer_start_idx = int(config.injection_layer_start_idx)
-    injection_layer_end_idx = injection_layer_start_idx + requested_window_size - 1
-    if injection_layer_end_idx >= reference_target_spec.num_layers:
-        raise ValueError(
-            "injection_layer_start_idx with the requested injection_window_size would exceed the reference target stack: "
-            f"start={injection_layer_start_idx}, end={injection_layer_end_idx}, "
-            f"last_layer={reference_target_spec.num_layers - 1}"
-        )
 
     edge_map = build_edge_map(edges)
+    anchor_edge = edge_map[active_directions[0]]
+    anchor_target_spec = model_specs[anchor_edge.dst_id]
+    injection_layer_end_idx = injection_layer_start_idx + requested_window_size - 1
+    if injection_layer_end_idx >= anchor_target_spec.num_layers:
+        raise ValueError(
+            "injection_layer_start_idx with the requested injection_window_size would exceed the anchor target stack: "
+            f"start={injection_layer_start_idx}, end={injection_layer_end_idx}, "
+            f"last_layer={anchor_target_spec.num_layers - 1}"
+        )
+
     mappings: Dict[str, LayerMapping] = {}
     for direction in active_directions:
         edge = edge_map[direction]
@@ -483,8 +481,6 @@ def build_layer_mappings(
             )
 
         mappings[direction] = LayerMapping(
-            reference_target_node_id=reference_edge.dst_id,
-            reference_target_num_layers=reference_target_spec.num_layers,
             src_layer_start_idx=src_layer_start_idx,
             src_layer_end_idx=src_layer_end_idx,
             dst_layer_start_idx=dst_layer_start_idx,
@@ -689,7 +685,7 @@ def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: TrainConfig,
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], List[Node], List[Edge], Dict[str, LayerMapping]]:
-    nodes, edges, active_directions, reference_edge = resolve_direction_metadata(
+    nodes, edges, active_directions = resolve_direction_metadata(
         config.model_ids,
         config.model_directions,
     )
@@ -697,7 +693,7 @@ def build_translator_pool(
         node.id: get_model_spec(models[node.id])
         for node in nodes
     }
-    layer_mappings = build_layer_mappings(config, model_specs, edges, active_directions, reference_edge)
+    layer_mappings = build_layer_mappings(config, model_specs, edges, active_directions)
     translator_pool = LayerWindowTranslatorPool(
         model_specs=model_specs,
         edges=edges,
@@ -748,7 +744,7 @@ def run_train(config: TrainConfig) -> Path:
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions, _ = resolve_direction_metadata(
+    nodes, edges, active_directions = resolve_direction_metadata(
         config.model_ids,
         config.model_directions,
     )

@@ -280,16 +280,6 @@ def load_model_spec_from_pretrained_config(model_id: str) -> ModelSpec:
     )
 
 
-def resolve_injection_layer_start_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
-    if reference_target_num_layers < 1:
-        raise ValueError("reference_target_num_layers must be >= 1")
-    layer_idx = int(config.injection_layer_start_idx)
-    if not (0 <= layer_idx < reference_target_num_layers):
-        raise ValueError(
-            f"injection_layer_start_idx={layer_idx} must be in [0, {reference_target_num_layers - 1}] for the reference target"
-        )
-    return layer_idx
-
 
 def resolve_run_position_label(config: LayerPositionConfig) -> str:
     return f"injection_layer_start_idx_{int(config.injection_layer_start_idx):03d}"
@@ -299,12 +289,14 @@ def resolve_target_num_layers(
     model_ids: str,
     model_directions: str,
 ) -> int:
-    nodes, _, _, reference_edge = resolve_direction_metadata(
+    nodes, edges, active_directions = resolve_direction_metadata(
         model_ids=model_ids,
         model_directions=model_directions,
     )
     node_map = build_node_map(nodes)
-    target_model_id = node_map[reference_edge.dst_id].model_id
+    edge_map = build_edge_map(edges)
+    anchor_edge = edge_map[active_directions[0]]
+    target_model_id = node_map[anchor_edge.dst_id].model_id
     return load_model_spec_from_pretrained_config(target_model_id).num_layers
 
 
@@ -387,11 +379,12 @@ def log_layer_mappings(
     anchor_direction = next(iter(layer_mappings))
     anchor_mapping = layer_mappings[anchor_direction]
     logger.info("[LayerMapping] anchor direction = %s", anchor_direction)
+    _, anchor_dst_id = anchor_direction.split("_to_")
     logger.info(
         "[LayerMapping] anchor target window = L%d-%d/%d",
         anchor_mapping.dst_layer_start_idx,
         anchor_mapping.dst_layer_end_idx,
-        anchor_mapping.reference_target_num_layers - 1,
+        model_specs[anchor_dst_id].num_layers - 1,
     )
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
@@ -458,7 +451,6 @@ def run_train(
     nodes: List[Node],
     edges: List[Edge],
     active_directions: List[str],
-    reference_edge: Edge,
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
     logger.info("Starting layer-window position training with target-layer replay")
@@ -1656,7 +1648,7 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions, reference_edge = resolve_direction_metadata(
+    nodes, edges, active_directions = resolve_direction_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
     )
@@ -1669,7 +1661,6 @@ def main() -> None:
         nodes=nodes,
         edges=edges,
         active_directions=active_directions,
-        reference_edge=reference_edge,
     )
     combined_metrics = run_eval(
         config=config,
