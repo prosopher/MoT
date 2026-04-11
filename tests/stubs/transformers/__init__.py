@@ -22,7 +22,7 @@ class TinyTokenizer(PreTrainedTokenizerBase):
         self.pad_token_id = 0
         self.eos_token_id = 1
         self.padding_side = "right"
-        self.model_max_length = 2048
+        self.model_max_length = 128
         self._vocab_size = 128
 
     def _encode_text(self, text: str) -> List[int]:
