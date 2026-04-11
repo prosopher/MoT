@@ -335,10 +335,12 @@ def run_eval(eval_config: EvalConfig) -> Path:
     for direction in active_directions:
         row = openwebtext_loss_results[direction]
         logger.info(
-            "[OpenWebText/validation] %s | native_loss=%.6f | translated_loss=%.6f | count=%d",
+            "[OpenWebText/validation] %s | native_loss=%.6f | native_profile=%s | translated_loss=%.6f | translated_profile=%s | count=%d",
             direction,
             row["native_loss"],
+            build_openwebtext_profile_cell(row, prefix="native"),
             row["loss"],
+            build_openwebtext_profile_cell(row),
             int(row["count"]),
         )
 

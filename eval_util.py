@@ -1,4 +1,5 @@
-from typing import Callable
+import time
+from typing import Callable, Tuple
 
 from common import *
 
@@ -29,6 +30,85 @@ class EvalConfig:
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
         initialize_eval_output_paths(self)
+
+
+@dataclass
+class InferenceProfileAccumulator:
+    total_latency_sec: float = 0.0
+    total_tokens: int = 0
+    num_calls: int = 0
+    peak_memory_bytes: Optional[int] = None
+
+    def update(
+        self,
+        *,
+        latency_sec: float,
+        tokens: int,
+        peak_memory_bytes: Optional[int],
+    ) -> None:
+        self.total_latency_sec += float(latency_sec)
+        self.total_tokens += int(tokens)
+        self.num_calls += 1
+        if peak_memory_bytes is not None:
+            peak_value = int(peak_memory_bytes)
+            if self.peak_memory_bytes is None or peak_value > self.peak_memory_bytes:
+                self.peak_memory_bytes = peak_value
+
+    def summary(self) -> Dict[str, float]:
+        if self.num_calls <= 0:
+            avg_latency_ms = float("nan")
+        else:
+            avg_latency_ms = (self.total_latency_sec / self.num_calls) * 1000.0
+
+        if self.total_latency_sec > 0.0 and self.total_tokens > 0:
+            throughput_tokens_per_sec = self.total_tokens / self.total_latency_sec
+        else:
+            throughput_tokens_per_sec = float("nan")
+
+        if self.peak_memory_bytes is None:
+            peak_memory_gib = float("nan")
+        else:
+            peak_memory_gib = float(self.peak_memory_bytes) / (1024 ** 3)
+
+        return {
+            "avg_latency_ms": avg_latency_ms,
+            "throughput_tokens_per_sec": throughput_tokens_per_sec,
+            "peak_memory_gib": peak_memory_gib,
+        }
+
+
+class InferenceProfiler:
+    def __init__(self, device: str) -> None:
+        self.device = str(device)
+        self.enabled = torch.cuda.is_available() and self.device.startswith("cuda")
+        if self.enabled:
+            device_index = torch.device(self.device).index
+            self.device_index = torch.cuda.current_device() if device_index is None else device_index
+        else:
+            self.device_index = None
+
+    def measure(self, fn: Callable[[], float], *, tokens: int) -> Tuple[float, Dict[str, Optional[float]]]:
+        if self.enabled:
+            torch.cuda.synchronize(self.device_index)
+            torch.cuda.reset_peak_memory_stats(self.device_index)
+
+        started_at = time.perf_counter()
+        result = fn()
+        if self.enabled:
+            torch.cuda.synchronize(self.device_index)
+        latency_sec = time.perf_counter() - started_at
+
+        peak_memory_bytes: Optional[int]
+        if self.enabled:
+            peak_memory_bytes = int(torch.cuda.max_memory_allocated(self.device_index))
+        else:
+            peak_memory_bytes = None
+
+        return result, {
+            "latency_sec": float(latency_sec),
+            "tokens": int(tokens),
+            "peak_memory_bytes": peak_memory_bytes,
+        }
 
 
 @dataclass
@@ -213,9 +293,13 @@ def summarize_openwebtext_named_losses(
     loss_field_by_name: Optional[Dict[str, str]] = None,
     loss_delta_reference_name: Optional[str] = None,
     loss_delta_field_by_name: Optional[Dict[str, str]] = None,
+    profile_summary_by_name: Optional[Dict[str, Dict[str, float]]] = None,
+    profile_field_prefix_by_name: Optional[Dict[str, str]] = None,
 ) -> Dict[str, float]:
     loss_field_by_name = dict(loss_field_by_name or {})
     loss_delta_field_by_name = dict(loss_delta_field_by_name or {})
+    profile_summary_by_name = dict(profile_summary_by_name or {})
+    profile_field_prefix_by_name = dict(profile_field_prefix_by_name or {})
 
     metric_names = set(loss_field_by_name)
     metric_names.add(primary_name)
@@ -233,6 +317,19 @@ def summarize_openwebtext_named_losses(
         loss_field = loss_field_by_name.get(name)
         if loss_field is not None:
             summary[loss_field] = average_loss
+
+    for name, profile_summary in profile_summary_by_name.items():
+        if name == primary_name:
+            prefix = ""
+        else:
+            prefix = profile_field_prefix_by_name.get(name)
+            if prefix is None:
+                continue
+
+        field_prefix = f"{prefix}_" if prefix else ""
+        summary[f"{field_prefix}latency_ms"] = float(profile_summary.get("avg_latency_ms", float("nan")))
+        summary[f"{field_prefix}throughput_tokens_per_sec"] = float(profile_summary.get("throughput_tokens_per_sec", float("nan")))
+        summary[f"{field_prefix}peak_memory_gib"] = float(profile_summary.get("peak_memory_gib", float("nan")))
 
     if loss_delta_reference_name is not None:
         if loss_delta_reference_name == primary_name:
@@ -270,8 +367,8 @@ def evaluate_openwebtext_validation_loss_metrics(
     edges,
     active_directions,
     logger: logging.Logger,
-    evaluate_direction_losses_fn: Callable[..., Dict[str, float]],
-    summarize_direction_fn: Callable[[Dict[str, float], int], Dict[str, float]],
+    evaluate_direction_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
+    summarize_direction_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
         tokenizer=tokenizer,
@@ -288,6 +385,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
     loss_sums = {direction: {} for direction in active_directions}
     counts = {direction: 0 for direction in active_directions}
+    profile_accumulators = {direction: {} for direction in active_directions}
 
     processed_examples = 0
     for batch_idx, input_ids in enumerate(dataloader, start=1):
@@ -311,7 +409,7 @@ def evaluate_openwebtext_validation_loss_metrics(
         batch_examples = int(input_ids.shape[0])
         for direction in active_directions:
             edge = edge_map[direction]
-            direction_losses = evaluate_direction_losses_fn(
+            direction_losses, direction_profiles = evaluate_direction_losses_fn(
                 direction=direction,
                 edge=edge,
                 prefix_cache_ids=prefix_cache_ids,
@@ -325,6 +423,16 @@ def evaluate_openwebtext_validation_loss_metrics(
                 loss_sums[direction][metric_name] = (
                     float(loss_sums[direction].get(metric_name, 0.0))
                     + float(loss_value) * batch_examples
+                )
+            for metric_name, profile_values in direction_profiles.items():
+                accumulator = profile_accumulators[direction].setdefault(
+                    metric_name,
+                    InferenceProfileAccumulator(),
+                )
+                accumulator.update(
+                    latency_sec=float(profile_values.get("latency_sec", 0.0)),
+                    tokens=int(profile_values.get("tokens", 0)),
+                    peak_memory_bytes=profile_values.get("peak_memory_bytes"),
                 )
             counts[direction] += batch_examples
 
@@ -346,7 +454,11 @@ def evaluate_openwebtext_validation_loss_metrics(
             }
         else:
             average_losses = {}
-        summaries[direction] = summarize_direction_fn(average_losses, count)
+        profile_summaries = {
+            metric_name: accumulator.summary()
+            for metric_name, accumulator in profile_accumulators[direction].items()
+        }
+        summaries[direction] = summarize_direction_fn(average_losses, count, profile_summaries)
 
     return summaries
 
@@ -364,6 +476,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
     active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    profiler = InferenceProfiler(train_config.device)
+
     def evaluate_direction_losses_fn(
         *,
         direction: str,
@@ -372,37 +486,57 @@ def evaluate_openwebtext_validation_loss_top_layers(
         lm_input_ids: torch.Tensor,
         lm_labels: torch.Tensor,
         past_by_node_id,
-    ) -> Dict[str, float]:
-        translated_top_past = translator_pool.translate_top_layers(
-            past_key_values=past_by_node_id[edge.src_id],
-            src_name=edge.src_id,
-            dst_name=edge.dst_id,
-            dst_spec=dst_model_specs[edge.dst_id],
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
+        profile_tokens = int(lm_labels.numel())
+
+        def compute_translated_loss_value() -> float:
+            translated_top_past = translator_pool.translate_top_layers(
+                past_key_values=past_by_node_id[edge.src_id],
+                src_name=edge.src_id,
+                dst_name=edge.dst_id,
+                dst_spec=dst_model_specs[edge.dst_id],
+            )
+            mixed_target_past = replace_top_layers(
+                base_past_key_values=past_by_node_id[edge.dst_id],
+                translated_top_past_key_values=translated_top_past,
+            )
+            return float(
+                compute_suffix_lm_loss(
+                    target_model=models[edge.dst_id],
+                    past_key_values=mixed_target_past,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                ).item()
+            )
+
+        def compute_native_loss_value() -> float:
+            return float(
+                compute_suffix_lm_loss(
+                    target_model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                ).item()
+            )
+
+        translated_loss, translated_profile = profiler.measure(
+            compute_translated_loss_value,
+            tokens=profile_tokens,
         )
-        mixed_target_past = replace_top_layers(
-            base_past_key_values=past_by_node_id[edge.dst_id],
-            translated_top_past_key_values=translated_top_past,
+        native_loss, native_profile = profiler.measure(
+            compute_native_loss_value,
+            tokens=profile_tokens,
         )
-        translated_loss = float(
-            compute_suffix_lm_loss(
-                target_model=models[edge.dst_id],
-                past_key_values=mixed_target_past,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            ).item()
+        return (
+            {
+                "translated": translated_loss,
+                "native": native_loss,
+            },
+            {
+                "translated": translated_profile,
+                "native": native_profile,
+            },
         )
-        native_loss = float(
-            compute_suffix_lm_loss(
-                target_model=models[edge.dst_id],
-                past_key_values=past_by_node_id[edge.dst_id],
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            ).item()
-        )
-        return {
-            "translated": translated_loss,
-            "native": native_loss,
-        }
 
     return evaluate_openwebtext_validation_loss_metrics(
         tokenizer=tokenizer,
@@ -419,12 +553,16 @@ def evaluate_openwebtext_validation_loss_top_layers(
         active_directions=active_directions,
         logger=logger,
         evaluate_direction_losses_fn=evaluate_direction_losses_fn,
-        summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
+        summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name="translated",
             loss_field_by_name={
                 "native": "native_loss",
+            },
+            profile_summary_by_name=profile_summaries,
+            profile_field_prefix_by_name={
+                "native": "native",
             },
         ),
     )
@@ -443,6 +581,8 @@ def evaluate_openwebtext_validation_loss_replay(
     active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    profiler = InferenceProfiler(train_config.device)
+
     def evaluate_direction_losses_fn(
         *,
         direction: str,
@@ -451,37 +591,57 @@ def evaluate_openwebtext_validation_loss_replay(
         lm_input_ids: torch.Tensor,
         lm_labels: torch.Tensor,
         past_by_node_id,
-    ) -> Dict[str, float]:
-        mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
-            source_past_key_values=past_by_node_id[edge.src_id],
-            prefix_input_ids=prefix_cache_ids,
-            target_model=models[edge.dst_id],
-            src_name=edge.src_id,
-            dst_name=edge.dst_id,
-            dst_spec=dst_model_specs[edge.dst_id],
-        )
-        translated_loss = float(
-            compute_prefix_correction_and_suffix_lm_loss(
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
+        profile_tokens = int(lm_labels.numel())
+
+        def compute_translated_loss_value() -> float:
+            mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
+                source_past_key_values=past_by_node_id[edge.src_id],
+                prefix_input_ids=prefix_cache_ids,
                 target_model=models[edge.dst_id],
-                past_key_values=mixed_target_past,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-                native_target_past_key_values=past_by_node_id[edge.dst_id],
-                target_start_layer_idx=mapping.dst_layer_start_idx,
-            ).item()
+                src_name=edge.src_id,
+                dst_name=edge.dst_id,
+                dst_spec=dst_model_specs[edge.dst_id],
+            )
+            return float(
+                compute_prefix_correction_and_suffix_lm_loss(
+                    target_model=models[edge.dst_id],
+                    past_key_values=mixed_target_past,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                    native_target_past_key_values=past_by_node_id[edge.dst_id],
+                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                ).item()
+            )
+
+        def compute_native_loss_value() -> float:
+            return float(
+                compute_suffix_lm_loss(
+                    target_model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                ).item()
+            )
+
+        translated_loss, translated_profile = profiler.measure(
+            compute_translated_loss_value,
+            tokens=profile_tokens,
         )
-        native_loss = float(
-            compute_suffix_lm_loss(
-                target_model=models[edge.dst_id],
-                past_key_values=past_by_node_id[edge.dst_id],
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            ).item()
+        native_loss, native_profile = profiler.measure(
+            compute_native_loss_value,
+            tokens=profile_tokens,
         )
-        return {
-            "translated": translated_loss,
-            "native": native_loss,
-        }
+        return (
+            {
+                "translated": translated_loss,
+                "native": native_loss,
+            },
+            {
+                "translated": translated_profile,
+                "native": native_profile,
+            },
+        )
 
     return evaluate_openwebtext_validation_loss_metrics(
         tokenizer=tokenizer,
@@ -498,12 +658,16 @@ def evaluate_openwebtext_validation_loss_replay(
         active_directions=active_directions,
         logger=logger,
         evaluate_direction_losses_fn=evaluate_direction_losses_fn,
-        summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
+        summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name="translated",
             loss_field_by_name={
                 "native": "native_loss",
+            },
+            profile_summary_by_name=profile_summaries,
+            profile_field_prefix_by_name={
+                "native": "native",
             },
         ),
     )
@@ -1755,6 +1919,30 @@ def _format_summary_percent(value: float) -> str:
     return f"{float(value) * 100.0:.1f}%"
 
 
+
+
+def _format_summary_throughput(value: float) -> str:
+    if not _is_valid_summary_value(value):
+        return "N/A"
+    return f"{float(value):.0f} tok/s"
+
+
+def build_openwebtext_profile_fields(row: Dict[str, float], *, prefix: str = "") -> Tuple[str, str, str]:
+    field_prefix = f"{prefix}_" if prefix else ""
+    latency_text = _format_summary_float(row.get(f"{field_prefix}latency_ms", float("nan")))
+    if latency_text != "N/A":
+        latency_text = f"{latency_text} ms"
+    throughput_value = row.get(f"{field_prefix}throughput_tokens_per_sec", float("nan"))
+    throughput_text = _format_summary_throughput(throughput_value)
+    peak_text = _format_summary_float(row.get(f"{field_prefix}peak_memory_gib", float("nan")))
+    if peak_text != "N/A":
+        peak_text = f"{peak_text} GiB"
+    return latency_text, throughput_text, peak_text
+
+def build_openwebtext_profile_cell(row: Dict[str, float], *, prefix: str = "") -> str:
+    latency_text, throughput_text, peak_text = build_openwebtext_profile_fields(row, prefix=prefix)
+    return f"{latency_text} · {throughput_text} · {peak_text}"
+
 def build_direction_summary_markdown_table(
     alg: str,
     direction: str,
@@ -1816,11 +2004,14 @@ def build_direction_summary_markdown_table(
         target_model_id = node_map[edge.dst_id].model_id
         direction_title = f"{edge.id} 방향 ({src_model_id} -> {target_model_id})"
 
+    native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(loss_row, prefix="native")
+    translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(loss_row)
+
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
@@ -1829,7 +2020,10 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(native_generation_f1_avg)} | "
-            f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} |"
+            f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} | "
+            f"{native_latency_text} | "
+            f"{native_throughput_text} | "
+            f"{native_peak_text} |"
         ),
         (
             f"| {alg} | "
@@ -1840,7 +2034,10 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
             f"{_format_summary_float(translated_generation_f1_avg)} | "
-            f"{_format_summary_float(loss_row.get('loss', float('nan')))} |"
+            f"{_format_summary_float(loss_row.get('loss', float('nan')))} | "
+            f"{translated_latency_text} | "
+            f"{translated_throughput_text} | "
+            f"{translated_peak_text} |"
         ),
     ]
     return "\n".join(lines)

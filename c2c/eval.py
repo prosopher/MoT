@@ -463,6 +463,8 @@ def evaluate_openwebtext_validation_loss(
     active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    profiler = InferenceProfiler(train_config.device)
+
     def evaluate_direction_losses_fn(
         *,
         direction: str,
@@ -471,40 +473,61 @@ def evaluate_openwebtext_validation_loss(
         lm_input_ids: torch.Tensor,
         lm_labels: torch.Tensor,
         past_by_node_id,
-    ) -> Dict[str, float]:
-        translated_top_past = translate_top_layers(
-            translator_pool=translator_pool,
-            train_config=train_config,
-            sharer_past_key_values=past_by_node_id[edge.src_id],
-            receiver_past_key_values=past_by_node_id[edge.dst_id],
-            src_name=edge.src_id,
-            dst_name=edge.dst_id,
-            dst_spec=model_specs[edge.dst_id],
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
+        profile_tokens = int(lm_labels.numel())
+        translation_loss_name = get_translation_loss_name(train_config)
+
+        def compute_translated_loss_value() -> float:
+            translated_top_past = translate_top_layers(
+                translator_pool=translator_pool,
+                train_config=train_config,
+                sharer_past_key_values=past_by_node_id[edge.src_id],
+                receiver_past_key_values=past_by_node_id[edge.dst_id],
+                src_name=edge.src_id,
+                dst_name=edge.dst_id,
+                dst_spec=model_specs[edge.dst_id],
+            )
+            translated_target_past = replace_top_layers(
+                base_past_key_values=past_by_node_id[edge.dst_id],
+                translated_top_past_key_values=translated_top_past,
+            )
+            return float(
+                compute_suffix_lm_loss(
+                    target_model=models[edge.dst_id],
+                    past_key_values=translated_target_past,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                ).item()
+            )
+
+        def compute_native_loss_value() -> float:
+            return float(
+                compute_suffix_lm_loss(
+                    target_model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                ).item()
+            )
+
+        translated_loss, translated_profile = profiler.measure(
+            compute_translated_loss_value,
+            tokens=profile_tokens,
         )
-        translated_target_past = replace_top_layers(
-            base_past_key_values=past_by_node_id[edge.dst_id],
-            translated_top_past_key_values=translated_top_past,
+        native_loss, native_profile = profiler.measure(
+            compute_native_loss_value,
+            tokens=profile_tokens,
         )
-        translated_loss = float(
-            compute_suffix_lm_loss(
-                target_model=models[edge.dst_id],
-                past_key_values=translated_target_past,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            ).item()
+        return (
+            {
+                translation_loss_name: translated_loss,
+                "native": native_loss,
+            },
+            {
+                translation_loss_name: translated_profile,
+                "native": native_profile,
+            },
         )
-        native_loss = float(
-            compute_suffix_lm_loss(
-                target_model=models[edge.dst_id],
-                past_key_values=past_by_node_id[edge.dst_id],
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            ).item()
-        )
-        return {
-            get_translation_loss_name(train_config): translated_loss,
-            "native": native_loss,
-        }
 
     return evaluate_openwebtext_validation_loss_metrics(
         tokenizer=tokenizer,
@@ -521,12 +544,16 @@ def evaluate_openwebtext_validation_loss(
         active_directions=active_directions,
         logger=logger,
         evaluate_direction_losses_fn=evaluate_direction_losses_fn,
-        summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
+        summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name=get_translation_loss_name(train_config),
             loss_field_by_name={
                 "native": "native_loss",
+            },
+            profile_summary_by_name=profile_summaries,
+            profile_field_prefix_by_name={
+                "native": "native",
             },
         ),
     )
@@ -601,12 +628,16 @@ def run_eval(eval_config: EvalConfig) -> Path:
     )
     for direction in active_directions:
         row = openwebtext_loss_results[direction]
+        translation_loss_name = get_translation_loss_name(train_config)
         logger.info(
-            "[OpenWebText/validation] %s | native_loss=%.6f | %s_loss=%.6f | count=%d",
+            "[OpenWebText/validation] %s | native_loss=%.6f | native_profile=%s | %s_loss=%.6f | %s_profile=%s | count=%d",
             direction,
             row["native_loss"],
-            get_translation_loss_name(train_config),
+            build_openwebtext_profile_cell(row, prefix="native"),
+            translation_loss_name,
             row["loss"],
+            translation_loss_name,
+            build_openwebtext_profile_cell(row),
             int(row["count"]),
         )
 
