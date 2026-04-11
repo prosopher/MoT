@@ -365,7 +365,6 @@ def evaluate_openwebtext_validation_loss_metrics(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
     evaluate_direction_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     summarize_direction_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
@@ -380,12 +379,11 @@ def evaluate_openwebtext_validation_loss_metrics(
         shuffle_buffer=shuffle_buffer,
     )
     device = config.device
-    edge_map = build_edge_map(edges)
     max_examples = max(1, int(max_examples))
 
-    loss_sums = {direction: {} for direction in active_directions}
-    counts = {direction: 0 for direction in active_directions}
-    profile_accumulators = {direction: {} for direction in active_directions}
+    loss_sums = {edge.id: {} for edge in edges}
+    counts = {edge.id: 0 for edge in edges}
+    profile_accumulators = {edge.id: {} for edge in edges}
 
     processed_examples = 0
     for batch_idx, input_ids in enumerate(dataloader, start=1):
@@ -407,25 +405,24 @@ def evaluate_openwebtext_validation_loss_metrics(
         }
 
         batch_examples = int(input_ids.shape[0])
-        for direction in active_directions:
-            edge = edge_map[direction]
-            direction_losses, direction_profiles = evaluate_direction_losses_fn(
-                direction=direction,
+        for edge in edges:
+            edge_losses, edge_profiles = evaluate_direction_losses_fn(
+                edge_id=edge.id,
                 edge=edge,
                 prefix_cache_ids=prefix_cache_ids,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
                 past_by_node_id=past_by_node_id,
             )
-            if not direction_losses:
+            if not edge_losses:
                 continue
-            for metric_name, loss_value in direction_losses.items():
-                loss_sums[direction][metric_name] = (
-                    float(loss_sums[direction].get(metric_name, 0.0))
+            for metric_name, loss_value in edge_losses.items():
+                loss_sums[edge.id][metric_name] = (
+                    float(loss_sums[edge.id].get(metric_name, 0.0))
                     + float(loss_value) * batch_examples
                 )
-            for metric_name, profile_values in direction_profiles.items():
-                accumulator = profile_accumulators[direction].setdefault(
+            for metric_name, profile_values in edge_profiles.items():
+                accumulator = profile_accumulators[edge.id].setdefault(
                     metric_name,
                     InferenceProfileAccumulator(),
                 )
@@ -434,7 +431,7 @@ def evaluate_openwebtext_validation_loss_metrics(
                     tokens=int(profile_values.get("tokens", 0)),
                     peak_memory_bytes=profile_values.get("peak_memory_bytes"),
                 )
-            counts[direction] += batch_examples
+            counts[edge.id] += batch_examples
 
         processed_examples += batch_examples
         if batch_idx % 25 == 0:
@@ -445,20 +442,20 @@ def evaluate_openwebtext_validation_loss_metrics(
             )
 
     summaries = {}
-    for direction in active_directions:
-        count = int(counts[direction])
+    for edge in edges:
+        count = int(counts[edge.id])
         if count > 0:
             average_losses = {
                 metric_name: float(total_loss / count)
-                for metric_name, total_loss in loss_sums[direction].items()
+                for metric_name, total_loss in loss_sums[edge.id].items()
             }
         else:
             average_losses = {}
         profile_summaries = {
             metric_name: accumulator.summary()
-            for metric_name, accumulator in profile_accumulators[direction].items()
+            for metric_name, accumulator in profile_accumulators[edge.id].items()
         }
-        summaries[direction] = summarize_direction_fn(average_losses, count, profile_summaries)
+        summaries[edge.id] = summarize_direction_fn(average_losses, count, profile_summaries)
 
     return summaries
 
@@ -473,14 +470,13 @@ def evaluate_openwebtext_validation_loss_top_layers(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     profiler = InferenceProfiler(train_config.device)
 
-    def evaluate_direction_losses_fn(
+    def evaluate_edge_losses_fn(
         *,
-        direction: str,
+        edge_id: str,
         edge: Edge,
         prefix_cache_ids: torch.Tensor,
         lm_input_ids: torch.Tensor,
@@ -550,9 +546,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
         models=models,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_direction_losses_fn,
+        evaluate_direction_losses_fn=evaluate_edge_losses_fn,
         summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
@@ -578,14 +573,13 @@ def evaluate_openwebtext_validation_loss_replay(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     profiler = InferenceProfiler(train_config.device)
 
-    def evaluate_direction_losses_fn(
+    def evaluate_edge_losses_fn(
         *,
-        direction: str,
+        edge_id: str,
         edge: Edge,
         prefix_cache_ids: torch.Tensor,
         lm_input_ids: torch.Tensor,
@@ -655,9 +649,8 @@ def evaluate_openwebtext_validation_loss_replay(
         models=models,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_direction_losses_fn,
+        evaluate_direction_losses_fn=evaluate_edge_losses_fn,
         summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
@@ -683,7 +676,6 @@ def evaluate_openwebtext_validation_loss(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
@@ -696,7 +688,6 @@ def evaluate_openwebtext_validation_loss(
             models=models,
             nodes=nodes,
             edges=edges,
-            active_directions=active_directions,
             logger=logger,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
@@ -708,7 +699,6 @@ def evaluate_openwebtext_validation_loss(
         models=models,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         logger=logger,
     )
 
@@ -1841,12 +1831,12 @@ def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningA
     return results
 
 
-def build_direction_pretty_name(direction: str, nodes: List[Node], edges: List[Edge]) -> str:
+def build_edge_pretty_name(edge_id: str, nodes: List[Node], edges: List[Edge]) -> str:
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
-    edge = edge_map.get(direction)
+    edge = edge_map.get(edge_id)
     if edge is None:
-        return direction
+        return edge_id
     src_model_id = node_map[edge.src_id].model_id
     dst_model_id = node_map[edge.dst_id].model_id
     return f"{edge.id} ({src_model_id} -> {dst_model_id})"
@@ -1858,12 +1848,11 @@ def log_dataset_result(
     results: Dict[str, Dict[str, float]],
     nodes: List[Node],
     edges: List[Edge],
-    active_directions,
 ) -> None:
     logger.info("===== %s =====", dataset_name)
-    for direction in active_directions:
-        row = results[direction]
-        pretty_name = build_direction_pretty_name(direction, nodes, edges)
+    for edge in edges:
+        row = results[edge.id]
+        pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_name,
@@ -1880,12 +1869,11 @@ def log_generation_dataset_result(
     results: Dict[str, Dict[str, float]],
     nodes: List[Node],
     edges: List[Edge],
-    active_directions,
 ) -> None:
     logger.info("===== %s =====", dataset_name)
-    for direction in active_directions:
-        row = results[direction]
-        pretty_name = build_direction_pretty_name(direction, nodes, edges)
+    for edge in edges:
+        row = results[edge.id]
+        pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
         logger.info(
             "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
@@ -1943,9 +1931,9 @@ def build_openwebtext_profile_cell(row: Dict[str, float], *, prefix: str = "") -
     latency_text, throughput_text, peak_text = build_openwebtext_profile_fields(row, prefix=prefix)
     return f"{latency_text} · {throughput_text} · {peak_text}"
 
-def build_direction_summary_markdown_table(
+def build_edge_summary_markdown_table(
     alg: str,
-    direction: str,
+    edge_id: str,
     nodes: List[Node],
     edges: List[Edge],
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
@@ -1954,7 +1942,7 @@ def build_direction_summary_markdown_table(
 ) -> str:
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
-    edge = edge_map.get(direction)
+    edge = edge_map.get(edge_id)
 
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
@@ -1966,14 +1954,14 @@ def build_direction_summary_markdown_table(
     ]
 
     logit_rows = {
-        display_name: all_logit_results.get(dataset_key, {}).get(direction, {})
+        display_name: all_logit_results.get(dataset_key, {}).get(edge_id, {})
         for display_name, dataset_key in logit_dataset_keys
     }
     generation_rows = {
-        display_name: all_generation_results.get(dataset_key, {}).get(direction, {})
+        display_name: all_generation_results.get(dataset_key, {}).get(edge_id, {})
         for display_name, dataset_key in generation_dataset_keys
     }
-    loss_row = (openwebtext_loss_results or {}).get(direction, {})
+    loss_row = (openwebtext_loss_results or {}).get(edge_id, {})
 
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
@@ -1998,7 +1986,7 @@ def build_direction_summary_markdown_table(
 
     if edge is None:
         target_model_id = "target"
-        direction_title = direction
+        direction_title = edge_id
     else:
         src_model_id = node_map[edge.src_id].model_id
         target_model_id = node_map[edge.dst_id].model_id
@@ -2047,18 +2035,17 @@ def build_final_summary_markdown(
     alg: str,
     nodes: List[Node],
     edges: List[Edge],
-    active_directions,
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
     openwebtext_loss_results: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> str:
     sections = []
 
-    for direction in active_directions:
+    for edge in edges:
         sections.append(
-            build_direction_summary_markdown_table(
+            build_edge_summary_markdown_table(
                 alg=alg,
-                direction=direction,
+                edge_id=edge.id,
                 nodes=nodes,
                 edges=edges,
                 all_logit_results=all_logit_results,

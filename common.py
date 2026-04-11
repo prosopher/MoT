@@ -261,7 +261,7 @@ def build_all_edges_from_nodes(nodes: List[Node]) -> List[Edge]:
 def parse_model_directions(model_directions: str, allowed_directions: Optional[Iterable[str]] = None) -> List[str]:
     parsed = [item.strip() for item in str(model_directions).split(",") if item.strip()]
     if not parsed:
-        raise ValueError("model_directions must contain at least one direction.")
+        raise ValueError("model_directions must contain at least one edge.")
 
     allowed_set = None
     if allowed_directions is not None:
@@ -274,7 +274,7 @@ def parse_model_directions(model_directions: str, allowed_directions: Optional[I
     for item in parsed:
         if allowed_set is not None and item not in allowed_set:
             raise ValueError(
-                f"Unsupported model direction: {item}. "
+                f"Unsupported model edge: {item}. "
                 f"Allowed values are: {sorted(allowed_set)}"
             )
         if item not in seen:
@@ -293,28 +293,28 @@ def build_edge_map(edges: Iterable[Edge]) -> Dict[str, Edge]:
 
 def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edge]:
     node_map = build_node_map(nodes)
-    direction_ids = parse_model_directions(
+    edge_ids = parse_model_directions(
         model_directions,
         allowed_directions=build_allowed_edge_ids(nodes),
     )
 
     edges = []
-    for direction_id in direction_ids:
-        match = re.fullmatch(r"([A-Z]+)_to_([A-Z]+)", direction_id)
+    for edge_id in edge_ids:
+        match = re.fullmatch(r"([A-Z]+)_to_([A-Z]+)", edge_id)
         if match is None:
             raise ValueError(
-                f"Invalid model direction format: {direction_id}. Expected format is <SRC>_to_<DST>."
+                f"Invalid model edge format: {edge_id}. Expected format is <SRC>_to_<DST>."
             )
         src_id, dst_id = match.groups()
         if src_id == dst_id:
-            raise ValueError(f"Self-direction is not allowed: {direction_id}")
+            raise ValueError(f"Self-edge is not allowed: {edge_id}")
         if src_id not in node_map or dst_id not in node_map:
             raise ValueError(
-                f"Unknown node in model direction: {direction_id}. Available node ids are: {sorted(node_map)}"
+                f"Unknown node in model edge: {edge_id}. Available node ids are: {sorted(node_map)}"
             )
         edges.append(
             Edge(
-                id=direction_id,
+                id=edge_id,
                 src_id=src_id,
                 dst_id=dst_id,
             )

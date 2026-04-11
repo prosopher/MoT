@@ -327,27 +327,24 @@ class LayerWindowTranslatorPool(nn.Module):
         translator_heads: int,
         translator_depth: int,
         mlp_ratio: int,
-        active_directions: List[str],
         variant: str,
         mot_num_translators: int,
         mot_top_k: int,
     ) -> None:
         super().__init__()
-        if not active_directions:
-            raise ValueError("active_directions must contain at least one direction.")
+        if not edges:
+            raise ValueError("edges must contain at least one edge.")
 
         self.model_specs = model_specs
         self.layer_mappings = layer_mappings
-        self.active_directions = tuple(active_directions)
+        self.edges = tuple(edges)
+        self.edge_ids = tuple(edge.id for edge in edges)
         self.edges_by_id = build_edge_map(edges)
 
         adapters = {}
-        for direction in self.active_directions:
-            if direction not in self.edges_by_id:
-                raise ValueError(f"Unknown direction: {direction}")
-            mapping = self.layer_mappings[direction]
-            edge = self.edges_by_id[direction]
-            adapters[direction] = LayerWindowDirectionalTranslator(
+        for edge in self.edges:
+            mapping = self.layer_mappings[edge.id]
+            adapters[edge.id] = LayerWindowDirectionalTranslator(
                 src_hidden_size=model_specs[edge.src_id].hidden_size,
                 dst_hidden_size=model_specs[edge.dst_id].hidden_size,
                 translated_num_layers=mapping.translated_num_layers,
@@ -367,19 +364,19 @@ class LayerWindowTranslatorPool(nn.Module):
         src_name: str,
         dst_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, LayerMapping]:
-        direction = f"{src_name}_to_{dst_name}"
-        if direction not in self.adapters:
+        edge_id = f"{src_name}_to_{dst_name}"
+        if edge_id not in self.adapters:
             raise ValueError(
-                f"Translator direction {direction} is not available. "
-                f"Active directions: {list(self.active_directions)}"
+                f"Translator edge {edge_id} is not available. "
+                f"Active edges: {list(self.edge_ids)}"
             )
-        mapping = self.layer_mappings[direction]
+        mapping = self.layer_mappings[edge_id]
         key_block, value_block = extract_layer_window_blocks(
             past_key_values=past_key_values,
             start_layer_idx=mapping.src_layer_start_idx,
             num_layers=mapping.translated_num_layers,
         )
-        translated_key, translated_value = self.adapters[direction](key_block, value_block)
+        translated_key, translated_value = self.adapters[edge_id](key_block, value_block)
         return translated_key, translated_value, mapping
 
     def build_replayed_target_past(
@@ -419,31 +416,26 @@ class SimpleNamespaceConfig:
         self.__dict__.update(kwargs)
 
 
-def resolve_direction_metadata(
+def resolve_edge_metadata(
     model_ids: str,
     model_directions: str,
-) -> Tuple[List[Node], List[Edge], List[str]]:
+) -> Tuple[List[Node], List[Edge]]:
     nodes, edges = build_nodes_and_edges(model_ids, model_directions)
-    active_directions = [edge.id for edge in edges]
-    if not active_directions:
-        raise ValueError("No active directions were resolved from model_directions")
-    return nodes, edges, active_directions
+    if not edges:
+        raise ValueError("No edges were resolved from model_directions")
+    return nodes, edges
 
 
 def build_layer_mappings(
     config: TrainConfig,
     model_specs: Dict[str, ModelSpec],
     edges: List[Edge],
-    active_directions: List[str],
 ) -> Dict[str, LayerMapping]:
     requested_window_size = int(config.injection_window_size)
     injection_layer_start_idx = int(config.injection_layer_start_idx)
 
-    edge_map = build_edge_map(edges)
-
     mappings: Dict[str, LayerMapping] = {}
-    for direction in active_directions:
-        edge = edge_map[direction]
+    for edge in edges:
         src_spec = model_specs[edge.src_id]
         dst_spec = model_specs[edge.dst_id]
 
@@ -451,7 +443,7 @@ def build_layer_mappings(
         dst_layer_end_idx = dst_layer_start_idx + requested_window_size - 1
         if dst_layer_end_idx >= dst_spec.num_layers:
             raise ValueError(
-                f"direction={direction} cannot use injection_layer_start_idx={dst_layer_start_idx} "
+                f"edge={edge.id} cannot use injection_layer_start_idx={dst_layer_start_idx} "
                 f"with injection_window_size={requested_window_size}: target end layer {dst_layer_end_idx} exceeds "
                 f"target last layer {dst_spec.num_layers - 1}"
             )
@@ -460,18 +452,18 @@ def build_layer_mappings(
         src_layer_start_idx = src_spec.num_layers - 1 - dst_depth_from_top
         if not (0 <= src_layer_start_idx < src_spec.num_layers):
             raise ValueError(
-                f"direction={direction} cannot align source window to target top-depth {dst_depth_from_top}: "
+                f"edge={edge.id} cannot align source window to target top-depth {dst_depth_from_top}: "
                 f"computed src_layer_start_idx={src_layer_start_idx} is outside [0, {src_spec.num_layers - 1}]"
             )
 
         src_layer_end_idx = src_layer_start_idx + requested_window_size - 1
         if src_layer_end_idx >= src_spec.num_layers:
             raise ValueError(
-                f"direction={direction} cannot use injection_window_size={requested_window_size} after top-depth alignment: "
+                f"edge={edge.id} cannot use injection_window_size={requested_window_size} after top-depth alignment: "
                 f"source end layer {src_layer_end_idx} exceeds source last layer {src_spec.num_layers - 1}"
             )
 
-        mappings[direction] = LayerMapping(
+        mappings[edge.id] = LayerMapping(
             src_layer_start_idx=src_layer_start_idx,
             src_layer_end_idx=src_layer_end_idx,
             dst_layer_start_idx=dst_layer_start_idx,
@@ -676,7 +668,7 @@ def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: TrainConfig,
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], List[Node], List[Edge], Dict[str, LayerMapping]]:
-    nodes, edges, active_directions = resolve_direction_metadata(
+    nodes, edges = resolve_edge_metadata(
         config.model_ids,
         config.model_directions,
     )
@@ -684,7 +676,7 @@ def build_translator_pool(
         node.id: get_model_spec(models[node.id])
         for node in nodes
     }
-    layer_mappings = build_layer_mappings(config, model_specs, edges, active_directions)
+    layer_mappings = build_layer_mappings(config, model_specs, edges)
     translator_pool = LayerWindowTranslatorPool(
         model_specs=model_specs,
         edges=edges,
@@ -693,7 +685,6 @@ def build_translator_pool(
         translator_heads=config.translator_heads,
         translator_depth=config.translator_depth,
         mlp_ratio=config.translator_mlp_ratio,
-        active_directions=active_directions,
         variant=config.variant,
         mot_num_translators=config.mot_num_translators,
         mot_top_k=config.mot_top_k,
@@ -735,7 +726,7 @@ def run_train(config: TrainConfig) -> Path:
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions = resolve_direction_metadata(
+    nodes, edges = resolve_edge_metadata(
         config.model_ids,
         config.model_directions,
     )
@@ -750,7 +741,7 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("train_config=%s", asdict(config))
 
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("active_directions=%s", active_directions)
+    logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
     models, tokenizer, _, _ = build_models_and_tokenizer(config)
@@ -806,8 +797,7 @@ def run_train(config: TrainConfig) -> Path:
                 }
 
             total_direction_loss = 0.0
-            for direction in active_directions:
-                edge = edge_map[direction]
+            for edge in edges:
                 mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
@@ -867,7 +857,7 @@ def run_train(config: TrainConfig) -> Path:
             "injection_layer_start_idx": config.injection_layer_start_idx,
             "injection_window_size": config.injection_window_size,
             "model_directions": config.model_directions,
-            "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
+            "layer_mappings": {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()},
         },
     )
     final_gpu_memory = gpu_memory_tracker.summary()

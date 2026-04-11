@@ -351,34 +351,31 @@ class C2CFuserPool(nn.Module):
         mlp_ratio: int,
         gate_temperature_start: float,
         hard_gate_eval: bool,
-        active_directions: List[str],
-    ) -> None:
+            ) -> None:
         super().__init__()
         if top_layers_to_fuse < 1:
             raise ValueError("top_layers_to_fuse must be >= 1")
-        if not active_directions:
-            raise ValueError("active_directions must contain at least one direction")
+        if not edges:
+            raise ValueError("edges must contain at least one edge")
 
         self.model_specs = model_specs
         self.top_layers_to_fuse = top_layers_to_fuse
-        self.active_directions = tuple(active_directions)
+        self.edges = tuple(edges)
+        self.edge_ids = tuple(edge.id for edge in edges)
         self.edges_by_id = build_edge_map(edges)
 
         adapters = {}
-        for direction in self.active_directions:
-            if direction not in self.edges_by_id:
-                raise ValueError(f"Unknown direction: {direction}")
-            edge = self.edges_by_id[direction]
+        for edge in self.edges:
             src_spec = model_specs[edge.src_id]
             dst_spec = model_specs[edge.dst_id]
             max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
             if top_layers_to_fuse > max_allowed:
                 raise ValueError(
                     f"top_layers_to_fuse={top_layers_to_fuse} exceeds min layer count {max_allowed} "
-                    f"for direction {direction}."
+                    f"for edge {edge.id}."
                 )
 
-            adapters[direction] = DirectionalCacheFuser(
+            adapters[edge.id] = DirectionalCacheFuser(
                 src_hidden_size=src_spec.hidden_size,
                 dst_hidden_size=dst_spec.hidden_size,
                 top_layers_to_fuse=top_layers_to_fuse,
@@ -417,7 +414,7 @@ class C2CFuserPool(nn.Module):
         adapter_name = f"{src_name}_to_{dst_name}"
         if adapter_name not in self.adapters:
             raise ValueError(
-                f"C2C direction {adapter_name} is not available. Active directions: {list(self.active_directions)}"
+                f"C2C edge {adapter_name} is not available. Active edges: {list(self.edge_ids)}"
             )
         return self.adapters[adapter_name](
             receiver_key_block=receiver_key_block,
@@ -557,33 +554,30 @@ class C2CProjectorPool(nn.Module):
         projector_dim: int,
         projector_depth: int,
         mlp_ratio: int,
-        active_directions: List[str],
-    ) -> None:
+            ) -> None:
         super().__init__()
         if top_layers_to_project < 1:
             raise ValueError("top_layers_to_project must be >= 1")
-        if not active_directions:
-            raise ValueError("active_directions must contain at least one direction")
+        if not edges:
+            raise ValueError("edges must contain at least one edge")
 
         self.model_specs = model_specs
         self.top_layers_to_project = top_layers_to_project
-        self.active_directions = tuple(active_directions)
+        self.edges = tuple(edges)
+        self.edge_ids = tuple(edge.id for edge in edges)
         self.edges_by_id = build_edge_map(edges)
 
         adapters = {}
-        for direction in self.active_directions:
-            if direction not in self.edges_by_id:
-                raise ValueError(f"Unknown direction: {direction}")
-            edge = self.edges_by_id[direction]
+        for edge in self.edges:
             src_spec = model_specs[edge.src_id]
             dst_spec = model_specs[edge.dst_id]
             max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
             if top_layers_to_project > max_allowed:
                 raise ValueError(
                     f"top_layers_to_project={top_layers_to_project} exceeds min layer count {max_allowed} "
-                    f"for direction {direction}."
+                    f"for edge {edge.id}."
                 )
-            adapters[direction] = DirectionalCacheProjector(
+            adapters[edge.id] = DirectionalCacheProjector(
                 src_hidden_size=src_spec.hidden_size,
                 dst_hidden_size=dst_spec.hidden_size,
                 top_layers_to_project=top_layers_to_project,
@@ -607,8 +601,8 @@ class C2CProjectorPool(nn.Module):
         adapter_name = f"{src_name}_to_{dst_name}"
         if adapter_name not in self.adapters:
             raise ValueError(
-                f"C2C-Project direction {adapter_name} is not available. "
-                f"Active directions: {list(self.active_directions)}"
+                f"C2C-Project edge {adapter_name} is not available. "
+                f"Active edges: {list(self.edge_ids)}"
             )
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
@@ -635,10 +629,6 @@ def build_translator_pool(
         node.id: get_model_spec(models[node.id])
         for node in nodes
     }
-    active_directions = parse_model_directions(
-        config.model_directions,
-        allowed_directions=[edge.id for edge in edges],
-    )
     if is_projection_only_variant(config):
         translator_pool = C2CProjectorPool(
             model_specs=model_specs,
@@ -647,7 +637,6 @@ def build_translator_pool(
             projector_dim=config.projector_dim,
             projector_depth=config.projector_depth,
             mlp_ratio=config.projector_mlp_ratio,
-            active_directions=active_directions,
         )
     else:
         translator_pool = C2CFuserPool(
@@ -660,7 +649,6 @@ def build_translator_pool(
             mlp_ratio=config.fuser_mlp_ratio,
             gate_temperature_start=config.gate_temperature_start,
             hard_gate_eval=config.hard_gate_eval,
-            active_directions=active_directions,
         )
     translator_pool.to(config.device)
     return translator_pool, model_specs, nodes, edges
@@ -723,12 +711,8 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("Starting training")
     logger.info("train_config=%s", asdict(config))
 
-    model_directions = parse_model_directions(
-        config.model_directions,
-        allowed_directions=[edge.id for edge in edges],
-    )
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("model_directions=%s", model_directions)
+    logger.info("edges=%s", [edge.id for edge in edges])
 
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
@@ -795,8 +779,7 @@ def run_train(config: TrainConfig) -> Path:
                 }
 
             total_direction_loss = 0.0
-            for direction in model_directions:
-                edge = edge_map[direction]
+            for edge in edges:
                 translated_top_past = translate_top_layers(
                     translator_pool=translator_pool,
                     train_config=config,

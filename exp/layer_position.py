@@ -361,12 +361,12 @@ def log_layer_mappings(
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     node_map = build_node_map(nodes)
-    for direction, mapping in layer_mappings.items():
-        src_id, dst_id = direction.split("_to_")
+    for edge_id, mapping in layer_mappings.items():
+        src_id, dst_id = edge_id.split("_to_")
         dst_depth_from_top = model_specs[dst_id].num_layers - 1 - mapping.dst_layer_start_idx
         logger.info(
             "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | dst_depth_from_top=%d",
-            direction,
+            edge_id,
             src_id,
             node_map[src_id].model_id,
             mapping.src_layer_start_idx,
@@ -398,7 +398,7 @@ def save_checkpoint(
         "scheduler_step": scheduler.step_id,
         "step": step,
         "experiment_config": asdict(config),
-        "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
+        "layer_mappings": {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()},
         "model_specs": {node_id: asdict(spec) for node_id, spec in model_specs.items()},
     }
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,7 +425,6 @@ def run_train(
     tokenizer: PreTrainedTokenizerBase,
     nodes: List[Node],
     edges: List[Edge],
-    active_directions: List[str],
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
     logger.info("Starting layer-window position training with target-layer replay")
@@ -455,7 +454,6 @@ def run_train(
         weight_decay=config.weight_decay,
     )
     scheduler = WarmupCosineScheduler(optimizer, config.warmup_steps, config.max_steps)
-    edge_map = build_edge_map(edges)
     gpu_memory_tracker = GPUMemoryTracker(config.device)
     running_loss = 0.0
 
@@ -478,8 +476,7 @@ def run_train(
                 }
 
             total_direction_loss = 0.0
-            for direction in active_directions:
-                edge = edge_map[direction]
+            for edge in edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
@@ -556,12 +553,10 @@ def evaluate_logit_dataset(
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
     edges: List[Edge],
-    active_directions: List[str],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
-    edge_map = build_edge_map(edges)
-    path_metrics = {direction: ControlMetricMeter("accuracy") for direction in active_directions}
-    path_logit_kl = {direction: LogitKLMeter() for direction in active_directions}
+    path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
+    path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
@@ -583,8 +578,7 @@ def evaluate_logit_dataset(
                 for node in nodes
             }
 
-            for direction in active_directions:
-                edge = edge_map[direction]
+            for edge in edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
@@ -681,7 +675,7 @@ def evaluate_logit_dataset(
                 dir_only_pred = predict_answer_label(dir_only_scores)
                 mag_only_pred = predict_answer_label(mag_only_scores)
                 full_mix_pred = predict_answer_label(full_mix_scores)
-                path_metrics[direction].update(
+                path_metrics[edge.id].update(
                     native_value=1.0 if native_pred == gold_answer else 0.0,
                     dir_only_value=1.0 if dir_only_pred == gold_answer else 0.0,
                     mag_only_value=1.0 if mag_only_pred == gold_answer else 0.0,
@@ -709,7 +703,7 @@ def evaluate_logit_dataset(
                     past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                 )
-                path_logit_kl[direction].update(
+                path_logit_kl[edge.id].update(
                     native_to_dir_only=compute_logit_kl(native_log_probs, dir_only_log_probs),
                     native_to_mag_only=compute_logit_kl(native_log_probs, mag_only_log_probs),
                     native_to_full_mix=compute_logit_kl(native_log_probs, full_mix_log_probs),
@@ -728,8 +722,8 @@ def evaluate_logit_dataset(
                 config.eval_max_examples_per_dataset,
             )
 
-    summarized_metrics = {direction: meter.summary() for direction, meter in path_metrics.items()}
-    summarized_logit_kl = {direction: meter.summary() for direction, meter in path_logit_kl.items()}
+    summarized_metrics = {edge_id: meter.summary() for edge_id, meter in path_metrics.items()}
+    summarized_logit_kl = {edge_id: meter.summary() for edge_id, meter in path_logit_kl.items()}
     return summarized_metrics, summarized_logit_kl
 
 
@@ -744,12 +738,10 @@ def evaluate_generation_dataset(
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
     edges: List[Edge],
-    active_directions: List[str],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
-    edge_map = build_edge_map(edges)
-    path_metrics = {direction: ControlMetricMeter("f1") for direction in active_directions}
-    path_logit_kl = {direction: LogitKLMeter() for direction in active_directions}
+    path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
+    path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
@@ -792,8 +784,7 @@ def evaluate_generation_dataset(
                 for node in nodes
             }
 
-            for direction in active_directions:
-                edge = edge_map[direction]
+            for edge in edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
@@ -869,7 +860,7 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
 
-                path_metrics[direction].update(
+                path_metrics[edge.id].update(
                     native_value=compute_generation_f1(native_answer, gold_answers),
                     dir_only_value=compute_generation_f1(dir_only_answer, gold_answers),
                     mag_only_value=compute_generation_f1(mag_only_answer, gold_answers),
@@ -918,7 +909,7 @@ def evaluate_generation_dataset(
                     past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                 )
-                path_logit_kl[direction].update(
+                path_logit_kl[edge.id].update(
                     native_to_dir_only=compute_logit_kl(native_log_probs, dir_only_log_probs),
                     native_to_mag_only=compute_logit_kl(native_log_probs, mag_only_log_probs),
                     native_to_full_mix=compute_logit_kl(native_log_probs, full_mix_log_probs),
@@ -937,8 +928,8 @@ def evaluate_generation_dataset(
                 config.eval_max_examples_per_dataset,
             )
 
-    summarized_metrics = {direction: meter.summary() for direction, meter in path_metrics.items()}
-    summarized_logit_kl = {direction: meter.summary() for direction, meter in path_logit_kl.items()}
+    summarized_metrics = {edge_id: meter.summary() for edge_id, meter in path_metrics.items()}
+    summarized_logit_kl = {edge_id: meter.summary() for edge_id, meter in path_logit_kl.items()}
     return summarized_metrics, summarized_logit_kl
 
 
@@ -1332,7 +1323,7 @@ def save_run_artifacts(
     study_dir.mkdir(parents=True, exist_ok=True)
     remove_stale_summary_artifacts(study_dir, run_dir)
     write_json(str(build_config_path(run_dir)), asdict(config))
-    write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
+    write_json(str(build_layer_mapping_path(run_dir)), {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()})
     write_json(str(build_metrics_path(run_dir)), eval_metrics)
     summary_path = update_summary(config, run_dir, combined_metrics)
     metric_controls_chart_path = plot_metric_controls_summary(summary_path)
@@ -1350,7 +1341,6 @@ def run_eval(
     tokenizer: PreTrainedTokenizerBase,
     nodes: List[Node],
     edges: List[Edge],
-    active_directions: List[str],
 ) -> Dict[str, Any]:
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
@@ -1377,7 +1367,7 @@ def run_eval(
 
     def evaluate_openwebtext_control_losses(
         *,
-        direction: str,
+        edge_id: str,
         edge: Edge,
         prefix_cache_ids: torch.Tensor,
         lm_input_ids: torch.Tensor,
@@ -1407,7 +1397,6 @@ def run_eval(
         models=models,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         logger=logger,
         evaluate_direction_losses_fn=evaluate_openwebtext_control_losses,
         summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
@@ -1424,11 +1413,11 @@ def run_eval(
             },
         ),
     )
-    for direction in active_directions:
-        row = openwebtext_loss_by_direction[direction]
+    for edge in edges:
+        row = openwebtext_loss_by_direction[edge.id]
         logger.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | count=%d",
-            direction,
+            edge.id,
             row["native_loss"],
             row["full_mix_loss"],
             int(row["count"]),
@@ -1475,18 +1464,17 @@ def run_eval(
             models=models,
             nodes=nodes,
             edges=edges,
-            active_directions=active_directions,
             logger=logger,
         )
         dataset_results_by_name[spec.name_for_log] = dataset_results
         dataset_logit_kl_by_name[spec.name_for_log] = dataset_logit_kl
-        for direction in active_directions:
-            metric_row = dataset_results[direction]
-            logit_row = dataset_logit_kl[direction]
+        for edge in edges:
+            metric_row = dataset_results[edge.id]
+            logit_row = dataset_logit_kl[edge.id]
             logger.info(
                 progress_log_template,
                 spec.name_for_log,
-                direction,
+                edge.id,
                 metric_name, metric_row[f"native_{metric_name}"],
                 metric_name, metric_row[f"dir_only_{metric_name}"],
                 metric_name, metric_row[f"mag_only_{metric_name}"],
@@ -1550,7 +1538,7 @@ def run_eval(
     return {
         "benchmark_mode": config.benchmark_mode,
         "metric_name": metric_name,
-        "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
+        "layer_mappings": {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()},
         dataset_results_key: dataset_results_by_name,
         "average_metric": average_full_mix_metric,
         "average_native_metric": average_native_metric,
@@ -1618,7 +1606,7 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions = resolve_direction_metadata(
+    nodes, edges = resolve_edge_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
     )
@@ -1630,7 +1618,6 @@ def main() -> None:
         tokenizer=tokenizer,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
     )
     combined_metrics = run_eval(
         config=config,
@@ -1642,7 +1629,6 @@ def main() -> None:
         tokenizer=tokenizer,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
     )
     eval_metrics = extract_eval_metrics(combined_metrics)
     analysis_metrics = extract_analysis_metrics(combined_metrics)

@@ -90,7 +90,7 @@ class CorrectionSummaryRow:
 
 
 def build_study_dir(config: CorrectionConfig) -> Path:
-    study_id = config.study_id or f"run_{sanitize_slug(config.model_directions)}"
+    study_id = config.study_id or f"run_{lp.sanitize_slug(config.model_directions)}"
     return Path(config.output_path) / study_id
 
 
@@ -493,7 +493,6 @@ def evaluate_correction(
     tokenizer: PreTrainedTokenizerBase,
     nodes: List[Node],
     edges: List[Edge],
-    active_directions: List[str],
 ) -> Dict[str, Any]:
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
@@ -516,9 +515,7 @@ def evaluate_correction(
 
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
-    edge_map = build_edge_map(edges)
-
-    reference_mapping = layer_mappings[active_directions[0]]
+    reference_mapping = layer_mappings[edges[0].id]
     num_layers = int(reference_mapping.dst_num_layers)
     source_idx = int(reference_mapping.dst_layer_end_idx) + 1
     num_points = num_layers + 1 - source_idx
@@ -550,9 +547,8 @@ def evaluate_correction(
                     logger.warning("Skipping example due to cache extraction error: %s", exc)
                     continue
 
-                for direction in active_directions:
-                    edge = edge_map[direction]
-                    mapping = layer_mappings[direction]
+                for edge in edges:
+                    mapping = layer_mappings[edge.id]
                     translated_key, translated_value, _ = translator_pool.translate_layer_window(
                         past_key_values=past_by_node_id[edge.src_id],
                         src_name=edge.src_id,
@@ -686,7 +682,7 @@ def evaluate_correction(
             "final_shrink_ratio": "||final hidden-state difference|| divided by ||initial post-window hidden-state difference||",
             "source_idx": "post-window boundary index used as the first correction analysis point",
         },
-        "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
+        "layer_mappings": {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()},
         "full_mix": fullmix_summary,
         "random_control": random_summary,
         "trajectory": trajectory_summary,
@@ -1072,7 +1068,7 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges, active_directions = lp.resolve_direction_metadata(
+    nodes, edges = lp.resolve_edge_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
     )
@@ -1085,7 +1081,6 @@ def main() -> None:
         tokenizer=tokenizer,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
     )
     metrics = evaluate_correction(
         config=config,
@@ -1097,7 +1092,6 @@ def main() -> None:
         tokenizer=tokenizer,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
     )
 
     write_json(str(build_config_path(run_dir)), asdict(config))

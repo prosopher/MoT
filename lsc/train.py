@@ -394,7 +394,7 @@ def run_train(config: TrainConfig) -> Path:
 
     model_directions = [edge.id for edge in edges]
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("model_directions=%s", model_directions)
+    logger.info("edges=%s", [edge.id for edge in edges])
 
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
@@ -465,8 +465,7 @@ def run_train(config: TrainConfig) -> Path:
                 }
 
             total_direction_loss = 0.0
-            for direction in model_directions:
-                edge = edge_map[direction]
+            for edge in edges:
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,

@@ -203,16 +203,10 @@ def evaluate_dataset(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
-    edge_map = build_edge_map(edges)
-
-    path_metrics = {
-        direction: RunningAverage()
-        for direction in active_directions
-    }
+    path_metrics = {edge.id: RunningAverage() for edge in edges}
 
     processed_examples = 0
 
@@ -247,8 +241,7 @@ def evaluate_dataset(
                 for node in nodes
             }
 
-            for direction in active_directions:
-                edge = edge_map[direction]
+            for edge in edges:
 
                 translated_top_past = translate_top_layers(
                     translator_pool=translator_pool,
@@ -303,7 +296,7 @@ def evaluate_dataset(
                 acc = 1.0 if translated_pred == gold_answer else 0.0
                 native_acc = 1.0 if native_pred == gold_answer else 0.0
 
-                path_metrics[direction].update(cosine_value, acc, native_acc, 1)
+                path_metrics[edge.id].update(cosine_value, acc, native_acc, 1)
 
             processed_examples += 1
 
@@ -330,16 +323,10 @@ def evaluate_generation_dataset(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
-    edge_map = build_edge_map(edges)
-
-    path_metrics = {
-        direction: GenerationRunningAverage()
-        for direction in active_directions
-    }
+    path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
 
@@ -386,8 +373,7 @@ def evaluate_generation_dataset(
                 for node in nodes
             }
 
-            for direction in active_directions:
-                edge = edge_map[direction]
+            for edge in edges:
 
                 translated_top_past = translate_top_layers(
                     translator_pool=translator_pool,
@@ -430,7 +416,7 @@ def evaluate_generation_dataset(
                 f1 = compute_generation_f1(translated_answer, gold_answers)
                 native_f1 = compute_generation_f1(native_answer, gold_answers)
 
-                path_metrics[direction].update(
+                path_metrics[edge.id].update(
                     cosine_value=cosine_value,
                     f1_value=f1,
                     native_f1_value=native_f1,
@@ -460,14 +446,13 @@ def evaluate_openwebtext_validation_loss(
     models,
     nodes,
     edges,
-    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     profiler = InferenceProfiler(train_config.device)
 
-    def evaluate_direction_losses_fn(
+    def evaluate_edge_losses_fn(
         *,
-        direction: str,
+        edge_id: str,
         edge: Edge,
         prefix_cache_ids: torch.Tensor,
         lm_input_ids: torch.Tensor,
@@ -541,9 +526,8 @@ def evaluate_openwebtext_validation_loss(
         models=models,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_direction_losses_fn,
+        evaluate_direction_losses_fn=evaluate_edge_losses_fn,
         summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
@@ -594,10 +578,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
         device_override=eval_config.device,
     )
 
-    active_directions = parse_model_directions(
-        train_config.model_directions,
-        allowed_directions=[edge.id for edge in edges],
-    )
 
     translator_pool.eval()
     for model in models.values():
@@ -606,7 +586,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
     logger.info("top_layers_to_translate=%d", get_top_layers_to_translate(train_config))
-    logger.info("active_directions=%s", active_directions)
+    logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("translation_mode=%s", get_translation_mode_name(train_config))
     logger.info("qa_eval_log_path=%s", log_path)
 
@@ -623,15 +603,14 @@ def run_eval(eval_config: EvalConfig) -> Path:
         models=models,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         logger=logger,
     )
-    for direction in active_directions:
-        row = openwebtext_loss_results[direction]
+    for edge in edges:
+        row = openwebtext_loss_results[edge.id]
         translation_loss_name = get_translation_loss_name(train_config)
         logger.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | native_profile=%s | %s_loss=%.6f | %s_profile=%s | count=%d",
-            direction,
+            edge.id,
             row["native_loss"],
             build_openwebtext_profile_cell(row, prefix="native"),
             translation_loss_name,
@@ -660,7 +639,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
             models=models,
             nodes=nodes,
             edges=edges,
-            active_directions=active_directions,
             logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
@@ -671,7 +649,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
             results=results,
             nodes=nodes,
             edges=edges,
-            active_directions=active_directions,
         )
 
         if torch.cuda.is_available():
@@ -696,7 +673,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
             models=models,
             nodes=nodes,
             edges=edges,
-            active_directions=active_directions,
             logger=logger,
         )
         all_generation_results[spec.name_for_log] = results
@@ -707,7 +683,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
             results=results,
             nodes=nodes,
             edges=edges,
-            active_directions=active_directions,
         )
 
         if torch.cuda.is_available():
@@ -717,7 +692,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
         alg=eval_config.alg,
         nodes=nodes,
         edges=edges,
-        active_directions=active_directions,
         all_logit_results=all_logit_results,
         all_generation_results=all_generation_results,
         openwebtext_loss_results=openwebtext_loss_results,
