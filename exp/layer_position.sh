@@ -9,7 +9,7 @@ STUDY_ID=${STUDY_ID:-$(date +%Y%m%d_%H%M%S)}
 OUTPUT_ROOT=${OUTPUT_ROOT:-outputs/layer_position}
 COMMON_ARGS=("$@")
 
-INJECTION_WINDOW_SIZE=5
+INJECTION_WINDOW_SIZE=6
 BENCHMARK_MODE=gen_qa
 for ((i=1; i<=$#; i++)); do
   arg="${!i}"
