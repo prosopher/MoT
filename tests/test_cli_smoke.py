@@ -17,7 +17,7 @@ CONFIGS_PATH = REPO_ROOT / "tests" / "configs"
     ("alg", "train_config_name"),
     [
         ("lsc", "train_lsc_smoke.json"),
-        ("heterocache", "train_heterocache_smoke.json"),
+        ("mot", "train_mot_smoke.json"),
     ],
 )
 def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from common import *
 from eval_util import *
-from heterocache.train import TrainConfig
+from mot.train import TrainConfig
 import exp.layer_position as lp
 
 

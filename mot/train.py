@@ -810,7 +810,7 @@ def require_gpt2_transformer(model: PreTrainedModel):
     transformer = getattr(model, "transformer", None)
     if transformer is None or not hasattr(transformer, "h"):
         raise ValueError(
-            "heterocache currently supports GPT-2 style decoder stacks only "
+            "mot currently supports GPT-2 style decoder stacks only "
             "(expected model.transformer.h to exist)."
         )
     return transformer

@@ -520,7 +520,7 @@ def evaluate_openwebtext_validation_loss(
     active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
-    if eval_config.alg == "heterocache":
+    if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
             tokenizer=tokenizer,
             train_config=train_config,

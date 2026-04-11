@@ -10,7 +10,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from common import *
 from eval_util import *
-from heterocache.train import *
+from mot.train import *
 from train_util import *
 from transformers import AutoConfig
 
