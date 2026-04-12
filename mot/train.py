@@ -19,9 +19,6 @@ class LayerMapping:
     src_layer_end_idx: int
     dst_layer_start_idx: int
     dst_layer_end_idx: int
-    translated_num_layers: int
-    src_num_layers: int
-    dst_num_layers: int
 
 
 @dataclass
@@ -258,7 +255,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
         self,
         src_hidden_size: int,
         dst_hidden_size: int,
-        translated_num_layers: int,
+        num_layers: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
@@ -268,15 +265,15 @@ class LayerWindowDirectionalTranslator(nn.Module):
         mot_top_k: int,
     ) -> None:
         super().__init__()
-        if translated_num_layers < 1:
-            raise ValueError("translated_num_layers must be >= 1")
-        self.translated_num_layers = translated_num_layers
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        self.num_layers = num_layers
         self.variant = variant
         self.key_translator = build_window_translator(
             variant=variant,
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
-            num_layers=translated_num_layers,
+            num_layers=num_layers,
             translator_dim=translator_dim,
             translator_heads=translator_heads,
             translator_depth=translator_depth,
@@ -288,7 +285,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             variant=variant,
             src_hidden_size=src_hidden_size,
             dst_hidden_size=dst_hidden_size,
-            num_layers=translated_num_layers,
+            num_layers=num_layers,
             translator_dim=translator_dim,
             translator_heads=translator_heads,
             translator_depth=translator_depth,
@@ -308,9 +305,9 @@ class LayerWindowDirectionalTranslator(nn.Module):
                 "Layer-window tensors must have shape [batch, seq, num_layers, hidden], "
                 f"got {tuple(key_block.shape)}"
             )
-        if key_block.shape[2] != self.translated_num_layers:
+        if key_block.shape[2] != self.num_layers:
             raise ValueError(
-                f"Expected {self.translated_num_layers} layers in the translation window, got {key_block.shape[2]}"
+                f"Expected {self.num_layers} layers in the translation window, got {key_block.shape[2]}"
             )
         translated_key = self.key_translator(key_block)
         translated_value = self.value_translator(value_block)
@@ -323,6 +320,7 @@ class LayerWindowTranslatorPool(nn.Module):
         model_specs: Dict[str, ModelSpec],
         edges: List[Edge],
         layer_mappings: Dict[str, LayerMapping],
+        injection_window_size: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
@@ -337,17 +335,17 @@ class LayerWindowTranslatorPool(nn.Module):
 
         self.model_specs = model_specs
         self.layer_mappings = layer_mappings
+        self.injection_window_size = int(injection_window_size)
         self.edges = tuple(edges)
         self.edge_ids = tuple(edge.id for edge in edges)
         self.edges_by_id = build_edge_map(edges)
 
         adapters = {}
         for edge in self.edges:
-            mapping = self.layer_mappings[edge.id]
             adapters[edge.id] = LayerWindowDirectionalTranslator(
                 src_hidden_size=model_specs[edge.src_id].hidden_size,
                 dst_hidden_size=model_specs[edge.dst_id].hidden_size,
-                translated_num_layers=mapping.translated_num_layers,
+                num_layers=self.injection_window_size,
                 translator_dim=translator_dim,
                 translator_heads=translator_heads,
                 translator_depth=translator_depth,
@@ -374,7 +372,7 @@ class LayerWindowTranslatorPool(nn.Module):
         key_block, value_block = extract_layer_window_blocks(
             past_key_values=past_key_values,
             start_layer_idx=mapping.src_layer_start_idx,
-            num_layers=mapping.translated_num_layers,
+            num_layers=self.injection_window_size,
         )
         translated_key, translated_value = self.adapters[edge_id](key_block, value_block)
         return translated_key, translated_value, mapping
@@ -468,9 +466,6 @@ def build_layer_mappings(
             src_layer_end_idx=src_layer_end_idx,
             dst_layer_start_idx=dst_layer_start_idx,
             dst_layer_end_idx=dst_layer_end_idx,
-            translated_num_layers=requested_window_size,
-            src_num_layers=src_spec.num_layers,
-            dst_num_layers=dst_spec.num_layers,
         )
     return mappings
 
@@ -681,6 +676,7 @@ def build_translator_pool(
         model_specs=model_specs,
         edges=edges,
         layer_mappings=layer_mappings,
+        injection_window_size=config.injection_window_size,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
         translator_depth=config.translator_depth,

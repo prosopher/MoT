@@ -373,13 +373,14 @@ def log_layer_mappings(
     nodes: List[Node],
     model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, LayerMapping],
+    injection_window_size: int,
 ) -> None:
     node_map = build_node_map(nodes)
     for edge_id, mapping in layer_mappings.items():
         src_id, dst_id = edge_id.split("_to_")
         dst_depth_from_top = model_specs[dst_id].num_layers - 1 - mapping.dst_layer_start_idx
         logger.info(
-            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | dst_depth_from_top=%d",
+            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | injection_window_size=%d | dst_depth_from_top=%d",
             edge_id,
             src_id,
             node_map[src_id].model_id,
@@ -391,7 +392,7 @@ def log_layer_mappings(
             mapping.dst_layer_start_idx,
             mapping.dst_layer_end_idx,
             model_specs[dst_id].num_layers - 1,
-            mapping.translated_num_layers,
+            int(injection_window_size),
             dst_depth_from_top,
         )
 
@@ -449,7 +450,7 @@ def run_train(
         config=config,
     )
     translator_pool.train()
-    log_layer_mappings(logger, nodes, model_specs, layer_mappings)
+    log_layer_mappings(logger, nodes, model_specs, layer_mappings, config.injection_window_size)
     logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(
@@ -499,7 +500,7 @@ def run_train(
                 native_target_key_block, native_target_value_block = extract_layer_window_blocks(
                     past_key_values=past_by_node_id[edge.dst_id],
                     start_layer_idx=mapping.dst_layer_start_idx,
-                    num_layers=mapping.translated_num_layers,
+                    num_layers=config.injection_window_size,
                 )
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
@@ -602,7 +603,7 @@ def evaluate_logit_dataset(
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
                     start_layer_idx=mapping.dst_layer_start_idx,
-                    num_layers=mapping.translated_num_layers,
+                    num_layers=config.injection_window_size,
                 )
                 control_windows = build_control_window_variants(
                     native_key_block=native_key_block,
@@ -808,7 +809,7 @@ def evaluate_generation_dataset(
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
                     start_layer_idx=mapping.dst_layer_start_idx,
-                    num_layers=mapping.translated_num_layers,
+                    num_layers=config.injection_window_size,
                 )
                 control_windows = build_control_window_variants(
                     native_key_block=native_key_block,
@@ -950,6 +951,7 @@ def evaluate_generation_dataset(
 @torch.inference_mode()
 def compute_openwebtext_native_and_full_mix_losses(
     *,
+    config: LayerPositionConfig,
     edge: Edge,
     prefix_cache_ids: torch.Tensor,
     lm_input_ids: torch.Tensor,
@@ -968,7 +970,7 @@ def compute_openwebtext_native_and_full_mix_losses(
     native_key_block, native_value_block = extract_layer_window_blocks(
         past_key_values=native_target_past,
         start_layer_idx=mapping.dst_layer_start_idx,
-        num_layers=mapping.translated_num_layers,
+        num_layers=config.injection_window_size,
     )
     full_mix_past = replay_target_prefill_with_injected_window(
         target_model=models[edge.dst_id],
@@ -1103,7 +1105,7 @@ def build_summary_row(
         benchmark_mode=str(metrics["benchmark_mode"]),
         metric_name=str(metrics["metric_name"]),
         injection_layer_start_idx=int(config.injection_layer_start_idx),
-        translated_num_layers=int(reference_mapping["translated_num_layers"]),
+        translated_num_layers=int(config.injection_window_size),
         source_layer_start_idx=int(reference_mapping["src_layer_start_idx"]),
         source_layer_end_idx=int(reference_mapping["src_layer_end_idx"]),
         target_layer_start_idx=int(reference_mapping["dst_layer_start_idx"]),
@@ -1359,7 +1361,7 @@ def run_eval(
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
-    log_layer_mappings(logger, nodes, model_specs, layer_mappings)
+    log_layer_mappings(logger, nodes, model_specs, layer_mappings, config.injection_window_size)
 
     translator_pool.eval()
     for model in models.values():
@@ -1389,6 +1391,7 @@ def run_eval(
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
         edge_losses = compute_openwebtext_native_and_full_mix_losses(
+            config=config,
             edge=edge,
             prefix_cache_ids=prefix_cache_ids,
             lm_input_ids=lm_input_ids,

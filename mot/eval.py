@@ -72,7 +72,7 @@ def evaluate_dataset(
                     *extract_layer_window_blocks(
                         past_key_values=past_by_node_id[edge.dst_id],
                         start_layer_idx=mapping.dst_layer_start_idx,
-                        num_layers=mapping.translated_num_layers,
+                        num_layers=train_config.injection_window_size,
                     ),
                     num_heads=model_specs[edge.dst_id].num_heads,
                     head_dim=model_specs[edge.dst_id].head_dim,
@@ -202,7 +202,7 @@ def evaluate_generation_dataset(
                     *extract_layer_window_blocks(
                         past_key_values=past_by_node_id[edge.dst_id],
                         start_layer_idx=mapping.dst_layer_start_idx,
-                        num_layers=mapping.translated_num_layers,
+                        num_layers=train_config.injection_window_size,
                     ),
                     num_heads=model_specs[edge.dst_id].num_heads,
                     head_dim=model_specs[edge.dst_id].head_dim,

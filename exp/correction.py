@@ -497,7 +497,7 @@ def evaluate_correction(
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
     logger.info("experiment_config=%s", asdict(config))
-    lp.log_layer_mappings(logger, nodes, model_specs, layer_mappings)
+    lp.log_layer_mappings(logger, nodes, model_specs, layer_mappings, config.injection_window_size)
 
     translator_pool.eval()
     for model in models.values():
@@ -516,7 +516,7 @@ def evaluate_correction(
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
     reference_mapping = layer_mappings[edges[0].id]
-    num_layers = int(reference_mapping.dst_num_layers)
+    num_layers = int(model_specs[edges[0].dst_id].num_layers)
     source_idx = int(reference_mapping.dst_layer_end_idx) + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
@@ -558,7 +558,7 @@ def evaluate_correction(
                     native_key_block, native_value_block = lp.extract_layer_window_blocks(
                         past_key_values=native_target_past,
                         start_layer_idx=mapping.dst_layer_start_idx,
-                        num_layers=mapping.translated_num_layers,
+                        num_layers=config.injection_window_size,
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=models[edge.dst_id],
@@ -740,12 +740,14 @@ def update_summary(config: CorrectionConfig, run_dir: Path, metrics: Dict[str, A
     full_mix = metrics["full_mix"]
     random_control = metrics["random_control"]
     post_window_boundary_idx = int(mapping.dst_layer_end_idx) + 1
-    num_upper_layers = max(0, int(mapping.dst_num_layers) - post_window_boundary_idx)
+    first_edge_id = next(iter(layer_mappings.keys()))
+    dst_id = first_edge_id.split("_to_")[1]
+    num_upper_layers = max(0, int(model_specs[dst_id].num_layers) - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
         injection_layer_start_idx=int(config.injection_layer_start_idx),
-        translated_num_layers=int(mapping.translated_num_layers),
+        translated_num_layers=int(config.injection_window_size),
         source_layer_start_idx=int(mapping.src_layer_start_idx),
         source_layer_end_idx=int(mapping.src_layer_end_idx),
         target_layer_start_idx=int(mapping.dst_layer_start_idx),
