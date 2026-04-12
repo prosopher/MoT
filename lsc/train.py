@@ -226,10 +226,10 @@ class SharedKVTranslatorPool(nn.Module):
         self.mm = ctx.mm
         self.adapters = nn.ModuleDict(
             {
-                node.model_id: ModelLatentAdapter(
-                    model_name=node.model_id,
-                    local_layers=self.mm.get_model_spec(node.model_id).num_layers,
-                    local_hidden_size=self.mm.get_model_spec(node.model_id).hidden_size,
+                node.id: ModelLatentAdapter(
+                    model_name=node.id,
+                    local_layers=self.mm.get_model_spec(node.id).num_layers,
+                    local_hidden_size=self.mm.get_model_spec(node.id).hidden_size,
                     shared_slots=shared_slots,
                     shared_dim=shared_dim,
                     translator_dim=translator_dim,

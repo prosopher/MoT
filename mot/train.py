@@ -327,8 +327,6 @@ class LayerWindowTranslatorPool(nn.Module):
         mot_top_k: int,
     ) -> None:
         super().__init__()
-        if not edges:
-            raise ValueError("edges must contain at least one edge.")
 
         self.mm = ctx.mm
         self.layer_mappings = layer_mappings
