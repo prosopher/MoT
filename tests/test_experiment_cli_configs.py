@@ -1,25 +1,45 @@
 from __future__ import annotations
 
-import json
+import importlib
 import os
-import subprocess
-import sys
 from pathlib import Path
+import sys
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from core.common import build_dataclass_kwargs_from_json_and_namespace
+
+
 STUBS_PATH = REPO_ROOT / "tests" / "stubs"
 
 
-def _build_env() -> dict[str, str]:
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(STUBS_PATH) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-    env["OMP_NUM_THREADS"] = "1"
-    env["MKL_NUM_THREADS"] = "1"
-    return env
+existing_pythonpath = os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = str(STUBS_PATH) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+
+def _load_experiment_module(script_path: str):
+    module_name = script_path.removesuffix(".py").replace("/", ".")
+    module = importlib.import_module(module_name)
+    config_cls_name = "LayerPositionConfig" if module_name.endswith("layer_position") else "CorrectionConfig"
+    config_cls = getattr(module, config_cls_name)
+    return module, config_cls
+
+
+def _parse_config_kwargs(module, config_cls, cli_args: list[str]):
+    parser = module.build_parser()
+    args = parser.parse_args(cli_args)
+    return build_dataclass_kwargs_from_json_and_namespace(
+        config_cls=config_cls,
+        default_config_path=args.default_config_path,
+        args=args,
+        exclude_fields={"alg"},
+    )
 
 
 @pytest.mark.parametrize(
@@ -30,16 +50,15 @@ def _build_env() -> dict[str, str]:
     ],
 )
 def test_experiment_scripts_use_default_config_for_target_layer_lookup(script_path: str) -> None:
-    result = subprocess.run(
-        [sys.executable, script_path, "--print-target-num-layers"],
-        cwd=REPO_ROOT,
-        env=_build_env(),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    module, config_cls = _load_experiment_module(script_path)
+    config_kwargs = _parse_config_kwargs(module, config_cls, ["--print-target-num-layers"])
 
-    assert result.stdout.strip() == "2"
+    if script_path == "exp/correction.py":
+        resolve_target_num_layers = module.lp.resolve_target_num_layers
+    else:
+        resolve_target_num_layers = module.resolve_target_num_layers
+
+    assert resolve_target_num_layers(config_kwargs["model_ids"], config_kwargs["model_directions"]) == 2
 
 
 @pytest.mark.parametrize(
@@ -89,35 +108,14 @@ def test_experiment_cli_args_override_json_defaults(
     extra_args: list[str],
     expected: dict[str, object],
 ) -> None:
-    python_code = f"""
-import json
-from pathlib import Path
+    module = importlib.import_module(module_name)
+    config_cls_name = "LayerPositionConfig" if module_name.endswith("layer_position") else "CorrectionConfig"
+    config_cls = getattr(module, config_cls_name)
 
-from core.common import build_dataclass_kwargs_from_json_and_namespace
-from {module_name} import build_parser, {'LayerPositionConfig' if module_name.endswith('layer_position') else 'CorrectionConfig'}
-
-config_cls = {'LayerPositionConfig' if module_name.endswith('layer_position') else 'CorrectionConfig'}
-parser = build_parser()
-args = parser.parse_args([
-    '--default-config-path',
-    str(Path({default_config_name!r})),
-    *{extra_args!r},
-])
-kwargs = build_dataclass_kwargs_from_json_and_namespace(
-    config_cls=config_cls,
-    default_config_path=args.default_config_path,
-    args=args,
-    exclude_fields={{'alg'}},
-)
-print(json.dumps({{key: kwargs[key] for key in {list(expected)!r}}}, sort_keys=True))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", python_code],
-        cwd=REPO_ROOT,
-        env=_build_env(),
-        check=True,
-        capture_output=True,
-        text=True,
+    config_kwargs = _parse_config_kwargs(
+        module,
+        config_cls,
+        ["--default-config-path", str(Path(default_config_name)), *extra_args],
     )
 
-    assert json.loads(result.stdout) == expected
+    assert {key: config_kwargs[key] for key in expected} == expected
