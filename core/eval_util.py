@@ -5,6 +5,7 @@ from typing import Callable, Tuple
 from core.common import *
 from core.config import Config
 from core.context import Context
+from core.train_util import get_train_config_path
 
 
 @dataclass
@@ -1003,6 +1004,11 @@ def load_train_config_from_checkpoint(
     checkpoint_path_obj = Path(checkpoint_path)
     if not checkpoint_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
+    checkpoint_dir_path = str(checkpoint_path_obj.parent)
+    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
+    train_config_path = get_train_config_path(checkpoint_dir_path_obj)
+    if not train_config_path.exists():
+        raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
 
     module_name = f"{alg}.train"
     try:
@@ -1012,8 +1018,7 @@ def load_train_config_from_checkpoint(
             raise SystemExit(f"Unsupported alg: {alg}") from exc
         raise
 
-    payload = torch.load(str(checkpoint_path_obj), map_location="cpu")
-    config = train_module.TrainConfig(**payload["train_config"])
+    config = train_module.TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
     return config
@@ -1027,9 +1032,12 @@ def build_eval_context(
 ):
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before build_eval_context.")
-    checkpoint_path = Path(eval_config.checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path = eval_config.checkpoint_path
+    checkpoint_path_obj = Path(checkpoint_path)
+    if not checkpoint_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
+    checkpoint_dir_path = str(checkpoint_path_obj.parent)
+    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
 
     module_name = f"{alg}.train"
     try:
@@ -1045,7 +1053,7 @@ def build_eval_context(
         raise AttributeError(f"{module_name} does not define load_translator_pool_from_checkpoint") from exc
 
     return load_from_checkpoint(
-        checkpoint_path=str(checkpoint_path),
+        checkpoint_path=checkpoint_path,
         nodes=nodes,
         edges=edges,
         device_override=eval_config.device,
@@ -1054,7 +1062,7 @@ def build_eval_context(
 def resolve_latest_checkpoint_for_alg(
     alg: str,
     outputs_path: str = "outputs",
-    checkpoint_name: str = "final_checkpoint_path.pt",
+    checkpoint_name: str = "checkpoint.pt",
 ) -> Path:
     outputs_path_obj = Path(outputs_path)
     candidates = sorted(

@@ -3,7 +3,7 @@ import csv
 import sys
 
 from pathlib import Path
-from types import SimpleNamespace as SimpleNamespaceConfig
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -357,10 +357,6 @@ def build_eval_log_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation.log"
 
 
-def build_checkpoint_path(run_dir: Path) -> Path:
-    return run_dir / "final_translator_checkpoint.pt"
-
-
 def build_config_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_run_config.json"
 
@@ -402,36 +398,12 @@ def log_layer_mappings(
         )
 
 
-def save_checkpoint(
-    checkpoint_path: Path,
-    translator_pool: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: WarmupCosineScheduler,
-    ctx: Context,
-    step: int,
-    layer_mappings: Dict[str, LayerMapping],
-) -> None:
-    config = ctx.config
-    model_specs = ctx.model_specs
-    payload = {
-        "translator_pool": translator_pool.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler_step": scheduler.step_id,
-        "step": step,
-        "experiment_config": asdict(config),
-        "layer_mappings": {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()},
-        "model_specs": {node_id: asdict(spec) for node_id, spec in model_specs.items()},
-    }
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, checkpoint_path)
-
-
 def build_models_for_experiment(
     config: LayerPositionConfig,
     nodes: List[Node],
 ) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase]:
     return build_models_and_tokenizer(
-        SimpleNamespaceConfig(
+        SimpleNamespace(
             device=config.device,
             dtype=config.dtype,
         ),
@@ -554,16 +526,7 @@ def run_train(
             )
             running_loss = 0.0
 
-    save_checkpoint(
-        checkpoint_path=build_checkpoint_path(run_dir),
-        translator_pool=translator_pool,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        ctx=ctx,
-        step=config.max_steps,
-        layer_mappings=layer_mappings,
-    )
-    logger.info("[Done] checkpoint saved to %s", build_checkpoint_path(run_dir))
+    logger.info("[Done] training complete")
     return translator_pool, layer_mappings
 
 
@@ -1380,7 +1343,7 @@ def run_eval(
     for model in models.values():
         model.eval()
 
-    eval_config = SimpleNamespaceConfig(
+    eval_config = SimpleNamespace(
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         max_examples_per_dataset=config.eval_max_examples_per_dataset,

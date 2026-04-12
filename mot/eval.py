@@ -269,9 +269,12 @@ def run_eval(
 
     set_seed(eval_config.seed)
 
-    checkpoint_path = Path(eval_config.checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path = eval_config.checkpoint_path
+    checkpoint_path_obj = Path(checkpoint_path)
+    if not checkpoint_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
+    checkpoint_dir_path = str(checkpoint_path_obj.parent)
+    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
 
     config_path = get_eval_config_path(eval_config.output_path)
     write_json(str(config_path), asdict(eval_config))
@@ -280,6 +283,7 @@ def run_eval(
     logger = setup_logger(f"{eval_config.alg}_eval", log_path)
     logger.info("Starting evaluation")
     logger.info("checkpoint_path=%s", checkpoint_path)
+    logger.info("checkpoint_dir_path=%s", checkpoint_dir_path)
     logger.info("eval_config=%s", asdict(eval_config))
 
     translator_pool.eval()

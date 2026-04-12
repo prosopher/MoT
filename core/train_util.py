@@ -114,26 +114,12 @@ def build_models_and_tokenizer(
 
 
 def save_checkpoint(
-    config,
     output_path: str,
     translator_pool: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: WarmupCosineScheduler,
-    step: int,
-    extra: Optional[Dict] = None,
 ) -> None:
-    payload = {
-        "translator_pool": translator_pool.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "step": step,
-        "train_config": asdict(config),
-        "scheduler_step": scheduler.step_id,
-    }
-    if extra is not None:
-        payload["extra"] = extra
     output_path = str(output_path)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, output_path)
+    torch.save(translator_pool.state_dict(), output_path)
 
 
 def get_train_config_path(output_path: Union[str, Path]) -> Path:
@@ -145,7 +131,7 @@ def get_train_log_path(output_path: Union[str, Path]) -> Path:
 
 
 def get_train_checkpoint_path(output_path: Union[str, Path]) -> Path:
-    return Path(output_path) / "final_checkpoint_path.pt"
+    return Path(output_path) / "checkpoint.pt"
 
 
 def initialize_train_output_paths(config) -> None:

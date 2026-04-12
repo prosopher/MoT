@@ -58,7 +58,7 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         text=True,
     )
 
-    checkpoint_path = output_path / "final_checkpoint_path.pt"
+    checkpoint_path = output_path / "checkpoint.pt"
     train_log_path = output_path / "train.log"
 
     assert checkpoint_path.exists(), f"missing checkpoint for {alg}: {checkpoint_path}"

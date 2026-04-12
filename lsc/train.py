@@ -350,10 +350,19 @@ def load_translator_pool_from_checkpoint(
     List[Node],
     List[Edge],
 ]:
-    payload = torch.load(checkpoint_path, map_location="cpu")
-    config = TrainConfig(**payload["train_config"])
+    checkpoint_path_obj = Path(checkpoint_path)
+    if not checkpoint_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
+    checkpoint_dir_path = str(checkpoint_path_obj.parent)
+    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
+    train_config_path = get_train_config_path(checkpoint_dir_path_obj)
+    if not train_config_path.exists():
+        raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
+
+    config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
+    translator_pool_state_dict = torch.load(str(checkpoint_path_obj), map_location="cpu")
     models, tokenizer = build_models_and_tokenizer(config, nodes)
     full_model_specs = build_model_specs_for_nodes(models, nodes)
     model_specs = build_model_specs_for_top_layers(
@@ -362,10 +371,11 @@ def load_translator_pool_from_checkpoint(
     )
     ctx = Context(config, model_specs, nodes, edges)
     translator_pool = build_translator_pool(ctx)
-    translator_pool.load_state_dict(payload["translator_pool"])
+    translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
     translator_pool.eval()
     return ctx, translator_pool, models, tokenizer
+
 
 
 def run_train(
@@ -519,17 +529,8 @@ def run_train(
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
-        config=config,
-        output_path=str(final_path),
+        output_path=final_path,
         translator_pool=translator_pool,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        step=config.max_steps,
-        extra={
-            "note": "Final checkpoint trained with suffix LM loss only.",
-            "model_ids": config.model_ids,
-            "top_layers_ratio": config.top_layers_ratio,
-        },
     )
     final_gpu_memory = gpu_memory_tracker.summary()
     logger.info(
