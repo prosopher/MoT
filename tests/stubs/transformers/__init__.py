@@ -12,6 +12,10 @@ class PreTrainedTokenizerBase:
     pass
 
 
+class PretrainedConfig:
+    pass
+
+
 class TinyTokenizer(PreTrainedTokenizerBase):
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
@@ -79,7 +83,7 @@ class PreTrainedModel(nn.Module):
 
 
 @dataclass
-class TinyConfig:
+class TinyConfig(PretrainedConfig):
     _name_or_path: str
     n_head: int = 2
     n_embd: int = 8
@@ -288,3 +292,8 @@ class AutoModelForCausalLM:
     @staticmethod
     def from_pretrained(model_id: str, torch_dtype: torch.dtype = torch.float32) -> TinyCausalLM:
         return TinyCausalLM(model_id=model_id, torch_dtype=torch_dtype)
+
+
+configuration_utils = SimpleNamespace(PretrainedConfig=PretrainedConfig)
+tokenization_utils_base = SimpleNamespace(PreTrainedTokenizerBase=PreTrainedTokenizerBase)
+modeling_utils = SimpleNamespace(PreTrainedModel=PreTrainedModel)
