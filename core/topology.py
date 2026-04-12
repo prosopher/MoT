@@ -108,34 +108,20 @@ def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edg
     if str(model_directions).strip().lower() == "all":
         return build_all_edges_from_nodes(nodes)
 
-    node_map = build_node_map(nodes)
     edge_ids = parse_model_directions(
         model_directions,
         allowed_directions=build_allowed_edge_ids(nodes),
     )
 
-    edges = []
-    for edge_id in edge_ids:
-        match = re.fullmatch(r"([A-Z]+)_to_([A-Z]+)", edge_id)
-        if match is None:
-            raise ValueError(
-                f"Invalid model edge format: {edge_id}. Expected format is <SRC>_to_<DST>."
-            )
-        src_id, dst_id = match.groups()
-        if src_id == dst_id:
-            raise ValueError(f"Self-edge is not allowed: {edge_id}")
-        if src_id not in node_map or dst_id not in node_map:
-            raise ValueError(
-                f"Unknown node in model edge: {edge_id}. Available node ids are: {sorted(node_map)}"
-            )
-        edges.append(
-            Edge(
-                id=edge_id,
-                src_id=src_id,
-                dst_id=dst_id,
-            )
+    return [
+        Edge(
+            id=edge_id,
+            src_id=src_id,
+            dst_id=dst_id,
         )
-    return edges
+        for edge_id in edge_ids
+        for src_id, dst_id in [edge_id.split("_to_", maxsplit=1)]
+    ]
 
 
 def build_nodes_and_edges(

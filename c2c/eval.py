@@ -555,17 +555,9 @@ def run_eval(
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    if eval_config.checkpoint_dir_path is None:
-        raise ValueError("EvalConfig.checkpoint_dir_path must be set before run_eval.")
-    if eval_config.output_path is None:
-        raise ValueError("EvalConfig.output_path must be initialized before run_eval.")
-
     set_seed(eval_config.seed)
 
     checkpoint_dir_path = eval_config.checkpoint_dir_path
-    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
-    if not checkpoint_dir_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
 
     config_path = get_eval_config_path(eval_config.output_path)
     write_json(str(config_path), asdict(eval_config))

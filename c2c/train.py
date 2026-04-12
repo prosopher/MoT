@@ -49,7 +49,6 @@ class TrainConfig(Config):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.variant = validate_c2c_variant(self.variant)
-        parse_model_ids_csv(self.model_ids)
         initialize_train_output_paths(self)
 
 
@@ -61,8 +60,9 @@ def validate_c2c_variant(variant: str) -> str:
 
 
 def is_projection_only_variant(variant_or_config: Union[str, TrainConfig]) -> bool:
-    variant = variant_or_config.variant if isinstance(variant_or_config, TrainConfig) else variant_or_config
-    return validate_c2c_variant(variant) == "c2c-pr"
+    if isinstance(variant_or_config, TrainConfig):
+        return variant_or_config.variant == "c2c-pr"
+    return validate_c2c_variant(variant_or_config) == "c2c-pr"
 
 
 def get_top_layers_to_translate(config: TrainConfig) -> int:
@@ -691,9 +691,6 @@ def run_train(
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    if config.output_path is None:
-        raise ValueError("TrainConfig.output_path must be initialized before run_train.")
-
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)

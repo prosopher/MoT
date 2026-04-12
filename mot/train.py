@@ -52,7 +52,6 @@ class TrainConfig(Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        parse_model_ids_csv(self.model_ids)
         if self.injection_layer_start_idx < 0:
             raise ValueError("injection_layer_start_idx must be >= 0")
         if self.injection_window_size < 1:
@@ -719,9 +718,6 @@ def run_train(
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    if config.output_path is None:
-        raise ValueError("TrainConfig.output_path must be initialized before run_train.")
-
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)

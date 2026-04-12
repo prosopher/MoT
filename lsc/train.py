@@ -38,7 +38,6 @@ class TrainConfig(Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        parse_model_ids_csv(self.model_ids)
         initialize_train_output_paths(self)
 
 
@@ -394,9 +393,6 @@ def run_train(
         top_layers_ratio=config.top_layers_ratio,
     )
     ctx.model_specs = model_specs
-    if config.output_path is None:
-        raise ValueError("TrainConfig.output_path must be initialized before run_train.")
-
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
