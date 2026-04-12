@@ -344,10 +344,6 @@ def load_translator_pool_from_checkpoint(
 ) -> Tuple[
     Context,
     SharedKVTranslatorPool,
-    Dict[str, PreTrainedModel],
-    PreTrainedTokenizerBase,
-    List[Node],
-    List[Edge],
 ]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
@@ -370,24 +366,23 @@ def load_translator_pool_from_checkpoint(
         full_model_specs=full_model_specs,
         top_layers_ratio=config.top_layers_ratio,
     )
-    ctx = Context(config, model_specs, nodes, edges)
+    ctx = Context(config, model_specs, nodes, edges, models, tokenizer)
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, models, tokenizer
+    return ctx, translator_pool
 
 
 
 def run_train(
     ctx: Context,
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
 ) -> Path:
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
     full_model_specs = ctx.model_specs
+    models = ctx.models
     model_specs = build_model_specs_for_top_layers(
         full_model_specs=full_model_specs,
         top_layers_ratio=config.top_layers_ratio,
@@ -443,7 +438,7 @@ def run_train(
     logger.info("[Setup] top_layers_ratio = %.4f", config.top_layers_ratio)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(config, tokenizer)
+    dataloader = build_training_dataloader(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),

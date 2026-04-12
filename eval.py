@@ -62,7 +62,7 @@ def main() -> None:
     nodes, edges = build_nodes_and_edges(train_config.model_ids, train_config.model_directions)
 
     eval_module = load_eval_module(args.alg)
-    ctx, translator_pool, models, tokenizer, *extra = build_eval_context(
+    ctx, translator_pool, *extra = build_eval_context(
         args.alg,
         eval_config,
         nodes,
@@ -72,8 +72,6 @@ def main() -> None:
         ctx,
         eval_config,
         translator_pool,
-        models,
-        tokenizer,
         *extra,
     )
 

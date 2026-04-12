@@ -62,9 +62,11 @@ def main() -> None:
         build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
+        models,
+        tokenizer,
     )
 
-    final_checkpoint = Path(train_module.run_train(ctx, models, tokenizer))
+    final_checkpoint = Path(train_module.run_train(ctx))
 
     print(f"Saved outputs to {final_checkpoint.parent}")
     print(f"Final checkpoint: {final_checkpoint}")

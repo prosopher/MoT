@@ -15,10 +15,8 @@ def evaluate_dataset(
     ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
@@ -26,6 +24,8 @@ def evaluate_dataset(
     nodes = ctx.nodes
     edges = ctx.edges
     device = train_config.device
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -130,10 +130,8 @@ def evaluate_generation_dataset(
     ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
@@ -141,6 +139,8 @@ def evaluate_generation_dataset(
     nodes = ctx.nodes
     edges = ctx.edges
     device = train_config.device
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -154,11 +154,10 @@ def evaluate_generation_dataset(
             context_budget = None
             if spec.answer_mode in {"squad", "newsqa"}:
                 context_budget = compute_benchmark_context_budget(
-                    tokenizer=tokenizer,
+                    ctx=ctx,
                     spec=spec,
                     question=question,
                     eval_config=eval_config,
-                    models=models,
                 )
 
             prepared_inputs = prepare_generation_task_inputs(
@@ -254,14 +253,13 @@ def run_eval(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    models,
-    tokenizer,
     layer_mappings,
 ) -> Path:
     train_config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
+    models = ctx.models
     set_seed(eval_config.seed)
 
     checkpoint_dir_path = eval_config.checkpoint_dir_path
@@ -294,10 +292,8 @@ def run_eval(
     logger.info("Preparing validation dataloader for OpenWebText/validation")
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
-        tokenizer=tokenizer,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        models=models,
         logger=logger,
     )
     for edge in edges:
@@ -324,10 +320,8 @@ def run_eval(
             ctx=ctx,
             spec=spec,
             dataloader=dataloader,
-            tokenizer=tokenizer,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            models=models,
             logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
@@ -355,10 +349,8 @@ def run_eval(
             ctx=ctx,
             spec=spec,
             dataloader=dataloader,
-            tokenizer=tokenizer,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            models=models,
             logger=logger,
         )
         all_generation_results[spec.name_for_log] = results

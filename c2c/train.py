@@ -635,10 +635,6 @@ def load_translator_pool_from_checkpoint(
 ) -> Tuple[
     Context,
     Union[C2CFuserPool, C2CProjectorPool],
-    Dict[str, PreTrainedModel],
-    PreTrainedTokenizerBase,
-    List[Node],
-    List[Edge],
 ]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
@@ -661,12 +657,14 @@ def load_translator_pool_from_checkpoint(
         build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
+        models,
+        tokenizer,
     )
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, models, tokenizer
+    return ctx, translator_pool
 
 
 
@@ -684,13 +682,12 @@ def compute_gate_temperature(config: TrainConfig, step: int) -> float:
 
 def run_train(
     ctx: Context,
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
 ) -> Path:
     config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
+    models = ctx.models
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -731,7 +728,7 @@ def run_train(
         logger.info("[Setup] top_layers_to_fuse = %d", config.top_layers_to_fuse)
     logger.info("[Setup] trainable %s params = %s", get_trainable_module_label(config), f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(config, tokenizer)
+    dataloader = build_training_dataloader(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),

@@ -355,20 +355,18 @@ def summarize_openwebtext_named_losses(
 def evaluate_openwebtext_validation_loss_metrics(
     *,
     ctx: Context,
-    tokenizer: PreTrainedTokenizerBase,
     batch_size: int,
     num_workers: int,
     shuffle: bool,
     seed: int,
     shuffle_buffer: int,
     max_examples: int,
-    models,
     logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     summarize_edge_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
-        tokenizer=tokenizer,
+        tokenizer=ctx.tokenizer,
         config=ctx.config,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -398,7 +396,7 @@ def evaluate_openwebtext_validation_loss_metrics(
             prefix_tokens=ctx.config.prefix_tokens,
         )
         past_by_node_id = {
-            node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+            node.id: extract_past_key_values(ctx.models[node.id], prefix_cache_ids)
             for node in ctx.nodes
         }
 
@@ -461,10 +459,8 @@ def evaluate_openwebtext_validation_loss_metrics(
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss_top_layers(
     ctx: Context,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
@@ -495,7 +491,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
             )
             return float(
                 compute_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=ctx.models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -505,7 +501,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=ctx.models[edge.dst_id],
                     past_key_values=past_by_node_id[edge.dst_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -533,14 +529,12 @@ def evaluate_openwebtext_validation_loss_top_layers(
 
     return evaluate_openwebtext_validation_loss_metrics(
         ctx=ctx,
-        tokenizer=tokenizer,
         batch_size=eval_config.batch_size,
         num_workers=eval_config.num_workers,
         shuffle=eval_config.shuffle_eval_stream,
         seed=eval_config.seed,
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
-        models=models,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -561,10 +555,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss_replay(
     ctx: Context,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
@@ -586,14 +578,14 @@ def evaluate_openwebtext_validation_loss_replay(
             mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
                 source_past_key_values=past_by_node_id[edge.src_id],
                 prefix_input_ids=prefix_cache_ids,
-                target_model=models[edge.dst_id],
+                target_model=ctx.models[edge.dst_id],
                 src_name=edge.src_id,
                 dst_name=edge.dst_id,
                 dst_spec=dst_model_specs[edge.dst_id],
             )
             return float(
                 compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=ctx.models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -605,7 +597,7 @@ def evaluate_openwebtext_validation_loss_replay(
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=ctx.models[edge.dst_id],
                     past_key_values=past_by_node_id[edge.dst_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -633,14 +625,12 @@ def evaluate_openwebtext_validation_loss_replay(
 
     return evaluate_openwebtext_validation_loss_metrics(
         ctx=ctx,
-        tokenizer=tokenizer,
         batch_size=eval_config.batch_size,
         num_workers=eval_config.num_workers,
         shuffle=eval_config.shuffle_eval_stream,
         seed=eval_config.seed,
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
-        models=models,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -661,27 +651,21 @@ def evaluate_openwebtext_validation_loss_replay(
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss(
     ctx: Context,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
             ctx=ctx,
-            tokenizer=tokenizer,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            models=models,
             logger=logger,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
         ctx=ctx,
-        tokenizer=tokenizer,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        models=models,
         logger=logger,
     )
 
@@ -1444,16 +1428,15 @@ def get_answer_token_budget(eval_config) -> int:
 
 
 def compute_benchmark_context_budget(
-    tokenizer: PreTrainedTokenizerBase,
+    ctx: Context,
     spec: HFDatasetSpec,
     question: str,
     eval_config,
-    models: Dict[str, PreTrainedModel],
 ) -> int:
-    shared_limit = min(get_model_context_limit(model, tokenizer) for model in models.values())
+    shared_limit = min(get_model_context_limit(model, ctx.tokenizer) for model in ctx.models.values())
     question_prefix = prepare_generation_task_question_prefix(
         spec=spec,
-        tokenizer=tokenizer,
+        tokenizer=ctx.tokenizer,
         question=question,
         device="cpu",
     )

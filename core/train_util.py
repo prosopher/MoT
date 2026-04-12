@@ -1,5 +1,5 @@
 from core.common import *
-
+from core.context import Context
 
 
 class InfiniteDataLoader:
@@ -18,9 +18,10 @@ class InfiniteDataLoader:
             return next(self.iterator)
 
 
-def build_training_dataloader(config, tokenizer: PreTrainedTokenizerBase) -> InfiniteDataLoader:
+def build_training_dataloader(ctx: Context) -> InfiniteDataLoader:
+    config = ctx.config
     dataset = OpenWebTextSequenceStream(
-        tokenizer=tokenizer,
+        tokenizer=ctx.tokenizer,
         sequence_length=config.total_tokens,
         split="train",
         shuffle=True,

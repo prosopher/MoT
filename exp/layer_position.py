@@ -414,12 +414,12 @@ def build_models_for_experiment(
 def run_train(
     ctx: Context,
     run_dir: Path,
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
     config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
     logger.info("Starting layer-window position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
@@ -535,14 +535,14 @@ def evaluate_logit_dataset(
     ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
-    tokenizer,
     translator_pool: LayerWindowTranslatorPool,
-    models: Dict[str, PreTrainedModel],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -721,14 +721,14 @@ def evaluate_generation_dataset(
     ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
-    tokenizer,
     translator_pool: LayerWindowTranslatorPool,
-    models: Dict[str, PreTrainedModel],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -741,11 +741,10 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             context_budget = compute_benchmark_context_budget(
-                tokenizer=tokenizer,
+                ctx=ctx,
                 spec=spec,
                 question=question,
                 eval_config=config,
-                models=models,
             )
             prepared_inputs = prepare_generation_task_inputs(
                 spec=spec,
@@ -926,16 +925,17 @@ def evaluate_generation_dataset(
 @torch.inference_mode()
 def compute_openwebtext_native_and_full_mix_losses(
     *,
-    config: LayerPositionConfig,
+    ctx: Context,
     edge: Edge,
     prefix_cache_ids: torch.Tensor,
     lm_input_ids: torch.Tensor,
     lm_labels: torch.Tensor,
     past_by_node_id,
     translator_pool: LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
-    models: Dict[str, PreTrainedModel],
 ) -> Dict[str, float]:
+    config = ctx.config
+    model_specs = ctx.model_specs
+    models = ctx.models
     translated_key, translated_value, mapping = translator_pool.translate_layer_window(
         past_key_values=past_by_node_id[edge.src_id],
         src_name=edge.src_id,
@@ -1327,11 +1327,11 @@ def run_eval(
     run_dir: Path,
     translator_pool: LayerWindowTranslatorPool,
     layer_mappings: Dict[str, LayerMapping],
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
 ) -> Dict[str, Any]:
     config = ctx.config
     model_specs = ctx.model_specs
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
@@ -1365,28 +1365,24 @@ def run_eval(
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
         edge_losses = compute_openwebtext_native_and_full_mix_losses(
-            config=config,
+            ctx=ctx,
             edge=edge,
             prefix_cache_ids=prefix_cache_ids,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
             past_by_node_id=past_by_node_id,
             translator_pool=translator_pool,
-            model_specs=model_specs,
-            models=models,
         )
         return edge_losses, {}
 
     openwebtext_loss_by_edge = evaluate_openwebtext_validation_loss_metrics(
         ctx=ctx,
-        tokenizer=tokenizer,
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         shuffle=config.eval_shuffle_stream,
         seed=config.seed,
         shuffle_buffer=config.shuffle_buffer,
         max_examples=config.eval_max_examples_per_dataset,
-        models=models,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_openwebtext_control_losses,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -1601,6 +1597,8 @@ def main() -> None:
         build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
+        models,
+        tokenizer,
     )
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1608,16 +1606,12 @@ def main() -> None:
     translator_pool, layer_mappings = run_train(
         ctx=ctx,
         run_dir=run_dir,
-        models=models,
-        tokenizer=tokenizer,
     )
     combined_metrics = run_eval(
         ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
         layer_mappings=layer_mappings,
-        models=models,
-        tokenizer=tokenizer,
     )
     eval_metrics = extract_eval_metrics(combined_metrics)
     analysis_metrics = extract_analysis_metrics(combined_metrics)

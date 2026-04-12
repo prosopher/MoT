@@ -673,10 +673,6 @@ def load_translator_pool_from_checkpoint(
 ) -> Tuple[
     Context,
     LayerWindowTranslatorPool,
-    Dict[str, PreTrainedModel],
-    PreTrainedTokenizerBase,
-    List[Node],
-    List[Edge],
     Dict[str, LayerMapping],
 ]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
@@ -700,24 +696,25 @@ def load_translator_pool_from_checkpoint(
         build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
+        models,
+        tokenizer,
     )
     translator_pool, layer_mappings = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, models, tokenizer, layer_mappings
+    return ctx, translator_pool, layer_mappings
 
 
 
 def run_train(
     ctx: Context,
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
 ) -> Path:
     config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
+    models = ctx.models
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -752,7 +749,7 @@ def run_train(
         )
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(config, tokenizer)
+    dataloader = build_training_dataloader(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),

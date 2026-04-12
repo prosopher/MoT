@@ -267,12 +267,12 @@ def build_teacher_forcing_answer_token_ids(
 
 
 def build_prepared_inputs(
+    ctx: Context,
     spec: HFDatasetSpec,
     example: Dict[str, Any],
-    tokenizer: PreTrainedTokenizerBase,
-    models: Dict[str, PreTrainedModel],
-    config: CorrectionConfig,
 ) -> Dict[str, Any]:
+    config = ctx.config
+    tokenizer = ctx.tokenizer
     if config.benchmark_mode == "logit_qa":
         return prepare_logit_task_inputs(
             spec=spec,
@@ -283,11 +283,10 @@ def build_prepared_inputs(
         )
     if config.benchmark_mode == "gen_qa":
         context_budget = compute_benchmark_context_budget(
-            tokenizer=tokenizer,
+            ctx=ctx,
             spec=spec,
             question=example["question"],
             eval_config=SimpleNamespace(generation_max_new_tokens=config.generation_max_new_tokens),
-            models=models,
         )
         return prepare_generation_task_inputs(
             spec=spec,
@@ -462,12 +461,13 @@ def evaluate_correction(
     run_dir: Path,
     translator_pool: lp.LayerWindowTranslatorPool,
     layer_mappings: Dict[str, lp.LayerMapping],
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
 ) -> Dict[str, Any]:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
     edges = ctx.edges
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
     logger.info("experiment_config=%s", asdict(config))
@@ -504,7 +504,7 @@ def evaluate_correction(
         for batch in dataloader:
             for example in batch:
                 try:
-                    prepared_inputs = build_prepared_inputs(spec=spec, example=example, tokenizer=tokenizer, models=models, config=config)
+                    prepared_inputs = build_prepared_inputs(ctx=ctx, spec=spec, example=example)
                 except Exception as exc:
                     logger.warning("Skipping example due to input preparation error: %s", exc)
                     continue
@@ -1012,23 +1012,19 @@ def main() -> None:
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     models, tokenizer = lp.build_models_for_experiment(config, nodes)
     model_specs = build_model_specs_for_nodes(models, nodes)
-    ctx = Context(config, model_specs, nodes, edges)
+    ctx = Context(config, model_specs, nodes, edges, models, tokenizer)
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     translator_pool, layer_mappings = lp.run_train(
         ctx=ctx,
         run_dir=run_dir,
-        models=models,
-        tokenizer=tokenizer,
     )
     metrics = evaluate_correction(
         ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
         layer_mappings=layer_mappings,
-        models=models,
-        tokenizer=tokenizer,
     )
 
     write_json(str(build_config_path(run_dir)), asdict(config))

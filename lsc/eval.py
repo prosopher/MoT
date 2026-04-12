@@ -12,19 +12,19 @@ from core.eval_util import *
 @torch.inference_mode()
 def evaluate_dataset(
     ctx: Context,
-    train_config,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
+    train_config = ctx.config
     device = train_config.device
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -125,19 +125,19 @@ def evaluate_dataset(
 @torch.inference_mode()
 def evaluate_generation_dataset(
     ctx: Context,
-    train_config,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
-    tokenizer,
     eval_config: EvalConfig,
     translator_pool,
-    models,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
+    train_config = ctx.config
     device = train_config.device
+    models = ctx.models
+    tokenizer = ctx.tokenizer
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -151,11 +151,10 @@ def evaluate_generation_dataset(
             context_budget = None
             if spec.answer_mode in {"squad", "newsqa"}:
                 context_budget = compute_benchmark_context_budget(
-                    tokenizer=tokenizer,
+                    ctx=ctx,
                     spec=spec,
                     question=question,
                     eval_config=eval_config,
-                    models=models,
                 )
 
             prepared_inputs = prepare_generation_task_inputs(
@@ -249,13 +248,12 @@ def run_eval(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    models,
-    tokenizer,
 ) -> Path:
     train_config = ctx.config
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
+    models = ctx.models
     full_model_specs = build_model_specs_for_nodes(models, nodes)
     set_seed(eval_config.seed)
 
@@ -295,10 +293,8 @@ def run_eval(
     logger.info("Preparing validation dataloader for OpenWebText/validation")
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
-        tokenizer=tokenizer,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        models=models,
         logger=logger,
     )
     for edge in edges:
@@ -323,13 +319,10 @@ def run_eval(
 
         results = evaluate_dataset(
             ctx=ctx,
-            train_config=train_config,
             spec=spec,
             dataloader=dataloader,
-            tokenizer=tokenizer,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            models=models,
             logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
@@ -355,13 +348,10 @@ def run_eval(
 
         results = evaluate_generation_dataset(
             ctx=ctx,
-            train_config=train_config,
             spec=spec,
             dataloader=dataloader,
-            tokenizer=tokenizer,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            models=models,
             logger=logger,
         )
         all_generation_results[spec.name_for_log] = results
