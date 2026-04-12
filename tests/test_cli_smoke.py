@@ -1,13 +1,13 @@
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import eval as eval_entry
+import train as train_entry
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STUBS_PATH = REPO_ROOT / "tests" / "stubs"
 CONFIGS_PATH = REPO_ROOT / "tests" / "configs"
 
 
@@ -19,13 +19,7 @@ CONFIGS_PATH = REPO_ROOT / "tests" / "configs"
         ("c2c", "train_c2c_smoke.json"),
     ],
 )
-def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Path) -> None:
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(STUBS_PATH) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-    env["OMP_NUM_THREADS"] = "1"
-    env["MKL_NUM_THREADS"] = "1"
-
+def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Path, capsys, monkeypatch) -> None:
     outputs_path = tmp_path / "outputs"
     outputs_path.mkdir(parents=True, exist_ok=True)
 
@@ -34,64 +28,57 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
     eval_config_path = CONFIGS_PATH / "eval_smoke.json"
 
     output_path = outputs_path / f"{alg}_{timestamp}"
-
-    train_cmd = [
-        sys.executable,
-        "train.py",
-        alg,
-        "--default-config-path",
-        str(train_config_path),
-        "--output-path",
-        str(output_path),
-        "--timestamp",
-        timestamp,
-        "--device",
-        "cpu",
-        "--max-steps",
-        "1",
-    ]
-    train_result = subprocess.run(
-        train_cmd,
-        cwd=REPO_ROOT,
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    checkpoint_path = output_path / "checkpoint.pt"
     checkpoint_dir_path = output_path
+    checkpoint_path = checkpoint_dir_path / "checkpoint.pt"
     train_log_path = output_path / "train.log"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            alg,
+            "--default-config-path",
+            str(train_config_path),
+            "--output-path",
+            str(output_path),
+            "--timestamp",
+            timestamp,
+            "--device",
+            "cpu",
+            "--max-steps",
+            "1",
+        ],
+    )
+    train_entry.main()
+    train_stdout = capsys.readouterr().out
 
     assert checkpoint_path.exists(), f"missing checkpoint for {alg}: {checkpoint_path}"
     assert train_log_path.exists(), f"missing train.log for {alg}: {train_log_path}"
-    assert "Final checkpoint:" in train_result.stdout
-
-    eval_cmd = [
-        sys.executable,
-        "eval.py",
-        alg,
-        "--default-config-path",
-        str(eval_config_path),
-        "--output-path",
-        str(output_path),
-        "--checkpoint-dir-path",
-        str(checkpoint_dir_path),
-        "--device",
-        "cpu",
-    ]
-    eval_result = subprocess.run(
-        eval_cmd,
-        cwd=REPO_ROOT,
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    assert "Final checkpoint:" in train_stdout
 
     eval_log_path = output_path / "eval.log"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval.py",
+            alg,
+            "--default-config-path",
+            str(eval_config_path),
+            "--output-path",
+            str(output_path),
+            "--checkpoint-dir-path",
+            str(checkpoint_dir_path),
+            "--device",
+            "cpu",
+        ],
+    )
+    eval_entry.main()
+    eval_stdout = capsys.readouterr().out
+
     assert eval_log_path.exists(), f"missing eval.log for {alg}: {eval_log_path}"
-    assert "Evaluation log:" in eval_result.stdout
+    assert "Evaluation log:" in eval_stdout
 
     train_log = train_log_path.read_text(encoding="utf-8")
     eval_log = eval_log_path.read_text(encoding="utf-8")
