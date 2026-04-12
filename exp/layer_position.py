@@ -476,8 +476,8 @@ def run_train(
             for edge in ctx.edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                 )
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -562,8 +562,8 @@ def evaluate_logit_dataset(
             for edge in edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                 )
                 native_target_past = past_by_node_id[edge.tgt_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
@@ -766,8 +766,8 @@ def evaluate_generation_dataset(
             for edge in edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                 )
                 native_target_past = past_by_node_id[edge.tgt_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
@@ -925,8 +925,8 @@ def compute_openwebtext_native_and_full_mix_losses(
 ) -> Dict[str, float]:
     translated_key, translated_value, mapping = translator_pool.translate_layer_window(
         past_key_values=past_by_node_id[edge.src_id],
-        src_name=edge.src_id,
-        tgt_name=edge.tgt_id,
+        src_node_id=edge.src_id,
+        tgt_node_id=edge.tgt_id,
     )
     native_target_past = past_by_node_id[edge.tgt_id]
     full_mix_past = replay_target_prefill_with_injected_window(

@@ -247,8 +247,8 @@ def evaluate_dataset(
                     train_config=train_config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
@@ -377,8 +377,8 @@ def evaluate_generation_dataset(
                     train_config=train_config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
@@ -461,8 +461,8 @@ def evaluate_openwebtext_validation_loss(
                 train_config=train_config,
                 sharer_past_key_values=past_by_node_id[edge.src_id],
                 receiver_past_key_values=past_by_node_id[edge.tgt_id],
-                src_name=edge.src_id,
-                tgt_name=edge.tgt_id,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
                 tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             )
             translated_target_past = replace_top_layers(

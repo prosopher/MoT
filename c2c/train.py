@@ -91,22 +91,22 @@ def translate_top_layers(
     train_config: TrainConfig,
     sharer_past_key_values: PastKeyValues,
     receiver_past_key_values: PastKeyValues,
-    src_name: str,
-    tgt_name: str,
+    src_node_id: str,
+    tgt_node_id: str,
     tgt_spec: ModelSpec,
 ) -> PastKeyValues:
     if is_projection_only_variant(train_config):
         return translator_pool.project_top_layers(
             sharer_past_key_values=sharer_past_key_values,
-            src_name=src_name,
-            tgt_name=tgt_name,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
             tgt_spec=tgt_spec,
         )
     return translator_pool.fuse_top_layers(
         sharer_past_key_values=sharer_past_key_values,
         receiver_past_key_values=receiver_past_key_values,
-        src_name=src_name,
-        tgt_name=tgt_name,
+        src_node_id=src_node_id,
+        tgt_node_id=tgt_node_id,
         tgt_spec=tgt_spec,
     )
 
@@ -382,10 +382,10 @@ class C2CFuserPool(nn.Module):
         receiver_value_block: torch.Tensor,
         sharer_key_block: torch.Tensor,
         sharer_value_block: torch.Tensor,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        adapter_name = f"{src_name}_to_{tgt_name}"
+        adapter_name = f"{src_node_id}_to_{tgt_node_id}"
         if adapter_name not in self.adapters:
             raise ValueError(
                 f"C2C edge {adapter_name} is not available. Active edges: {list(self.edge_ids)}"
@@ -401,8 +401,8 @@ class C2CFuserPool(nn.Module):
         self,
         sharer_past_key_values: PastKeyValues,
         receiver_past_key_values: PastKeyValues,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> PastKeyValues:
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
@@ -418,8 +418,8 @@ class C2CFuserPool(nn.Module):
             receiver_value_block=receiver_value_block,
             sharer_key_block=sharer_key_block,
             sharer_value_block=sharer_value_block,
-            src_name=src_name,
-            tgt_name=tgt_name,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
         )
         return blocks_to_partial_past_key_values(
             key_block=fused_key,
@@ -565,11 +565,11 @@ class C2CProjectorPool(nn.Module):
     def project_top_layers(
         self,
         sharer_past_key_values: PastKeyValues,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> PastKeyValues:
-        adapter_name = f"{src_name}_to_{tgt_name}"
+        adapter_name = f"{src_node_id}_to_{tgt_node_id}"
         if adapter_name not in self.adapters:
             raise ValueError(
                 f"C2C-Project edge {adapter_name} is not available. "
@@ -763,8 +763,8 @@ def run_train(
                     train_config=config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
                 translated_target_past = replace_top_layers(

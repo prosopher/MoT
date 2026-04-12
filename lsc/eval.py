@@ -57,8 +57,8 @@ def evaluate_dataset(
             for edge in edges:
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
@@ -183,8 +183,8 @@ def evaluate_generation_dataset(
             for edge in edges:
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 

@@ -354,10 +354,10 @@ class LayerWindowTranslatorPool(nn.Module):
     def translate_layer_window(
         self,
         past_key_values: PastKeyValues,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, LayerMapping]:
-        edge_id = f"{src_name}_to_{tgt_name}"
+        edge_id = f"{src_node_id}_to_{tgt_node_id}"
         if edge_id not in self.adapters:
             raise ValueError(
                 f"Translator edge {edge_id} is not available. "
@@ -378,14 +378,14 @@ class LayerWindowTranslatorPool(nn.Module):
         source_past_key_values: PastKeyValues,
         prefix_input_ids: torch.Tensor,
         target_model: PreTrainedModel,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> Tuple[PastKeyValues, PastKeyValues, LayerMapping]:
         translated_key, translated_value, mapping = self.translate_layer_window(
             past_key_values=source_past_key_values,
-            src_name=src_name,
-            tgt_name=tgt_name,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
         )
         translated_window_past = blocks_to_partial_past_key_values(
             key_block=translated_key,
@@ -782,8 +782,8 @@ def run_train(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
                 direction_loss = compute_prefix_correction_and_suffix_lm_loss(

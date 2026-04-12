@@ -480,8 +480,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
         def compute_translated_loss_value() -> float:
             translated_top_past = translator_pool.translate_top_layers(
                 past_key_values=past_by_node_id[edge.src_id],
-                src_name=edge.src_id,
-                tgt_name=edge.tgt_id,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
                 tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             )
             mixed_target_past = replace_top_layers(
@@ -577,8 +577,8 @@ def evaluate_openwebtext_validation_loss_replay(
                 source_past_key_values=past_by_node_id[edge.src_id],
                 prefix_input_ids=prefix_cache_ids,
                 target_model=ctx.mm.get_model(edge.tgt_id),
-                src_name=edge.src_id,
-                tgt_name=edge.tgt_id,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
                 tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             )
             return float(

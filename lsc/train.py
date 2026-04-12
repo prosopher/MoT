@@ -152,7 +152,6 @@ class SharedToLocalTranslator(nn.Module):
 class ModelLatentAdapter(nn.Module):
     def __init__(
         self,
-        model_name: str,
         local_layers: int,
         local_hidden_size: int,
         shared_slots: int,
@@ -162,7 +161,6 @@ class ModelLatentAdapter(nn.Module):
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.model_name = model_name
         self.key_to_shared = LocalToSharedTranslator(
             local_hidden_size=local_hidden_size,
             local_layers=local_layers,
@@ -227,7 +225,6 @@ class SharedKVTranslatorPool(nn.Module):
         self.adapters = nn.ModuleDict(
             {
                 node.id: ModelLatentAdapter(
-                    model_name=node.id,
                     local_layers=self.mm.get_model_spec(node.id).num_layers,
                     local_hidden_size=self.mm.get_model_spec(node.id).hidden_size,
                     shared_slots=shared_slots,
@@ -244,20 +241,20 @@ class SharedKVTranslatorPool(nn.Module):
         self,
         key_block: torch.Tensor,
         value_block: torch.Tensor,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        shared_cache = self.adapters[src_name].to_shared(key_block, value_block)
-        return self.adapters[tgt_name].from_shared(shared_cache)
+        shared_cache = self.adapters[src_node_id].to_shared(key_block, value_block)
+        return self.adapters[tgt_node_id].from_shared(shared_cache)
 
     def translate_top_layers(
         self,
         past_key_values: PastKeyValues,
-        src_name: str,
-        tgt_name: str,
+        src_node_id: str,
+        tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> PastKeyValues:
-        src_top_layers = self.mm.get_model_spec(src_name).num_layers
+        src_top_layers = self.mm.get_model_spec(src_node_id).num_layers
         src_top_past = slice_top_layers(
             past_key_values=past_key_values,
             top_layers_to_translate=src_top_layers,
@@ -266,8 +263,8 @@ class SharedKVTranslatorPool(nn.Module):
         translated_key, translated_value = self.translate_blocks(
             key_block=key_block,
             value_block=value_block,
-            src_name=src_name,
-            tgt_name=tgt_name,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
         )
         return blocks_to_past_key_values(
             key_block=translated_key,
@@ -433,8 +430,8 @@ def run_train(
             for edge in edges:
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    tgt_name=edge.tgt_id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
                 mixed_target_past = replace_top_layers(
