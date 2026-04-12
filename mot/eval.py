@@ -56,7 +56,7 @@ def evaluate_dataset(
             }
 
             for edge in edges:
-                mixed_target_past, translated_window_past, channel = translator_pool.build_replayed_target_past(
+                mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -68,7 +68,7 @@ def evaluate_dataset(
                 native_target_window = blocks_to_partial_past_key_values(
                     *extract_layer_window_blocks(
                         past_key_values=past_by_node_id[edge.tgt_id],
-                        start_layer_idx=channel.tgt_layer_start_idx,
+                        start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                         num_layers=train_config.injection_window_size,
                     ),
                     num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
@@ -184,7 +184,7 @@ def evaluate_generation_dataset(
             }
 
             for edge in edges:
-                mixed_target_past, translated_window_past, channel = translator_pool.build_replayed_target_past(
+                mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -196,7 +196,7 @@ def evaluate_generation_dataset(
                 native_target_window = blocks_to_partial_past_key_values(
                     *extract_layer_window_blocks(
                         past_key_values=past_by_node_id[edge.tgt_id],
-                        start_layer_idx=channel.tgt_layer_start_idx,
+                        start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                         num_layers=train_config.injection_window_size,
                     ),
                     num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
@@ -249,7 +249,6 @@ def run_eval(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    channel_map,
 ) -> Path:
     train_config = ctx.config
     nodes = ctx.nodes
@@ -275,7 +274,7 @@ def run_eval(
     logger.info("nodes=%s", [asdict(node) for node in nodes])
     logger.info("injection_layer_start_idx=%d", train_config.injection_layer_start_idx)
     logger.info("injection_window_size=%d", train_config.injection_window_size)
-    logger.info("channel_map=%s", {edge_id: asdict(channel) for edge_id, channel in channel_map.items()})
+
     logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("translation_mode=translate_window_and_replay_target_prefill")
     logger.info("qa_eval_log_path=%s", log_path)

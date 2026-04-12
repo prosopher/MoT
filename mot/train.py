@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.config import Config
+from core.channel_manager import Channel, ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
 from core.model_spec import ModelSpec
@@ -16,13 +17,6 @@ from core.train_util import *
 
 MOT_VARIANTS = {"single", "mot"}
 
-
-@dataclass(frozen=True)
-class Channel:
-    src_layer_start_idx: int
-    src_layer_end_idx: int
-    tgt_layer_start_idx: int
-    tgt_layer_end_idx: int
 
 
 @dataclass
@@ -316,7 +310,6 @@ class LayerWindowTranslatorPool(nn.Module):
     def __init__(
         self,
         ctx: Context,
-        channel_map: Dict[str, Channel],
         injection_window_size: int,
         translator_dim: int,
         translator_heads: int,
@@ -328,8 +321,9 @@ class LayerWindowTranslatorPool(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.ctx = ctx
         self.mm = ctx.mm
-        self.channel_map = channel_map
+        self.cm = ctx.cm
         self.injection_window_size = injection_window_size
         self.edges = tuple(ctx.edges)
         self.edge_ids = tuple(edge.id for edge in ctx.edges)
@@ -351,26 +345,41 @@ class LayerWindowTranslatorPool(nn.Module):
             )
         self.adapters = nn.ModuleDict(adapters)
 
+    def _get_channels(self, edge_id: str) -> List[Channel]:
+        channels = self.cm.get_channels(edge_id)
+        if len(channels) != self.injection_window_size:
+            raise ValueError(
+                f"edge={edge_id} expected {self.injection_window_size} channels, got {len(channels)}"
+            )
+        return channels
+
+    def _extract_channel_blocks(
+        self,
+        past_key_values: PastKeyValues,
+        edge_id: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        channels = self._get_channels(edge_id)
+        selected_past = tuple(past_key_values[channel.src_layer_idx] for channel in channels)
+        return past_key_values_to_blocks(selected_past)
+
     def translate_layer_window(
         self,
         past_key_values: PastKeyValues,
         src_node_id: str,
         tgt_node_id: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Channel]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         edge_id = f"{src_node_id}_to_{tgt_node_id}"
         if edge_id not in self.adapters:
             raise ValueError(
                 f"Translator edge {edge_id} is not available. "
                 f"Active edges: {list(self.edge_ids)}"
             )
-        channel = self.channel_map[edge_id]
-        key_block, value_block = extract_layer_window_blocks(
+        key_block, value_block = self._extract_channel_blocks(
             past_key_values=past_key_values,
-            start_layer_idx=channel.src_layer_start_idx,
-            num_layers=self.injection_window_size,
+            edge_id=edge_id,
         )
         translated_key, translated_value = self.adapters[edge_id](key_block, value_block)
-        return translated_key, translated_value, channel
+        return translated_key, translated_value
 
     def build_replayed_target_past(
         self,
@@ -381,8 +390,9 @@ class LayerWindowTranslatorPool(nn.Module):
         src_node_id: str,
         tgt_node_id: str,
         tgt_spec: ModelSpec,
-    ) -> Tuple[PastKeyValues, PastKeyValues, Channel]:
-        translated_key, translated_value, channel = self.translate_layer_window(
+    ) -> Tuple[PastKeyValues, PastKeyValues]:
+        edge_id = f"{src_node_id}_to_{tgt_node_id}"
+        translated_key, translated_value = self.translate_layer_window(
             past_key_values=source_past_key_values,
             src_node_id=src_node_id,
             tgt_node_id=tgt_node_id,
@@ -396,24 +406,23 @@ class LayerWindowTranslatorPool(nn.Module):
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=prefix_input_ids,
-            target_start_layer_idx=channel.tgt_layer_start_idx,
+            target_start_layer_idx=self.cm.get_tgt_layer_start_idx(edge_id),
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
         )
-        return mixed_target_past, translated_window_past, channel
+        return mixed_target_past, translated_window_past
 
 
 
 def build_channel_map(
     ctx: Context,
     edges: List[Edge],
-) -> Dict[str, Channel]:
+) -> None:
     config = ctx.config
     requested_window_size = config.injection_window_size
     injection_layer_start_idx = config.injection_layer_start_idx
 
-    channel_map: Dict[str, Channel] = {}
     for edge in edges:
         src_spec = ctx.mm.get_model_spec(edge.src_id)
         tgt_spec = ctx.mm.get_model_spec(edge.tgt_id)
@@ -442,13 +451,15 @@ def build_channel_map(
                 f"source end layer {src_layer_end_idx} exceeds source last layer {src_spec.num_layers - 1}"
             )
 
-        channel_map[edge.id] = Channel(
-            src_layer_start_idx=src_layer_start_idx,
-            src_layer_end_idx=src_layer_end_idx,
-            tgt_layer_start_idx=tgt_layer_start_idx,
-            tgt_layer_end_idx=tgt_layer_end_idx,
-        )
-    return channel_map
+        for offset in range(requested_window_size):
+            # ChannelManager assumes channels are appended in layer order so its
+            # start/end lookups can stay O(1) via the first/last entries.
+            ctx.cm.add_channel(
+                edge.id,
+                src_layer_idx=src_layer_start_idx + offset,
+                dst_layer_idx=tgt_layer_start_idx + offset,
+            )
+
 
 
 def extract_layer_window_blocks(
@@ -642,13 +653,12 @@ def replay_target_prefill_with_injected_window(
 
 def build_translator_pool(
     ctx: Context,
-) -> Tuple[LayerWindowTranslatorPool, Dict[str, Channel]]:
+) -> LayerWindowTranslatorPool:
     config = ctx.config
     edges = ctx.edges
-    channel_map = build_channel_map(ctx, edges)
+    build_channel_map(ctx, edges)
     translator_pool = LayerWindowTranslatorPool(
         ctx=ctx,
-        channel_map=channel_map,
         injection_window_size=config.injection_window_size,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
@@ -659,7 +669,7 @@ def build_translator_pool(
         mot_top_k=config.mot_top_k,
     )
     translator_pool.to(config.device)
-    return translator_pool, channel_map
+    return translator_pool
 
 
 def load_translator_pool_from_checkpoint(
@@ -670,7 +680,6 @@ def load_translator_pool_from_checkpoint(
 ) -> Tuple[
     Context,
     LayerWindowTranslatorPool,
-    Dict[str, Channel],
 ]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
@@ -693,12 +702,13 @@ def load_translator_pool_from_checkpoint(
         edges,
         ModelManager(models),
         tokenizer,
+        ChannelManager(edges),
     )
-    translator_pool, channel_map = build_translator_pool(ctx)
+    translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, channel_map
+    return ctx, translator_pool
 
 
 
@@ -725,7 +735,7 @@ def run_train(
     logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    translator_pool = build_translator_pool(ctx)[0]
+    translator_pool = build_translator_pool(ctx)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
@@ -778,7 +788,7 @@ def run_train(
 
             total_direction_loss = 0.0
             for edge in edges:
-                mixed_target_past, _, channel = translator_pool.build_replayed_target_past(
+                mixed_target_past, _ = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -792,7 +802,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=channel.tgt_layer_start_idx,
+                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 

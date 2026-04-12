@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from core.config import Config
 from core.context import Context
+from core.channel_manager import ChannelManager
 from core.model_manager import ModelManager
 from core.model_spec import ModelSpec
 from core.train_util import *
@@ -650,6 +651,7 @@ def load_translator_pool_from_checkpoint(
         edges,
         ModelManager(models),
         tokenizer,
+        ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)

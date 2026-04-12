@@ -2,6 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 
+from core.channel_manager import ChannelManager
 from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 from core.context import Context
 from core.model_manager import ModelManager
@@ -64,6 +65,7 @@ def main() -> None:
         edges,
         ModelManager(models),
         tokenizer,
+        ChannelManager(edges),
     )
 
     final_checkpoint = Path(train_module.run_train(ctx))

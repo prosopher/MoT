@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.common import *
+from core.channel_manager import ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
 from core.eval_util import *
@@ -376,14 +377,15 @@ class MetricCollector:
 def compute_correction_metrics_from_traces(
     native_trace: Dict[str, Any],
     mixed_trace: Dict[str, Any],
-    channel: lp.Channel,
+    tgt_layer_start_idx: int,
+    tgt_layer_end_idx: int,
 ) -> Dict[str, Any]:
     hidden_delta = mixed_trace["hidden_states"] - native_trace["hidden_states"]
     attn_delta = mixed_trace["attn_additions"] - native_trace["attn_additions"]
     mlp_delta = mixed_trace["mlp_additions"] - native_trace["mlp_additions"]
 
-    source_idx = channel.tgt_layer_end_idx + 1
-    window_input_idx = channel.tgt_layer_start_idx
+    source_idx = tgt_layer_end_idx + 1
+    window_input_idx = tgt_layer_start_idx
     initial_shift = hidden_delta[source_idx]
     initial_shift_norm = float(initial_shift.norm().item())
     window_input_norm = float(native_trace["hidden_states"][window_input_idx].norm().item())
@@ -460,7 +462,6 @@ def evaluate_correction(
     ctx: Context,
     run_dir: Path,
     translator_pool: lp.LayerWindowTranslatorPool,
-    channel_map: Dict[str, lp.Channel],
 ) -> Dict[str, Any]:
     config = ctx.config
     nodes = ctx.nodes
@@ -469,7 +470,6 @@ def evaluate_correction(
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
     logger.info("experiment_config=%s", asdict(config))
-    lp.log_channel_map(ctx, logger, channel_map)
 
     translator_pool.eval()
     for node in nodes:
@@ -487,9 +487,8 @@ def evaluate_correction(
 
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
-    reference_channel = channel_map[edges[0].id]
     num_layers = ctx.mm.get_model_spec(edges[0].tgt_id).num_layers
-    source_idx = reference_channel.tgt_layer_end_idx + 1
+    source_idx = ctx.cm.get_tgt_layer_end_idx(edges[0].id) + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
     random_collector = MetricCollector()
@@ -520,8 +519,7 @@ def evaluate_correction(
                     continue
 
                 for edge in edges:
-                    channel = channel_map[edge.id]
-                    translated_key, translated_value, _ = translator_pool.translate_layer_window(
+                    translated_key, translated_value = translator_pool.translate_layer_window(
                         past_key_values=past_by_node_id[edge.src_id],
                         src_node_id=edge.src_id,
                         tgt_node_id=edge.tgt_id,
@@ -529,13 +527,13 @@ def evaluate_correction(
                     native_target_past = past_by_node_id[edge.tgt_id]
                     native_key_block, native_value_block = lp.extract_layer_window_blocks(
                         past_key_values=native_target_past,
-                        start_layer_idx=channel.tgt_layer_start_idx,
+                        start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                         num_layers=config.injection_window_size,
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=channel.tgt_layer_start_idx,
+                        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -549,7 +547,7 @@ def evaluate_correction(
                     random_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=channel.tgt_layer_start_idx,
+                        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -567,7 +565,12 @@ def evaluate_correction(
                         current_input_ids = answer_token_ids[token_idx : token_idx + 1].view(1, 1)
                         native_trace = trace_single_token_with_past(target_model, native_past, current_input_ids)
                         fullmix_trace = trace_single_token_with_past(target_model, fullmix_past, current_input_ids)
-                        correction_metrics = compute_correction_metrics_from_traces(native_trace, fullmix_trace, channel)
+                        correction_metrics = compute_correction_metrics_from_traces(
+                            native_trace,
+                            fullmix_trace,
+                            ctx.cm.get_tgt_layer_start_idx(edge.id),
+                            ctx.cm.get_tgt_layer_end_idx(edge.id),
+                        )
                         if correction_metrics.get("valid", False):
                             fullmix_collector.update(
                                 initial_shift_norm=correction_metrics["initial_shift_norm"],
@@ -589,7 +592,12 @@ def evaluate_correction(
                                 correction_cosine=correction_metrics["trajectory"]["correction_cosine"],
                             )
                         random_trace = trace_single_token_with_past(target_model, random_past, current_input_ids)
-                        random_metrics = compute_correction_metrics_from_traces(native_trace, random_trace, channel)
+                        random_metrics = compute_correction_metrics_from_traces(
+                            native_trace,
+                            random_trace,
+                            ctx.cm.get_tgt_layer_start_idx(edge.id),
+                            ctx.cm.get_tgt_layer_end_idx(edge.id),
+                        )
                         if random_metrics.get("valid", False):
                             random_collector.update(
                                 initial_shift_norm=random_metrics["initial_shift_norm"],
@@ -654,7 +662,6 @@ def evaluate_correction(
             "final_shrink_ratio": "||final hidden-state difference|| divided by ||initial post-window hidden-state difference||",
             "source_idx": "post-window boundary index used as the first correction analysis point",
         },
-        "channel_map": {edge_id: asdict(channel) for edge_id, channel in channel_map.items()},
         "full_mix": fullmix_summary,
         "random_control": random_summary,
         "trajectory": trajectory_summary,
@@ -704,27 +711,27 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
         return rows
 
 
-def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], channel_map: Dict[str, lp.Channel]) -> Path:
+def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path:
     config = ctx.config
     study_dir = run_dir.parent
     summary_path = build_summary_path(study_dir)
     rows = read_summary_rows(summary_path)
-    channel = next(iter(channel_map.values()))
     full_mix = metrics["full_mix"]
     random_control = metrics["random_control"]
-    post_window_boundary_idx = channel.tgt_layer_end_idx + 1
-    first_edge_id = next(iter(channel_map.keys()))
-    tgt_id = first_edge_id.split("_to_")[1]
+    reference_edge = ctx.edges[0]
+    reference_edge_id = reference_edge.id
+    post_window_boundary_idx = ctx.cm.get_tgt_layer_end_idx(reference_edge_id) + 1
+    tgt_id = reference_edge.tgt_id
     num_upper_layers = max(0, ctx.mm.get_model_spec(tgt_id).num_layers - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
         injection_layer_start_idx=config.injection_layer_start_idx,
         translated_num_layers=config.injection_window_size,
-        source_layer_start_idx=channel.src_layer_start_idx,
-        source_layer_end_idx=channel.src_layer_end_idx,
-        target_layer_start_idx=channel.tgt_layer_start_idx,
-        target_layer_end_idx=channel.tgt_layer_end_idx,
+        source_layer_start_idx=ctx.cm.get_src_layer_start_idx(reference_edge_id),
+        source_layer_end_idx=ctx.cm.get_src_layer_end_idx(reference_edge_id),
+        target_layer_start_idx=ctx.cm.get_tgt_layer_start_idx(reference_edge_id),
+        target_layer_end_idx=ctx.cm.get_tgt_layer_end_idx(reference_edge_id),
         num_samples=metrics.get("processed_examples", config.eval_max_examples_per_dataset),
         num_tokens=full_mix["num_tokens"],
         average_initial_shift_norm=float(full_mix["average_initial_shift_norm"]),
@@ -760,12 +767,16 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], channel
     return summary_path
 
 
-def plot_run_trajectories(run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path, Path]:
+def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path, Path]:
     import matplotlib.pyplot as plt
 
     source_idx = metrics["trajectory"]["source_idx"]
-    channel = next(iter(metrics["channel_map"].values()))
-    injected_window_label = format_layer_range(channel["tgt_layer_start_idx"], channel["tgt_layer_end_idx"])
+    reference_edge = ctx.edges[0]
+    reference_edge_id = reference_edge.id
+    injected_window_label = format_layer_range(
+        ctx.cm.get_tgt_layer_start_idx(reference_edge_id),
+        ctx.cm.get_tgt_layer_end_idx(reference_edge_id),
+    )
     token_00 = metrics["trajectory"]["token_trajectories"].get("token_00", {})
     full = token_00.get("full_mix", {})
     rand = token_00.get("random", {})
@@ -1014,11 +1025,12 @@ def main() -> None:
         edges,
         ModelManager(models),
         tokenizer,
+        ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    translator_pool, channel_map = lp.run_train(
+    translator_pool = lp.run_train(
         ctx=ctx,
         run_dir=run_dir,
     )
@@ -1026,13 +1038,12 @@ def main() -> None:
         ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
-        channel_map=channel_map,
     )
 
     write_json(str(build_config_path(run_dir)), asdict(config))
     write_json(str(build_metrics_path(run_dir)), metrics)
-    summary_path = update_summary(ctx, run_dir, metrics, channel_map)
-    run_chart_paths = plot_run_trajectories(run_dir, metrics)
+    summary_path = update_summary(ctx, run_dir, metrics)
+    run_chart_paths = plot_run_trajectories(ctx, run_dir, metrics)
     summary_chart_paths = plot_summary(summary_path)
 
     print(f"Run directory: {run_dir}")

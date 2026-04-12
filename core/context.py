@@ -3,6 +3,7 @@ from typing import List
 
 from transformers import PreTrainedTokenizerBase
 
+from .channel_manager import ChannelManager
 from .config import Config
 from .model_manager import ModelManager
 from .topology import Edge, Node
@@ -15,3 +16,4 @@ class Context:
     edges: List[Edge]
     mm: ModelManager
     tokenizer: PreTrainedTokenizerBase
+    cm: ChannelManager
