@@ -554,7 +554,7 @@ def build_best_alignment_summary(matrix: torch.Tensor) -> Dict[str, object]:
         per_row.append(
             {
                 "src_layer_idx": row_idx,
-                "best_dst_layer_idx": best_col,
+                "best_tgt_layer_idx": best_col,
                 "score": float(matrix[row_idx, best_col].item()),
             }
         )
@@ -565,7 +565,7 @@ def build_best_alignment_summary(matrix: torch.Tensor) -> Dict[str, object]:
         "best_per_src_layer": per_row,
         "global_best_pair": {
             "src_layer_idx": global_row,
-            "dst_layer_idx": global_col,
+            "tgt_layer_idx": global_col,
             "score": float(matrix[global_row, global_col].item()),
         },
     }
@@ -725,7 +725,7 @@ def run_layer_similarity(config: LayerSimConfig) -> Path:
         "Global best mean K/V pair on dataset=%s: A layer %d <-> B layer %d (score=%.6f)",
         config.dataset_name,
         summary["kv_alignment"]["global_best_pair"]["src_layer_idx"],
-        summary["kv_alignment"]["global_best_pair"]["dst_layer_idx"],
+        summary["kv_alignment"]["global_best_pair"]["tgt_layer_idx"],
         summary["kv_alignment"]["global_best_pair"]["score"],
     )
     logger.info("Saved artifacts to %s", output_dir)
@@ -797,10 +797,10 @@ def write_suite_summary(output_root: Path, rows: List[Dict[str, object]]) -> Pat
         "study_id",
         "output_dir",
         "key_best_src_layer",
-        "key_best_dst_layer",
+        "key_best_tgt_layer",
         "key_best_score",
         "kv_best_src_layer",
-        "kv_best_dst_layer",
+        "kv_best_tgt_layer",
         "kv_best_score",
     ]
     with path.open("w", encoding="utf-8", newline="") as fp:
@@ -874,10 +874,10 @@ def main() -> None:
                 "study_id": pair_config.study_id,
                 "output_dir": str(output_dir),
                 "key_best_src_layer": summary["key_alignment"]["global_best_pair"]["src_layer_idx"],
-                "key_best_dst_layer": summary["key_alignment"]["global_best_pair"]["dst_layer_idx"],
+                "key_best_tgt_layer": summary["key_alignment"]["global_best_pair"]["tgt_layer_idx"],
                 "key_best_score": f"{summary['key_alignment']['global_best_pair']['score']:.6f}",
                 "kv_best_src_layer": summary["kv_alignment"]["global_best_pair"]["src_layer_idx"],
-                "kv_best_dst_layer": summary["kv_alignment"]["global_best_pair"]["dst_layer_idx"],
+                "kv_best_tgt_layer": summary["kv_alignment"]["global_best_pair"]["tgt_layer_idx"],
                 "kv_best_score": f"{summary['kv_alignment']['global_best_pair']['score']:.6f}",
             }
         )

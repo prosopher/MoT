@@ -299,7 +299,7 @@ def resolve_target_num_layers(
     )
     node_map = build_node_map(nodes)
     reference_edge = edges[0]
-    target_model_id = node_map[reference_edge.dst_id].model_id
+    target_model_id = node_map[reference_edge.tgt_id].model_id
     return load_model_spec_from_pretrained_config(target_model_id).num_layers
 
 
@@ -377,23 +377,23 @@ def log_layer_mappings(
     injection_window_size = config.injection_window_size
     node_map = build_node_map(ctx.nodes)
     for edge_id, mapping in layer_mappings.items():
-        src_id, dst_id = edge_id.split("_to_")
-        dst_depth_from_top = model_specs[dst_id].num_layers - 1 - mapping.dst_layer_start_idx
+        src_id, tgt_id = edge_id.split("_to_")
+        tgt_depth_from_top = model_specs[tgt_id].num_layers - 1 - mapping.tgt_layer_start_idx
         logger.info(
-            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | injection_window_size=%d | dst_depth_from_top=%d",
+            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | injection_window_size=%d | tgt_depth_from_top=%d",
             edge_id,
             src_id,
             node_map[src_id].model_id,
             mapping.src_layer_start_idx,
             mapping.src_layer_end_idx,
             model_specs[src_id].num_layers - 1,
-            dst_id,
-            node_map[dst_id].model_id,
-            mapping.dst_layer_start_idx,
-            mapping.dst_layer_end_idx,
-            model_specs[dst_id].num_layers - 1,
+            tgt_id,
+            node_map[tgt_id].model_id,
+            mapping.tgt_layer_start_idx,
+            mapping.tgt_layer_end_idx,
+            model_specs[tgt_id].num_layers - 1,
             injection_window_size,
-            dst_depth_from_top,
+            tgt_depth_from_top,
         )
 
 
@@ -476,23 +476,23 @@ def run_train(
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
+                    tgt_name=edge.tgt_id,
                 )
                 mixed_target_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=prefix_cache_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 total_direction_loss = total_direction_loss + compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.dst_id],
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                 )
 
             loss = total_direction_loss / config.grad_accum_steps
@@ -563,12 +563,12 @@ def evaluate_logit_dataset(
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
+                    tgt_name=edge.tgt_id,
                 )
-                native_target_past = past_by_node_id[edge.dst_id]
+                native_target_past = past_by_node_id[edge.tgt_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
-                    start_layer_idx=mapping.dst_layer_start_idx,
+                    start_layer_idx=mapping.tgt_layer_start_idx,
                     num_layers=config.injection_window_size,
                 )
                 control_windows = build_control_window_variants(
@@ -578,74 +578,74 @@ def evaluate_logit_dataset(
                     translated_value_block=translated_value,
                 )
                 dir_only_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
 
                 native_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 dir_only_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=dir_only_past,
                     question_cache_ids=question_cache_ids,
                 )
                 mag_only_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mag_only_past,
                     question_cache_ids=question_cache_ids,
                 )
                 full_mix_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=full_mix_past,
                     question_cache_ids=question_cache_ids,
                 )
 
                 native_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 dir_only_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=dir_only_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 mag_only_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mag_only_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 full_mix_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
@@ -665,22 +665,22 @@ def evaluate_logit_dataset(
                 )
 
                 native_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                 )
                 dir_only_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=dir_only_scoring_past,
                     seed_token=seed_token,
                 )
                 mag_only_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mag_only_scoring_past,
                     seed_token=seed_token,
                 )
                 full_mix_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                 )
@@ -768,12 +768,12 @@ def evaluate_generation_dataset(
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
+                    tgt_name=edge.tgt_id,
                 )
-                native_target_past = past_by_node_id[edge.dst_id]
+                native_target_past = past_by_node_id[edge.tgt_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
-                    start_layer_idx=mapping.dst_layer_start_idx,
+                    start_layer_idx=mapping.tgt_layer_start_idx,
                     num_layers=config.injection_window_size,
                 )
                 control_windows = build_control_window_variants(
@@ -783,32 +783,32 @@ def evaluate_generation_dataset(
                     translated_value_block=translated_value,
                 )
                 dir_only_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
 
                 native_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
                     past_key_values=native_target_past,
                     seed_token=seed_token,
@@ -816,7 +816,7 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 dir_only_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
                     past_key_values=dir_only_past,
                     seed_token=seed_token,
@@ -824,7 +824,7 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 mag_only_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
                     past_key_values=mag_only_past,
                     seed_token=seed_token,
@@ -832,7 +832,7 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 full_mix_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
                     past_key_values=full_mix_past,
                     seed_token=seed_token,
@@ -849,43 +849,43 @@ def evaluate_generation_dataset(
                 )
 
                 native_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 dir_only_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=dir_only_past,
                     question_cache_ids=question_cache_ids,
                 )
                 mag_only_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mag_only_past,
                     question_cache_ids=question_cache_ids,
                 )
                 full_mix_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=full_mix_past,
                     question_cache_ids=question_cache_ids,
                 )
 
                 native_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                 )
                 dir_only_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=dir_only_scoring_past,
                     seed_token=seed_token,
                 )
                 mag_only_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mag_only_scoring_past,
                     seed_token=seed_token,
                 )
                 full_mix_log_probs = compute_next_token_log_probs(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                 )
@@ -929,21 +929,21 @@ def compute_openwebtext_native_and_full_mix_losses(
     translated_key, translated_value, mapping = translator_pool.translate_layer_window(
         past_key_values=past_by_node_id[edge.src_id],
         src_name=edge.src_id,
-        dst_name=edge.dst_id,
+        tgt_name=edge.tgt_id,
     )
-    native_target_past = past_by_node_id[edge.dst_id]
+    native_target_past = past_by_node_id[edge.tgt_id]
     full_mix_past = replay_target_prefill_with_injected_window(
-        target_model=models[edge.dst_id],
+        target_model=models[edge.tgt_id],
         prefix_input_ids=prefix_cache_ids,
-        target_start_layer_idx=mapping.dst_layer_start_idx,
+        target_start_layer_idx=mapping.tgt_layer_start_idx,
         injected_key_block=translated_key,
         injected_value_block=translated_value,
-        dst_spec=model_specs[edge.dst_id],
+        tgt_spec=model_specs[edge.tgt_id],
     )
 
     native_loss = float(
         compute_suffix_lm_loss(
-            target_model=models[edge.dst_id],
+            target_model=models[edge.tgt_id],
             past_key_values=native_target_past,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
@@ -951,7 +951,7 @@ def compute_openwebtext_native_and_full_mix_losses(
     )
     full_mix_loss = float(
         compute_suffix_lm_loss(
-            target_model=models[edge.dst_id],
+            target_model=models[edge.tgt_id],
             past_key_values=full_mix_past,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
@@ -1068,8 +1068,8 @@ def build_summary_row(
         translated_num_layers=config.injection_window_size,
         source_layer_start_idx=reference_mapping["src_layer_start_idx"],
         source_layer_end_idx=reference_mapping["src_layer_end_idx"],
-        target_layer_start_idx=reference_mapping["dst_layer_start_idx"],
-        target_layer_end_idx=reference_mapping["dst_layer_end_idx"],
+        target_layer_start_idx=reference_mapping["tgt_layer_start_idx"],
+        target_layer_end_idx=reference_mapping["tgt_layer_end_idx"],
         average_metric=float(metrics["average_metric"]),
         average_native_metric=float(metrics["average_native_metric"]),
         average_dir_only_metric=float(metrics["average_dir_only_metric"]),

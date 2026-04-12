@@ -464,7 +464,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    dst_model_specs = ctx.model_specs
+    tgt_model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -482,16 +482,16 @@ def evaluate_openwebtext_validation_loss_top_layers(
             translated_top_past = translator_pool.translate_top_layers(
                 past_key_values=past_by_node_id[edge.src_id],
                 src_name=edge.src_id,
-                dst_name=edge.dst_id,
-                dst_spec=dst_model_specs[edge.dst_id],
+                tgt_name=edge.tgt_id,
+                tgt_spec=tgt_model_specs[edge.tgt_id],
             )
             mixed_target_past = replace_top_layers(
-                base_past_key_values=past_by_node_id[edge.dst_id],
+                base_past_key_values=past_by_node_id[edge.tgt_id],
                 translated_top_past_key_values=translated_top_past,
             )
             return float(
                 compute_suffix_lm_loss(
-                    target_model=ctx.models[edge.dst_id],
+                    target_model=ctx.models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -501,8 +501,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=ctx.models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    target_model=ctx.models[edge.tgt_id],
+                    past_key_values=past_by_node_id[edge.tgt_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 ).item()
@@ -560,7 +560,7 @@ def evaluate_openwebtext_validation_loss_replay(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    dst_model_specs = ctx.model_specs
+    tgt_model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -578,27 +578,27 @@ def evaluate_openwebtext_validation_loss_replay(
             mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
                 source_past_key_values=past_by_node_id[edge.src_id],
                 prefix_input_ids=prefix_cache_ids,
-                target_model=ctx.models[edge.dst_id],
+                target_model=ctx.models[edge.tgt_id],
                 src_name=edge.src_id,
-                dst_name=edge.dst_id,
-                dst_spec=dst_model_specs[edge.dst_id],
+                tgt_name=edge.tgt_id,
+                tgt_spec=tgt_model_specs[edge.tgt_id],
             )
             return float(
                 compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.models[edge.dst_id],
+                    target_model=ctx.models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.dst_id],
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                 ).item()
             )
 
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=ctx.models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    target_model=ctx.models[edge.tgt_id],
+                    past_key_values=past_by_node_id[edge.tgt_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 ).item()
@@ -1862,8 +1862,8 @@ def build_edge_pretty_name(edge_id: str, nodes: List[Node], edges: List[Edge]) -
     if edge is None:
         return edge_id
     src_model_id = node_map[edge.src_id].model_id
-    dst_model_id = node_map[edge.dst_id].model_id
-    return f"{edge.id} ({src_model_id} -> {dst_model_id})"
+    tgt_model_id = node_map[edge.tgt_id].model_id
+    return f"{edge.id} ({src_model_id} -> {tgt_model_id})"
 
 
 def log_dataset_result(
@@ -2013,7 +2013,7 @@ def build_edge_summary_markdown_table(
         direction_title = edge_id
     else:
         src_model_id = node_map[edge.src_id].model_id
-        target_model_id = node_map[edge.dst_id].model_id
+        target_model_id = node_map[edge.tgt_id].model_id
         direction_title = f"{edge.id} 방향 ({src_model_id} -> {target_model_id})"
 
     native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(loss_row, prefix="native")

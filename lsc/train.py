@@ -265,17 +265,17 @@ class SharedKVTranslatorPool(nn.Module):
         key_block: torch.Tensor,
         value_block: torch.Tensor,
         src_name: str,
-        dst_name: str,
+        tgt_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         shared_cache = self.adapters[src_name].to_shared(key_block, value_block)
-        return self.adapters[dst_name].from_shared(shared_cache)
+        return self.adapters[tgt_name].from_shared(shared_cache)
 
     def translate_top_layers(
         self,
         past_key_values: PastKeyValues,
         src_name: str,
-        dst_name: str,
-        dst_spec: ModelSpec,
+        tgt_name: str,
+        tgt_spec: ModelSpec,
     ) -> PastKeyValues:
         src_top_layers = self.model_specs[src_name].num_layers
         src_top_past = slice_top_layers(
@@ -287,12 +287,12 @@ class SharedKVTranslatorPool(nn.Module):
             key_block=key_block,
             value_block=value_block,
             src_name=src_name,
-            dst_name=dst_name,
+            tgt_name=tgt_name,
         )
         return blocks_to_past_key_values(
             key_block=translated_key,
             value_block=translated_value,
-            model_spec=dst_spec,
+            model_spec=tgt_spec,
         )
 
 
@@ -475,15 +475,15 @@ def run_train(
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
+                    base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,

@@ -90,22 +90,22 @@ def translate_top_layers(
     sharer_past_key_values: PastKeyValues,
     receiver_past_key_values: PastKeyValues,
     src_name: str,
-    dst_name: str,
-    dst_spec: ModelSpec,
+    tgt_name: str,
+    tgt_spec: ModelSpec,
 ) -> PastKeyValues:
     if is_projection_only_variant(train_config):
         return translator_pool.project_top_layers(
             sharer_past_key_values=sharer_past_key_values,
             src_name=src_name,
-            dst_name=dst_name,
-            dst_spec=dst_spec,
+            tgt_name=tgt_name,
+            tgt_spec=tgt_spec,
         )
     return translator_pool.fuse_top_layers(
         sharer_past_key_values=sharer_past_key_values,
         receiver_past_key_values=receiver_past_key_values,
         src_name=src_name,
-        dst_name=dst_name,
-        dst_spec=dst_spec,
+        tgt_name=tgt_name,
+        tgt_spec=tgt_spec,
     )
 
 
@@ -114,15 +114,15 @@ class ResidualCacheFuser(nn.Module):
     Fuses top-layer receiver/sharer cache blocks following the C2C recipe:
     project -> feature fuse -> dynamic weighting -> gated residual injection.
 
-    receiver_block: [batch, seq, num_layers, dst_hidden]
+    receiver_block: [batch, seq, num_layers, tgt_hidden]
     sharer_block:   [batch, seq, num_layers, src_hidden]
-    output:         [batch, seq, num_layers, dst_hidden]
+    output:         [batch, seq, num_layers, tgt_hidden]
     """
 
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         num_layers: int,
         fuser_dim: int,
         fuser_heads: int,
@@ -144,8 +144,8 @@ class ResidualCacheFuser(nn.Module):
         self.hard_gate_eval = hard_gate_eval
         self.temperature = gate_temperature_start
 
-        self.receiver_norm = nn.LayerNorm(dst_hidden_size)
-        self.receiver_proj = nn.Linear(dst_hidden_size, fuser_dim)
+        self.receiver_norm = nn.LayerNorm(tgt_hidden_size)
+        self.receiver_proj = nn.Linear(tgt_hidden_size, fuser_dim)
         self.sharer_norm = nn.LayerNorm(src_hidden_size)
         self.sharer_proj = nn.Linear(src_hidden_size, fuser_dim)
 
@@ -178,7 +178,7 @@ class ResidualCacheFuser(nn.Module):
         )
 
         self.output_norm = nn.LayerNorm(num_layers * fuser_dim)
-        self.output_proj = nn.Linear(num_layers * fuser_dim, num_layers * dst_hidden_size)
+        self.output_proj = nn.Linear(num_layers * fuser_dim, num_layers * tgt_hidden_size)
         # Starting all gates exactly at 0.0 makes it very easy for a short toy run to
         # learn an all-closed hard gate solution, which turns the whole C2C path into
         # an exact identity map at evaluation time. We bias the gates slightly open so
@@ -221,7 +221,7 @@ class ResidualCacheFuser(nn.Module):
                 f"ResidualCacheFuser expected {self.num_layers} aligned layers, got {receiver_block.shape[2]}"
             )
 
-        batch_size, seq_len, _, dst_hidden_size = receiver_block.shape
+        batch_size, seq_len, _, tgt_hidden_size = receiver_block.shape
 
         receiver_projected = F.gelu(self.receiver_proj(self.receiver_norm(receiver_block)))
         sharer_projected = F.gelu(self.sharer_proj(self.sharer_norm(sharer_block)))
@@ -245,7 +245,7 @@ class ResidualCacheFuser(nn.Module):
             collected = stage_collected
 
         residual = F.gelu(self.output_proj(self.output_norm(torch.cat(collected, dim=-1))))
-        residual = residual.view(batch_size, seq_len, self.num_layers, dst_hidden_size)
+        residual = residual.view(batch_size, seq_len, self.num_layers, tgt_hidden_size)
 
         gate = self.sample_gate().view(1, 1, self.num_layers, 1)
         return receiver_block + (gate * residual)
@@ -255,7 +255,7 @@ class DirectionalCacheFuser(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         top_layers_to_fuse: int,
         fuser_dim: int,
         fuser_heads: int,
@@ -268,7 +268,7 @@ class DirectionalCacheFuser(nn.Module):
         self.top_layers_to_fuse = top_layers_to_fuse
         self.key_fuser = ResidualCacheFuser(
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             num_layers=top_layers_to_fuse,
             fuser_dim=fuser_dim,
             fuser_heads=fuser_heads,
@@ -279,7 +279,7 @@ class DirectionalCacheFuser(nn.Module):
         )
         self.value_fuser = ResidualCacheFuser(
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             num_layers=top_layers_to_fuse,
             fuser_dim=fuser_dim,
             fuser_heads=fuser_heads,
@@ -342,8 +342,8 @@ class C2CFuserPool(nn.Module):
         adapters = {}
         for edge in self.edges:
             src_spec = model_specs[edge.src_id]
-            dst_spec = model_specs[edge.dst_id]
-            max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
+            tgt_spec = model_specs[edge.tgt_id]
+            max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
             if top_layers_to_fuse > max_allowed:
                 raise ValueError(
                     f"top_layers_to_fuse={top_layers_to_fuse} exceeds min layer count {max_allowed} "
@@ -352,7 +352,7 @@ class C2CFuserPool(nn.Module):
 
             adapters[edge.id] = DirectionalCacheFuser(
                 src_hidden_size=src_spec.hidden_size,
-                dst_hidden_size=dst_spec.hidden_size,
+                tgt_hidden_size=tgt_spec.hidden_size,
                 top_layers_to_fuse=top_layers_to_fuse,
                 fuser_dim=fuser_dim,
                 fuser_heads=fuser_heads,
@@ -384,9 +384,9 @@ class C2CFuserPool(nn.Module):
         sharer_key_block: torch.Tensor,
         sharer_value_block: torch.Tensor,
         src_name: str,
-        dst_name: str,
+        tgt_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        adapter_name = f"{src_name}_to_{dst_name}"
+        adapter_name = f"{src_name}_to_{tgt_name}"
         if adapter_name not in self.adapters:
             raise ValueError(
                 f"C2C edge {adapter_name} is not available. Active edges: {list(self.edge_ids)}"
@@ -403,8 +403,8 @@ class C2CFuserPool(nn.Module):
         sharer_past_key_values: PastKeyValues,
         receiver_past_key_values: PastKeyValues,
         src_name: str,
-        dst_name: str,
-        dst_spec: ModelSpec,
+        tgt_name: str,
+        tgt_spec: ModelSpec,
     ) -> PastKeyValues:
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
@@ -420,13 +420,13 @@ class C2CFuserPool(nn.Module):
             sharer_key_block=sharer_key_block,
             sharer_value_block=sharer_value_block,
             src_name=src_name,
-            dst_name=dst_name,
+            tgt_name=tgt_name,
         )
         return blocks_to_partial_past_key_values(
             key_block=fused_key,
             value_block=fused_value,
-            num_heads=dst_spec.num_heads,
-            head_dim=dst_spec.head_dim,
+            num_heads=tgt_spec.num_heads,
+            head_dim=tgt_spec.head_dim,
         )
 
 
@@ -457,7 +457,7 @@ class ProjectionMLP(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         hidden_dim: int,
         depth: int,
         mlp_ratio: int,
@@ -467,15 +467,15 @@ class ProjectionMLP(nn.Module):
             raise ValueError("depth must be >= 1")
         layers: List[nn.Module] = [nn.LayerNorm(src_hidden_size)]
         in_dim = src_hidden_size
-        inner_dim = max(hidden_dim, dst_hidden_size)
+        inner_dim = max(hidden_dim, tgt_hidden_size)
         for _ in range(max(depth - 1, 0)):
             layers.extend([
                 nn.Linear(in_dim, inner_dim),
                 nn.GELU(),
             ])
             in_dim = inner_dim
-            inner_dim = max(inner_dim, dst_hidden_size * max(1, mlp_ratio))
-        layers.append(nn.Linear(in_dim, dst_hidden_size))
+            inner_dim = max(inner_dim, tgt_hidden_size * max(1, mlp_ratio))
+        layers.append(nn.Linear(in_dim, tgt_hidden_size))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -486,7 +486,7 @@ class DirectionalCacheProjector(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         top_layers_to_project: int,
         hidden_dim: int,
         depth: int,
@@ -496,14 +496,14 @@ class DirectionalCacheProjector(nn.Module):
         self.top_layers_to_project = top_layers_to_project
         self.key_projector = ProjectionMLP(
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             hidden_dim=hidden_dim,
             depth=depth,
             mlp_ratio=mlp_ratio,
         )
         self.value_projector = ProjectionMLP(
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             hidden_dim=hidden_dim,
             depth=depth,
             mlp_ratio=mlp_ratio,
@@ -545,8 +545,8 @@ class C2CProjectorPool(nn.Module):
         adapters = {}
         for edge in self.edges:
             src_spec = model_specs[edge.src_id]
-            dst_spec = model_specs[edge.dst_id]
-            max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
+            tgt_spec = model_specs[edge.tgt_id]
+            max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
             if top_layers_to_project > max_allowed:
                 raise ValueError(
                     f"top_layers_to_project={top_layers_to_project} exceeds min layer count {max_allowed} "
@@ -554,7 +554,7 @@ class C2CProjectorPool(nn.Module):
                 )
             adapters[edge.id] = DirectionalCacheProjector(
                 src_hidden_size=src_spec.hidden_size,
-                dst_hidden_size=dst_spec.hidden_size,
+                tgt_hidden_size=tgt_spec.hidden_size,
                 top_layers_to_project=top_layers_to_project,
                 hidden_dim=projector_dim,
                 depth=projector_depth,
@@ -570,10 +570,10 @@ class C2CProjectorPool(nn.Module):
         self,
         sharer_past_key_values: PastKeyValues,
         src_name: str,
-        dst_name: str,
-        dst_spec: ModelSpec,
+        tgt_name: str,
+        tgt_spec: ModelSpec,
     ) -> PastKeyValues:
-        adapter_name = f"{src_name}_to_{dst_name}"
+        adapter_name = f"{src_name}_to_{tgt_name}"
         if adapter_name not in self.adapters:
             raise ValueError(
                 f"C2C-Project edge {adapter_name} is not available. "
@@ -590,8 +590,8 @@ class C2CProjectorPool(nn.Module):
         return blocks_to_partial_past_key_values(
             key_block=projected_key,
             value_block=projected_value,
-            num_heads=dst_spec.num_heads,
-            head_dim=dst_spec.head_dim,
+            num_heads=tgt_spec.num_heads,
+            head_dim=tgt_spec.head_dim,
         )
 
 
@@ -772,17 +772,17 @@ def run_train(
                     translator_pool=translator_pool,
                     train_config=config,
                     sharer_past_key_values=past_by_node_id[edge.src_id],
-                    receiver_past_key_values=past_by_node_id[edge.dst_id],
+                    receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 translated_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
+                    base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,

@@ -381,8 +381,8 @@ def compute_correction_metrics_from_traces(
     attn_delta = mixed_trace["attn_additions"] - native_trace["attn_additions"]
     mlp_delta = mixed_trace["mlp_additions"] - native_trace["mlp_additions"]
 
-    source_idx = mapping.dst_layer_end_idx + 1
-    window_input_idx = mapping.dst_layer_start_idx
+    source_idx = mapping.tgt_layer_end_idx + 1
+    window_input_idx = mapping.tgt_layer_start_idx
     initial_shift = hidden_delta[source_idx]
     initial_shift_norm = float(initial_shift.norm().item())
     window_input_norm = float(native_trace["hidden_states"][window_input_idx].norm().item())
@@ -489,8 +489,8 @@ def evaluate_correction(
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
     reference_mapping = layer_mappings[edges[0].id]
-    num_layers = model_specs[edges[0].dst_id].num_layers
-    source_idx = reference_mapping.dst_layer_end_idx + 1
+    num_layers = model_specs[edges[0].tgt_id].num_layers
+    source_idx = reference_mapping.tgt_layer_end_idx + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
     random_collector = MetricCollector()
@@ -525,21 +525,21 @@ def evaluate_correction(
                     translated_key, translated_value, _ = translator_pool.translate_layer_window(
                         past_key_values=past_by_node_id[edge.src_id],
                         src_name=edge.src_id,
-                        dst_name=edge.dst_id,
+                        tgt_name=edge.tgt_id,
                     )
-                    native_target_past = past_by_node_id[edge.dst_id]
+                    native_target_past = past_by_node_id[edge.tgt_id]
                     native_key_block, native_value_block = lp.extract_layer_window_blocks(
                         past_key_values=native_target_past,
-                        start_layer_idx=mapping.dst_layer_start_idx,
+                        start_layer_idx=mapping.tgt_layer_start_idx,
                         num_layers=config.injection_window_size,
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
-                        target_model=models[edge.dst_id],
+                        target_model=models[edge.tgt_id],
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=mapping.dst_layer_start_idx,
+                        target_start_layer_idx=mapping.tgt_layer_start_idx,
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
-                        dst_spec=model_specs[edge.dst_id],
+                        tgt_spec=model_specs[edge.tgt_id],
                     )
                     random_key_block, random_value_block = build_random_matched_window(
                         native_key_block=native_key_block,
@@ -548,15 +548,15 @@ def evaluate_correction(
                         translated_value_block=translated_value,
                     )
                     random_past = lp.replay_target_prefill_with_injected_window(
-                        target_model=models[edge.dst_id],
+                        target_model=models[edge.tgt_id],
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=mapping.dst_layer_start_idx,
+                        target_start_layer_idx=mapping.tgt_layer_start_idx,
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
-                        dst_spec=model_specs[edge.dst_id],
+                        tgt_spec=model_specs[edge.tgt_id],
                     )
 
-                    target_model = models[edge.dst_id]
+                    target_model = models[edge.tgt_id]
                     native_past = maybe_append_input_ids(target_model, native_target_past, question_cache_ids)
                     fullmix_past = maybe_append_input_ids(target_model, full_mix_past, question_cache_ids)
                     random_past = maybe_append_input_ids(target_model, random_past, question_cache_ids)
@@ -714,10 +714,10 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_m
     mapping = next(iter(layer_mappings.values()))
     full_mix = metrics["full_mix"]
     random_control = metrics["random_control"]
-    post_window_boundary_idx = mapping.dst_layer_end_idx + 1
+    post_window_boundary_idx = mapping.tgt_layer_end_idx + 1
     first_edge_id = next(iter(layer_mappings.keys()))
-    dst_id = first_edge_id.split("_to_")[1]
-    num_upper_layers = max(0, model_specs[dst_id].num_layers - post_window_boundary_idx)
+    tgt_id = first_edge_id.split("_to_")[1]
+    num_upper_layers = max(0, model_specs[tgt_id].num_layers - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
@@ -725,8 +725,8 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_m
         translated_num_layers=config.injection_window_size,
         source_layer_start_idx=mapping.src_layer_start_idx,
         source_layer_end_idx=mapping.src_layer_end_idx,
-        target_layer_start_idx=mapping.dst_layer_start_idx,
-        target_layer_end_idx=mapping.dst_layer_end_idx,
+        target_layer_start_idx=mapping.tgt_layer_start_idx,
+        target_layer_end_idx=mapping.tgt_layer_end_idx,
         num_samples=metrics.get("processed_examples", config.eval_max_examples_per_dataset),
         num_tokens=full_mix["num_tokens"],
         average_initial_shift_norm=float(full_mix["average_initial_shift_norm"]),
@@ -767,7 +767,7 @@ def plot_run_trajectories(run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path,
 
     source_idx = metrics["trajectory"]["source_idx"]
     mapping = next(iter(metrics["layer_mappings"].values()))
-    injected_window_label = format_layer_range(mapping["dst_layer_start_idx"], mapping["dst_layer_end_idx"])
+    injected_window_label = format_layer_range(mapping["tgt_layer_start_idx"], mapping["tgt_layer_end_idx"])
     token_00 = metrics["trajectory"]["token_trajectories"].get("token_00", {})
     full = token_00.get("full_mix", {})
     rand = token_00.get("random", {})

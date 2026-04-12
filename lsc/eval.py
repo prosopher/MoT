@@ -60,41 +60,41 @@ def evaluate_dataset(
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
 
                 target_top = slice_top_layers(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=model_specs[edge.dst_id].num_layers,
+                    past_key_values=past_by_node_id[edge.tgt_id],
+                    top_layers_to_translate=model_specs[edge.tgt_id].num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
                 mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
+                    base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
 
                 translated_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 native_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    model=models[edge.tgt_id],
+                    past_key_values=past_by_node_id[edge.tgt_id],
                     question_cache_ids=question_cache_ids,
                 )
 
                 translated_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=translated_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
@@ -188,23 +188,23 @@ def evaluate_generation_dataset(
                 translated_top_past = translator_pool.translate_top_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
 
                 target_top = slice_top_layers(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=model_specs[edge.dst_id].num_layers,
+                    past_key_values=past_by_node_id[edge.tgt_id],
+                    top_layers_to_translate=model_specs[edge.tgt_id].num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
                 mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
+                    base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
 
                 translated_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
@@ -212,9 +212,9 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
                     eval_config=eval_config,
                     question_cache_ids=question_cache_ids,

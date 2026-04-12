@@ -13,7 +13,7 @@ class Node:
 class Edge:
     id: str
     src_id: str
-    dst_id: str
+    tgt_id: str
 
 
 def index_to_node_id(index: int) -> str:
@@ -48,24 +48,24 @@ def build_nodes_from_model_ids(model_ids: str) -> List[Node]:
 def build_allowed_edge_ids(nodes: List[Node]) -> List[str]:
     edge_ids = []
     for src_node in nodes:
-        for dst_node in nodes:
-            if src_node.id == dst_node.id:
+        for tgt_node in nodes:
+            if src_node.id == tgt_node.id:
                 continue
-            edge_ids.append(f"{src_node.id}_to_{dst_node.id}")
+            edge_ids.append(f"{src_node.id}_to_{tgt_node.id}")
     return edge_ids
 
 
 def build_all_edges_from_nodes(nodes: List[Node]) -> List[Edge]:
     edges = []
     for src_node in nodes:
-        for dst_node in nodes:
-            if src_node.id == dst_node.id:
+        for tgt_node in nodes:
+            if src_node.id == tgt_node.id:
                 continue
             edges.append(
                 Edge(
-                    id=f"{src_node.id}_to_{dst_node.id}",
+                    id=f"{src_node.id}_to_{tgt_node.id}",
                     src_id=src_node.id,
-                    dst_id=dst_node.id,
+                    tgt_id=tgt_node.id,
                 )
             )
     return edges
@@ -117,10 +117,10 @@ def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edg
         Edge(
             id=edge_id,
             src_id=src_id,
-            dst_id=dst_id,
+            tgt_id=tgt_id,
         )
         for edge_id in edge_ids
-        for src_id, dst_id in [edge_id.split("_to_", maxsplit=1)]
+        for src_id, tgt_id in [edge_id.split("_to_", maxsplit=1)]
     ]
 
 

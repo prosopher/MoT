@@ -61,43 +61,43 @@ def evaluate_dataset(
                 mixed_target_past, translated_window_past, mapping = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
 
                 native_target_window = blocks_to_partial_past_key_values(
                     *extract_layer_window_blocks(
-                        past_key_values=past_by_node_id[edge.dst_id],
-                        start_layer_idx=mapping.dst_layer_start_idx,
+                        past_key_values=past_by_node_id[edge.tgt_id],
+                        start_layer_idx=mapping.tgt_layer_start_idx,
                         num_layers=train_config.injection_window_size,
                     ),
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
+                    num_heads=model_specs[edge.tgt_id].num_heads,
+                    head_dim=model_specs[edge.tgt_id].head_dim,
                 )
                 cosine_value = cosine_similarity_between_past(translated_window_past, native_target_window)
 
                 translated_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 native_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    model=models[edge.tgt_id],
+                    past_key_values=past_by_node_id[edge.tgt_id],
                     question_cache_ids=question_cache_ids,
                 )
 
                 translated_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=translated_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
@@ -191,25 +191,25 @@ def evaluate_generation_dataset(
                 mixed_target_past, translated_window_past, mapping = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
 
                 native_target_window = blocks_to_partial_past_key_values(
                     *extract_layer_window_blocks(
-                        past_key_values=past_by_node_id[edge.dst_id],
-                        start_layer_idx=mapping.dst_layer_start_idx,
+                        past_key_values=past_by_node_id[edge.tgt_id],
+                        start_layer_idx=mapping.tgt_layer_start_idx,
                         num_layers=train_config.injection_window_size,
                     ),
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
+                    num_heads=model_specs[edge.tgt_id].num_heads,
+                    head_dim=model_specs[edge.tgt_id].head_dim,
                 )
                 cosine_value = cosine_similarity_between_past(translated_window_past, native_target_window)
 
                 translated_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
@@ -217,9 +217,9 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=models[edge.dst_id],
+                    model=models[edge.tgt_id],
                     tokenizer=tokenizer,
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
                     eval_config=eval_config,
                     question_cache_ids=question_cache_ids,

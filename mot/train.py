@@ -19,8 +19,8 @@ MOT_VARIANTS = {"single", "mot"}
 class LayerMapping:
     src_layer_start_idx: int
     src_layer_end_idx: int
-    dst_layer_start_idx: int
-    dst_layer_end_idx: int
+    tgt_layer_start_idx: int
+    tgt_layer_end_idx: int
 
 
 @dataclass
@@ -74,13 +74,13 @@ class CrossLayerWindowTranslator(nn.Module):
     Recurrent cross-attention translator following the LSC translator pattern.
 
     Input:  [batch, seq, num_layers, src_hidden]
-    Output: [batch, seq, num_layers, dst_hidden]
+    Output: [batch, seq, num_layers, tgt_hidden]
     """
 
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         num_layers: int,
         translator_dim: int,
         translator_heads: int,
@@ -112,7 +112,7 @@ class CrossLayerWindowTranslator(nn.Module):
             ]
         )
         self.output_norm = nn.LayerNorm(num_layers * translator_dim)
-        self.output_proj = nn.Linear(num_layers * translator_dim, num_layers * dst_hidden_size)
+        self.output_proj = nn.Linear(num_layers * translator_dim, num_layers * tgt_hidden_size)
 
     def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         if layer_window_cache.ndim != 4:
@@ -148,7 +148,7 @@ class MixtureOfTranslators(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         num_layers: int,
         translator_dim: int,
         translator_heads: int,
@@ -170,7 +170,7 @@ class MixtureOfTranslators(nn.Module):
             [
                 CrossLayerWindowTranslator(
                     src_hidden_size=src_hidden_size,
-                    dst_hidden_size=dst_hidden_size,
+                    tgt_hidden_size=tgt_hidden_size,
                     num_layers=num_layers,
                     translator_dim=translator_dim,
                     translator_heads=translator_heads,
@@ -212,7 +212,7 @@ def build_window_translator(
     *,
     variant: str,
     src_hidden_size: int,
-    dst_hidden_size: int,
+    tgt_hidden_size: int,
     num_layers: int,
     translator_dim: int,
     translator_heads: int,
@@ -224,7 +224,7 @@ def build_window_translator(
     if variant == "single":
         return CrossLayerWindowTranslator(
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             num_layers=num_layers,
             translator_dim=translator_dim,
             translator_heads=translator_heads,
@@ -234,7 +234,7 @@ def build_window_translator(
     if variant == "mot":
         return MixtureOfTranslators(
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             num_layers=num_layers,
             translator_dim=translator_dim,
             translator_heads=translator_heads,
@@ -250,7 +250,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
-        dst_hidden_size: int,
+        tgt_hidden_size: int,
         num_layers: int,
         translator_dim: int,
         translator_heads: int,
@@ -268,7 +268,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
         self.key_translator = build_window_translator(
             variant=variant,
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             num_layers=num_layers,
             translator_dim=translator_dim,
             translator_heads=translator_heads,
@@ -280,7 +280,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
         self.value_translator = build_window_translator(
             variant=variant,
             src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
+            tgt_hidden_size=tgt_hidden_size,
             num_layers=num_layers,
             translator_dim=translator_dim,
             translator_heads=translator_heads,
@@ -340,7 +340,7 @@ class LayerWindowTranslatorPool(nn.Module):
         for edge in self.edges:
             adapters[edge.id] = LayerWindowDirectionalTranslator(
                 src_hidden_size=model_specs[edge.src_id].hidden_size,
-                dst_hidden_size=model_specs[edge.dst_id].hidden_size,
+                tgt_hidden_size=model_specs[edge.tgt_id].hidden_size,
                 num_layers=self.injection_window_size,
                 translator_dim=translator_dim,
                 translator_heads=translator_heads,
@@ -356,9 +356,9 @@ class LayerWindowTranslatorPool(nn.Module):
         self,
         past_key_values: PastKeyValues,
         src_name: str,
-        dst_name: str,
+        tgt_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, LayerMapping]:
-        edge_id = f"{src_name}_to_{dst_name}"
+        edge_id = f"{src_name}_to_{tgt_name}"
         if edge_id not in self.adapters:
             raise ValueError(
                 f"Translator edge {edge_id} is not available. "
@@ -380,27 +380,27 @@ class LayerWindowTranslatorPool(nn.Module):
         prefix_input_ids: torch.Tensor,
         target_model: PreTrainedModel,
         src_name: str,
-        dst_name: str,
-        dst_spec: ModelSpec,
+        tgt_name: str,
+        tgt_spec: ModelSpec,
     ) -> Tuple[PastKeyValues, PastKeyValues, LayerMapping]:
         translated_key, translated_value, mapping = self.translate_layer_window(
             past_key_values=source_past_key_values,
             src_name=src_name,
-            dst_name=dst_name,
+            tgt_name=tgt_name,
         )
         translated_window_past = blocks_to_partial_past_key_values(
             key_block=translated_key,
             value_block=translated_value,
-            num_heads=dst_spec.num_heads,
-            head_dim=dst_spec.head_dim,
+            num_heads=tgt_spec.num_heads,
+            head_dim=tgt_spec.head_dim,
         )
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=prefix_input_ids,
-            target_start_layer_idx=mapping.dst_layer_start_idx,
+            target_start_layer_idx=mapping.tgt_layer_start_idx,
             injected_key_block=translated_key,
             injected_value_block=translated_value,
-            dst_spec=dst_spec,
+            tgt_spec=tgt_spec,
         )
         return mixed_target_past, translated_window_past, mapping
 
@@ -418,22 +418,22 @@ def build_layer_mappings(
     mappings: Dict[str, LayerMapping] = {}
     for edge in edges:
         src_spec = model_specs[edge.src_id]
-        dst_spec = model_specs[edge.dst_id]
+        tgt_spec = model_specs[edge.tgt_id]
 
-        dst_layer_start_idx = injection_layer_start_idx
-        dst_layer_end_idx = dst_layer_start_idx + requested_window_size - 1
-        if dst_layer_end_idx >= dst_spec.num_layers:
+        tgt_layer_start_idx = injection_layer_start_idx
+        tgt_layer_end_idx = tgt_layer_start_idx + requested_window_size - 1
+        if tgt_layer_end_idx >= tgt_spec.num_layers:
             raise ValueError(
-                f"edge={edge.id} cannot use injection_layer_start_idx={dst_layer_start_idx} "
-                f"with injection_window_size={requested_window_size}: target end layer {dst_layer_end_idx} exceeds "
-                f"target last layer {dst_spec.num_layers - 1}"
+                f"edge={edge.id} cannot use injection_layer_start_idx={tgt_layer_start_idx} "
+                f"with injection_window_size={requested_window_size}: target end layer {tgt_layer_end_idx} exceeds "
+                f"target last layer {tgt_spec.num_layers - 1}"
             )
 
-        dst_depth_from_top = dst_spec.num_layers - 1 - dst_layer_start_idx
-        src_layer_start_idx = src_spec.num_layers - 1 - dst_depth_from_top
+        tgt_depth_from_top = tgt_spec.num_layers - 1 - tgt_layer_start_idx
+        src_layer_start_idx = src_spec.num_layers - 1 - tgt_depth_from_top
         if not (0 <= src_layer_start_idx < src_spec.num_layers):
             raise ValueError(
-                f"edge={edge.id} cannot align source window to target top-depth {dst_depth_from_top}: "
+                f"edge={edge.id} cannot align source window to target top-depth {tgt_depth_from_top}: "
                 f"computed src_layer_start_idx={src_layer_start_idx} is outside [0, {src_spec.num_layers - 1}]"
             )
 
@@ -447,8 +447,8 @@ def build_layer_mappings(
         mappings[edge.id] = LayerMapping(
             src_layer_start_idx=src_layer_start_idx,
             src_layer_end_idx=src_layer_end_idx,
-            dst_layer_start_idx=dst_layer_start_idx,
-            dst_layer_end_idx=dst_layer_end_idx,
+            tgt_layer_start_idx=tgt_layer_start_idx,
+            tgt_layer_end_idx=tgt_layer_end_idx,
         )
     return mappings
 
@@ -591,13 +591,13 @@ def replay_target_prefill_with_injected_window(
     target_start_layer_idx: int,
     injected_key_block: torch.Tensor,
     injected_value_block: torch.Tensor,
-    dst_spec: ModelSpec,
+    tgt_spec: ModelSpec,
 ) -> PastKeyValues:
     injected_window = blocks_to_partial_past_key_values(
         key_block=injected_key_block,
         value_block=injected_value_block,
-        num_heads=dst_spec.num_heads,
-        head_dim=dst_spec.head_dim,
+        num_heads=tgt_spec.num_heads,
+        head_dim=tgt_spec.head_dim,
     )
     translated_num_layers = len(injected_window)
 
@@ -787,18 +787,18 @@ def run_train(
                 mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                    tgt_name=edge.tgt_id,
+                    tgt_spec=model_specs[edge.tgt_id],
                 )
                 direction_loss = compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=models[edge.dst_id],
+                    target_model=models[edge.tgt_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.dst_id],
-                    target_start_layer_idx=mapping.dst_layer_start_idx,
+                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                    target_start_layer_idx=mapping.tgt_layer_start_idx,
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 
