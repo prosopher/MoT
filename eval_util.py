@@ -366,8 +366,8 @@ def evaluate_openwebtext_validation_loss_metrics(
     nodes,
     edges,
     logger: logging.Logger,
-    evaluate_direction_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
-    summarize_direction_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
+    evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
+    summarize_edge_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
         tokenizer=tokenizer,
@@ -406,7 +406,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
         batch_examples = int(input_ids.shape[0])
         for edge in edges:
-            edge_eval_result = evaluate_direction_losses_fn(
+            edge_losses, edge_profiles = evaluate_edge_losses_fn(
                 edge_id=edge.id,
                 edge=edge,
                 prefix_cache_ids=prefix_cache_ids,
@@ -414,12 +414,6 @@ def evaluate_openwebtext_validation_loss_metrics(
                 lm_labels=lm_labels,
                 past_by_node_id=past_by_node_id,
             )
-            if isinstance(edge_eval_result, tuple):
-                edge_losses, edge_profiles = edge_eval_result
-            else:
-                edge_losses = edge_eval_result
-                edge_profiles = {}
-
             if not edge_losses:
                 continue
             for metric_name, loss_value in edge_losses.items():
@@ -461,10 +455,7 @@ def evaluate_openwebtext_validation_loss_metrics(
             metric_name: accumulator.summary()
             for metric_name, accumulator in profile_accumulators[edge.id].items()
         }
-        try:
-            summaries[edge.id] = summarize_direction_fn(average_losses, count, profile_summaries)
-        except TypeError:
-            summaries[edge.id] = summarize_direction_fn(average_losses, count)
+        summaries[edge.id] = summarize_edge_fn(average_losses, count, profile_summaries)
 
     return summaries
 
@@ -556,8 +547,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
         nodes=nodes,
         edges=edges,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_edge_losses_fn,
-        summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
+        evaluate_edge_losses_fn=evaluate_edge_losses_fn,
+        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name="translated",
@@ -659,8 +650,8 @@ def evaluate_openwebtext_validation_loss_replay(
         nodes=nodes,
         edges=edges,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_edge_losses_fn,
-        summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
+        evaluate_edge_losses_fn=evaluate_edge_losses_fn,
+        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name="translated",

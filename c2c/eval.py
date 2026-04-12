@@ -527,8 +527,8 @@ def evaluate_openwebtext_validation_loss(
         nodes=nodes,
         edges=edges,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_edge_losses_fn,
-        summarize_direction_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
+        evaluate_edge_losses_fn=evaluate_edge_losses_fn,
+        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name=get_translation_loss_name(train_config),

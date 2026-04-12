@@ -1387,8 +1387,8 @@ def run_eval(
         lm_input_ids: torch.Tensor,
         lm_labels: torch.Tensor,
         past_by_node_id,
-    ) -> Dict[str, float]:
-        return compute_openwebtext_native_and_full_mix_losses(
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
+        edge_losses = compute_openwebtext_native_and_full_mix_losses(
             edge=edge,
             prefix_cache_ids=prefix_cache_ids,
             lm_input_ids=lm_input_ids,
@@ -1398,8 +1398,9 @@ def run_eval(
             model_specs=model_specs,
             models=models,
         )
+        return edge_losses, {}
 
-    openwebtext_loss_by_direction = evaluate_openwebtext_validation_loss_metrics(
+    openwebtext_loss_by_edge = evaluate_openwebtext_validation_loss_metrics(
         tokenizer=tokenizer,
         config=config,
         batch_size=config.eval_batch_size,
@@ -1412,8 +1413,8 @@ def run_eval(
         nodes=nodes,
         edges=edges,
         logger=logger,
-        evaluate_direction_losses_fn=evaluate_openwebtext_control_losses,
-        summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
+        evaluate_edge_losses_fn=evaluate_openwebtext_control_losses,
+        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
             average_losses,
             count,
             primary_name="full_mix",
@@ -1428,7 +1429,7 @@ def run_eval(
         ),
     )
     for edge in edges:
-        row = openwebtext_loss_by_direction[edge.id]
+        row = openwebtext_loss_by_edge[edge.id]
         logger.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | count=%d",
             edge.id,
@@ -1518,7 +1519,7 @@ def run_eval(
     average_native_to_full_mix_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_full_mix_logit_kl")
     average_full_mix_to_dir_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "full_mix_to_dir_only_logit_kl")
     average_full_mix_to_mag_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "full_mix_to_mag_only_logit_kl")
-    openwebtext_loss_results = {"OpenWebText/validation": openwebtext_loss_by_direction}
+    openwebtext_loss_results = {"OpenWebText/validation": openwebtext_loss_by_edge}
     average_native_loss = compute_average_metric(openwebtext_loss_results, "native_loss")
     average_full_mix_loss = compute_average_metric(openwebtext_loss_results, "full_mix_loss")
 
@@ -1562,7 +1563,7 @@ def run_eval(
         "average_delta_dir_only": average_delta_dir_only,
         "average_delta_mag_only": average_delta_mag_only,
         "average_delta_full_mix": average_delta_full_mix,
-        "openwebtext_validation_loss": openwebtext_loss_by_direction,
+        "openwebtext_validation_loss": openwebtext_loss_by_edge,
         "average_native_loss": average_native_loss,
         "average_full_mix_loss": average_full_mix_loss,
         f"average_{metric_name}": average_full_mix_metric,
