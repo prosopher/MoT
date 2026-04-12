@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from core.config import Config
 from core.context import Context
 from core.model_manager import ModelManager
+from core.model_spec import ModelSpec
 from core.train_util import *
 
 
@@ -314,8 +315,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
 class LayerWindowTranslatorPool(nn.Module):
     def __init__(
         self,
-        model_specs: Dict[str, ModelSpec],
-        edges: List[Edge],
+        ctx: Context,
         layer_mappings: Dict[str, LayerMapping],
         injection_window_size: int,
         translator_dim: int,
@@ -330,18 +330,18 @@ class LayerWindowTranslatorPool(nn.Module):
         if not edges:
             raise ValueError("edges must contain at least one edge.")
 
-        self.model_specs = model_specs
+        self.mm = ctx.mm
         self.layer_mappings = layer_mappings
         self.injection_window_size = injection_window_size
-        self.edges = tuple(edges)
-        self.edge_ids = tuple(edge.id for edge in edges)
-        self.edges_by_id = build_edge_map(edges)
+        self.edges = tuple(ctx.edges)
+        self.edge_ids = tuple(edge.id for edge in ctx.edges)
+        self.edges_by_id = build_edge_map(ctx.edges)
 
         adapters = {}
         for edge in self.edges:
             adapters[edge.id] = LayerWindowDirectionalTranslator(
-                src_hidden_size=model_specs[edge.src_id].hidden_size,
-                tgt_hidden_size=model_specs[edge.tgt_id].hidden_size,
+                src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
+                tgt_hidden_size=self.mm.get_model_spec(edge.tgt_id).hidden_size,
                 num_layers=self.injection_window_size,
                 translator_dim=translator_dim,
                 translator_heads=translator_heads,
@@ -649,8 +649,7 @@ def build_translator_pool(
     edges = ctx.edges
     layer_mappings = build_layer_mappings(ctx, edges)
     translator_pool = LayerWindowTranslatorPool(
-        model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
-        edges=edges,
+        ctx=ctx,
         layer_mappings=layer_mappings,
         injection_window_size=config.injection_window_size,
         translator_dim=config.translator_dim,
@@ -694,7 +693,7 @@ def load_translator_pool_from_checkpoint(
         config,
         nodes,
         edges,
-        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
+        ModelManager(models),
         tokenizer,
     )
     translator_pool, layer_mappings = build_translator_pool(ctx)

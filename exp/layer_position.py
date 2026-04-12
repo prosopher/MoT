@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
 from core.common import *
 from core.context import Context
 from core.model_manager import ModelManager
+from core.model_spec import ModelSpec
 from core.eval_util import *
 from mot.train import *
 from core.train_util import *
@@ -1573,7 +1574,7 @@ def main() -> None:
         config,
         nodes,
         edges,
-        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
+        ModelManager(models),
         tokenizer,
     )
     run_dir = build_run_output_dir(config)

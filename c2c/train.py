@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from core.config import Config
 from core.context import Context
 from core.model_manager import ModelManager
+from core.model_spec import ModelSpec
 from core.train_util import *
 
 
@@ -318,8 +319,7 @@ class DirectionalCacheFuser(nn.Module):
 class C2CFuserPool(nn.Module):
     def __init__(
         self,
-        model_specs: Dict[str, ModelSpec],
-        edges: List[Edge],
+        ctx: Context,
         top_layers_to_fuse: int,
         fuser_dim: int,
         fuser_heads: int,
@@ -331,19 +331,17 @@ class C2CFuserPool(nn.Module):
         super().__init__()
         if top_layers_to_fuse < 1:
             raise ValueError("top_layers_to_fuse must be >= 1")
-        if not edges:
-            raise ValueError("edges must contain at least one edge")
 
-        self.model_specs = model_specs
+        self.mm = ctx.mm
         self.top_layers_to_fuse = top_layers_to_fuse
-        self.edges = tuple(edges)
-        self.edge_ids = tuple(edge.id for edge in edges)
-        self.edges_by_id = build_edge_map(edges)
+        self.edges = tuple(ctx.edges)
+        self.edge_ids = tuple(edge.id for edge in ctx.edges)
+        self.edges_by_id = build_edge_map(ctx.edges)
 
         adapters = {}
         for edge in self.edges:
-            src_spec = model_specs[edge.src_id]
-            tgt_spec = model_specs[edge.tgt_id]
+            src_spec = self.mm.get_model_spec(edge.src_id)
+            tgt_spec = self.mm.get_model_spec(edge.tgt_id)
             max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
             if top_layers_to_fuse > max_allowed:
                 raise ValueError(
@@ -524,8 +522,7 @@ class DirectionalCacheProjector(nn.Module):
 class C2CProjectorPool(nn.Module):
     def __init__(
         self,
-        model_specs: Dict[str, ModelSpec],
-        edges: List[Edge],
+        ctx: Context,
         top_layers_to_project: int,
         projector_dim: int,
         projector_depth: int,
@@ -534,19 +531,17 @@ class C2CProjectorPool(nn.Module):
         super().__init__()
         if top_layers_to_project < 1:
             raise ValueError("top_layers_to_project must be >= 1")
-        if not edges:
-            raise ValueError("edges must contain at least one edge")
 
-        self.model_specs = model_specs
+        self.mm = ctx.mm
         self.top_layers_to_project = top_layers_to_project
-        self.edges = tuple(edges)
-        self.edge_ids = tuple(edge.id for edge in edges)
-        self.edges_by_id = build_edge_map(edges)
+        self.edges = tuple(ctx.edges)
+        self.edge_ids = tuple(edge.id for edge in ctx.edges)
+        self.edges_by_id = build_edge_map(ctx.edges)
 
         adapters = {}
         for edge in self.edges:
-            src_spec = model_specs[edge.src_id]
-            tgt_spec = model_specs[edge.tgt_id]
+            src_spec = self.mm.get_model_spec(edge.src_id)
+            tgt_spec = self.mm.get_model_spec(edge.tgt_id)
             max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
             if top_layers_to_project > max_allowed:
                 raise ValueError(
@@ -603,8 +598,7 @@ def build_translator_pool(
     edges = ctx.edges
     if is_projection_only_variant(config):
         translator_pool = C2CProjectorPool(
-            model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
-            edges=edges,
+            ctx=ctx,
             top_layers_to_project=config.top_layers_to_project,
             projector_dim=config.projector_dim,
             projector_depth=config.projector_depth,
@@ -612,8 +606,7 @@ def build_translator_pool(
         )
     else:
         translator_pool = C2CFuserPool(
-            model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
-            edges=edges,
+            ctx=ctx,
             top_layers_to_fuse=config.top_layers_to_fuse,
             fuser_dim=config.fuser_dim,
             fuser_heads=config.fuser_heads,
@@ -655,7 +648,7 @@ def load_translator_pool_from_checkpoint(
         config,
         nodes,
         edges,
-        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
+        ModelManager(models),
         tokenizer,
     )
     translator_pool = build_translator_pool(ctx)

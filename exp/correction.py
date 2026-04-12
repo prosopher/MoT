@@ -1008,12 +1008,11 @@ def main() -> None:
     set_seed(config.seed)
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     models, tokenizer = lp.build_models_for_experiment(config, nodes)
-    model_specs = build_model_specs_for_nodes(models, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models, model_specs),
+        ModelManager(models),
         tokenizer,
     )
     run_dir = build_run_output_dir(config)

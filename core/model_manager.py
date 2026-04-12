@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict
 
 from transformers import PreTrainedModel
 
@@ -29,16 +29,12 @@ class ModelManager:
     def __init__(
         self,
         models: Dict[str, PreTrainedModel],
-        model_specs: Optional[Dict[str, ModelSpec]] = None,
     ) -> None:
         self._models = dict(models)
-        if model_specs is None:
-            self._model_specs = {
-                model_id: get_model_spec(model)
-                for model_id, model in self._models.items()
-            }
-        else:
-            self._model_specs = dict(model_specs)
+        self._model_specs = {
+            model_id: get_model_spec(model)
+            for model_id, model in self._models.items()
+        }
 
     def get_model(self, model_id: str) -> PreTrainedModel:
         return self._models[model_id]

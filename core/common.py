@@ -18,8 +18,6 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-from .model_manager import get_model_spec
-from .model_spec import ModelSpec
 from .topology import *
 
 
@@ -229,12 +227,6 @@ def load_frozen_model(model_id: str, device: str, dtype: str = "float32") -> Pre
     freeze_model(model)
     return model
 
-
-def build_model_specs_for_nodes(
-    models: Dict[str, PreTrainedModel],
-    nodes: List[Node],
-) -> Dict[str, ModelSpec]:
-    return {node.id: get_model_spec(models[node.id]) for node in nodes}
 
 
 @torch.no_grad()

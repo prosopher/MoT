@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from core.config import Config
 from core.context import Context
 from core.model_manager import ModelManager
+from core.model_spec import ModelSpec
 from core.train_util import *
 
 
@@ -214,7 +215,7 @@ class ModelLatentAdapter(nn.Module):
 class SharedKVTranslatorPool(nn.Module):
     def __init__(
         self,
-        model_specs: Dict[str, ModelSpec],
+        ctx: Context,
         shared_slots: int,
         shared_dim: int,
         translator_dim: int,
@@ -222,20 +223,20 @@ class SharedKVTranslatorPool(nn.Module):
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.model_specs = model_specs
+        self.mm = ctx.mm
         self.adapters = nn.ModuleDict(
             {
-                name: ModelLatentAdapter(
-                    model_name=name,
-                    local_layers=spec.num_layers,
-                    local_hidden_size=spec.hidden_size,
+                node.model_id: ModelLatentAdapter(
+                    model_name=node.model_id,
+                    local_layers=self.mm.get_model_spec(node.model_id).num_layers,
+                    local_hidden_size=self.mm.get_model_spec(node.model_id).hidden_size,
                     shared_slots=shared_slots,
                     shared_dim=shared_dim,
                     translator_dim=translator_dim,
                     translator_heads=translator_heads,
                     mlp_ratio=mlp_ratio,
                 )
-                for name, spec in model_specs.items()
+                for node in ctx.nodes
             }
         )
 
@@ -256,7 +257,7 @@ class SharedKVTranslatorPool(nn.Module):
         tgt_name: str,
         tgt_spec: ModelSpec,
     ) -> PastKeyValues:
-        src_top_layers = self.model_specs[src_name].num_layers
+        src_top_layers = self.mm.get_model_spec(src_name).num_layers
         src_top_past = slice_top_layers(
             past_key_values=past_key_values,
             top_layers_to_translate=src_top_layers,
@@ -303,7 +304,7 @@ def build_translator_pool(
 ) -> SharedKVTranslatorPool:
     config = ctx.config
     translator_pool = SharedKVTranslatorPool(
-        model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
+        ctx=ctx,
         shared_slots=config.shared_slots,
         shared_dim=config.shared_dim,
         translator_dim=config.translator_dim,

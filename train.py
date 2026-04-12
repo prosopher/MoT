@@ -2,7 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 
-from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, build_model_specs_for_nodes
+from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import build_nodes_and_edges
@@ -62,7 +62,7 @@ def main() -> None:
         config,
         nodes,
         edges,
-        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
+        ModelManager(models),
         tokenizer,
     )
 
