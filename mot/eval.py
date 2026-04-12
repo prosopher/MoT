@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from core.context import Context
 from core.eval_util import *
 from core.train_util import blocks_to_partial_past_key_values
 from mot.train import (
@@ -14,18 +15,19 @@ from mot.train import (
 
 @torch.inference_mode()
 def evaluate_dataset(
+    ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    model_specs,
     models,
     nodes,
     edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    train_config = ctx.config
+    model_specs = ctx.model_specs
     device = train_config.device
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
@@ -128,18 +130,19 @@ def evaluate_dataset(
 
 @torch.inference_mode()
 def evaluate_generation_dataset(
+    ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    model_specs,
     models,
     nodes,
     edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    train_config = ctx.config
+    model_specs = ctx.model_specs
     device = train_config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
@@ -249,7 +252,19 @@ def evaluate_generation_dataset(
     return summarize_generation_path_metrics(path_metrics)
 
 
-def run_eval(eval_config: EvalConfig) -> Path:
+
+def run_eval(
+    ctx: Context,
+    eval_config: EvalConfig,
+    translator_pool,
+    models,
+    tokenizer,
+    nodes,
+    edges,
+    layer_mappings,
+) -> Path:
+    train_config = ctx.config
+    model_specs = ctx.model_specs
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
     if eval_config.output_path is None:
@@ -270,21 +285,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
 
-    (
-        train_config,
-        translator_pool,
-        model_specs,
-        models,
-        tokenizer,
-        nodes,
-        edges,
-        layer_mappings,
-    ) = load_translator_pool_from_checkpoint(
-        checkpoint_path=str(checkpoint_path),
-        device_override=eval_config.device,
-    )
-
-
     translator_pool.eval()
     for model in models.values():
         model.eval()
@@ -303,11 +303,10 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     logger.info("Preparing validation dataloader for OpenWebText/validation")
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
+        ctx=ctx,
         tokenizer=tokenizer,
-        train_config=train_config,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        dst_model_specs=model_specs,
         models=models,
         nodes=nodes,
         edges=edges,
@@ -334,13 +333,12 @@ def run_eval(eval_config: EvalConfig) -> Path:
         )
 
         results = evaluate_dataset(
+            ctx=ctx,
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
-            train_config=train_config,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            model_specs=model_specs,
             models=models,
             nodes=nodes,
             edges=edges,
@@ -368,13 +366,12 @@ def run_eval(eval_config: EvalConfig) -> Path:
         )
 
         results = evaluate_generation_dataset(
+            ctx=ctx,
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
-            train_config=train_config,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            model_specs=model_specs,
             models=models,
             nodes=nodes,
             edges=edges,

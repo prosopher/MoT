@@ -390,6 +390,13 @@ def get_model_spec(model: PreTrainedModel) -> ModelSpec:
     )
 
 
+def build_model_specs_for_nodes(
+    models: Dict[str, PreTrainedModel],
+    nodes: List[Node],
+) -> Dict[str, ModelSpec]:
+    return {node.id: get_model_spec(models[node.id]) for node in nodes}
+
+
 @torch.no_grad()
 def extract_past_key_values(model: PreTrainedModel, input_ids: torch.Tensor) -> PastKeyValues:
     outputs = model(input_ids=input_ids, use_cache=True)

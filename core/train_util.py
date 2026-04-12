@@ -18,7 +18,7 @@ class InfiniteDataLoader:
             return next(self.iterator)
 
 
-def build_training_dataloader(tokenizer: PreTrainedTokenizerBase, config) -> InfiniteDataLoader:
+def build_training_dataloader(config, tokenizer: PreTrainedTokenizerBase) -> InfiniteDataLoader:
     dataset = OpenWebTextSequenceStream(
         tokenizer=tokenizer,
         sequence_length=config.total_tokens,
@@ -102,9 +102,10 @@ class WarmupCosineScheduler:
 
 
 def build_models_and_tokenizer(config) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
+    model_directions = getattr(config, "model_directions", None)
     nodes, edges = build_nodes_and_edges(
         config.model_ids,
-        getattr(config, "model_directions", None),
+        model_directions,
     )
     tokenizer = load_tokenizer(nodes[0].model_id)
     models = {
@@ -115,11 +116,11 @@ def build_models_and_tokenizer(config) -> Tuple[Dict[str, PreTrainedModel], PreT
 
 
 def save_checkpoint(
+    config,
     output_path: str,
     translator_pool: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: WarmupCosineScheduler,
-    train_config,
     step: int,
     extra: Optional[Dict] = None,
 ) -> None:
@@ -127,7 +128,7 @@ def save_checkpoint(
         "translator_pool": translator_pool.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
-        "train_config": asdict(train_config),
+        "train_config": asdict(config),
         "scheduler_step": scheduler.step_id,
     }
     if extra is not None:
@@ -150,21 +151,20 @@ def get_train_checkpoint_path(output_path: Union[str, Path]) -> Path:
 
 
 def initialize_train_output_paths(config) -> None:
-    alg = getattr(config, "alg", "")
-    output_path = getattr(config, "output_path", None)
-    timestamp = getattr(config, "timestamp", None)
+    output_path = config.output_path
+    timestamp = config.timestamp
 
     if output_path is None:
-        if not alg:
+        if not config.alg:
             return
         if timestamp is None:
             timestamp = build_timestamp_string()
-            setattr(config, "timestamp", timestamp)
+            config.timestamp = timestamp
         output_path_obj = build_timestamped_output_path(
-            alg=alg,
+            alg=config.alg,
             timestamp=timestamp,
         )
     else:
         output_path_obj = Path(output_path)
 
-    setattr(config, "output_path", str(output_path_obj))
+    config.output_path = str(output_path_obj)

@@ -1,8 +1,10 @@
+import importlib
 import time
 from typing import Callable, Tuple
 
 from core.common import *
 from core.config import Config
+from core.context import Context
 
 
 @dataclass
@@ -459,16 +461,17 @@ def evaluate_openwebtext_validation_loss_metrics(
 
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss_top_layers(
+    ctx: Context,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    dst_model_specs: Dict[str, ModelSpec],
     models,
     nodes,
     edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    train_config = ctx.config
+    dst_model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -562,16 +565,17 @@ def evaluate_openwebtext_validation_loss_top_layers(
 
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss_replay(
+    ctx: Context,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    dst_model_specs: Dict[str, ModelSpec],
     models,
     nodes,
     edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    train_config = ctx.config
+    dst_model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -665,11 +669,10 @@ def evaluate_openwebtext_validation_loss_replay(
 
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss(
+    ctx: Context,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    dst_model_specs: Dict[str, ModelSpec],
     models,
     nodes,
     edges,
@@ -677,22 +680,20 @@ def evaluate_openwebtext_validation_loss(
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
+            ctx=ctx,
             tokenizer=tokenizer,
-            train_config=train_config,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            dst_model_specs=dst_model_specs,
             models=models,
             nodes=nodes,
             edges=edges,
             logger=logger,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
+        ctx=ctx,
         tokenizer=tokenizer,
-        train_config=train_config,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        dst_model_specs=dst_model_specs,
         models=models,
         nodes=nodes,
         edges=edges,
@@ -974,32 +975,56 @@ def get_eval_log_path(output_path: Union[str, Path]) -> Path:
     return Path(output_path) / "eval.log"
 
 
-def initialize_eval_output_paths(config) -> None:
-    output_path = getattr(config, "output_path", None)
-    checkpoint_path = getattr(config, "checkpoint_path", None)
+def initialize_eval_output_paths(config: EvalConfig) -> None:
+    output_path = config.output_path
+    checkpoint_path = config.checkpoint_path
 
     if output_path is None:
         if checkpoint_path is not None:
             output_path_obj = Path(checkpoint_path).parent
         else:
-            alg = getattr(config, "alg", "")
-            if not alg:
+            if not config.alg:
                 return
-            outputs_path = getattr(config, "outputs_path", "outputs")
-            timestamp = getattr(config, "timestamp", None)
+            timestamp = config.timestamp
             if timestamp is None:
                 timestamp = build_timestamp_string()
-                setattr(config, "timestamp", timestamp)
+                config.timestamp = timestamp
             output_path_obj = build_timestamped_output_path(
-                alg=alg,
-                outputs_path=outputs_path,
+                alg=config.alg,
+                outputs_path=config.outputs_path,
                 timestamp=timestamp,
             )
     else:
         output_path_obj = Path(output_path)
 
-    setattr(config, "output_path", str(output_path_obj))
+    config.output_path = str(output_path_obj)
 
+
+
+def build_eval_context(alg: str, eval_config: EvalConfig):
+    if eval_config.checkpoint_path is None:
+        raise ValueError("EvalConfig.checkpoint_path must be set before build_eval_context.")
+    checkpoint_path = Path(eval_config.checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    module_name = f"{alg}.train"
+    try:
+        train_module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            raise SystemExit(f"Unsupported alg: {alg}") from exc
+        raise
+
+    try:
+        load_from_checkpoint = train_module.load_translator_pool_from_checkpoint
+    except AttributeError as exc:
+        raise AttributeError(f"{module_name} does not define load_translator_pool_from_checkpoint") from exc
+
+    return load_from_checkpoint(
+        checkpoint_path=str(checkpoint_path),
+        device_override=eval_config.device,
+    )
 
 def resolve_latest_checkpoint_for_alg(
     alg: str,

@@ -5,25 +5,25 @@ from typing import Dict
 import torch
 from torch.utils.data import DataLoader
 
+from core.context import Context
 from core.eval_util import *
-from lsc.train import load_translator_pool_from_checkpoint
 
 
 @torch.inference_mode()
 def evaluate_dataset(
+    ctx: Context,
+    train_config,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    model_specs,
-    translated_model_specs,
     models,
     nodes,
     edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    model_specs = ctx.model_specs
     device = train_config.device
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
@@ -61,12 +61,12 @@ def evaluate_dataset(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
-                    dst_spec=translated_model_specs[edge.dst_id],
+                    dst_spec=model_specs[edge.dst_id],
                 )
 
                 target_top = slice_top_layers(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=translated_model_specs[edge.dst_id].num_layers,
+                    top_layers_to_translate=model_specs[edge.dst_id].num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
@@ -124,19 +124,19 @@ def evaluate_dataset(
 
 @torch.inference_mode()
 def evaluate_generation_dataset(
+    ctx: Context,
+    train_config,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     tokenizer,
-    train_config,
     eval_config: EvalConfig,
     translator_pool,
-    model_specs,
-    translated_model_specs,
     models,
     nodes,
     edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
+    model_specs = ctx.model_specs
     device = train_config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
@@ -190,12 +190,12 @@ def evaluate_generation_dataset(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
-                    dst_spec=translated_model_specs[edge.dst_id],
+                    dst_spec=model_specs[edge.dst_id],
                 )
 
                 target_top = slice_top_layers(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=translated_model_specs[edge.dst_id].num_layers,
+                    top_layers_to_translate=model_specs[edge.dst_id].num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
@@ -244,7 +244,19 @@ def evaluate_generation_dataset(
     return summarize_generation_path_metrics(path_metrics)
 
 
-def run_eval(eval_config: EvalConfig) -> Path:
+
+def run_eval(
+    ctx: Context,
+    eval_config: EvalConfig,
+    translator_pool,
+    models,
+    tokenizer,
+    nodes,
+    edges,
+) -> Path:
+    train_config = ctx.config
+    model_specs = ctx.model_specs
+    full_model_specs = build_model_specs_for_nodes(models, nodes)
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
     if eval_config.output_path is None:
@@ -265,21 +277,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
 
-    (
-        train_config,
-        translator_pool,
-        model_specs,
-        translated_model_specs,
-        models,
-        tokenizer,
-        nodes,
-        edges,
-    ) = load_translator_pool_from_checkpoint(
-        checkpoint_path=str(checkpoint_path),
-        device_override=eval_config.device,
-    )
-
-
     translator_pool.eval()
     for model in models.values():
         model.eval()
@@ -291,8 +288,8 @@ def run_eval(eval_config: EvalConfig) -> Path:
         logger.info(
             "translated_layers: %s_top=%d/%d (%s)",
             node.id,
-            translated_model_specs[node.id].num_layers,
             model_specs[node.id].num_layers,
+            full_model_specs[node.id].num_layers,
             node.model_id,
         )
     logger.info("edges=%s", [edge.id for edge in edges])
@@ -304,11 +301,10 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     logger.info("Preparing validation dataloader for OpenWebText/validation")
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
+        ctx=ctx,
         tokenizer=tokenizer,
-        train_config=train_config,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        dst_model_specs=translated_model_specs,
         models=models,
         nodes=nodes,
         edges=edges,
@@ -335,14 +331,13 @@ def run_eval(eval_config: EvalConfig) -> Path:
         )
 
         results = evaluate_dataset(
+            ctx=ctx,
+            train_config=train_config,
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
-            train_config=train_config,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            model_specs=model_specs,
-            translated_model_specs=translated_model_specs,
             models=models,
             nodes=nodes,
             edges=edges,
@@ -370,14 +365,13 @@ def run_eval(eval_config: EvalConfig) -> Path:
         )
 
         results = evaluate_generation_dataset(
+            ctx=ctx,
+            train_config=train_config,
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
-            train_config=train_config,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            model_specs=model_specs,
-            translated_model_specs=translated_model_specs,
             models=models,
             nodes=nodes,
             edges=edges,

@@ -2,7 +2,7 @@ import argparse
 import importlib
 
 from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
-from core.eval_util import EvalConfig, resolve_latest_checkpoint_for_alg
+from core.eval_util import EvalConfig, build_eval_context, resolve_latest_checkpoint_for_alg
 
 
 def load_eval_module(alg: str):
@@ -54,7 +54,17 @@ def main() -> None:
     )
 
     eval_module = load_eval_module(args.alg)
-    log_path = eval_module.run_eval(eval_config)
+    ctx, translator_pool, models, tokenizer, nodes, edges, *extra = build_eval_context(args.alg, eval_config)
+    log_path = eval_module.run_eval(
+        ctx,
+        eval_config,
+        translator_pool,
+        models,
+        tokenizer,
+        nodes,
+        edges,
+        *extra,
+    )
 
     print(f"Evaluation log: {log_path}")
 

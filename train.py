@@ -2,7 +2,9 @@ import argparse
 import importlib
 from pathlib import Path
 
-from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
+from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, build_model_specs_for_nodes
+from core.context import Context
+from core.train_util import build_models_and_tokenizer
 
 
 def load_train_module(alg: str):
@@ -52,7 +54,13 @@ def main() -> None:
         **config_kwargs,
     )
 
-    final_checkpoint = Path(train_module.run_train(config))
+    models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
+    ctx = Context(
+        config=config,
+        model_specs=build_model_specs_for_nodes(models, nodes),
+    )
+
+    final_checkpoint = Path(train_module.run_train(ctx, models, tokenizer, nodes, edges))
 
     print(f"Saved outputs to {final_checkpoint.parent}")
     print(f"Final checkpoint: {final_checkpoint}")

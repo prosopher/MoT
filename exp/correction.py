@@ -15,42 +15,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.common import *
+from core.context import Context
 from core.eval_util import *
-from mot.train import TrainConfig
 import exp.layer_position as lp
 
 
 @dataclass
-class CorrectionConfig(TrainConfig):
-    injection_layer_start_idx: int
-    injection_window_size: int
-    study_id: Optional[str]
-
-    eval_batch_size: int
-    eval_num_workers: int
-    eval_max_examples_per_dataset: int
-    eval_shuffle_stream: bool
-    benchmark_mode: str
-    generation_max_new_tokens: int
-
+class CorrectionConfig(lp.LayerPositionConfig):
     correction_max_analysis_tokens: int
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.max_steps < 1:
-            raise ValueError("max_steps must be >= 1")
-        if self.grad_accum_steps < 1:
-            raise ValueError("grad_accum_steps must be >= 1")
-        if self.prefix_tokens < 2 or self.prefix_tokens >= self.total_tokens:
-            raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
-        if self.injection_layer_start_idx < 0:
-            raise ValueError("injection_layer_start_idx must be >= 0")
-        if self.injection_window_size < 1:
-            raise ValueError("injection_window_size must be >= 1")
-        if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
-            raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
-        if self.translator_dim % self.translator_heads != 0:
-            raise ValueError("translator_dim must be divisible by translator_heads")
         if self.correction_max_analysis_tokens < 1:
             raise ValueError("correction_max_analysis_tokens must be >= 1")
 
@@ -484,20 +459,21 @@ def maybe_append_input_ids(model: PreTrainedModel, past_key_values: PastKeyValue
 
 
 def evaluate_correction(
-    config: CorrectionConfig,
+    ctx: Context,
     run_dir: Path,
     translator_pool: lp.LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, lp.LayerMapping],
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
     nodes: List[Node],
     edges: List[Edge],
 ) -> Dict[str, Any]:
+    config = ctx.config
+    model_specs = ctx.model_specs
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
     logger.info("experiment_config=%s", asdict(config))
-    lp.log_layer_mappings(logger, nodes, model_specs, layer_mappings, config.injection_window_size)
+    lp.log_layer_mappings(ctx, logger, nodes, layer_mappings)
 
     translator_pool.eval()
     for model in models.values():
@@ -732,7 +708,9 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
         return rows
 
 
-def update_summary(config: CorrectionConfig, run_dir: Path, metrics: Dict[str, Any], layer_mappings: Dict[str, lp.LayerMapping], model_specs: Dict[str, ModelSpec]) -> Path:
+def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_mappings: Dict[str, lp.LayerMapping]) -> Path:
+    config = ctx.config
+    model_specs = ctx.model_specs
     study_dir = run_dir.parent
     summary_path = build_summary_path(study_dir)
     rows = read_summary_rows(summary_path)
@@ -985,45 +963,6 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     return outputs
 
 
-def build_layer_position_config(config: CorrectionConfig) -> lp.LayerPositionConfig:
-    return lp.LayerPositionConfig(
-        alg=config.alg,
-        timestamp=config.timestamp,
-        output_path=config.output_path,
-        model_ids=config.model_ids,
-        model_directions=config.model_directions,
-        max_steps=config.max_steps,
-        batch_size=config.batch_size,
-        grad_accum_steps=config.grad_accum_steps,
-        total_tokens=config.total_tokens,
-        prefix_tokens=config.prefix_tokens,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        warmup_steps=config.warmup_steps,
-        grad_clip_norm=config.grad_clip_norm,
-        log_every=config.log_every,
-        seed=config.seed,
-        shuffle_buffer=config.shuffle_buffer,
-        translator_dim=config.translator_dim,
-        translator_heads=config.translator_heads,
-        translator_depth=config.translator_depth,
-        translator_mlp_ratio=config.translator_mlp_ratio,
-        device=config.device,
-        dtype=config.dtype,
-        variant=config.variant,
-        mot_num_translators=config.mot_num_translators,
-        mot_top_k=config.mot_top_k,
-        injection_layer_start_idx=config.injection_layer_start_idx,
-        injection_window_size=config.injection_window_size,
-        study_id=config.study_id,
-        eval_batch_size=config.eval_batch_size,
-        eval_num_workers=config.eval_num_workers,
-        eval_max_examples_per_dataset=config.eval_max_examples_per_dataset,
-        eval_shuffle_stream=config.eval_shuffle_stream,
-        benchmark_mode=config.benchmark_mode,
-        generation_max_new_tokens=config.generation_max_new_tokens,
-    )
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1072,17 +1011,18 @@ def main() -> None:
     )
 
     set_seed(config.seed)
-    run_dir = build_run_output_dir(config)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
     nodes, edges = lp.resolve_edge_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
     )
-    layer_position_config = build_layer_position_config(config)
-    models, tokenizer, _, _ = lp.build_models_for_experiment(layer_position_config)
-    translator_pool, model_specs, layer_mappings = lp.run_train(
-        config=layer_position_config,
+    models, tokenizer, _, _ = lp.build_models_for_experiment(config)
+    model_specs = build_model_specs_for_nodes(models, nodes)
+    ctx = Context(config=config, model_specs=model_specs)
+    run_dir = build_run_output_dir(config)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    translator_pool, layer_mappings = lp.run_train(
+        ctx=ctx,
         run_dir=run_dir,
         models=models,
         tokenizer=tokenizer,
@@ -1090,10 +1030,9 @@ def main() -> None:
         edges=edges,
     )
     metrics = evaluate_correction(
-        config=config,
+        ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
-        model_specs=model_specs,
         layer_mappings=layer_mappings,
         models=models,
         tokenizer=tokenizer,
@@ -1103,7 +1042,7 @@ def main() -> None:
 
     write_json(str(build_config_path(run_dir)), asdict(config))
     write_json(str(build_metrics_path(run_dir)), metrics)
-    summary_path = update_summary(config, run_dir, metrics, layer_mappings, model_specs)
+    summary_path = update_summary(ctx, run_dir, metrics, layer_mappings)
     run_chart_paths = plot_run_trajectories(run_dir, metrics)
     summary_chart_paths = plot_summary(summary_path)
 

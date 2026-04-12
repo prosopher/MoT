@@ -9,6 +9,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.common import *
+from core.context import Context
 from core.eval_util import *
 from mot.train import *
 from core.train_util import *
@@ -369,12 +370,14 @@ def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
 
 def log_layer_mappings(
+    ctx: Context,
     logger: logging.Logger,
     nodes: List[Node],
-    model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, LayerMapping],
-    injection_window_size: int,
 ) -> None:
+    config = ctx.config
+    model_specs = ctx.model_specs
+    injection_window_size = config.injection_window_size
     node_map = build_node_map(nodes)
     for edge_id, mapping in layer_mappings.items():
         src_id, dst_id = edge_id.split("_to_")
@@ -402,11 +405,12 @@ def save_checkpoint(
     translator_pool: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: WarmupCosineScheduler,
-    config: LayerPositionConfig,
+    ctx: Context,
     step: int,
     layer_mappings: Dict[str, LayerMapping],
-    model_specs: Dict[str, ModelSpec],
 ) -> None:
+    config = ctx.config
+    model_specs = ctx.model_specs
     payload = {
         "translator_pool": translator_pool.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -434,33 +438,41 @@ def build_models_for_experiment(
 
 
 def run_train(
-    config: LayerPositionConfig,
+    ctx: Context,
     run_dir: Path,
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
     nodes: List[Node],
     edges: List[Edge],
-) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
+) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
+    config = ctx.config
+    model_specs = ctx.model_specs
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
     logger.info("Starting layer-window position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
 
-    translator_pool, model_specs, _, _, layer_mappings = build_translator_pool(
+    translator_pool, layer_mappings = build_translator_pool(
+        ctx=ctx,
         models=models,
-        config=config,
+        edges=edges,
     )
     translator_pool.train()
-    log_layer_mappings(logger, nodes, model_specs, layer_mappings, config.injection_window_size)
+    log_layer_mappings(ctx, logger, nodes, layer_mappings)
     logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(
-        tokenizer=tokenizer,
-        config=SimpleNamespaceConfig(
-            total_tokens=config.total_tokens,
+    dataloader = InfiniteDataLoader(
+        DataLoader(
+            OpenWebTextSequenceStream(
+                tokenizer=tokenizer,
+                sequence_length=config.total_tokens,
+                split="train",
+                shuffle=True,
+                shuffle_buffer=config.shuffle_buffer,
+                seed=config.seed,
+            ),
             batch_size=config.batch_size,
-            shuffle_buffer=config.shuffle_buffer,
-            seed=config.seed,
-        ),
+            num_workers=0,
+        )
     )
 
     optimizer = torch.optim.AdamW(
@@ -548,28 +560,28 @@ def run_train(
         translator_pool=translator_pool,
         optimizer=optimizer,
         scheduler=scheduler,
-        config=config,
+        ctx=ctx,
         step=config.max_steps,
         layer_mappings=layer_mappings,
-        model_specs=model_specs,
     )
     logger.info("[Done] checkpoint saved to %s", build_checkpoint_path(run_dir))
-    return translator_pool, model_specs, layer_mappings
+    return translator_pool, layer_mappings
 
 
 @torch.inference_mode()
 def evaluate_logit_dataset(
+    ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     tokenizer,
-    config: LayerPositionConfig,
     translator_pool: LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
     edges: List[Edge],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    config = ctx.config
+    model_specs = ctx.model_specs
     path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
     processed_examples = 0
@@ -744,17 +756,18 @@ def evaluate_logit_dataset(
 
 @torch.inference_mode()
 def evaluate_generation_dataset(
+    ctx: Context,
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     tokenizer,
-    config: LayerPositionConfig,
     translator_pool: LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
     edges: List[Edge],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    config = ctx.config
+    model_specs = ctx.model_specs
     path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
     processed_examples = 0
@@ -1348,20 +1361,21 @@ def save_run_artifacts(
     return summary_path, build_metrics_path(run_dir), metric_controls_chart_path, logit_kl_chart_path, openwebtext_loss_chart_path
 
 def run_eval(
-    config: LayerPositionConfig,
+    ctx: Context,
     run_dir: Path,
     translator_pool: LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, LayerMapping],
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
     nodes: List[Node],
     edges: List[Edge],
 ) -> Dict[str, Any]:
+    config = ctx.config
+    model_specs = ctx.model_specs
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
-    log_layer_mappings(logger, nodes, model_specs, layer_mappings, config.injection_window_size)
+    log_layer_mappings(ctx, logger, nodes, layer_mappings)
 
     translator_pool.eval()
     for model in models.values():
@@ -1476,9 +1490,8 @@ def run_eval(
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
-            config=config,
+            ctx=ctx,
             translator_pool=translator_pool,
-            model_specs=model_specs,
             models=models,
             nodes=nodes,
             edges=edges,
@@ -1624,18 +1637,18 @@ def main() -> None:
         **config_kwargs,
     )
 
-
     set_seed(config.seed)
-    run_dir = build_run_output_dir(config)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
     nodes, edges = resolve_edge_metadata(
         model_ids=config.model_ids,
         model_directions=config.model_directions,
     )
     models, tokenizer, _, _ = build_models_for_experiment(config)
-    translator_pool, model_specs, layer_mappings = run_train(
-        config=config,
+    ctx = Context(config=config, model_specs=build_model_specs_for_nodes(models, nodes))
+    run_dir = build_run_output_dir(config)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    translator_pool, layer_mappings = run_train(
+        ctx=ctx,
         run_dir=run_dir,
         models=models,
         tokenizer=tokenizer,
@@ -1643,10 +1656,9 @@ def main() -> None:
         edges=edges,
     )
     combined_metrics = run_eval(
-        config=config,
+        ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
-        model_specs=model_specs,
         layer_mappings=layer_mappings,
         models=models,
         tokenizer=tokenizer,

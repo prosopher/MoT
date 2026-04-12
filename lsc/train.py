@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.config import Config
+from core.context import Context
 from core.train_util import *
 
 
@@ -52,20 +53,20 @@ def resolve_top_layers_to_translate(num_layers: int, top_layers_ratio: float) ->
     return max(1, min(num_layers, int(math.ceil(num_layers * top_layers_ratio))))
 
 
-def build_translated_model_specs(
+def build_model_specs_for_top_layers(
     full_model_specs: Dict[str, ModelSpec],
     top_layers_ratio: float,
 ) -> Dict[str, ModelSpec]:
-    translated_specs = {}
+    model_specs = {}
     for name, spec in full_model_specs.items():
-        translated_specs[name] = ModelSpec(
+        model_specs[name] = ModelSpec(
             model_id=spec.model_id,
             num_layers=resolve_top_layers_to_translate(spec.num_layers, top_layers_ratio),
             hidden_size=spec.hidden_size,
             num_heads=spec.num_heads,
             head_dim=spec.head_dim,
         )
-    return translated_specs
+    return model_specs
 
 
 class LocalToSharedTranslator(nn.Module):
@@ -234,7 +235,7 @@ class ModelLatentAdapter(nn.Module):
 class SharedKVTranslatorPool(nn.Module):
     def __init__(
         self,
-        translated_model_specs: Dict[str, ModelSpec],
+        model_specs: Dict[str, ModelSpec],
         shared_slots: int,
         shared_dim: int,
         translator_dim: int,
@@ -242,7 +243,7 @@ class SharedKVTranslatorPool(nn.Module):
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.translated_model_specs = translated_model_specs
+        self.model_specs = model_specs
         self.adapters = nn.ModuleDict(
             {
                 name: ModelLatentAdapter(
@@ -255,7 +256,7 @@ class SharedKVTranslatorPool(nn.Module):
                     translator_heads=translator_heads,
                     mlp_ratio=mlp_ratio,
                 )
-                for name, spec in translated_model_specs.items()
+                for name, spec in model_specs.items()
             }
         )
 
@@ -276,7 +277,7 @@ class SharedKVTranslatorPool(nn.Module):
         dst_name: str,
         dst_spec: ModelSpec,
     ) -> PastKeyValues:
-        src_top_layers = self.translated_model_specs[src_name].num_layers
+        src_top_layers = self.model_specs[src_name].num_layers
         src_top_past = slice_top_layers(
             past_key_values=past_key_values,
             top_layers_to_translate=src_top_layers,
@@ -319,20 +320,14 @@ def blocks_to_past_key_values(
 
 
 def build_translator_pool(
+    ctx: Context,
     models: Dict[str, PreTrainedModel],
-    config: TrainConfig,
-) -> Tuple[SharedKVTranslatorPool, Dict[str, ModelSpec], Dict[str, ModelSpec], List[Node], List[Edge]]:
-    nodes, edges = build_nodes_and_edges(config.model_ids)
-    full_model_specs = {
-        node.id: get_model_spec(models[node.id])
-        for node in nodes
-    }
-    translated_model_specs = build_translated_model_specs(
-        full_model_specs=full_model_specs,
-        top_layers_ratio=config.top_layers_ratio,
-    )
+    edges: List[Edge],
+) -> SharedKVTranslatorPool:
+    config = ctx.config
+    model_specs = ctx.model_specs
     translator_pool = SharedKVTranslatorPool(
-        translated_model_specs=translated_model_specs,
+        model_specs=model_specs,
         shared_slots=config.shared_slots,
         shared_dim=config.shared_dim,
         translator_dim=config.translator_dim,
@@ -340,17 +335,15 @@ def build_translator_pool(
         mlp_ratio=config.translator_mlp_ratio,
     )
     translator_pool.to(config.device)
-    return translator_pool, full_model_specs, translated_model_specs, nodes, edges
+    return translator_pool
 
 
 def load_translator_pool_from_checkpoint(
     checkpoint_path: str,
     device_override: Optional[str] = None,
 ) -> Tuple[
-    TrainConfig,
+    Context,
     SharedKVTranslatorPool,
-    Dict[str, ModelSpec],
-    Dict[str, ModelSpec],
     Dict[str, PreTrainedModel],
     PreTrainedTokenizerBase,
     List[Node],
@@ -361,14 +354,33 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = device_override
     models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
-    translator_pool, full_model_specs, translated_model_specs, _, _ = build_translator_pool(models, config)
+    full_model_specs = build_model_specs_for_nodes(models, nodes)
+    model_specs = build_model_specs_for_top_layers(
+        full_model_specs=full_model_specs,
+        top_layers_ratio=config.top_layers_ratio,
+    )
+    ctx = Context(config=config, model_specs=model_specs)
+    translator_pool = build_translator_pool(ctx, models, edges)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return config, translator_pool, full_model_specs, translated_model_specs, models, tokenizer, nodes, edges
+    return ctx, translator_pool, models, tokenizer, nodes, edges
 
 
-def run_train(config: TrainConfig) -> Path:
+def run_train(
+    ctx: Context,
+    models: Dict[str, PreTrainedModel],
+    tokenizer: PreTrainedTokenizerBase,
+    nodes: List[Node],
+    edges: List[Edge],
+) -> Path:
+    config = ctx.config
+    full_model_specs = ctx.model_specs
+    model_specs = build_model_specs_for_top_layers(
+        full_model_specs=full_model_specs,
+        top_layers_ratio=config.top_layers_ratio,
+    )
+    ctx.model_specs = model_specs
     if config.output_path is None:
         raise ValueError("TrainConfig.output_path must be initialized before run_train.")
 
@@ -376,7 +388,6 @@ def run_train(config: TrainConfig) -> Path:
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges = build_nodes_and_edges(config.model_ids)
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
 
@@ -388,19 +399,17 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("Starting training")
     logger.info("train_config=%s", asdict(config))
 
-    model_directions = [edge.id for edge in edges]
     logger.info("nodes=%s", [asdict(node) for node in nodes])
     logger.info("edges=%s", [edge.id for edge in edges])
 
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    models, tokenizer, _, _ = build_models_and_tokenizer(config)
-    translator_pool, model_specs, translated_model_specs, _, _ = build_translator_pool(models, config)
+    translator_pool = build_translator_pool(ctx, models, edges)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
     for node in nodes:
-        spec = model_specs[node.id]
+        spec = full_model_specs[node.id]
         logger.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
@@ -412,8 +421,8 @@ def run_train(config: TrainConfig) -> Path:
 
     logger.info("[Setup] translated top-layer specs")
     for node in nodes:
-        translated_spec = translated_model_specs[node.id]
-        full_spec = model_specs[node.id]
+        translated_spec = model_specs[node.id]
+        full_spec = full_model_specs[node.id]
         logger.info(
             "  %s_top (%s): layers=%d / %d",
             node.id,
@@ -425,7 +434,7 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("[Setup] top_layers_ratio = %.4f", config.top_layers_ratio)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(tokenizer, config)
+    dataloader = build_training_dataloader(config, tokenizer)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
@@ -466,7 +475,7 @@ def run_train(config: TrainConfig) -> Path:
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
-                    dst_spec=translated_model_specs[edge.dst_id],
+                    dst_spec=model_specs[edge.dst_id],
                 )
                 mixed_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
@@ -509,11 +518,11 @@ def run_train(config: TrainConfig) -> Path:
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
+        config=config,
         output_path=str(final_path),
         translator_pool=translator_pool,
         optimizer=optimizer,
         scheduler=scheduler,
-        train_config=config,
         step=config.max_steps,
         extra={
             "note": "Final checkpoint trained with suffix LM loss only.",

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.config import Config
+from core.context import Context
 from core.train_util import *
 
 
@@ -421,10 +422,11 @@ def resolve_edge_metadata(
 
 
 def build_layer_mappings(
-    config: TrainConfig,
-    model_specs: Dict[str, ModelSpec],
+    ctx: Context,
     edges: List[Edge],
 ) -> Dict[str, LayerMapping]:
+    config = ctx.config
+    model_specs = ctx.model_specs
     requested_window_size = int(config.injection_window_size)
     injection_layer_start_idx = int(config.injection_layer_start_idx)
 
@@ -656,20 +658,14 @@ def replay_target_prefill_with_injected_window(
 
 
 def build_translator_pool(
+    ctx: Context,
     models: Dict[str, PreTrainedModel],
-    config: TrainConfig,
-) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], List[Node], List[Edge], Dict[str, LayerMapping]]:
-    nodes, edges = resolve_edge_metadata(
-        config.model_ids,
-        config.model_directions,
-    )
-    model_specs = {
-        node.id: get_model_spec(models[node.id])
-        for node in nodes
-    }
-    layer_mappings = build_layer_mappings(config, model_specs, edges)
+    edges: List[Edge],
+) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
+    config = ctx.config
+    layer_mappings = build_layer_mappings(ctx, edges)
     translator_pool = LayerWindowTranslatorPool(
-        model_specs=model_specs,
+        model_specs=ctx.model_specs,
         edges=edges,
         layer_mappings=layer_mappings,
         injection_window_size=config.injection_window_size,
@@ -682,16 +678,15 @@ def build_translator_pool(
         mot_top_k=config.mot_top_k,
     )
     translator_pool.to(config.device)
-    return translator_pool, model_specs, nodes, edges, layer_mappings
+    return translator_pool, layer_mappings
 
 
 def load_translator_pool_from_checkpoint(
     checkpoint_path: str,
     device_override: Optional[str] = None,
 ) -> Tuple[
-    TrainConfig,
+    Context,
     LayerWindowTranslatorPool,
-    Dict[str, ModelSpec],
     Dict[str, PreTrainedModel],
     PreTrainedTokenizerBase,
     List[Node],
@@ -703,14 +698,23 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = device_override
     models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
-    translator_pool, model_specs, _, _, layer_mappings = build_translator_pool(models, config)
+    ctx = Context(config=config, model_specs=build_model_specs_for_nodes(models, nodes))
+    translator_pool, layer_mappings = build_translator_pool(ctx, models, edges)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return config, translator_pool, model_specs, models, tokenizer, nodes, edges, layer_mappings
+    return ctx, translator_pool, models, tokenizer, nodes, edges, layer_mappings
 
 
-def run_train(config: TrainConfig) -> Path:
+def run_train(
+    ctx: Context,
+    models: Dict[str, PreTrainedModel],
+    tokenizer: PreTrainedTokenizerBase,
+    nodes: List[Node],
+    edges: List[Edge],
+) -> Path:
+    config = ctx.config
+    model_specs = ctx.model_specs
     if config.output_path is None:
         raise ValueError("TrainConfig.output_path must be initialized before run_train.")
 
@@ -718,10 +722,6 @@ def run_train(config: TrainConfig) -> Path:
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges = resolve_edge_metadata(
-        config.model_ids,
-        config.model_directions,
-    )
     edge_map = build_edge_map(edges)
 
     config_path = get_train_config_path(output_path)
@@ -736,8 +736,7 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    models, tokenizer, _, _ = build_models_and_tokenizer(config)
-    translator_pool, model_specs, _, _, layer_mappings = build_translator_pool(models, config)
+    translator_pool, layer_mappings = build_translator_pool(ctx, models, edges)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
@@ -753,7 +752,7 @@ def run_train(config: TrainConfig) -> Path:
         )
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(tokenizer, config)
+    dataloader = build_training_dataloader(config, tokenizer)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
@@ -837,11 +836,11 @@ def run_train(config: TrainConfig) -> Path:
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
+        config=config,
         output_path=str(final_path),
         translator_pool=translator_pool,
         optimizer=optimizer,
         scheduler=scheduler,
-        train_config=config,
         step=config.max_steps,
         extra={
             "note": "Final checkpoint trained with translated-window injection and target replay.",
