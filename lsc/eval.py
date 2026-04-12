@@ -170,11 +170,11 @@ def evaluate_generation_dataset(
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else int(question_cache_ids.shape[1])
+                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
                 logger.info(
                     "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    int(cache_input_ids.shape[1]),
+                    cache_input_ids.shape[1],
                     question_cache_tokens,
                     get_answer_token_budget(eval_config),
                 )
@@ -306,7 +306,7 @@ def run_eval(
             build_openwebtext_profile_cell(row, prefix="native"),
             row["loss"],
             build_openwebtext_profile_cell(row),
-            int(row["count"]),
+            row["count"],
         )
 
     logit_dataset_specs = get_default_logit_qa_dataset_specs()

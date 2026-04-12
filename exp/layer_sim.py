@@ -112,7 +112,7 @@ DATASET_ALLOWED_SUITES: Dict[str, set] = {
 
 
 def normalize_model_id(model_id: str) -> str:
-    key = str(model_id).strip()
+    key = model_id.strip()
     if not key:
         raise ValueError("model id must not be empty")
     return MODEL_ID_ALIASES.get(key.lower(), key)
@@ -167,7 +167,7 @@ class LayerSimConfig:
         self.tokenizer_a_id = normalize_model_id(self.tokenizer_a_id or self.model_a_id)
         self.tokenizer_b_id = normalize_model_id(self.tokenizer_b_id or self.model_b_id)
         self.device = resolve_device(self.device)
-        self.dataset_name = str(self.dataset_name).strip().lower()
+        self.dataset_name = self.dataset_name.strip().lower()
 
         if self.dataset_name not in DATASET_SPECS:
             raise ValueError(f"dataset_name must be one of {sorted(DATASET_SPECS)}")
@@ -258,11 +258,11 @@ class HFTextStream(IterableDataset):
             self.spec["hf_path"],
             self.spec["hf_name"],
             split=self.split,
-            streaming=bool(self.spec["streaming"]),
+            streaming=self.spec["streaming"],
         )
 
         if self.shuffle:
-            if bool(self.spec["streaming"]):
+            if self.spec["streaming"]:
                 ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
             else:
                 ds = ds.shuffle(seed=self.seed)
@@ -298,7 +298,7 @@ class LayerFeatureStore:
 
         self.mean_key_block_sum += key_cpu.to(dtype=torch.float64).sum(dim=0)
         self.mean_value_block_sum += value_cpu.to(dtype=torch.float64).sum(dim=0)
-        self.num_examples += int(batch_size)
+        self.num_examples += batch_size
 
         if pool_mode == "mean":
             pooled_key = key_cpu.mean(dim=1)
@@ -358,10 +358,10 @@ def get_model_spec_flexible(model) -> SimpleModelSpec:
 
     return SimpleModelSpec(
         model_id=getattr(config, "_name_or_path", "unknown"),
-        num_layers=int(num_layers),
-        hidden_size=int(hidden_size),
-        num_heads=int(num_heads),
-        head_dim=int(hidden_size) // int(num_heads),
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        head_dim=hidden_size // num_heads,
         architecture=arch,
     )
 
@@ -437,8 +437,8 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
         full_len_a = encoded_a["attention_mask"].sum(dim=1) >= config.prefix_tokens
         full_len_b = encoded_b["attention_mask"].sum(dim=1) >= config.prefix_tokens
         valid_mask = full_len_a & full_len_b
-        skipped_short += int((~valid_mask).sum().item())
-        valid_count = int(valid_mask.sum().item())
+        skipped_short += (~valid_mask).sum().item()
+        valid_count = valid_mask.sum().item()
         if valid_count == 0:
             continue
 
@@ -459,7 +459,7 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
 
         store_a.update(key_a, value_a, pool_mode=config.pool_mode)
         store_b.update(key_b, value_b, pool_mode=config.pool_mode)
-        processed += int(input_ids_a.shape[0])
+        processed += input_ids_a.shape[0]
 
         if batch_idx == 1:
             logger.info(
@@ -550,7 +550,7 @@ def compute_similarity_matrix(
 def build_best_alignment_summary(matrix: torch.Tensor) -> Dict[str, object]:
     per_row = []
     for row_idx in range(matrix.shape[0]):
-        best_col = int(torch.argmax(matrix[row_idx]).item())
+        best_col = torch.argmax(matrix[row_idx]).item()
         per_row.append(
             {
                 "src_layer_idx": row_idx,
@@ -558,7 +558,7 @@ def build_best_alignment_summary(matrix: torch.Tensor) -> Dict[str, object]:
                 "score": float(matrix[row_idx, best_col].item()),
             }
         )
-    global_flat_idx = int(torch.argmax(matrix).item())
+    global_flat_idx = torch.argmax(matrix).item()
     global_row = global_flat_idx // matrix.shape[1]
     global_col = global_flat_idx % matrix.shape[1]
     return {

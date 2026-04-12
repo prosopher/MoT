@@ -102,7 +102,7 @@ class TinyGPT2Attention(nn.Module):
         self.resid_dropout = nn.Identity()
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_size = tensor.shape
+        batch_size, seq_len, _ = tensor.shape
         return tensor.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
 
     def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -247,7 +247,7 @@ class TinyCausalLM(PreTrainedModel):
         batch_size, seq_len = input_ids.shape
         past_length = 0
         if past_key_values is not None and len(past_key_values) > 0:
-            past_length = int(past_key_values[0][0].shape[2])
+            past_length = past_key_values[0][0].shape[2]
 
         position_ids = torch.arange(
             past_length,

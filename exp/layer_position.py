@@ -286,7 +286,7 @@ def load_model_spec_from_pretrained_config(model_id: str) -> ModelSpec:
 
 
 def resolve_run_position_label(config: LayerPositionConfig) -> str:
-    return f"injection_layer_start_idx_{int(config.injection_layer_start_idx):03d}"
+    return f"injection_layer_start_idx_{config.injection_layer_start_idx:03d}"
 
 
 def resolve_target_num_layers(
@@ -374,7 +374,6 @@ def log_layer_mappings(
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     config = ctx.config
-    model_specs = ctx.model_specs
     injection_window_size = config.injection_window_size
     node_map = build_node_map(ctx.nodes)
     for edge_id, mapping in layer_mappings.items():
@@ -393,7 +392,7 @@ def log_layer_mappings(
             mapping.dst_layer_start_idx,
             mapping.dst_layer_end_idx,
             model_specs[dst_id].num_layers - 1,
-            int(injection_window_size),
+            injection_window_size,
             dst_depth_from_top,
         )
 
@@ -416,7 +415,6 @@ def run_train(
     run_dir: Path,
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
     config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     models = ctx.models
     tokenizer = ctx.tokenizer
@@ -480,11 +478,6 @@ def run_train(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                native_target_key_block, native_target_value_block = extract_layer_window_blocks(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    start_layer_idx=mapping.dst_layer_start_idx,
-                    num_layers=config.injection_window_size,
-                )
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_cache_ids,
@@ -539,7 +532,6 @@ def evaluate_logit_dataset(
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     models = ctx.models
     tokenizer = ctx.tokenizer
@@ -725,7 +717,6 @@ def evaluate_generation_dataset(
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     models = ctx.models
     tokenizer = ctx.tokenizer
@@ -759,11 +750,11 @@ def evaluate_generation_dataset(
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else int(question_cache_ids.shape[1])
+                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
                 logger.info(
                     "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    int(cache_input_ids.shape[1]),
+                    cache_input_ids.shape[1],
                     question_cache_tokens,
                     get_answer_token_budget(config),
                 )
@@ -933,7 +924,6 @@ def compute_openwebtext_native_and_full_mix_losses(
     past_by_node_id,
     translator_pool: LayerWindowTranslatorPool,
 ) -> Dict[str, float]:
-    config = ctx.config
     model_specs = ctx.model_specs
     models = ctx.models
     translated_key, translated_value, mapping = translator_pool.translate_layer_window(
@@ -942,11 +932,6 @@ def compute_openwebtext_native_and_full_mix_losses(
         dst_name=edge.dst_id,
     )
     native_target_past = past_by_node_id[edge.dst_id]
-    native_key_block, native_value_block = extract_layer_window_blocks(
-        past_key_values=native_target_past,
-        start_layer_idx=mapping.dst_layer_start_idx,
-        num_layers=config.injection_window_size,
-    )
     full_mix_past = replay_target_prefill_with_injected_window(
         target_model=models[edge.dst_id],
         prefix_input_ids=prefix_cache_ids,
@@ -1077,14 +1062,14 @@ def build_summary_row(
     reference_mapping = next(iter(metrics["layer_mappings"].values()))
     return SummaryRow(
         study_id=config.study_id or "",
-        benchmark_mode=str(metrics["benchmark_mode"]),
-        metric_name=str(metrics["metric_name"]),
-        injection_layer_start_idx=int(config.injection_layer_start_idx),
-        translated_num_layers=int(config.injection_window_size),
-        source_layer_start_idx=int(reference_mapping["src_layer_start_idx"]),
-        source_layer_end_idx=int(reference_mapping["src_layer_end_idx"]),
-        target_layer_start_idx=int(reference_mapping["dst_layer_start_idx"]),
-        target_layer_end_idx=int(reference_mapping["dst_layer_end_idx"]),
+        benchmark_mode=metrics["benchmark_mode"],
+        metric_name=metrics["metric_name"],
+        injection_layer_start_idx=config.injection_layer_start_idx,
+        translated_num_layers=config.injection_window_size,
+        source_layer_start_idx=reference_mapping["src_layer_start_idx"],
+        source_layer_end_idx=reference_mapping["src_layer_end_idx"],
+        target_layer_start_idx=reference_mapping["dst_layer_start_idx"],
+        target_layer_end_idx=reference_mapping["dst_layer_end_idx"],
         average_metric=float(metrics["average_metric"]),
         average_native_metric=float(metrics["average_native_metric"]),
         average_dir_only_metric=float(metrics["average_dir_only_metric"]),
@@ -1155,9 +1140,9 @@ def update_summary(
 
 def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
     for row in rows:
-        x_value = float(row.injection_layer_start_idx)
+        x_value = row.injection_layer_start_idx
         ax.annotate(
-            format_layer_range(int(row.target_layer_start_idx), int(row.target_layer_end_idx)),
+            format_layer_range(row.target_layer_start_idx, row.target_layer_end_idx),
             (x_value, float(y_getter(row))),
             textcoords="offset points",
             xytext=(0, 7),
@@ -1329,7 +1314,6 @@ def run_eval(
     layer_mappings: Dict[str, LayerMapping],
 ) -> Dict[str, Any]:
     config = ctx.config
-    model_specs = ctx.model_specs
     models = ctx.models
     tokenizer = ctx.tokenizer
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
@@ -1406,7 +1390,7 @@ def run_eval(
             edge.id,
             row["native_loss"],
             row["full_mix_loss"],
-            int(row["count"]),
+            row["count"],
         )
 
     if config.benchmark_mode == "logit_qa":
@@ -1470,7 +1454,7 @@ def run_eval(
                 logit_row["native_to_full_mix_logit_kl"],
                 logit_row["full_mix_to_dir_only_logit_kl"],
                 logit_row["full_mix_to_mag_only_logit_kl"],
-                int(metric_row["count"]),
+                metric_row["count"],
             )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

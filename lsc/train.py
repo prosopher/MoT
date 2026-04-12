@@ -50,7 +50,7 @@ class SharedCache:
 def resolve_top_layers_to_translate(num_layers: int, top_layers_ratio: float) -> int:
     if not (0.0 < top_layers_ratio <= 1.0):
         raise ValueError(f"top_layers_ratio must be in (0, 1], got {top_layers_ratio}")
-    return max(1, min(num_layers, int(math.ceil(num_layers * top_layers_ratio))))
+    return max(1, min(num_layers, math.ceil(num_layers * top_layers_ratio)))
 
 
 def build_model_specs_for_top_layers(
@@ -349,7 +349,6 @@ def load_translator_pool_from_checkpoint(
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
     checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
-    checkpoint_path = str(checkpoint_path_obj)
     if not checkpoint_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
@@ -392,8 +391,6 @@ def run_train(
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    node_map = build_node_map(nodes)
-    edge_map = build_edge_map(edges)
 
     config_path = get_train_config_path(output_path)
     write_json(str(config_path), asdict(config))

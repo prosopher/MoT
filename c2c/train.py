@@ -53,7 +53,7 @@ class TrainConfig(Config):
 
 
 def validate_c2c_variant(variant: str) -> str:
-    normalized = str(variant).strip().lower()
+    normalized = variant.strip().lower()
     if normalized not in C2C_VARIANTS:
         raise ValueError(f"Unsupported c2c variant: {variant}. Expected one of {sorted(C2C_VARIANTS)}")
     return normalized
@@ -142,7 +142,7 @@ class ResidualCacheFuser(nn.Module):
         self.num_layers = num_layers
         self.fuser_depth = fuser_depth
         self.hard_gate_eval = hard_gate_eval
-        self.temperature = float(gate_temperature_start)
+        self.temperature = gate_temperature_start
 
         self.receiver_norm = nn.LayerNorm(dst_hidden_size)
         self.receiver_proj = nn.Linear(dst_hidden_size, fuser_dim)
@@ -186,10 +186,10 @@ class ResidualCacheFuser(nn.Module):
         self.gate_logits = nn.Parameter(torch.full((num_layers,), 1.5))
 
     def set_temperature(self, temperature: float) -> None:
-        self.temperature = max(1e-4, float(temperature))
+        self.temperature = max(1e-4, temperature)
 
     def set_hard_gate_eval(self, enabled: bool) -> None:
-        self.hard_gate_eval = bool(enabled)
+        self.hard_gate_eval = enabled
 
     def gate_probabilities(self) -> torch.Tensor:
         return torch.sigmoid(self.gate_logits)
@@ -640,7 +640,6 @@ def load_translator_pool_from_checkpoint(
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
     checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
-    checkpoint_path = str(checkpoint_path_obj)
     if not checkpoint_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
@@ -670,11 +669,11 @@ def load_translator_pool_from_checkpoint(
 
 def compute_gate_temperature(config: TrainConfig, step: int) -> float:
     if config.max_steps <= 1:
-        return float(config.gate_temperature_end)
+        return config.gate_temperature_end
     progress = (step - 1) / (config.max_steps - 1)
     temperature = (
-        (1.0 - progress) * float(config.gate_temperature_start)
-        + progress * float(config.gate_temperature_end)
+        (1.0 - progress) * config.gate_temperature_start
+        + progress * config.gate_temperature_end
     )
     return max(1e-4, temperature)
 
@@ -692,7 +691,6 @@ def run_train(
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    edge_map = build_edge_map(edges)
 
     config_path = get_train_config_path(output_path)
     write_json(str(config_path), asdict(config))

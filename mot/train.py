@@ -331,7 +331,7 @@ class LayerWindowTranslatorPool(nn.Module):
 
         self.model_specs = model_specs
         self.layer_mappings = layer_mappings
-        self.injection_window_size = int(injection_window_size)
+        self.injection_window_size = injection_window_size
         self.edges = tuple(edges)
         self.edge_ids = tuple(edge.id for edge in edges)
         self.edges_by_id = build_edge_map(edges)
@@ -412,8 +412,8 @@ def build_layer_mappings(
 ) -> Dict[str, LayerMapping]:
     config = ctx.config
     model_specs = ctx.model_specs
-    requested_window_size = int(config.injection_window_size)
-    injection_layer_start_idx = int(config.injection_layer_start_idx)
+    requested_window_size = config.injection_window_size
+    injection_layer_start_idx = config.injection_layer_start_idx
 
     mappings: Dict[str, LayerMapping] = {}
     for edge in edges:
@@ -679,7 +679,6 @@ def load_translator_pool_from_checkpoint(
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
     checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
-    checkpoint_path = str(checkpoint_path_obj)
     if not checkpoint_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
@@ -719,7 +718,6 @@ def run_train(
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    edge_map = build_edge_map(edges)
 
     config_path = get_train_config_path(output_path)
     write_json(str(config_path), asdict(config))
@@ -733,7 +731,7 @@ def run_train(
     logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    translator_pool, layer_mappings = build_translator_pool(ctx)
+    translator_pool = build_translator_pool(ctx)[0]
     translator_pool.train()
 
     logger.info("[Setup] full model specs")

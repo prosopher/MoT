@@ -343,14 +343,14 @@ def count_trainable_parameters(module: nn.Module) -> int:
 
 
 def format_memory_gib(num_bytes: float) -> str:
-    gib = float(num_bytes) / (1024 ** 3)
+    gib = num_bytes / (1024 ** 3)
     return f"{gib:.2f} GiB"
 
 
 class GPUMemoryTracker:
     def __init__(self, device: str) -> None:
         self.device = device
-        self.enabled = torch.cuda.is_available() and str(device).startswith("cuda")
+        self.enabled = torch.cuda.is_available() and device.startswith("cuda")
         self.total_allocated_bytes = 0.0
         self.num_samples = 0
         self.peak_allocated_bytes = 0
@@ -372,7 +372,7 @@ class GPUMemoryTracker:
 
         self.total_allocated_bytes += float(allocated)
         self.num_samples += 1
-        self.peak_allocated_bytes = max(self.peak_allocated_bytes, int(peak))
+        self.peak_allocated_bytes = max(self.peak_allocated_bytes, peak)
 
     @property
     def avg_allocated_bytes(self) -> float:

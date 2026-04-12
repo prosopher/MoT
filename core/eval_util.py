@@ -47,10 +47,10 @@ class InferenceProfileAccumulator:
         peak_memory_bytes: Optional[int],
     ) -> None:
         self.total_latency_sec += float(latency_sec)
-        self.total_tokens += int(tokens)
+        self.total_tokens += tokens
         self.num_calls += 1
         if peak_memory_bytes is not None:
-            peak_value = int(peak_memory_bytes)
+            peak_value = peak_memory_bytes
             if self.peak_memory_bytes is None or peak_value > self.peak_memory_bytes:
                 self.peak_memory_bytes = peak_value
 
@@ -79,7 +79,7 @@ class InferenceProfileAccumulator:
 
 class InferenceProfiler:
     def __init__(self, device: str) -> None:
-        self.device = str(device)
+        self.device = device
         self.enabled = torch.cuda.is_available() and self.device.startswith("cuda")
         if self.enabled:
             device_index = torch.device(self.device).index
@@ -100,13 +100,13 @@ class InferenceProfiler:
 
         peak_memory_bytes: Optional[int]
         if self.enabled:
-            peak_memory_bytes = int(torch.cuda.max_memory_allocated(self.device_index))
+            peak_memory_bytes = torch.cuda.max_memory_allocated(self.device_index)
         else:
             peak_memory_bytes = None
 
         return result, {
             "latency_sec": float(latency_sec),
-            "tokens": int(tokens),
+            "tokens": tokens,
             "peak_memory_bytes": peak_memory_bytes,
         }
 
@@ -278,8 +278,8 @@ def build_openwebtext_eval_dataloader(
         sequence_length=config.total_tokens,
         split="train",
         shuffle=shuffle,
-        shuffle_buffer=config.shuffle_buffer if shuffle_buffer is None else int(shuffle_buffer),
-        seed=(int(config.seed) if seed is None else int(seed)) + int(seed_offset),
+        shuffle_buffer=config.shuffle_buffer if shuffle_buffer is None else shuffle_buffer,
+        seed=(config.seed if seed is None else seed) + seed_offset,
     )
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
 
@@ -307,7 +307,7 @@ def summarize_openwebtext_named_losses(
         metric_names.add(loss_delta_reference_name)
     metric_names.update(loss_delta_field_by_name)
 
-    summary: Dict[str, float] = {"count": int(count)}
+    summary: Dict[str, float] = {"count": count}
 
     for name in sorted(metric_names):
         average_loss = float(average_losses.get(name, float("nan"))) if count > 0 else float("nan")
@@ -375,7 +375,7 @@ def evaluate_openwebtext_validation_loss_metrics(
         shuffle_buffer=shuffle_buffer,
     )
     device = ctx.config.device
-    max_examples = max(1, int(max_examples))
+    max_examples = max(1, max_examples)
 
     loss_sums = {edge.id: {} for edge in ctx.edges}
     counts = {edge.id: 0 for edge in ctx.edges}
@@ -400,7 +400,7 @@ def evaluate_openwebtext_validation_loss_metrics(
             for node in ctx.nodes
         }
 
-        batch_examples = int(input_ids.shape[0])
+        batch_examples = input_ids.shape[0]
         for edge in ctx.edges:
             edge_losses, edge_profiles = evaluate_edge_losses_fn(
                 edge_id=edge.id,
@@ -424,7 +424,7 @@ def evaluate_openwebtext_validation_loss_metrics(
                 )
                 accumulator.update(
                     latency_sec=float(profile_values.get("latency_sec", 0.0)),
-                    tokens=int(profile_values.get("tokens", 0)),
+                    tokens=profile_values.get("tokens", 0),
                     peak_memory_bytes=profile_values.get("peak_memory_bytes"),
                 )
             counts[edge.id] += batch_examples
@@ -439,7 +439,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
     summaries = {}
     for edge in ctx.edges:
-        count = int(counts[edge.id])
+        count = counts[edge.id]
         if count > 0:
             average_losses = {
                 metric_name: float(total_loss / count)
@@ -476,7 +476,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = int(lm_labels.numel())
+        profile_tokens = lm_labels.numel()
 
         def compute_translated_loss_value() -> float:
             translated_top_past = translator_pool.translate_top_layers(
@@ -572,7 +572,7 @@ def evaluate_openwebtext_validation_loss_replay(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = int(lm_labels.numel())
+        profile_tokens = lm_labels.numel()
 
         def compute_translated_loss_value() -> float:
             mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
@@ -1388,7 +1388,7 @@ def prepare_full_text_inputs(
         if max_input_tokens < 1:
             raise ValueError("max_input_tokens must be >= 1")
         tokenizer_kwargs["truncation"] = True
-        tokenizer_kwargs["max_length"] = int(max_input_tokens)
+        tokenizer_kwargs["max_length"] = max_input_tokens
     tokenized = tokenizer(text, **tokenizer_kwargs)
     input_ids = tokenized.input_ids.to(device)
     if input_ids.shape[1] < 1:
@@ -1396,7 +1396,7 @@ def prepare_full_text_inputs(
     return {
         "text": text,
         "input_ids": input_ids,
-        "was_truncated": bool(max_input_tokens is not None and input_ids.shape[1] >= int(max_input_tokens)),
+        "was_truncated": max_input_tokens is not None and input_ids.shape[1] >= max_input_tokens,
     }
 
 
@@ -1417,14 +1417,14 @@ def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrain
         if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
             candidates.append(tokenizer_limit)
 
-    limits = [int(value) for value in candidates if isinstance(value, int) and value > 0]
+    limits = [value for value in candidates if isinstance(value, int) and value > 0]
     if not limits:
         return 1024
     return min(limits)
 
 
 def get_answer_token_budget(eval_config) -> int:
-    return int(eval_config.generation_max_new_tokens)
+    return eval_config.generation_max_new_tokens
 
 
 def compute_benchmark_context_budget(
@@ -1441,8 +1441,8 @@ def compute_benchmark_context_budget(
         device="cpu",
     )
     reserved_tokens = (
-        int(question_prefix["cache_ids"].shape[1])
-        + int(question_prefix["seed_token"].shape[1])
+        question_prefix["cache_ids"].shape[1]
+        + question_prefix["seed_token"].shape[1]
         + get_answer_token_budget(eval_config)
     )
     budget = shared_limit - reserved_tokens
@@ -1571,7 +1571,7 @@ def prepare_generation_task_inputs(
             "cache_input_ids": context_prefix["input_ids"],
             "question_cache_ids": question_prefix["cache_ids"],
             "seed_token": question_prefix["seed_token"],
-            "was_truncated": bool(context_prefix.get("was_truncated", False)),
+            "was_truncated": context_prefix.get("was_truncated", False),
         }
 
     # if spec.answer_mode == "multinews":
@@ -1630,7 +1630,7 @@ def predict_generation_task_answer(
         tokenizer=tokenizer,
         past_key_values=generation_past,
         seed_token=seed_token,
-        max_new_tokens=int(eval_config.generation_max_new_tokens),
+        max_new_tokens=eval_config.generation_max_new_tokens,
     )
 
 
@@ -1776,7 +1776,7 @@ def generate_greedy_answer(
             use_cache=True,
         )
         next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        next_token_id = int(next_token.item())
+        next_token_id = next_token.item()
 
         if eos_token_id is not None and next_token_id == eos_token_id:
             break
@@ -1883,7 +1883,7 @@ def log_dataset_result(
             row["cosine"],
             row["accuracy"],
             row["native_accuracy"],
-            int(row["count"]),
+            row["count"],
         )
 
 
@@ -1904,7 +1904,7 @@ def log_generation_dataset_result(
             row["cosine"],
             row["f1"],
             row["native_f1"],
-            int(row["count"]),
+            row["count"],
         )
 
 

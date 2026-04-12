@@ -70,7 +70,7 @@ def build_study_dir(config: CorrectionConfig) -> Path:
 
 def build_run_output_dir(config: CorrectionConfig) -> Path:
     study_dir = build_study_dir(config)
-    run_label = f"injection_layer_start_idx_{int(config.injection_layer_start_idx):03d}"
+    run_label = f"injection_layer_start_idx_{config.injection_layer_start_idx:03d}"
     return study_dir / run_label
 
 
@@ -197,7 +197,7 @@ def trace_single_token_with_past(
     input_ids: torch.Tensor,
 ) -> Dict[str, Any]:
     transformer = lp.require_gpt2_transformer(model)
-    past_length = 0 if len(past_key_values) == 0 else int(past_key_values[0][0].shape[2])
+    past_length = 0 if len(past_key_values) == 0 else past_key_values[0][0].shape[2]
     hidden_states = build_input_hidden_states_with_past(model, input_ids, past_length)
     token_hidden_states = [hidden_states[:, -1, :].detach()]
     token_attn_additions: List[torch.Tensor] = []
@@ -351,7 +351,7 @@ class MetricCollector:
         self.final_correction_cosines.append(float(final_correction_cosine))
         self.final_attn_alpha_over_initial.append(float(final_attn_alpha_over_initial))
         self.final_mlp_alpha_over_initial.append(float(final_mlp_alpha_over_initial))
-        self.final_shrink_flags.append(bool(final_shrink_ratio < 1.0))
+        self.final_shrink_flags.append(final_shrink_ratio < 1.0)
 
     def summary(self) -> Dict[str, float]:
         return {
@@ -381,8 +381,8 @@ def compute_correction_metrics_from_traces(
     attn_delta = mixed_trace["attn_additions"] - native_trace["attn_additions"]
     mlp_delta = mixed_trace["mlp_additions"] - native_trace["mlp_additions"]
 
-    source_idx = int(mapping.dst_layer_end_idx) + 1
-    window_input_idx = int(mapping.dst_layer_start_idx)
+    source_idx = mapping.dst_layer_end_idx + 1
+    window_input_idx = mapping.dst_layer_start_idx
     initial_shift = hidden_delta[source_idx]
     initial_shift_norm = float(initial_shift.norm().item())
     window_input_norm = float(native_trace["hidden_states"][window_input_idx].norm().item())
@@ -394,7 +394,6 @@ def compute_correction_metrics_from_traces(
         }
 
     u = initial_shift / initial_shift_norm
-    num_points = hidden_delta.shape[0] - source_idx
 
     rho_values: List[float] = []
     alpha_values: List[float] = []
@@ -403,7 +402,7 @@ def compute_correction_metrics_from_traces(
     beta_over_initial_values: List[float] = []
     correction_cosine_values: List[float] = []
 
-    for point_offset, hidden_idx in enumerate(range(source_idx, hidden_delta.shape[0])):
+    for hidden_idx in range(source_idx, hidden_delta.shape[0]):
         delta_h = hidden_delta[hidden_idx]
         delta_h_norm = float(delta_h.norm().item())
         rho_values.append(delta_h_norm / initial_shift_norm)
@@ -490,8 +489,8 @@ def evaluate_correction(
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
     reference_mapping = layer_mappings[edges[0].id]
-    num_layers = int(model_specs[edges[0].dst_id].num_layers)
-    source_idx = int(reference_mapping.dst_layer_end_idx) + 1
+    num_layers = model_specs[edges[0].dst_id].num_layers
+    source_idx = reference_mapping.dst_layer_end_idx + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
     random_collector = MetricCollector()
@@ -509,7 +508,7 @@ def evaluate_correction(
                     logger.warning("Skipping example due to input preparation error: %s", exc)
                     continue
                 answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, tokenizer=tokenizer)
-                if answer_token_ids is None or int(answer_token_ids.shape[0]) < 1:
+                if answer_token_ids is None or answer_token_ids.shape[0] < 1:
                     continue
                 answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
                 cache_input_ids = prepared_inputs["cache_input_ids"]
@@ -565,7 +564,7 @@ def evaluate_correction(
                     fullmix_past = maybe_append_input_ids(target_model, fullmix_past, seed_token)
                     random_past = maybe_append_input_ids(target_model, random_past, seed_token)
 
-                    for token_idx in range(int(answer_token_ids.shape[0])):
+                    for token_idx in range(answer_token_ids.shape[0]):
                         current_input_ids = answer_token_ids[token_idx : token_idx + 1].view(1, 1)
                         native_trace = trace_single_token_with_past(target_model, native_past, current_input_ids)
                         fullmix_trace = trace_single_token_with_past(target_model, fullmix_past, current_input_ids)
@@ -660,7 +659,7 @@ def evaluate_correction(
         "full_mix": fullmix_summary,
         "random_control": random_summary,
         "trajectory": trajectory_summary,
-        "processed_examples": int(processed_examples),
+        "processed_examples": processed_examples,
     }
 
 
@@ -715,21 +714,21 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_m
     mapping = next(iter(layer_mappings.values()))
     full_mix = metrics["full_mix"]
     random_control = metrics["random_control"]
-    post_window_boundary_idx = int(mapping.dst_layer_end_idx) + 1
+    post_window_boundary_idx = mapping.dst_layer_end_idx + 1
     first_edge_id = next(iter(layer_mappings.keys()))
     dst_id = first_edge_id.split("_to_")[1]
-    num_upper_layers = max(0, int(model_specs[dst_id].num_layers) - post_window_boundary_idx)
+    num_upper_layers = max(0, model_specs[dst_id].num_layers - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
-        injection_layer_start_idx=int(config.injection_layer_start_idx),
-        translated_num_layers=int(config.injection_window_size),
-        source_layer_start_idx=int(mapping.src_layer_start_idx),
-        source_layer_end_idx=int(mapping.src_layer_end_idx),
-        target_layer_start_idx=int(mapping.dst_layer_start_idx),
-        target_layer_end_idx=int(mapping.dst_layer_end_idx),
-        num_samples=int(metrics.get("processed_examples", config.eval_max_examples_per_dataset)),
-        num_tokens=int(full_mix["num_tokens"]),
+        injection_layer_start_idx=config.injection_layer_start_idx,
+        translated_num_layers=config.injection_window_size,
+        source_layer_start_idx=mapping.src_layer_start_idx,
+        source_layer_end_idx=mapping.src_layer_end_idx,
+        target_layer_start_idx=mapping.dst_layer_start_idx,
+        target_layer_end_idx=mapping.dst_layer_end_idx,
+        num_samples=metrics.get("processed_examples", config.eval_max_examples_per_dataset),
+        num_tokens=full_mix["num_tokens"],
         average_initial_shift_norm=float(full_mix["average_initial_shift_norm"]),
         average_window_input_norm=float(full_mix["average_window_input_norm"]),
         average_final_shift_norm=float(full_mix["average_final_shift_norm"]),
@@ -766,9 +765,9 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_m
 def plot_run_trajectories(run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path, Path]:
     import matplotlib.pyplot as plt
 
-    source_idx = int(metrics["trajectory"]["source_idx"])
+    source_idx = metrics["trajectory"]["source_idx"]
     mapping = next(iter(metrics["layer_mappings"].values()))
-    injected_window_label = format_layer_range(int(mapping["dst_layer_start_idx"]), int(mapping["dst_layer_end_idx"]))
+    injected_window_label = format_layer_range(mapping["dst_layer_start_idx"], mapping["dst_layer_end_idx"])
     token_00 = metrics["trajectory"]["token_trajectories"].get("token_00", {})
     full = token_00.get("full_mix", {})
     rand = token_00.get("random", {})

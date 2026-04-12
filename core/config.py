@@ -5,7 +5,7 @@ import torch
 
 
 def resolve_device(device: str) -> str:
-    normalized = str(device).strip().lower()
+    normalized = device.strip().lower()
     if normalized == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device
