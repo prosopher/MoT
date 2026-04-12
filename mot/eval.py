@@ -272,10 +272,9 @@ def run_eval(
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
+    logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("injection_layer_start_idx=%d", train_config.injection_layer_start_idx)
     logger.info("injection_window_size=%d", train_config.injection_window_size)
-
-    logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("translation_mode=translate_window_and_replay_target_prefill")
     logger.info("qa_eval_log_path=%s", log_path)
 

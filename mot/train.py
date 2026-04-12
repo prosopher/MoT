@@ -452,8 +452,6 @@ def build_channel_map(
             )
 
         for offset in range(requested_window_size):
-            # ChannelManager assumes channels are appended in layer order so its
-            # start/end lookups can stay O(1) via the first/last entries.
             ctx.cm.add_channel(
                 edge.id,
                 src_layer_idx=src_layer_start_idx + offset,

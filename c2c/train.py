@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -34,7 +34,7 @@ class TrainConfig(Config):
     log_every: int
     seed: int
     shuffle_buffer: int
-    top_layers_to_fuse: int
+    top_layers_to_translate: int
     fuser_dim: int
     fuser_heads: int
     fuser_depth: int
@@ -42,7 +42,6 @@ class TrainConfig(Config):
     gate_temperature_start: float
     gate_temperature_end: float
     hard_gate_eval: bool
-    top_layers_to_project: int
     projector_dim: int
     projector_depth: int
     projector_mlp_ratio: int
@@ -69,7 +68,7 @@ def is_projection_only_variant(variant_or_config: Union[str, TrainConfig]) -> bo
 
 
 def get_top_layers_to_translate(config: TrainConfig) -> int:
-    return config.top_layers_to_project if is_projection_only_variant(config) else config.top_layers_to_fuse
+    return config.top_layers_to_translate
 
 
 def get_translation_loss_name(config: TrainConfig) -> str:
@@ -259,7 +258,7 @@ class DirectionalCacheFuser(nn.Module):
         self,
         src_hidden_size: int,
         tgt_hidden_size: int,
-        top_layers_to_fuse: int,
+        top_layers_to_translate: int,
         fuser_dim: int,
         fuser_heads: int,
         fuser_depth: int,
@@ -268,11 +267,11 @@ class DirectionalCacheFuser(nn.Module):
         hard_gate_eval: bool,
     ) -> None:
         super().__init__()
-        self.top_layers_to_fuse = top_layers_to_fuse
+        self.top_layers_to_translate = top_layers_to_translate
         self.key_fuser = ResidualCacheFuser(
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
-            num_layers=top_layers_to_fuse,
+            num_layers=top_layers_to_translate,
             fuser_dim=fuser_dim,
             fuser_heads=fuser_heads,
             fuser_depth=fuser_depth,
@@ -283,7 +282,7 @@ class DirectionalCacheFuser(nn.Module):
         self.value_fuser = ResidualCacheFuser(
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
-            num_layers=top_layers_to_fuse,
+            num_layers=top_layers_to_translate,
             fuser_dim=fuser_dim,
             fuser_heads=fuser_heads,
             fuser_depth=fuser_depth,
@@ -321,7 +320,7 @@ class C2CFuserPool(nn.Module):
     def __init__(
         self,
         ctx: Context,
-        top_layers_to_fuse: int,
+        top_layers_to_translate: int,
         fuser_dim: int,
         fuser_heads: int,
         fuser_depth: int,
@@ -330,11 +329,11 @@ class C2CFuserPool(nn.Module):
         hard_gate_eval: bool,
             ) -> None:
         super().__init__()
-        if top_layers_to_fuse < 1:
-            raise ValueError("top_layers_to_fuse must be >= 1")
+        if top_layers_to_translate < 1:
+            raise ValueError("top_layers_to_translate must be >= 1")
 
         self.mm = ctx.mm
-        self.top_layers_to_fuse = top_layers_to_fuse
+        self.top_layers_to_translate = top_layers_to_translate
         self.edges = tuple(ctx.edges)
         self.edge_ids = tuple(edge.id for edge in ctx.edges)
         self.edges_by_id = build_edge_map(ctx.edges)
@@ -344,16 +343,16 @@ class C2CFuserPool(nn.Module):
             src_spec = self.mm.get_model_spec(edge.src_id)
             tgt_spec = self.mm.get_model_spec(edge.tgt_id)
             max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
-            if top_layers_to_fuse > max_allowed:
+            if top_layers_to_translate > max_allowed:
                 raise ValueError(
-                    f"top_layers_to_fuse={top_layers_to_fuse} exceeds min layer count {max_allowed} "
+                    f"top_layers_to_translate={top_layers_to_translate} exceeds min layer count {max_allowed} "
                     f"for edge {edge.id}."
                 )
 
             adapters[edge.id] = DirectionalCacheFuser(
                 src_hidden_size=src_spec.hidden_size,
                 tgt_hidden_size=tgt_spec.hidden_size,
-                top_layers_to_fuse=top_layers_to_fuse,
+                top_layers_to_translate=top_layers_to_translate,
                 fuser_dim=fuser_dim,
                 fuser_heads=fuser_heads,
                 fuser_depth=fuser_depth,
@@ -408,11 +407,11 @@ class C2CFuserPool(nn.Module):
     ) -> PastKeyValues:
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
-            top_layers_to_fuse=self.top_layers_to_fuse,
+            top_layers_to_translate=self.top_layers_to_translate,
         )
         receiver_key_block, receiver_value_block = extract_top_layer_blocks(
             past_key_values=receiver_past_key_values,
-            top_layers_to_fuse=self.top_layers_to_fuse,
+            top_layers_to_translate=self.top_layers_to_translate,
         )
         fused_key, fused_value = self.fuse_top_layer_blocks(
             receiver_key_block=receiver_key_block,
@@ -432,15 +431,15 @@ class C2CFuserPool(nn.Module):
 
 def extract_top_layer_blocks(
     past_key_values: PastKeyValues,
-    top_layers_to_fuse: int,
+    top_layers_to_translate: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if top_layers_to_fuse < 1:
-        raise ValueError("top_layers_to_fuse must be >= 1")
-    if top_layers_to_fuse > len(past_key_values):
+    if top_layers_to_translate < 1:
+        raise ValueError("top_layers_to_translate must be >= 1")
+    if top_layers_to_translate > len(past_key_values):
         raise ValueError(
-            f"Cannot extract {top_layers_to_fuse} layers from cache with only {len(past_key_values)} layers."
+            f"Cannot extract {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
         )
-    return past_key_values_to_blocks(past_key_values[-top_layers_to_fuse:])
+    return past_key_values_to_blocks(past_key_values[-top_layers_to_translate:])
 
 
 
@@ -487,13 +486,13 @@ class DirectionalCacheProjector(nn.Module):
         self,
         src_hidden_size: int,
         tgt_hidden_size: int,
-        top_layers_to_project: int,
+        top_layers_to_translate: int,
         hidden_dim: int,
         depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.top_layers_to_project = top_layers_to_project
+        self.top_layers_to_translate = top_layers_to_translate
         self.key_projector = ProjectionMLP(
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
@@ -524,17 +523,17 @@ class C2CProjectorPool(nn.Module):
     def __init__(
         self,
         ctx: Context,
-        top_layers_to_project: int,
+        top_layers_to_translate: int,
         projector_dim: int,
         projector_depth: int,
         mlp_ratio: int,
             ) -> None:
         super().__init__()
-        if top_layers_to_project < 1:
-            raise ValueError("top_layers_to_project must be >= 1")
+        if top_layers_to_translate < 1:
+            raise ValueError("top_layers_to_translate must be >= 1")
 
         self.mm = ctx.mm
-        self.top_layers_to_project = top_layers_to_project
+        self.top_layers_to_translate = top_layers_to_translate
         self.edges = tuple(ctx.edges)
         self.edge_ids = tuple(edge.id for edge in ctx.edges)
         self.edges_by_id = build_edge_map(ctx.edges)
@@ -544,15 +543,15 @@ class C2CProjectorPool(nn.Module):
             src_spec = self.mm.get_model_spec(edge.src_id)
             tgt_spec = self.mm.get_model_spec(edge.tgt_id)
             max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
-            if top_layers_to_project > max_allowed:
+            if top_layers_to_translate > max_allowed:
                 raise ValueError(
-                    f"top_layers_to_project={top_layers_to_project} exceeds min layer count {max_allowed} "
+                    f"top_layers_to_translate={top_layers_to_translate} exceeds min layer count {max_allowed} "
                     f"for edge {edge.id}."
                 )
             adapters[edge.id] = DirectionalCacheProjector(
                 src_hidden_size=src_spec.hidden_size,
                 tgt_hidden_size=tgt_spec.hidden_size,
-                top_layers_to_project=top_layers_to_project,
+                top_layers_to_translate=top_layers_to_translate,
                 hidden_dim=projector_dim,
                 depth=projector_depth,
                 mlp_ratio=mlp_ratio,
@@ -578,7 +577,7 @@ class C2CProjectorPool(nn.Module):
             )
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
-            top_layers_to_fuse=self.top_layers_to_project,
+            top_layers_to_translate=self.top_layers_to_translate,
         )
         projected_key, projected_value = self.adapters[adapter_name](
             sharer_key_block=sharer_key_block,
@@ -600,7 +599,7 @@ def build_translator_pool(
     if is_projection_only_variant(config):
         translator_pool = C2CProjectorPool(
             ctx=ctx,
-            top_layers_to_project=config.top_layers_to_project,
+            top_layers_to_translate=config.top_layers_to_translate,
             projector_dim=config.projector_dim,
             projector_depth=config.projector_depth,
             mlp_ratio=config.projector_mlp_ratio,
@@ -608,7 +607,7 @@ def build_translator_pool(
     else:
         translator_pool = C2CFuserPool(
             ctx=ctx,
-            top_layers_to_fuse=config.top_layers_to_fuse,
+            top_layers_to_translate=config.top_layers_to_translate,
             fuser_dim=config.fuser_dim,
             fuser_heads=config.fuser_heads,
             fuser_depth=config.fuser_depth,
@@ -712,10 +711,7 @@ def run_train(
             spec.num_heads,
         )
     logger.info("[Setup] variant = %s", config.variant)
-    if is_projection_only_variant(config):
-        logger.info("[Setup] top_layers_to_project = %d", config.top_layers_to_project)
-    else:
-        logger.info("[Setup] top_layers_to_fuse = %d", config.top_layers_to_fuse)
+    logger.info("[Setup] top_layers_to_translate = %d", config.top_layers_to_translate)
     logger.info("[Setup] trainable %s params = %s", get_trainable_module_label(config), f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(ctx)

@@ -15,7 +15,7 @@
   "log_every": 1,
   "seed": 123,
   "shuffle_buffer": 8,
-  "top_layers_to_fuse": 1,
+  "top_layers_to_translate": 1,
   "fuser_dim": 8,
   "fuser_heads": 1,
   "fuser_depth": 1,
@@ -26,7 +26,6 @@
   "device": "cpu",
   "dtype": "float32",
   "variant": "c2c",
-  "top_layers_to_project": 1,
   "projector_dim": 8,
   "projector_depth": 1,
   "projector_mlp_ratio": 1

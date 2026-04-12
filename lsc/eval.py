@@ -267,6 +267,7 @@ def run_eval(
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
+    logger.info("edges=%s", [edge.id for edge in edges])
     for node in nodes:
         logger.info(
             "translation_spec: %s layers=%d hidden=%d heads=%d (%s)",
@@ -276,7 +277,6 @@ def run_eval(
             ctx.mm.get_model_spec(node.id).num_heads,
             node.model_id,
         )
-    logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("translation_mode=replace_top_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
 
