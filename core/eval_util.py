@@ -573,7 +573,7 @@ def evaluate_openwebtext_validation_loss_replay(
         profile_tokens = lm_labels.numel()
 
         def compute_translated_loss_value() -> float:
-            mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
+            mixed_target_past, _, channel = translator_pool.build_replayed_target_past(
                 source_past_key_values=past_by_node_id[edge.src_id],
                 prefix_input_ids=prefix_cache_ids,
                 target_model=ctx.mm.get_model(edge.tgt_id),
@@ -588,7 +588,7 @@ def evaluate_openwebtext_validation_loss_replay(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                 ).item()
             )
 

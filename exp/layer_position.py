@@ -363,36 +363,36 @@ def build_config_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_run_config.json"
 
 
-def build_layer_mapping_path(run_dir: Path) -> Path:
-    return run_dir / "target_injection_layer_mapping.json"
+def build_channel_map_path(run_dir: Path) -> Path:
+    return run_dir / "target_injection_channel_map.json"
 
 
 def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
 
-def log_layer_mappings(
+def log_channel_map(
     ctx: Context,
     logger: logging.Logger,
-    layer_mappings: Dict[str, LayerMapping],
+    channel_map: Dict[str, Channel],
 ) -> None:
     config = ctx.config
     injection_window_size = config.injection_window_size
     node_map = build_node_map(ctx.nodes)
-    for edge_id, mapping in layer_mappings.items():
+    for edge_id, channel in channel_map.items():
         src_id, tgt_id = edge_id.split("_to_")
-        tgt_depth_from_top = ctx.mm.get_model_spec(tgt_id).num_layers - 1 - mapping.tgt_layer_start_idx
+        tgt_depth_from_top = ctx.mm.get_model_spec(tgt_id).num_layers - 1 - channel.tgt_layer_start_idx
         logger.info(
-            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | injection_window_size=%d | tgt_depth_from_top=%d",
+            "[Channel] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | injection_window_size=%d | tgt_depth_from_top=%d",
             edge_id,
             src_id,
             node_map[src_id].model_id,
-            mapping.src_layer_start_idx,
-            mapping.src_layer_end_idx,
+            channel.src_layer_start_idx,
+            channel.src_layer_end_idx,
             ctx.mm.get_model_spec(src_id).num_layers - 1,
             tgt_id,
             node_map[tgt_id].model_id,
-            mapping.tgt_layer_start_idx,
-            mapping.tgt_layer_end_idx,
+            channel.tgt_layer_start_idx,
+            channel.tgt_layer_end_idx,
             ctx.mm.get_model_spec(tgt_id).num_layers - 1,
             injection_window_size,
             tgt_depth_from_top,
@@ -415,7 +415,7 @@ def build_models_for_experiment(
 def run_train(
     ctx: Context,
     run_dir: Path,
-) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
+) -> Tuple[LayerWindowTranslatorPool, Dict[str, Channel]]:
     config = ctx.config
     nodes = ctx.nodes
     tokenizer = ctx.tokenizer
@@ -423,11 +423,11 @@ def run_train(
     logger.info("Starting layer-window position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
 
-    translator_pool, layer_mappings = build_translator_pool(
+    translator_pool, channel_map = build_translator_pool(
         ctx=ctx,
     )
     translator_pool.train()
-    log_layer_mappings(ctx, logger, layer_mappings)
+    log_channel_map(ctx, logger, channel_map)
     logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = InfiniteDataLoader(
@@ -474,7 +474,7 @@ def run_train(
 
             total_direction_loss = 0.0
             for edge in ctx.edges:
-                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
+                translated_key, translated_value, channel = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
@@ -482,7 +482,7 @@ def run_train(
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=prefix_cache_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -493,7 +493,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                 )
 
             loss = total_direction_loss / config.grad_accum_steps
@@ -521,7 +521,7 @@ def run_train(
             running_loss = 0.0
 
     logger.info("[Done] training complete")
-    return translator_pool, layer_mappings
+    return translator_pool, channel_map
 
 
 @torch.inference_mode()
@@ -560,7 +560,7 @@ def evaluate_logit_dataset(
             }
 
             for edge in edges:
-                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
+                translated_key, translated_value, channel = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
@@ -568,7 +568,7 @@ def evaluate_logit_dataset(
                 native_target_past = past_by_node_id[edge.tgt_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
-                    start_layer_idx=mapping.tgt_layer_start_idx,
+                    start_layer_idx=channel.tgt_layer_start_idx,
                     num_layers=config.injection_window_size,
                 )
                 control_windows = build_control_window_variants(
@@ -580,7 +580,7 @@ def evaluate_logit_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -588,7 +588,7 @@ def evaluate_logit_dataset(
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -596,7 +596,7 @@ def evaluate_logit_dataset(
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -764,7 +764,7 @@ def evaluate_generation_dataset(
             }
 
             for edge in edges:
-                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
+                translated_key, translated_value, channel = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
@@ -772,7 +772,7 @@ def evaluate_generation_dataset(
                 native_target_past = past_by_node_id[edge.tgt_id]
                 native_key_block, native_value_block = extract_layer_window_blocks(
                     past_key_values=native_target_past,
-                    start_layer_idx=mapping.tgt_layer_start_idx,
+                    start_layer_idx=channel.tgt_layer_start_idx,
                     num_layers=config.injection_window_size,
                 )
                 control_windows = build_control_window_variants(
@@ -784,7 +784,7 @@ def evaluate_generation_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -792,7 +792,7 @@ def evaluate_generation_dataset(
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -800,7 +800,7 @@ def evaluate_generation_dataset(
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=mapping.tgt_layer_start_idx,
+                    target_start_layer_idx=channel.tgt_layer_start_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -923,7 +923,7 @@ def compute_openwebtext_native_and_full_mix_losses(
     past_by_node_id,
     translator_pool: LayerWindowTranslatorPool,
 ) -> Dict[str, float]:
-    translated_key, translated_value, mapping = translator_pool.translate_layer_window(
+    translated_key, translated_value, channel = translator_pool.translate_layer_window(
         past_key_values=past_by_node_id[edge.src_id],
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
@@ -932,7 +932,7 @@ def compute_openwebtext_native_and_full_mix_losses(
     full_mix_past = replay_target_prefill_with_injected_window(
         target_model=ctx.mm.get_model(edge.tgt_id),
         prefix_input_ids=prefix_cache_ids,
-        target_start_layer_idx=mapping.tgt_layer_start_idx,
+        target_start_layer_idx=channel.tgt_layer_start_idx,
         injected_key_block=translated_key,
         injected_value_block=translated_value,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -1013,7 +1013,7 @@ def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "benchmark_mode": combined_metrics["benchmark_mode"],
         "metric_name": metric_name,
-        "layer_mappings": combined_metrics["layer_mappings"],
+        "channel_map": combined_metrics["channel_map"],
         dataset_results_key: combined_metrics[dataset_results_key],
         "average_metric": combined_metrics["average_metric"],
         "average_native_metric": combined_metrics["average_native_metric"],
@@ -1035,7 +1035,7 @@ def extract_analysis_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]
     return {
         "benchmark_mode": combined_metrics["benchmark_mode"],
         "metric_name": combined_metrics["metric_name"],
-        "layer_mappings": combined_metrics["layer_mappings"],
+        "channel_map": combined_metrics["channel_map"],
         "dataset_logit_kl": combined_metrics["dataset_logit_kl"],
         "average_native_to_dir_only_logit_kl": combined_metrics["average_native_to_dir_only_logit_kl"],
         "average_native_to_mag_only_logit_kl": combined_metrics["average_native_to_mag_only_logit_kl"],
@@ -1056,17 +1056,17 @@ def build_summary_row(
     run_dir: Path,
     metrics: Dict[str, Any],
 ) -> SummaryRow:
-    reference_mapping = next(iter(metrics["layer_mappings"].values()))
+    reference_channel = next(iter(metrics["channel_map"].values()))
     return SummaryRow(
         study_id=config.study_id or "",
         benchmark_mode=metrics["benchmark_mode"],
         metric_name=metrics["metric_name"],
         injection_layer_start_idx=config.injection_layer_start_idx,
         translated_num_layers=config.injection_window_size,
-        source_layer_start_idx=reference_mapping["src_layer_start_idx"],
-        source_layer_end_idx=reference_mapping["src_layer_end_idx"],
-        target_layer_start_idx=reference_mapping["tgt_layer_start_idx"],
-        target_layer_end_idx=reference_mapping["tgt_layer_end_idx"],
+        source_layer_start_idx=reference_channel["src_layer_start_idx"],
+        source_layer_end_idx=reference_channel["src_layer_end_idx"],
+        target_layer_start_idx=reference_channel["tgt_layer_start_idx"],
+        target_layer_end_idx=reference_channel["tgt_layer_end_idx"],
         average_metric=float(metrics["average_metric"]),
         average_native_metric=float(metrics["average_native_metric"]),
         average_dir_only_metric=float(metrics["average_dir_only_metric"]),
@@ -1288,7 +1288,7 @@ def save_analysis_artifacts(run_dir: Path, metrics: Dict[str, Any]) -> Path:
 def save_run_artifacts(
     config: LayerPositionConfig,
     run_dir: Path,
-    layer_mappings: Dict[str, LayerMapping],
+    channel_map: Dict[str, Channel],
     eval_metrics: Dict[str, Any],
     combined_metrics: Dict[str, Any],
 ) -> Tuple[Path, Path, Path, Path, Path]:
@@ -1296,7 +1296,7 @@ def save_run_artifacts(
     study_dir.mkdir(parents=True, exist_ok=True)
     remove_stale_summary_artifacts(study_dir, run_dir)
     write_json(str(build_config_path(run_dir)), asdict(config))
-    write_json(str(build_layer_mapping_path(run_dir)), {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()})
+    write_json(str(build_channel_map_path(run_dir)), {edge_id: asdict(channel) for edge_id, channel in channel_map.items()})
     write_json(str(build_metrics_path(run_dir)), eval_metrics)
     summary_path = update_summary(config, run_dir, combined_metrics)
     metric_controls_chart_path = plot_metric_controls_summary(summary_path)
@@ -1308,14 +1308,14 @@ def run_eval(
     ctx: Context,
     run_dir: Path,
     translator_pool: LayerWindowTranslatorPool,
-    layer_mappings: Dict[str, LayerMapping],
+    channel_map: Dict[str, Channel],
 ) -> Dict[str, Any]:
     config = ctx.config
     edges = ctx.edges
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
-    log_layer_mappings(ctx, logger, layer_mappings)
+    log_channel_map(ctx, logger, channel_map)
 
     translator_pool.eval()
     for node in ctx.nodes:
@@ -1499,7 +1499,7 @@ def run_eval(
     return {
         "benchmark_mode": config.benchmark_mode,
         "metric_name": metric_name,
-        "layer_mappings": {edge_id: asdict(mapping) for edge_id, mapping in layer_mappings.items()},
+        "channel_map": {edge_id: asdict(channel) for edge_id, channel in channel_map.items()},
         dataset_results_key: dataset_results_by_name,
         "average_metric": average_full_mix_metric,
         "average_native_metric": average_native_metric,
@@ -1580,7 +1580,7 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    translator_pool, layer_mappings = run_train(
+    translator_pool, channel_map = run_train(
         ctx=ctx,
         run_dir=run_dir,
     )
@@ -1588,7 +1588,7 @@ def main() -> None:
         ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
-        layer_mappings=layer_mappings,
+        channel_map=channel_map,
     )
     eval_metrics = extract_eval_metrics(combined_metrics)
     analysis_metrics = extract_analysis_metrics(combined_metrics)
@@ -1596,7 +1596,7 @@ def main() -> None:
     summary_path, metrics_path, metric_controls_chart_path, logit_kl_chart_path, openwebtext_loss_chart_path = save_run_artifacts(
         config=config,
         run_dir=run_dir,
-        layer_mappings=layer_mappings,
+        channel_map=channel_map,
         eval_metrics=eval_metrics,
         combined_metrics=combined_metrics,
     )
