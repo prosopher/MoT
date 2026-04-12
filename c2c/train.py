@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from core.config import Config
 from core.context import Context
+from core.model_manager import ModelManager
 from core.train_util import *
 
 
@@ -599,11 +600,10 @@ def build_translator_pool(
     ctx: Context,
 ) -> Union[C2CFuserPool, C2CProjectorPool]:
     config = ctx.config
-    model_specs = ctx.model_specs
     edges = ctx.edges
     if is_projection_only_variant(config):
         translator_pool = C2CProjectorPool(
-            model_specs=model_specs,
+            model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
             edges=edges,
             top_layers_to_project=config.top_layers_to_project,
             projector_dim=config.projector_dim,
@@ -612,7 +612,7 @@ def build_translator_pool(
         )
     else:
         translator_pool = C2CFuserPool(
-            model_specs=model_specs,
+            model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
             edges=edges,
             top_layers_to_fuse=config.top_layers_to_fuse,
             fuser_dim=config.fuser_dim,
@@ -653,10 +653,9 @@ def load_translator_pool_from_checkpoint(
     models, tokenizer = build_models_and_tokenizer(config, nodes)
     ctx = Context(
         config,
-        build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
-        models,
+        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
         tokenizer,
     )
     translator_pool = build_translator_pool(ctx)
@@ -683,10 +682,8 @@ def run_train(
     ctx: Context,
 ) -> Path:
     config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    models = ctx.models
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -710,7 +707,7 @@ def run_train(
 
     logger.info("[Setup] full model specs")
     for node in nodes:
-        spec = model_specs[node.id]
+        spec = ctx.mm.get_model_spec(node.id)
         logger.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
@@ -762,7 +759,7 @@ def run_train(
 
             with torch.no_grad():
                 past_by_node_id = {
-                    node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
                     for node in nodes
                 }
 
@@ -775,14 +772,14 @@ def run_train(
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
                 translated_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
-                    target_model=models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,

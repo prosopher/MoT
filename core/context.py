@@ -1,18 +1,17 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import List
 
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from .config import Config
-from .model_spec import ModelSpec
+from .model_manager import ModelManager
 from .topology import Edge, Node
 
 
 @dataclass
 class Context:
     config: Config
-    model_specs: Dict[str, ModelSpec]
     nodes: List[Node]
     edges: List[Edge]
-    models: Dict[str, PreTrainedModel]
+    mm: ModelManager
     tokenizer: PreTrainedTokenizerBase

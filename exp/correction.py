@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from core.common import *
 from core.context import Context
+from core.model_manager import ModelManager
 from core.eval_util import *
 import exp.layer_position as lp
 
@@ -462,10 +463,8 @@ def evaluate_correction(
     layer_mappings: Dict[str, lp.LayerMapping],
 ) -> Dict[str, Any]:
     config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    models = ctx.models
     tokenizer = ctx.tokenizer
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
@@ -473,8 +472,8 @@ def evaluate_correction(
     lp.log_layer_mappings(ctx, logger, layer_mappings)
 
     translator_pool.eval()
-    for model in models.values():
-        model.eval()
+    for node in nodes:
+        ctx.mm.get_model(node.id).eval()
 
     eval_config = SimpleNamespace(
         batch_size=config.eval_batch_size,
@@ -489,7 +488,7 @@ def evaluate_correction(
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
     reference_mapping = layer_mappings[edges[0].id]
-    num_layers = model_specs[edges[0].tgt_id].num_layers
+    num_layers = ctx.mm.get_model_spec(edges[0].tgt_id).num_layers
     source_idx = reference_mapping.tgt_layer_end_idx + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
@@ -515,7 +514,7 @@ def evaluate_correction(
                 question_cache_ids = prepared_inputs.get("question_cache_ids", None)
                 seed_token = prepared_inputs["seed_token"]
                 try:
-                    past_by_node_id = {node.id: extract_past_key_values(models[node.id], cache_input_ids) for node in nodes}
+                    past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids) for node in nodes}
                 except Exception as exc:
                     logger.warning("Skipping example due to cache extraction error: %s", exc)
                     continue
@@ -534,12 +533,12 @@ def evaluate_correction(
                         num_layers=config.injection_window_size,
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
-                        target_model=models[edge.tgt_id],
+                        target_model=ctx.mm.get_model(edge.tgt_id),
                         prefix_input_ids=cache_input_ids,
                         target_start_layer_idx=mapping.tgt_layer_start_idx,
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
-                        tgt_spec=model_specs[edge.tgt_id],
+                        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                     )
                     random_key_block, random_value_block = build_random_matched_window(
                         native_key_block=native_key_block,
@@ -548,15 +547,15 @@ def evaluate_correction(
                         translated_value_block=translated_value,
                     )
                     random_past = lp.replay_target_prefill_with_injected_window(
-                        target_model=models[edge.tgt_id],
+                        target_model=ctx.mm.get_model(edge.tgt_id),
                         prefix_input_ids=cache_input_ids,
                         target_start_layer_idx=mapping.tgt_layer_start_idx,
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
-                        tgt_spec=model_specs[edge.tgt_id],
+                        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                     )
 
-                    target_model = models[edge.tgt_id]
+                    target_model = ctx.mm.get_model(edge.tgt_id)
                     native_past = maybe_append_input_ids(target_model, native_target_past, question_cache_ids)
                     fullmix_past = maybe_append_input_ids(target_model, full_mix_past, question_cache_ids)
                     random_past = maybe_append_input_ids(target_model, random_past, question_cache_ids)
@@ -707,7 +706,6 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
 
 def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_mappings: Dict[str, lp.LayerMapping]) -> Path:
     config = ctx.config
-    model_specs = ctx.model_specs
     study_dir = run_dir.parent
     summary_path = build_summary_path(study_dir)
     rows = read_summary_rows(summary_path)
@@ -717,7 +715,7 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any], layer_m
     post_window_boundary_idx = mapping.tgt_layer_end_idx + 1
     first_edge_id = next(iter(layer_mappings.keys()))
     tgt_id = first_edge_id.split("_to_")[1]
-    num_upper_layers = max(0, model_specs[tgt_id].num_layers - post_window_boundary_idx)
+    num_upper_layers = max(0, ctx.mm.get_model_spec(tgt_id).num_layers - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
@@ -1011,7 +1009,13 @@ def main() -> None:
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     models, tokenizer = lp.build_models_for_experiment(config, nodes)
     model_specs = build_model_specs_for_nodes(models, nodes)
-    ctx = Context(config, model_specs, nodes, edges, models, tokenizer)
+    ctx = Context(
+        config,
+        nodes,
+        edges,
+        ModelManager(models, model_specs),
+        tokenizer,
+    )
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 

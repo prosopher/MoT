@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from core.config import Config
 from core.context import Context
+from core.model_manager import ModelManager
 from core.train_util import *
 
 
@@ -411,14 +412,13 @@ def build_layer_mappings(
     edges: List[Edge],
 ) -> Dict[str, LayerMapping]:
     config = ctx.config
-    model_specs = ctx.model_specs
     requested_window_size = config.injection_window_size
     injection_layer_start_idx = config.injection_layer_start_idx
 
     mappings: Dict[str, LayerMapping] = {}
     for edge in edges:
-        src_spec = model_specs[edge.src_id]
-        tgt_spec = model_specs[edge.tgt_id]
+        src_spec = ctx.mm.get_model_spec(edge.src_id)
+        tgt_spec = ctx.mm.get_model_spec(edge.tgt_id)
 
         tgt_layer_start_idx = injection_layer_start_idx
         tgt_layer_end_idx = tgt_layer_start_idx + requested_window_size - 1
@@ -649,7 +649,7 @@ def build_translator_pool(
     edges = ctx.edges
     layer_mappings = build_layer_mappings(ctx, edges)
     translator_pool = LayerWindowTranslatorPool(
-        model_specs=ctx.model_specs,
+        model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
         edges=edges,
         layer_mappings=layer_mappings,
         injection_window_size=config.injection_window_size,
@@ -692,10 +692,9 @@ def load_translator_pool_from_checkpoint(
     models, tokenizer = build_models_and_tokenizer(config, nodes)
     ctx = Context(
         config,
-        build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
-        models,
+        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
         tokenizer,
     )
     translator_pool, layer_mappings = build_translator_pool(ctx)
@@ -710,10 +709,8 @@ def run_train(
     ctx: Context,
 ) -> Path:
     config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    models = ctx.models
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -736,7 +733,7 @@ def run_train(
 
     logger.info("[Setup] full model specs")
     for node in nodes:
-        spec = model_specs[node.id]
+        spec = ctx.mm.get_model_spec(node.id)
         logger.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
@@ -778,7 +775,7 @@ def run_train(
 
             with torch.no_grad():
                 past_by_node_id = {
-                    node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
                     for node in nodes
                 }
 
@@ -787,13 +784,13 @@ def run_train(
                 mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
-                    target_model=models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
                 direction_loss = compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,

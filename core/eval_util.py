@@ -396,7 +396,7 @@ def evaluate_openwebtext_validation_loss_metrics(
             prefix_tokens=ctx.config.prefix_tokens,
         )
         past_by_node_id = {
-            node.id: extract_past_key_values(ctx.models[node.id], prefix_cache_ids)
+            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
             for node in ctx.nodes
         }
 
@@ -464,7 +464,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    tgt_model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -483,7 +482,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
                 past_key_values=past_by_node_id[edge.src_id],
                 src_name=edge.src_id,
                 tgt_name=edge.tgt_id,
-                tgt_spec=tgt_model_specs[edge.tgt_id],
+                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             )
             mixed_target_past = replace_top_layers(
                 base_past_key_values=past_by_node_id[edge.tgt_id],
@@ -491,7 +490,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
             )
             return float(
                 compute_suffix_lm_loss(
-                    target_model=ctx.models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -501,7 +500,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=ctx.models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=past_by_node_id[edge.tgt_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -560,7 +559,6 @@ def evaluate_openwebtext_validation_loss_replay(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    tgt_model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -578,14 +576,14 @@ def evaluate_openwebtext_validation_loss_replay(
             mixed_target_past, _, mapping = translator_pool.build_replayed_target_past(
                 source_past_key_values=past_by_node_id[edge.src_id],
                 prefix_input_ids=prefix_cache_ids,
-                target_model=ctx.models[edge.tgt_id],
+                target_model=ctx.mm.get_model(edge.tgt_id),
                 src_name=edge.src_id,
                 tgt_name=edge.tgt_id,
-                tgt_spec=tgt_model_specs[edge.tgt_id],
+                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             )
             return float(
                 compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -597,7 +595,7 @@ def evaluate_openwebtext_validation_loss_replay(
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=ctx.models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=past_by_node_id[edge.tgt_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -1433,7 +1431,10 @@ def compute_benchmark_context_budget(
     question: str,
     eval_config,
 ) -> int:
-    shared_limit = min(get_model_context_limit(model, ctx.tokenizer) for model in ctx.models.values())
+    shared_limit = min(
+        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
+        for node in ctx.nodes
+    )
     question_prefix = prepare_generation_task_question_prefix(
         spec=spec,
         tokenizer=ctx.tokenizer,

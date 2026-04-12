@@ -4,6 +4,7 @@ from pathlib import Path
 
 from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, build_model_specs_for_nodes
 from core.context import Context
+from core.model_manager import ModelManager
 from core.topology import build_nodes_and_edges
 from core.train_util import build_models_and_tokenizer
 
@@ -59,10 +60,9 @@ def main() -> None:
     models, tokenizer = build_models_and_tokenizer(config, nodes)
     ctx = Context(
         config,
-        build_model_specs_for_nodes(models, nodes),
         nodes,
         edges,
-        models,
+        ModelManager(models, build_model_specs_for_nodes(models, nodes)),
         tokenizer,
     )
 

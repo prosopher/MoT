@@ -204,9 +204,7 @@ def evaluate_dataset(
     nodes = ctx.nodes
     edges = ctx.edges
     device = train_config.device
-    models = ctx.models
     tokenizer = ctx.tokenizer
-    model_specs = ctx.model_specs
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -238,7 +236,7 @@ def evaluate_dataset(
             )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
                 for node in nodes
             }
 
@@ -251,7 +249,7 @@ def evaluate_dataset(
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
                 target_top = slice_top_layers(
@@ -266,25 +264,25 @@ def evaluate_dataset(
                 )
 
                 translated_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=translated_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 native_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=past_by_node_id[edge.tgt_id],
                     question_cache_ids=question_cache_ids,
                 )
 
                 translated_scores = score_answer_choices(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=translated_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
@@ -325,9 +323,7 @@ def evaluate_generation_dataset(
     nodes = ctx.nodes
     edges = ctx.edges
     device = train_config.device
-    models = ctx.models
     tokenizer = ctx.tokenizer
-    model_specs = ctx.model_specs
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -370,7 +366,7 @@ def evaluate_generation_dataset(
                 )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
                 for node in nodes
             }
 
@@ -383,7 +379,7 @@ def evaluate_generation_dataset(
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
                 target_top = slice_top_layers(
@@ -398,7 +394,7 @@ def evaluate_generation_dataset(
                 )
 
                 translated_answer = predict_generation_task_answer(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=translated_target_past,
                     seed_token=seed_token,
@@ -406,7 +402,7 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
@@ -445,8 +441,6 @@ def evaluate_openwebtext_validation_loss(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    models = ctx.models
-    model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -469,7 +463,7 @@ def evaluate_openwebtext_validation_loss(
                 receiver_past_key_values=past_by_node_id[edge.tgt_id],
                 src_name=edge.src_id,
                 tgt_name=edge.tgt_id,
-                tgt_spec=model_specs[edge.tgt_id],
+                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             )
             translated_target_past = replace_top_layers(
                 base_past_key_values=past_by_node_id[edge.tgt_id],
@@ -477,7 +471,7 @@ def evaluate_openwebtext_validation_loss(
             )
             return float(
                 compute_suffix_lm_loss(
-                    target_model=models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -487,7 +481,7 @@ def evaluate_openwebtext_validation_loss(
         def compute_native_loss_value() -> float:
             return float(
                 compute_suffix_lm_loss(
-                    target_model=models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=past_by_node_id[edge.tgt_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -548,7 +542,6 @@ def run_eval(
     train_config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
-    models = ctx.models
     set_seed(eval_config.seed)
 
     checkpoint_dir_path = eval_config.checkpoint_dir_path
@@ -563,8 +556,8 @@ def run_eval(
     logger.info("eval_config=%s", asdict(eval_config))
 
     translator_pool.eval()
-    for model in models.values():
-        model.eval()
+    for node in nodes:
+        ctx.mm.get_model(node.id).eval()
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])

@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from core.config import Config
 from core.context import Context
+from core.model_manager import ModelManager
 from core.train_util import *
 
 
@@ -323,9 +324,8 @@ def build_translator_pool(
     ctx: Context,
 ) -> SharedKVTranslatorPool:
     config = ctx.config
-    model_specs = ctx.model_specs
     translator_pool = SharedKVTranslatorPool(
-        model_specs=model_specs,
+        model_specs={node.id: ctx.mm.get_model_spec(node.id) for node in ctx.nodes},
         shared_slots=config.shared_slots,
         shared_dim=config.shared_dim,
         translator_dim=config.translator_dim,
@@ -365,7 +365,13 @@ def load_translator_pool_from_checkpoint(
         full_model_specs=full_model_specs,
         top_layers_ratio=config.top_layers_ratio,
     )
-    ctx = Context(config, model_specs, nodes, edges, models, tokenizer)
+    ctx = Context(
+        config,
+        nodes,
+        edges,
+        ModelManager(models, model_specs),
+        tokenizer,
+    )
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
@@ -380,13 +386,15 @@ def run_train(
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
-    full_model_specs = ctx.model_specs
-    models = ctx.models
-    model_specs = build_model_specs_for_top_layers(
+    full_model_specs = {node.id: get_model_spec(ctx.mm.get_model(node.id)) for node in nodes}
+    translated_model_specs = build_model_specs_for_top_layers(
         full_model_specs=full_model_specs,
         top_layers_ratio=config.top_layers_ratio,
     )
-    ctx.model_specs = model_specs
+    ctx.mm = ModelManager(
+        {node.id: ctx.mm.get_model(node.id) for node in nodes},
+        translated_model_specs,
+    )
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -422,7 +430,7 @@ def run_train(
 
     logger.info("[Setup] translated top-layer specs")
     for node in nodes:
-        translated_spec = model_specs[node.id]
+        translated_spec = ctx.mm.get_model_spec(node.id)
         full_spec = full_model_specs[node.id]
         logger.info(
             "  %s_top (%s): layers=%d / %d",
@@ -466,7 +474,7 @@ def run_train(
 
             with torch.no_grad():
                 past_by_node_id = {
-                    node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
                     for node in nodes
                 }
 
@@ -476,14 +484,14 @@ def run_train(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
                 mixed_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
-                    target_model=models[edge.tgt_id],
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,

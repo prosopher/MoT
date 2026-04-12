@@ -18,12 +18,10 @@ def evaluate_dataset(
     translator_pool,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
     train_config = ctx.config
     device = train_config.device
-    models = ctx.models
     tokenizer = ctx.tokenizer
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
@@ -52,7 +50,7 @@ def evaluate_dataset(
             )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
                 for node in nodes
             }
 
@@ -61,12 +59,12 @@ def evaluate_dataset(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
                 target_top = slice_top_layers(
                     past_key_values=past_by_node_id[edge.tgt_id],
-                    top_layers_to_translate=model_specs[edge.tgt_id].num_layers,
+                    top_layers_to_translate=ctx.mm.get_model_spec(edge.tgt_id).num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
@@ -76,25 +74,25 @@ def evaluate_dataset(
                 )
 
                 translated_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     question_cache_ids=question_cache_ids,
                 )
                 native_scoring_past = prepare_answer_scoring_past(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=past_by_node_id[edge.tgt_id],
                     question_cache_ids=question_cache_ids,
                 )
 
                 translated_scores = score_answer_choices(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=translated_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
@@ -131,12 +129,10 @@ def evaluate_generation_dataset(
     translator_pool,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
     train_config = ctx.config
     device = train_config.device
-    models = ctx.models
     tokenizer = ctx.tokenizer
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
@@ -180,7 +176,7 @@ def evaluate_generation_dataset(
                 )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
                 for node in nodes
             }
 
@@ -189,12 +185,12 @@ def evaluate_generation_dataset(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     tgt_name=edge.tgt_id,
-                    tgt_spec=model_specs[edge.tgt_id],
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
                 target_top = slice_top_layers(
                     past_key_values=past_by_node_id[edge.tgt_id],
-                    top_layers_to_translate=model_specs[edge.tgt_id].num_layers,
+                    top_layers_to_translate=ctx.mm.get_model_spec(edge.tgt_id).num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
@@ -204,7 +200,7 @@ def evaluate_generation_dataset(
                 )
 
                 translated_answer = predict_generation_task_answer(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
@@ -212,7 +208,7 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=models[edge.tgt_id],
+                    model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
@@ -250,11 +246,9 @@ def run_eval(
     translator_pool,
 ) -> Path:
     train_config = ctx.config
-    model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    models = ctx.models
-    full_model_specs = build_model_specs_for_nodes(models, nodes)
+    full_model_specs = {node.id: get_model_spec(ctx.mm.get_model(node.id)) for node in nodes}
     set_seed(eval_config.seed)
 
     checkpoint_dir_path = eval_config.checkpoint_dir_path
@@ -269,8 +263,8 @@ def run_eval(
     logger.info("eval_config=%s", asdict(eval_config))
 
     translator_pool.eval()
-    for model in models.values():
-        model.eval()
+    for node in nodes:
+        ctx.mm.get_model(node.id).eval()
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
@@ -279,7 +273,7 @@ def run_eval(
         logger.info(
             "translated_layers: %s_top=%d/%d (%s)",
             node.id,
-            model_specs[node.id].num_layers,
+            ctx.mm.get_model_spec(node.id).num_layers,
             full_model_specs[node.id].num_layers,
             node.model_id,
         )
