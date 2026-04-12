@@ -2,6 +2,7 @@
   "timestamp": null,
   "output_path": null,
   "model_ids": "tiny-a,tiny-b",
+  "model_directions": "all",
   "max_steps": 1,
   "batch_size": 1,
   "grad_accum_steps": 1,

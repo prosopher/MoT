@@ -1421,7 +1421,7 @@ def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrain
 
 
 def get_answer_token_budget(eval_config) -> int:
-    return int(getattr(eval_config, "generation_max_new_tokens"))
+    return int(eval_config.generation_max_new_tokens)
 
 
 def compute_benchmark_context_budget(
@@ -1628,7 +1628,7 @@ def predict_generation_task_answer(
         tokenizer=tokenizer,
         past_key_values=generation_past,
         seed_token=seed_token,
-        max_new_tokens=int(getattr(eval_config, "generation_max_new_tokens")),
+        max_new_tokens=int(eval_config.generation_max_new_tokens),
     )
 
 

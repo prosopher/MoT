@@ -15,6 +15,7 @@ from core.train_util import *
 @dataclass
 class TrainConfig(Config):
     model_ids: str
+    model_directions: str = "all"
     max_steps: int
     batch_size: int
     grad_accum_steps: int

@@ -102,10 +102,9 @@ class WarmupCosineScheduler:
 
 
 def build_models_and_tokenizer(config) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
-    model_directions = getattr(config, "model_directions", None)
     nodes, edges = build_nodes_and_edges(
         config.model_ids,
-        model_directions,
+        config.model_directions,
     )
     tokenizer = load_tokenizer(nodes[0].model_id)
     models = {

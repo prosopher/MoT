@@ -285,6 +285,9 @@ def build_edge_map(edges: Iterable[Edge]) -> Dict[str, Edge]:
 
 
 def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edge]:
+    if str(model_directions).strip().lower() == "all":
+        return build_all_edges_from_nodes(nodes)
+
     node_map = build_node_map(nodes)
     edge_ids = parse_model_directions(
         model_directions,
@@ -317,13 +320,10 @@ def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edg
 
 def build_nodes_and_edges(
     model_ids: str,
-    model_directions: Optional[str] = None,
+    model_directions: str,
 ) -> Tuple[List[Node], List[Edge]]:
     nodes = build_nodes_from_model_ids(model_ids)
-    if model_directions is None:
-        edges = build_all_edges_from_nodes(nodes)
-    else:
-        edges = build_edges_from_nodes(nodes, model_directions)
+    edges = build_edges_from_nodes(nodes, model_directions)
     return nodes, edges
 
 
@@ -374,15 +374,17 @@ def load_frozen_model(model_id: str, device: str, dtype: str = "float32") -> Pre
 
 def get_model_spec(model: PreTrainedModel) -> ModelSpec:
     config = model.config
-    num_heads = getattr(config, "n_head", None)
-    hidden_size = getattr(config, "n_embd", None)
-    num_layers = getattr(config, "n_layer", None)
-    if num_heads is None or hidden_size is None or num_layers is None:
-        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.")
+    try:
+        num_heads = config.n_head
+        hidden_size = config.n_embd
+        num_layers = config.n_layer
+    except AttributeError as exc:
+        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.") from exc
     if hidden_size % num_heads != 0:
         raise ValueError("hidden_size must be divisible by num_heads.")
+    model_id = config._name_or_path if hasattr(config, "_name_or_path") else "unknown"
     return ModelSpec(
-        model_id=getattr(config, "_name_or_path", "unknown"),
+        model_id=model_id,
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_heads=num_heads,
