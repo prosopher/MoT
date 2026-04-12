@@ -248,7 +248,6 @@ def run_eval(
     train_config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
-    full_model_specs = {node.id: get_model_spec(ctx.mm.get_model(node.id)) for node in nodes}
     set_seed(eval_config.seed)
 
     checkpoint_dir_path = eval_config.checkpoint_dir_path
@@ -268,13 +267,13 @@ def run_eval(
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("top_layers_ratio=%.6f", train_config.top_layers_ratio)
     for node in nodes:
         logger.info(
-            "translated_layers: %s_top=%d/%d (%s)",
+            "translation_spec: %s layers=%d hidden=%d heads=%d (%s)",
             node.id,
             ctx.mm.get_model_spec(node.id).num_layers,
-            full_model_specs[node.id].num_layers,
+            ctx.mm.get_model_spec(node.id).hidden_size,
+            ctx.mm.get_model_spec(node.id).num_heads,
             node.model_id,
         )
     logger.info("edges=%s", [edge.id for edge in edges])

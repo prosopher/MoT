@@ -34,7 +34,6 @@ class TrainConfig(Config):
     translator_dim: int
     translator_heads: int
     translator_mlp_ratio: int
-    top_layers_ratio: float
     dtype: str
 
     def __post_init__(self) -> None:
@@ -47,27 +46,6 @@ class SharedCache:
     key: torch.Tensor
     value: torch.Tensor
 
-
-def resolve_top_layers_to_translate(num_layers: int, top_layers_ratio: float) -> int:
-    if not (0.0 < top_layers_ratio <= 1.0):
-        raise ValueError(f"top_layers_ratio must be in (0, 1], got {top_layers_ratio}")
-    return max(1, min(num_layers, math.ceil(num_layers * top_layers_ratio)))
-
-
-def build_model_specs_for_top_layers(
-    full_model_specs: Dict[str, ModelSpec],
-    top_layers_ratio: float,
-) -> Dict[str, ModelSpec]:
-    model_specs = {}
-    for name, spec in full_model_specs.items():
-        model_specs[name] = ModelSpec(
-            model_id=spec.model_id,
-            num_layers=resolve_top_layers_to_translate(spec.num_layers, top_layers_ratio),
-            hidden_size=spec.hidden_size,
-            num_heads=spec.num_heads,
-            head_dim=spec.head_dim,
-        )
-    return model_specs
 
 
 class LocalToSharedTranslator(nn.Module):
@@ -360,16 +338,11 @@ def load_translator_pool_from_checkpoint(
         config.device = device_override
     translator_pool_state_dict = torch.load(str(checkpoint_path_obj), map_location="cpu")
     models, tokenizer = build_models_and_tokenizer(config, nodes)
-    full_model_specs = build_model_specs_for_nodes(models, nodes)
-    model_specs = build_model_specs_for_top_layers(
-        full_model_specs=full_model_specs,
-        top_layers_ratio=config.top_layers_ratio,
-    )
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models, model_specs),
+        ModelManager(models),
         tokenizer,
     )
     translator_pool = build_translator_pool(ctx)
@@ -386,15 +359,6 @@ def run_train(
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
-    full_model_specs = {node.id: get_model_spec(ctx.mm.get_model(node.id)) for node in nodes}
-    translated_model_specs = build_model_specs_for_top_layers(
-        full_model_specs=full_model_specs,
-        top_layers_ratio=config.top_layers_ratio,
-    )
-    ctx.mm = ModelManager(
-        {node.id: ctx.mm.get_model(node.id) for node in nodes},
-        translated_model_specs,
-    )
     set_seed(config.seed)
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -416,9 +380,9 @@ def run_train(
     translator_pool = build_translator_pool(ctx)
     translator_pool.train()
 
-    logger.info("[Setup] full model specs")
+    logger.info("[Setup] model specs used for translation")
     for node in nodes:
-        spec = full_model_specs[node.id]
+        spec = ctx.mm.get_model_spec(node.id)
         logger.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
@@ -427,20 +391,6 @@ def run_train(
             spec.hidden_size,
             spec.num_heads,
         )
-
-    logger.info("[Setup] translated top-layer specs")
-    for node in nodes:
-        translated_spec = ctx.mm.get_model_spec(node.id)
-        full_spec = full_model_specs[node.id]
-        logger.info(
-            "  %s_top (%s): layers=%d / %d",
-            node.id,
-            node.model_id,
-            translated_spec.num_layers,
-            full_spec.num_layers,
-        )
-
-    logger.info("[Setup] top_layers_ratio = %.4f", config.top_layers_ratio)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(ctx)

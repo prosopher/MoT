@@ -1310,7 +1310,6 @@ def run_eval(
     layer_mappings: Dict[str, LayerMapping],
 ) -> Dict[str, Any]:
     config = ctx.config
-    nodes = ctx.nodes
     edges = ctx.edges
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
@@ -1318,7 +1317,7 @@ def run_eval(
     log_layer_mappings(ctx, logger, layer_mappings)
 
     translator_pool.eval()
-    for node in nodes:
+    for node in ctx.nodes:
         ctx.mm.get_model(node.id).eval()
 
     eval_config = SimpleNamespace(

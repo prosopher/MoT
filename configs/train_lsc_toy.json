@@ -20,7 +20,6 @@
   "translator_dim": 256,
   "translator_heads": 4,
   "translator_mlp_ratio": 2,
-  "top_layers_ratio": 1.0,
   "device": "auto",
   "dtype": "float32"
 }
