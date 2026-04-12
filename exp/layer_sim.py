@@ -2,7 +2,6 @@
 import argparse
 import csv
 import sys
-from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple

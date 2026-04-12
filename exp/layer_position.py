@@ -3,6 +3,7 @@ import csv
 import sys
 
 from pathlib import Path
+from types import SimpleNamespace as SimpleNamespaceConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -292,7 +293,7 @@ def resolve_target_num_layers(
     model_ids: str,
     model_directions: str,
 ) -> int:
-    nodes, edges = resolve_edge_metadata(
+    nodes, edges = build_nodes_and_edges(
         model_ids=model_ids,
         model_directions=model_directions,
     )
@@ -374,13 +375,12 @@ def build_metrics_path(run_dir: Path) -> Path:
 def log_layer_mappings(
     ctx: Context,
     logger: logging.Logger,
-    nodes: List[Node],
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     config = ctx.config
     model_specs = ctx.model_specs
     injection_window_size = config.injection_window_size
-    node_map = build_node_map(nodes)
+    node_map = build_node_map(ctx.nodes)
     for edge_id, mapping in layer_mappings.items():
         src_id, dst_id = edge_id.split("_to_")
         dst_depth_from_top = model_specs[dst_id].num_layers - 1 - mapping.dst_layer_start_idx
@@ -428,14 +428,14 @@ def save_checkpoint(
 
 def build_models_for_experiment(
     config: LayerPositionConfig,
-) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
+    nodes: List[Node],
+) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase]:
     return build_models_and_tokenizer(
         SimpleNamespaceConfig(
-            model_ids=config.model_ids,
-            model_directions=config.model_directions,
             device=config.device,
             dtype=config.dtype,
-        )
+        ),
+        nodes,
     )
 
 
@@ -444,22 +444,19 @@ def run_train(
     run_dir: Path,
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
     logger.info("Starting layer-window position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
 
     translator_pool, layer_mappings = build_translator_pool(
         ctx=ctx,
-        models=models,
-        edges=edges,
     )
     translator_pool.train()
-    log_layer_mappings(ctx, logger, nodes, layer_mappings)
+    log_layer_mappings(ctx, logger, layer_mappings)
     logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = InfiniteDataLoader(
@@ -505,7 +502,7 @@ def run_train(
                 }
 
             total_direction_loss = 0.0
-            for edge in edges:
+            for edge in ctx.edges:
                 translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
@@ -578,12 +575,12 @@ def evaluate_logit_dataset(
     tokenizer,
     translator_pool: LayerWindowTranslatorPool,
     models: Dict[str, PreTrainedModel],
-    nodes: List[Node],
-    edges: List[Edge],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
     processed_examples = 0
@@ -764,12 +761,12 @@ def evaluate_generation_dataset(
     tokenizer,
     translator_pool: LayerWindowTranslatorPool,
     models: Dict[str, PreTrainedModel],
-    nodes: List[Node],
-    edges: List[Edge],
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
     processed_examples = 0
@@ -1369,15 +1366,15 @@ def run_eval(
     layer_mappings: Dict[str, LayerMapping],
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
 ) -> Dict[str, Any]:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
-    log_layer_mappings(ctx, logger, nodes, layer_mappings)
+    log_layer_mappings(ctx, logger, layer_mappings)
 
     translator_pool.eval()
     for model in models.values():
@@ -1495,8 +1492,6 @@ def run_eval(
             ctx=ctx,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         dataset_results_by_name[spec.name_for_log] = dataset_results
@@ -1640,12 +1635,14 @@ def main() -> None:
     )
 
     set_seed(config.seed)
-    nodes, edges = resolve_edge_metadata(
-        model_ids=config.model_ids,
-        model_directions=config.model_directions,
+    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
+    models, tokenizer = build_models_for_experiment(config, nodes)
+    ctx = Context(
+        config,
+        build_model_specs_for_nodes(models, nodes),
+        nodes,
+        edges,
     )
-    models, tokenizer, _, _ = build_models_for_experiment(config)
-    ctx = Context(config=config, model_specs=build_model_specs_for_nodes(models, nodes))
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1654,8 +1651,6 @@ def main() -> None:
         run_dir=run_dir,
         models=models,
         tokenizer=tokenizer,
-        nodes=nodes,
-        edges=edges,
     )
     combined_metrics = run_eval(
         ctx=ctx,
@@ -1664,8 +1659,6 @@ def main() -> None:
         layer_mappings=layer_mappings,
         models=models,
         tokenizer=tokenizer,
-        nodes=nodes,
-        edges=edges,
     )
     eval_metrics = extract_eval_metrics(combined_metrics)
     analysis_metrics = extract_analysis_metrics(combined_metrics)

@@ -1,8 +1,9 @@
 import argparse
 import importlib
 
+from core.eval_util import EvalConfig, build_eval_context, load_train_config_from_checkpoint, resolve_latest_checkpoint_for_alg
 from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
-from core.eval_util import EvalConfig, build_eval_context, resolve_latest_checkpoint_for_alg
+from core.topology import build_nodes_and_edges
 
 
 def load_eval_module(alg: str):
@@ -53,16 +54,26 @@ def main() -> None:
         **eval_config_kwargs,
     )
 
+    train_config = load_train_config_from_checkpoint(
+        alg=args.alg,
+        checkpoint_path=eval_config.checkpoint_path,
+        device_override=eval_config.device,
+    )
+    nodes, edges = build_nodes_and_edges(train_config.model_ids, train_config.model_directions)
+
     eval_module = load_eval_module(args.alg)
-    ctx, translator_pool, models, tokenizer, nodes, edges, *extra = build_eval_context(args.alg, eval_config)
+    ctx, translator_pool, models, tokenizer, *extra = build_eval_context(
+        args.alg,
+        eval_config,
+        nodes,
+        edges,
+    )
     log_path = eval_module.run_eval(
         ctx,
         eval_config,
         translator_pool,
         models,
         tokenizer,
-        nodes,
-        edges,
         *extra,
     )
 

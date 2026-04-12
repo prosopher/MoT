@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import logging
 import math
 import numpy as np
 import sys
@@ -465,15 +464,14 @@ def evaluate_correction(
     layer_mappings: Dict[str, lp.LayerMapping],
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
 ) -> Dict[str, Any]:
     config = ctx.config
     model_specs = ctx.model_specs
+    edges = ctx.edges
     logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting correction analysis")
     logger.info("experiment_config=%s", asdict(config))
-    lp.log_layer_mappings(ctx, logger, nodes, layer_mappings)
+    lp.log_layer_mappings(ctx, logger, layer_mappings)
 
     translator_pool.eval()
     for model in models.values():
@@ -1011,13 +1009,10 @@ def main() -> None:
     )
 
     set_seed(config.seed)
-    nodes, edges = lp.resolve_edge_metadata(
-        model_ids=config.model_ids,
-        model_directions=config.model_directions,
-    )
-    models, tokenizer, _, _ = lp.build_models_for_experiment(config)
+    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
+    models, tokenizer = lp.build_models_for_experiment(config, nodes)
     model_specs = build_model_specs_for_nodes(models, nodes)
-    ctx = Context(config=config, model_specs=model_specs)
+    ctx = Context(config, model_specs, nodes, edges)
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1026,8 +1021,6 @@ def main() -> None:
         run_dir=run_dir,
         models=models,
         tokenizer=tokenizer,
-        nodes=nodes,
-        edges=edges,
     )
     metrics = evaluate_correction(
         ctx=ctx,
@@ -1036,8 +1029,6 @@ def main() -> None:
         layer_mappings=layer_mappings,
         models=models,
         tokenizer=tokenizer,
-        nodes=nodes,
-        edges=edges,
     )
 
     write_json(str(build_config_path(run_dir)), asdict(config))

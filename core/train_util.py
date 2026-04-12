@@ -101,17 +101,16 @@ class WarmupCosineScheduler:
         return self.optimizer.param_groups[0]["lr"]
 
 
-def build_models_and_tokenizer(config) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
-    nodes, edges = build_nodes_and_edges(
-        config.model_ids,
-        config.model_directions,
-    )
+def build_models_and_tokenizer(
+    config,
+    nodes: List[Node],
+) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase]:
     tokenizer = load_tokenizer(nodes[0].model_id)
     models = {
         node.id: load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
         for node in nodes
     }
-    return models, tokenizer, nodes, edges
+    return models, tokenizer
 
 
 def save_checkpoint(

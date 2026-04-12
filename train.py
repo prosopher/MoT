@@ -4,6 +4,7 @@ from pathlib import Path
 
 from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, build_model_specs_for_nodes
 from core.context import Context
+from core.topology import build_nodes_and_edges
 from core.train_util import build_models_and_tokenizer
 
 
@@ -54,13 +55,16 @@ def main() -> None:
         **config_kwargs,
     )
 
-    models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
+    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
+    models, tokenizer = build_models_and_tokenizer(config, nodes)
     ctx = Context(
-        config=config,
-        model_specs=build_model_specs_for_nodes(models, nodes),
+        config,
+        build_model_specs_for_nodes(models, nodes),
+        nodes,
+        edges,
     )
 
-    final_checkpoint = Path(train_module.run_train(ctx, models, tokenizer, nodes, edges))
+    final_checkpoint = Path(train_module.run_train(ctx, models, tokenizer))
 
     print(f"Saved outputs to {final_checkpoint.parent}")
     print(f"Final checkpoint: {final_checkpoint}")

@@ -406,20 +406,6 @@ class LayerWindowTranslatorPool(nn.Module):
         return mixed_target_past, translated_window_past, mapping
 
 
-class SimpleNamespaceConfig:
-    def __init__(self, **kwargs: Any) -> None:
-        self.__dict__.update(kwargs)
-
-
-def resolve_edge_metadata(
-    model_ids: str,
-    model_directions: str,
-) -> Tuple[List[Node], List[Edge]]:
-    nodes, edges = build_nodes_and_edges(model_ids, model_directions)
-    if not edges:
-        raise ValueError("No edges were resolved from model_directions")
-    return nodes, edges
-
 
 def build_layer_mappings(
     ctx: Context,
@@ -659,10 +645,9 @@ def replay_target_prefill_with_injected_window(
 
 def build_translator_pool(
     ctx: Context,
-    models: Dict[str, PreTrainedModel],
-    edges: List[Edge],
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
     config = ctx.config
+    edges = ctx.edges
     layer_mappings = build_layer_mappings(ctx, edges)
     translator_pool = LayerWindowTranslatorPool(
         model_specs=ctx.model_specs,
@@ -683,6 +668,8 @@ def build_translator_pool(
 
 def load_translator_pool_from_checkpoint(
     checkpoint_path: str,
+    nodes: List[Node],
+    edges: List[Edge],
     device_override: Optional[str] = None,
 ) -> Tuple[
     Context,
@@ -697,24 +684,29 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**payload["train_config"])
     if device_override is not None:
         config.device = device_override
-    models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
-    ctx = Context(config=config, model_specs=build_model_specs_for_nodes(models, nodes))
-    translator_pool, layer_mappings = build_translator_pool(ctx, models, edges)
+    models, tokenizer = build_models_and_tokenizer(config, nodes)
+    ctx = Context(
+        config,
+        build_model_specs_for_nodes(models, nodes),
+        nodes,
+        edges,
+    )
+    translator_pool, layer_mappings = build_translator_pool(ctx)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, models, tokenizer, nodes, edges, layer_mappings
+    return ctx, translator_pool, models, tokenizer, layer_mappings
 
 
 def run_train(
     ctx: Context,
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
 ) -> Path:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     if config.output_path is None:
         raise ValueError("TrainConfig.output_path must be initialized before run_train.")
 
@@ -736,7 +728,7 @@ def run_train(
     logger.info("edges=%s", [edge.id for edge in edges])
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    translator_pool, layer_mappings = build_translator_pool(ctx, models, edges)
+    translator_pool, layer_mappings = build_translator_pool(ctx)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")

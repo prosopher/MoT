@@ -12,7 +12,6 @@ from c2c.train import (
     get_top_layers_to_translate,
     get_translation_loss_name,
     get_translation_mode_name,
-    load_translator_pool_from_checkpoint,
     translate_top_layers,
 )
 
@@ -201,12 +200,12 @@ def evaluate_dataset(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
@@ -322,12 +321,12 @@ def evaluate_generation_dataset(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
@@ -528,8 +527,6 @@ def evaluate_openwebtext_validation_loss(
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -555,11 +552,11 @@ def run_eval(
     translator_pool,
     models,
     tokenizer,
-    nodes,
-    edges,
 ) -> Path:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
     if eval_config.output_path is None:
@@ -601,8 +598,6 @@ def run_eval(
         eval_config=eval_config,
         translator_pool=translator_pool,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
     )
     for edge in edges:
@@ -636,8 +631,6 @@ def run_eval(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
@@ -669,8 +662,6 @@ def run_eval(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         all_generation_results[spec.name_for_log] = results

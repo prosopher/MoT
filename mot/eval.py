@@ -7,10 +7,7 @@ from torch.utils.data import DataLoader
 from core.context import Context
 from core.eval_util import *
 from core.train_util import blocks_to_partial_past_key_values
-from mot.train import (
-    extract_layer_window_blocks,
-    load_translator_pool_from_checkpoint,
-)
+from mot.train import extract_layer_window_blocks
 
 
 @torch.inference_mode()
@@ -22,12 +19,12 @@ def evaluate_dataset(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
@@ -137,12 +134,12 @@ def evaluate_generation_dataset(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
@@ -259,12 +256,12 @@ def run_eval(
     translator_pool,
     models,
     tokenizer,
-    nodes,
-    edges,
     layer_mappings,
 ) -> Path:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
     if eval_config.output_path is None:
@@ -308,8 +305,6 @@ def run_eval(
         eval_config=eval_config,
         translator_pool=translator_pool,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
     )
     for edge in edges:
@@ -340,8 +335,6 @@ def run_eval(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
@@ -373,8 +366,6 @@ def run_eval(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         all_generation_results[spec.name_for_log] = results

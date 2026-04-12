@@ -619,11 +619,10 @@ class C2CProjectorPool(nn.Module):
 
 def build_translator_pool(
     ctx: Context,
-    models: Dict[str, PreTrainedModel],
-    edges: List[Edge],
 ) -> Union[C2CFuserPool, C2CProjectorPool]:
     config = ctx.config
     model_specs = ctx.model_specs
+    edges = ctx.edges
     if is_projection_only_variant(config):
         translator_pool = C2CProjectorPool(
             model_specs=model_specs,
@@ -652,6 +651,8 @@ def build_translator_pool(
 
 def load_translator_pool_from_checkpoint(
     checkpoint_path: str,
+    nodes: List[Node],
+    edges: List[Edge],
     device_override: Optional[str] = None,
 ) -> Tuple[
     Context,
@@ -665,13 +666,18 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**payload["train_config"])
     if device_override is not None:
         config.device = device_override
-    models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
-    ctx = Context(config=config, model_specs=build_model_specs_for_nodes(models, nodes))
-    translator_pool = build_translator_pool(ctx, models, edges)
+    models, tokenizer = build_models_and_tokenizer(config, nodes)
+    ctx = Context(
+        config,
+        build_model_specs_for_nodes(models, nodes),
+        nodes,
+        edges,
+    )
+    translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, models, tokenizer, nodes, edges
+    return ctx, translator_pool, models, tokenizer
 
 
 
@@ -691,11 +697,11 @@ def run_train(
     ctx: Context,
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
 ) -> Path:
     config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     if config.output_path is None:
         raise ValueError("TrainConfig.output_path must be initialized before run_train.")
 
@@ -718,7 +724,7 @@ def run_train(
 
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    translator_pool = build_translator_pool(ctx, models, edges)
+    translator_pool = build_translator_pool(ctx)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")

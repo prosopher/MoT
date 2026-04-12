@@ -19,11 +19,11 @@ def evaluate_dataset(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
@@ -132,11 +132,11 @@ def evaluate_generation_dataset(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
@@ -251,11 +251,11 @@ def run_eval(
     translator_pool,
     models,
     tokenizer,
-    nodes,
-    edges,
 ) -> Path:
     train_config = ctx.config
     model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     full_model_specs = build_model_specs_for_nodes(models, nodes)
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
@@ -306,8 +306,6 @@ def run_eval(
         eval_config=eval_config,
         translator_pool=translator_pool,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
     )
     for edge in edges:
@@ -339,8 +337,6 @@ def run_eval(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
@@ -373,8 +369,6 @@ def run_eval(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
         all_generation_results[spec.name_for_log] = results

@@ -322,8 +322,6 @@ def blocks_to_past_key_values(
 
 def build_translator_pool(
     ctx: Context,
-    models: Dict[str, PreTrainedModel],
-    edges: List[Edge],
 ) -> SharedKVTranslatorPool:
     config = ctx.config
     model_specs = ctx.model_specs
@@ -341,6 +339,8 @@ def build_translator_pool(
 
 def load_translator_pool_from_checkpoint(
     checkpoint_path: str,
+    nodes: List[Node],
+    edges: List[Edge],
     device_override: Optional[str] = None,
 ) -> Tuple[
     Context,
@@ -354,28 +354,28 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**payload["train_config"])
     if device_override is not None:
         config.device = device_override
-    models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
+    models, tokenizer = build_models_and_tokenizer(config, nodes)
     full_model_specs = build_model_specs_for_nodes(models, nodes)
     model_specs = build_model_specs_for_top_layers(
         full_model_specs=full_model_specs,
         top_layers_ratio=config.top_layers_ratio,
     )
-    ctx = Context(config=config, model_specs=model_specs)
-    translator_pool = build_translator_pool(ctx, models, edges)
+    ctx = Context(config, model_specs, nodes, edges)
+    translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return ctx, translator_pool, models, tokenizer, nodes, edges
+    return ctx, translator_pool, models, tokenizer
 
 
 def run_train(
     ctx: Context,
     models: Dict[str, PreTrainedModel],
     tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
 ) -> Path:
     config = ctx.config
+    nodes = ctx.nodes
+    edges = ctx.edges
     full_model_specs = ctx.model_specs
     model_specs = build_model_specs_for_top_layers(
         full_model_specs=full_model_specs,
@@ -405,7 +405,7 @@ def run_train(
 
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
-    translator_pool = build_translator_pool(ctx, models, edges)
+    translator_pool = build_translator_pool(ctx)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")

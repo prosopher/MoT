@@ -466,12 +466,12 @@ def evaluate_openwebtext_validation_loss_top_layers(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     dst_model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -570,12 +570,12 @@ def evaluate_openwebtext_validation_loss_replay(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     dst_model_specs = ctx.model_specs
+    nodes = ctx.nodes
+    edges = ctx.edges
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -674,8 +674,6 @@ def evaluate_openwebtext_validation_loss(
     eval_config: EvalConfig,
     translator_pool,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
@@ -685,8 +683,6 @@ def evaluate_openwebtext_validation_loss(
             eval_config=eval_config,
             translator_pool=translator_pool,
             models=models,
-            nodes=nodes,
-            edges=edges,
             logger=logger,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
@@ -695,8 +691,6 @@ def evaluate_openwebtext_validation_loss(
         eval_config=eval_config,
         translator_pool=translator_pool,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
     )
 
@@ -1001,7 +995,36 @@ def initialize_eval_output_paths(config: EvalConfig) -> None:
 
 
 
-def build_eval_context(alg: str, eval_config: EvalConfig):
+def load_train_config_from_checkpoint(
+    alg: str,
+    checkpoint_path: str,
+    device_override: Optional[str] = None,
+):
+    checkpoint_path_obj = Path(checkpoint_path)
+    if not checkpoint_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
+
+    module_name = f"{alg}.train"
+    try:
+        train_module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            raise SystemExit(f"Unsupported alg: {alg}") from exc
+        raise
+
+    payload = torch.load(str(checkpoint_path_obj), map_location="cpu")
+    config = train_module.TrainConfig(**payload["train_config"])
+    if device_override is not None:
+        config.device = device_override
+    return config
+
+
+def build_eval_context(
+    alg: str,
+    eval_config: EvalConfig,
+    nodes: List[Node],
+    edges: List[Edge],
+):
     if eval_config.checkpoint_path is None:
         raise ValueError("EvalConfig.checkpoint_path must be set before build_eval_context.")
     checkpoint_path = Path(eval_config.checkpoint_path)
@@ -1023,6 +1046,8 @@ def build_eval_context(alg: str, eval_config: EvalConfig):
 
     return load_from_checkpoint(
         checkpoint_path=str(checkpoint_path),
+        nodes=nodes,
+        edges=edges,
         device_override=eval_config.device,
     )
 
