@@ -206,6 +206,7 @@ def evaluate_dataset(
     device = train_config.device
     models = ctx.models
     tokenizer = ctx.tokenizer
+    model_specs = ctx.model_specs
     path_metrics = {edge.id: RunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -326,6 +327,7 @@ def evaluate_generation_dataset(
     device = train_config.device
     models = ctx.models
     tokenizer = ctx.tokenizer
+    model_specs = ctx.model_specs
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -444,6 +446,7 @@ def evaluate_openwebtext_validation_loss(
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     models = ctx.models
+    model_specs = ctx.model_specs
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(

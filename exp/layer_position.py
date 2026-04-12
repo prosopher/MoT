@@ -374,6 +374,7 @@ def log_layer_mappings(
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
     config = ctx.config
+    model_specs = ctx.model_specs
     injection_window_size = config.injection_window_size
     node_map = build_node_map(ctx.nodes)
     for edge_id, mapping in layer_mappings.items():
@@ -415,6 +416,7 @@ def run_train(
     run_dir: Path,
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, LayerMapping]]:
     config = ctx.config
+    model_specs = ctx.model_specs
     nodes = ctx.nodes
     models = ctx.models
     tokenizer = ctx.tokenizer
@@ -532,6 +534,7 @@ def evaluate_logit_dataset(
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
+    model_specs = ctx.model_specs
     nodes = ctx.nodes
     models = ctx.models
     tokenizer = ctx.tokenizer
@@ -717,6 +720,7 @@ def evaluate_generation_dataset(
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
+    model_specs = ctx.model_specs
     nodes = ctx.nodes
     models = ctx.models
     tokenizer = ctx.tokenizer
@@ -1314,8 +1318,8 @@ def run_eval(
     layer_mappings: Dict[str, LayerMapping],
 ) -> Dict[str, Any]:
     config = ctx.config
+    edges = ctx.edges
     models = ctx.models
-    tokenizer = ctx.tokenizer
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
@@ -1425,12 +1429,10 @@ def run_eval(
     for spec in dataset_specs:
         dataloader = dataloader_builder(spec=spec, eval_config=eval_config)
         dataset_results, dataset_logit_kl = dataset_evaluator(
+            ctx=ctx,
             spec=spec,
             dataloader=dataloader,
-            tokenizer=tokenizer,
-            ctx=ctx,
             translator_pool=translator_pool,
-            models=models,
             logger=logger,
         )
         dataset_results_by_name[spec.name_for_log] = dataset_results
