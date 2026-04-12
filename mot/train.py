@@ -37,6 +37,7 @@ class TrainConfig(Config):
     shuffle_buffer: int
     injection_layer_start_idx: int
     injection_window_size: int
+    layer_alignment: str
     translator_dim: int
     translator_heads: int
     translator_depth: int
