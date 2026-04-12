@@ -1,7 +1,7 @@
 import argparse
 import importlib
 
-from core.eval_util import EvalConfig, build_eval_context, load_train_config_from_checkpoint, resolve_latest_checkpoint_for_alg
+from core.eval_util import EvalConfig, build_eval_context, load_train_config_from_checkpoint, resolve_latest_checkpoint_dir_for_alg
 from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 from core.topology import build_nodes_and_edges
 
@@ -43,10 +43,10 @@ def main() -> None:
         exclude_fields={"alg"},
     )
 
-    if eval_config_kwargs["checkpoint_path"] is None:
+    if eval_config_kwargs["checkpoint_dir_path"] is None:
         outputs_path = eval_config_kwargs["outputs_path"]
-        eval_config_kwargs["checkpoint_path"] = str(
-            resolve_latest_checkpoint_for_alg(args.alg, outputs_path=outputs_path)
+        eval_config_kwargs["checkpoint_dir_path"] = str(
+            resolve_latest_checkpoint_dir_for_alg(args.alg, outputs_path=outputs_path)
         )
 
     eval_config = EvalConfig(
@@ -56,7 +56,7 @@ def main() -> None:
 
     train_config = load_train_config_from_checkpoint(
         alg=args.alg,
-        checkpoint_path=eval_config.checkpoint_path,
+        checkpoint_dir_path=eval_config.checkpoint_dir_path,
         device_override=eval_config.device,
     )
     nodes, edges = build_nodes_and_edges(train_config.model_ids, train_config.model_directions)

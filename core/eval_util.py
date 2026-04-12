@@ -11,7 +11,7 @@ from core.train_util import get_train_config_path
 @dataclass
 class EvalConfig(Config):
     outputs_path: str
-    checkpoint_path: Optional[str]
+    checkpoint_dir_path: Optional[str]
 
     # evaluation sampling
     batch_size: int
@@ -354,8 +354,8 @@ def summarize_openwebtext_named_losses(
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss_metrics(
     *,
+    ctx: Context,
     tokenizer: PreTrainedTokenizerBase,
-    config,
     batch_size: int,
     num_workers: int,
     shuffle: bool,
@@ -363,27 +363,25 @@ def evaluate_openwebtext_validation_loss_metrics(
     shuffle_buffer: int,
     max_examples: int,
     models,
-    nodes,
-    edges,
     logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     summarize_edge_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
         tokenizer=tokenizer,
-        config=config,
+        config=ctx.config,
         batch_size=batch_size,
         num_workers=num_workers,
         shuffle=shuffle,
         seed=seed,
         shuffle_buffer=shuffle_buffer,
     )
-    device = config.device
+    device = ctx.config.device
     max_examples = max(1, int(max_examples))
 
-    loss_sums = {edge.id: {} for edge in edges}
-    counts = {edge.id: 0 for edge in edges}
-    profile_accumulators = {edge.id: {} for edge in edges}
+    loss_sums = {edge.id: {} for edge in ctx.edges}
+    counts = {edge.id: 0 for edge in ctx.edges}
+    profile_accumulators = {edge.id: {} for edge in ctx.edges}
 
     processed_examples = 0
     for batch_idx, input_ids in enumerate(dataloader, start=1):
@@ -397,15 +395,15 @@ def evaluate_openwebtext_validation_loss_metrics(
 
         prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
             input_ids=input_ids,
-            prefix_tokens=config.prefix_tokens,
+            prefix_tokens=ctx.config.prefix_tokens,
         )
         past_by_node_id = {
             node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
-            for node in nodes
+            for node in ctx.nodes
         }
 
         batch_examples = int(input_ids.shape[0])
-        for edge in edges:
+        for edge in ctx.edges:
             edge_losses, edge_profiles = evaluate_edge_losses_fn(
                 edge_id=edge.id,
                 edge=edge,
@@ -442,7 +440,7 @@ def evaluate_openwebtext_validation_loss_metrics(
             )
 
     summaries = {}
-    for edge in edges:
+    for edge in ctx.edges:
         count = int(counts[edge.id])
         if count > 0:
             average_losses = {
@@ -471,8 +469,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     dst_model_specs = ctx.model_specs
-    nodes = ctx.nodes
-    edges = ctx.edges
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -536,8 +532,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
         )
 
     return evaluate_openwebtext_validation_loss_metrics(
+        ctx=ctx,
         tokenizer=tokenizer,
-        config=train_config,
         batch_size=eval_config.batch_size,
         num_workers=eval_config.num_workers,
         shuffle=eval_config.shuffle_eval_stream,
@@ -545,8 +541,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -575,8 +569,6 @@ def evaluate_openwebtext_validation_loss_replay(
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     dst_model_specs = ctx.model_specs
-    nodes = ctx.nodes
-    edges = ctx.edges
     profiler = InferenceProfiler(train_config.device)
 
     def evaluate_edge_losses_fn(
@@ -640,8 +632,8 @@ def evaluate_openwebtext_validation_loss_replay(
         )
 
     return evaluate_openwebtext_validation_loss_metrics(
+        ctx=ctx,
         tokenizer=tokenizer,
-        config=train_config,
         batch_size=eval_config.batch_size,
         num_workers=eval_config.num_workers,
         shuffle=eval_config.shuffle_eval_stream,
@@ -649,8 +641,6 @@ def evaluate_openwebtext_validation_loss_replay(
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -972,11 +962,11 @@ def get_eval_log_path(output_path: Union[str, Path]) -> Path:
 
 def initialize_eval_output_paths(config: EvalConfig) -> None:
     output_path = config.output_path
-    checkpoint_path = config.checkpoint_path
+    checkpoint_dir_path = config.checkpoint_dir_path
 
     if output_path is None:
-        if checkpoint_path is not None:
-            output_path_obj = Path(checkpoint_path).parent
+        if checkpoint_dir_path is not None:
+            output_path_obj = Path(checkpoint_dir_path)
         else:
             if not config.alg:
                 return
@@ -998,14 +988,12 @@ def initialize_eval_output_paths(config: EvalConfig) -> None:
 
 def load_train_config_from_checkpoint(
     alg: str,
-    checkpoint_path: str,
+    checkpoint_dir_path: str,
     device_override: Optional[str] = None,
 ):
-    checkpoint_path_obj = Path(checkpoint_path)
-    if not checkpoint_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
-    checkpoint_dir_path = str(checkpoint_path_obj.parent)
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
+    if not checkpoint_dir_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
@@ -1030,14 +1018,12 @@ def build_eval_context(
     nodes: List[Node],
     edges: List[Edge],
 ):
-    if eval_config.checkpoint_path is None:
-        raise ValueError("EvalConfig.checkpoint_path must be set before build_eval_context.")
-    checkpoint_path = eval_config.checkpoint_path
-    checkpoint_path_obj = Path(checkpoint_path)
-    if not checkpoint_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
-    checkpoint_dir_path = str(checkpoint_path_obj.parent)
+    if eval_config.checkpoint_dir_path is None:
+        raise ValueError("EvalConfig.checkpoint_dir_path must be set before build_eval_context.")
+    checkpoint_dir_path = eval_config.checkpoint_dir_path
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
+    if not checkpoint_dir_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
 
     module_name = f"{alg}.train"
     try:
@@ -1053,13 +1039,13 @@ def build_eval_context(
         raise AttributeError(f"{module_name} does not define load_translator_pool_from_checkpoint") from exc
 
     return load_from_checkpoint(
-        checkpoint_path=checkpoint_path,
+        checkpoint_dir_path=checkpoint_dir_path,
         nodes=nodes,
         edges=edges,
         device_override=eval_config.device,
     )
 
-def resolve_latest_checkpoint_for_alg(
+def resolve_latest_checkpoint_dir_for_alg(
     alg: str,
     outputs_path: str = "outputs",
     checkpoint_name: str = "checkpoint.pt",
@@ -1074,7 +1060,7 @@ def resolve_latest_checkpoint_for_alg(
         raise FileNotFoundError(
             f"No checkpoint directories found for alg={alg!r} under {outputs_path_obj}"
         )
-    return candidates[-1] / checkpoint_name
+    return candidates[-1]
 
 
 def build_eval_dataloader(

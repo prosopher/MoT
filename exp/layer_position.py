@@ -1332,8 +1332,6 @@ def run_eval(
 ) -> Dict[str, Any]:
     config = ctx.config
     model_specs = ctx.model_specs
-    nodes = ctx.nodes
-    edges = ctx.edges
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
@@ -1380,8 +1378,8 @@ def run_eval(
         return edge_losses, {}
 
     openwebtext_loss_by_edge = evaluate_openwebtext_validation_loss_metrics(
+        ctx=ctx,
         tokenizer=tokenizer,
-        config=config,
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         shuffle=config.eval_shuffle_stream,
@@ -1389,8 +1387,6 @@ def run_eval(
         shuffle_buffer=config.shuffle_buffer,
         max_examples=config.eval_max_examples_per_dataset,
         models=models,
-        nodes=nodes,
-        edges=edges,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_openwebtext_control_losses,
         summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
@@ -1407,7 +1403,7 @@ def run_eval(
             },
         ),
     )
-    for edge in edges:
+    for edge in ctx.edges:
         row = openwebtext_loss_by_edge[edge.id]
         logger.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | count=%d",

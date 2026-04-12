@@ -667,7 +667,7 @@ def build_translator_pool(
 
 
 def load_translator_pool_from_checkpoint(
-    checkpoint_path: str,
+    checkpoint_dir_path: str,
     nodes: List[Node],
     edges: List[Edge],
     device_override: Optional[str] = None,
@@ -680,11 +680,13 @@ def load_translator_pool_from_checkpoint(
     List[Edge],
     Dict[str, LayerMapping],
 ]:
-    checkpoint_path_obj = Path(checkpoint_path)
+    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
+    if not checkpoint_dir_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
+    checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
+    checkpoint_path = str(checkpoint_path_obj)
     if not checkpoint_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
-    checkpoint_dir_path = str(checkpoint_path_obj.parent)
-    checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")

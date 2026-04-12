@@ -262,19 +262,17 @@ def run_eval(
     model_specs = ctx.model_specs
     nodes = ctx.nodes
     edges = ctx.edges
-    if eval_config.checkpoint_path is None:
-        raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
+    if eval_config.checkpoint_dir_path is None:
+        raise ValueError("EvalConfig.checkpoint_dir_path must be set before run_eval.")
     if eval_config.output_path is None:
         raise ValueError("EvalConfig.output_path must be initialized before run_eval.")
 
     set_seed(eval_config.seed)
 
-    checkpoint_path = eval_config.checkpoint_path
-    checkpoint_path_obj = Path(checkpoint_path)
-    if not checkpoint_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
-    checkpoint_dir_path = str(checkpoint_path_obj.parent)
+    checkpoint_dir_path = eval_config.checkpoint_dir_path
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
+    if not checkpoint_dir_path_obj.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
 
     config_path = get_eval_config_path(eval_config.output_path)
     write_json(str(config_path), asdict(eval_config))
@@ -282,7 +280,6 @@ def run_eval(
     log_path = get_eval_log_path(eval_config.output_path)
     logger = setup_logger(f"{eval_config.alg}_eval", log_path)
     logger.info("Starting evaluation")
-    logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("checkpoint_dir_path=%s", checkpoint_dir_path)
     logger.info("eval_config=%s", asdict(eval_config))
 

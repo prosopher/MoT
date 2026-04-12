@@ -2,7 +2,7 @@
   "outputs_path": "outputs",
   "timestamp": null,
   "output_path": null,
-  "checkpoint_path": null,
+  "checkpoint_dir_path": null,
   "device": "auto",
   "batch_size": 1,
   "num_workers": 0,
