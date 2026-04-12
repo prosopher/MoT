@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset
 from datasets import load_dataset
 
-from eval_util import *
+from core.eval_util import *
 from c2c.train import (
     get_top_layers_to_translate,
     get_translation_loss_name,

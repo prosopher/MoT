@@ -2,7 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 
-from common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
+from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 
 
 def load_train_module(alg: str):

@@ -19,6 +19,8 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from .model_spec import ModelSpec
+
 
 class TqdmLoggingHandler(logging.Handler):
     def emit(self, record) -> None:
@@ -181,15 +183,6 @@ def compute_prefix_correction_and_suffix_lm_loss(
     return suffix_lm_loss + (prefix_correction_weight * prefix_correction_loss)
 
 
-@dataclass
-class ModelSpec:
-    model_id: str
-    num_layers: int
-    hidden_size: int
-    num_heads: int
-    head_dim: int
-
-
 @dataclass(frozen=True)
 class Node:
     id: str
@@ -339,12 +332,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-def resolve_device(device: str) -> str:
-    normalized = str(device).strip().lower()
-    if normalized == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return device
 
 
 def get_torch_dtype(dtype_name: str) -> torch.dtype:

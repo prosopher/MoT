@@ -15,16 +15,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from common import (  # noqa: E402
+from core.common import (  # noqa: E402
     extract_past_key_values,
     load_frozen_model,
     load_tokenizer,
     parse_bool_arg,
     past_key_values_to_blocks,
-    resolve_device,
     setup_logger,
     write_json,
 )
+from core.config import resolve_device
 
 PoolMode = Literal["mean", "last"]
 MetricName = Literal["linear_cka"]

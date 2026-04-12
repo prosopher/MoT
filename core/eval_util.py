@@ -1,17 +1,14 @@
 import time
 from typing import Callable, Tuple
 
-from common import *
+from core.common import *
+from core.config import Config
 
 
 @dataclass
-class EvalConfig:
-    alg: str
+class EvalConfig(Config):
     outputs_path: str
-    timestamp: Optional[str]
-    output_path: Optional[str]
     checkpoint_path: Optional[str]
-    device: str
 
     # evaluation sampling
     batch_size: int
@@ -28,7 +25,7 @@ class EvalConfig:
 
 
     def __post_init__(self) -> None:
-        self.device = resolve_device(self.device)
+        super().__post_init__()
         initialize_eval_output_paths(self)
 
 

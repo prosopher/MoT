@@ -1,8 +1,8 @@
 import argparse
 import importlib
 
-from common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
-from eval_util import EvalConfig, resolve_latest_checkpoint_for_alg
+from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
+from core.eval_util import EvalConfig, resolve_latest_checkpoint_for_alg
 
 
 def load_eval_module(alg: str):

@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from train_util import *
+from core.config import Config
+from core.train_util import *
 
 
 MOT_VARIANTS = {"single", "mot"}
@@ -22,11 +23,7 @@ class LayerMapping:
 
 
 @dataclass
-class TrainConfig:
-    alg: str
-    timestamp: Optional[str]
-    output_path: Optional[str]
-
+class TrainConfig(Config):
     model_ids: str
     model_directions: str
     max_steps: int
@@ -47,14 +44,13 @@ class TrainConfig:
     translator_heads: int
     translator_depth: int
     translator_mlp_ratio: int
-    device: str
     dtype: str
     variant: str
     mot_num_translators: int
     mot_top_k: int
 
     def __post_init__(self) -> None:
-        self.device = resolve_device(self.device)
+        super().__post_init__()
         parse_model_ids_csv(self.model_ids)
         if self.injection_layer_start_idx < 0:
             raise ValueError("injection_layer_start_idx must be >= 0")

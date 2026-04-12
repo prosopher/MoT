@@ -4,8 +4,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from eval_util import *
-from train_util import blocks_to_partial_past_key_values
+from core.eval_util import *
+from core.train_util import blocks_to_partial_past_key_values
 from mot.train import (
     extract_layer_window_blocks,
     load_translator_pool_from_checkpoint,

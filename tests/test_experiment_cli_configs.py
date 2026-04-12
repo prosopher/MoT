@@ -93,7 +93,7 @@ def test_experiment_cli_args_override_json_defaults(
 import json
 from pathlib import Path
 
-from common import build_dataclass_kwargs_from_json_and_namespace
+from core.common import build_dataclass_kwargs_from_json_and_namespace
 from {module_name} import build_parser, {'LayerPositionConfig' if module_name.endswith('layer_position') else 'CorrectionConfig'}
 
 config_cls = {'LayerPositionConfig' if module_name.endswith('layer_position') else 'CorrectionConfig'}

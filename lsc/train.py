@@ -7,15 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from train_util import *
+from core.config import Config
+from core.train_util import *
 
 
 @dataclass
-class TrainConfig:
-    alg: str
-    timestamp: Optional[str]
-    output_path: Optional[str]
-
+class TrainConfig(Config):
     model_ids: str
     max_steps: int
     batch_size: int
@@ -35,11 +32,10 @@ class TrainConfig:
     translator_heads: int
     translator_mlp_ratio: int
     top_layers_ratio: float
-    device: str
     dtype: str
 
     def __post_init__(self) -> None:
-        self.device = resolve_device(self.device)
+        super().__post_init__()
         parse_model_ids_csv(self.model_ids)
         initialize_train_output_paths(self)
 
