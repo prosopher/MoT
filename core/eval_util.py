@@ -594,11 +594,13 @@ def evaluate_openwebtext_validation_loss_replay(
 
         def compute_native_loss_value() -> float:
             return float(
-                compute_suffix_lm_loss(
+                compute_prefix_correction_and_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=past_by_node_id[edge.tgt_id],
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
+                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
                 ).item()
             )
 
