@@ -2,11 +2,7 @@ import importlib
 import time
 from typing import Callable, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.manifold import TSNE
 
 from core.common import *
 from core.config import Config
@@ -353,6 +349,19 @@ def build_openwebtext_tsne_named_pasts(
         "target_top": target_top_past_key_values,
     }
 
+def _load_openwebtext_tsne_plotting_deps():
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+    except ModuleNotFoundError as exc:
+        missing_name = exc.name or "optional plotting dependency"
+        raise ModuleNotFoundError(
+            "OpenWebText t-SNE plotting requires optional dependency "
+            f"'{missing_name}'. Install matplotlib and scikit-learn to enable plotting."
+        ) from exc
+    return plt, TSNE
 
 
 def _build_openwebtext_tsne_output_dir(output_path: Union[str, Path]) -> Path:
@@ -408,6 +417,12 @@ def _finalize_openwebtext_tsne_plots(
     perplexity: float = 50.0,
     max_iter: int = 1000,
 ) -> Dict[str, str]:
+    try:
+        plt, TSNE = _load_openwebtext_tsne_plotting_deps()
+    except ModuleNotFoundError as exc:
+        logger.warning("Skipping OpenWebText t-SNE plots: %s", exc)
+        return {}
+
     output_dir = _build_openwebtext_tsne_output_dir(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -529,7 +544,6 @@ def _finalize_openwebtext_tsne_plots(
         )
 
     return saved_paths
-
 
 
 def summarize_openwebtext_named_losses(
