@@ -17,6 +17,7 @@ CONFIGS_PATH = REPO_ROOT / "tests" / "configs"
         ("lsc", "train_lsc_smoke.json"),
         ("mot", "train_mot_smoke.json"),
         ("c2c", "train_c2c_smoke.json"),
+        ("kvcomm", "train_kvcomm_smoke.json"),
     ],
 )
 def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Path, capsys, monkeypatch) -> None:
@@ -44,9 +45,9 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         timestamp,
         "--device",
         "cpu",
-        "--max-steps",
-        "1",
     ]
+    if alg != "kvcomm":
+        train_argv.extend(["--max-steps", "1"])
     if alg == "mot":
         train_argv.extend(["--channel-profile-config-path", str(channel_profile_config_path)])
     monkeypatch.setattr(sys, "argv", train_argv)
@@ -83,7 +84,10 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
     train_log = train_log_path.read_text(encoding="utf-8")
     eval_log = eval_log_path.read_text(encoding="utf-8")
 
-    assert "Starting training" in train_log
+    if alg == "kvcomm":
+        assert "Starting KVComm layer selection" in train_log
+    else:
+        assert "Starting training" in train_log
     assert "Starting evaluation" in eval_log
     assert "Preparing validation dataloader for OpenWebText/validation" in eval_log
     assert "[OpenWebText/validation]" in eval_log
