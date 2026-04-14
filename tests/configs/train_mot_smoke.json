@@ -15,8 +15,6 @@
   "log_every": 1,
   "seed": 123,
   "shuffle_buffer": 8,
-  "injection_layer_start_idx": 1,
-  "injection_window_size": 1,
   "layer_alignment": "terminal",
   "translator_dim": 8,
   "translator_heads": 1,

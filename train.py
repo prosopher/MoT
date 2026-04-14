@@ -35,6 +35,12 @@ def build_train_parser(alg: str):
         train_module.TrainConfig,
         exclude_fields={"alg"},
     )
+    if hasattr(train_module, "ChannelProfiler"):
+        parser.add_argument(
+            "--channel-profile-config-path",
+            dest="channel_profile_config_path",
+            default="configs/channel_profile.json",
+        )
     return parser, train_module
 
 
@@ -67,6 +73,9 @@ def main() -> None:
         tokenizer,
         ChannelManager(edges),
     )
+    if hasattr(train_module, "ChannelProfiler") and getattr(config, "layer_alignment", None) == "terminal":
+        profile_config = train_module.load_channel_profile_config(Path(args.channel_profile_config_path))
+        ctx.cp = train_module.ChannelProfiler(ctx, profile_config)
 
     final_checkpoint = Path(train_module.run_train(ctx))
 
