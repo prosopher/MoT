@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 
 from core.config import Config
 from core.channel_manager import Channel, ChannelManager
+from core.channel_profiler import ChannelProfiler, load_channel_profile_config
 from core.context import Context
 from core.model_manager import ModelManager
 from core.model_spec import ModelSpec
@@ -17,6 +18,11 @@ from core.train_util import *
 
 MOT_VARIANTS = {"single", "mot"}
 
+
+def require_channel_profiler(ctx: Context) -> ChannelProfiler:
+    if ctx.cp is None:
+        raise ValueError("Channel profiler is required when layer_alignment='terminal'.")
+    return ctx.cp
 
 
 @dataclass
@@ -35,8 +41,6 @@ class TrainConfig(Config):
     log_every: int
     seed: int
     shuffle_buffer: int
-    injection_layer_start_idx: int
-    injection_window_size: int
     layer_alignment: str
     translator_dim: int
     translator_heads: int
@@ -49,10 +53,8 @@ class TrainConfig(Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.injection_layer_start_idx < 0:
-            raise ValueError("injection_layer_start_idx must be >= 0")
-        if self.injection_window_size < 1:
-            raise ValueError("injection_window_size must be >= 1")
+        if self.layer_alignment not in {"injection", "terminal"}:
+            raise ValueError("layer_alignment must be one of {'injection', 'terminal'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
         if self.variant not in MOT_VARIANTS:
@@ -311,7 +313,6 @@ class LayerWindowTranslatorPool(nn.Module):
     def __init__(
         self,
         ctx: Context,
-        injection_window_size: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
@@ -325,17 +326,17 @@ class LayerWindowTranslatorPool(nn.Module):
         self.ctx = ctx
         self.mm = ctx.mm
         self.cm = ctx.cm
-        self.injection_window_size = injection_window_size
         self.edges = tuple(ctx.edges)
         self.edge_ids = tuple(edge.id for edge in ctx.edges)
         self.edges_by_id = build_edge_map(ctx.edges)
 
         adapters = {}
         for edge in self.edges:
+            channels = self.cm.get_channels(edge.id)
             adapters[edge.id] = LayerWindowDirectionalTranslator(
                 src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
                 tgt_hidden_size=self.mm.get_model_spec(edge.tgt_id).hidden_size,
-                num_layers=self.injection_window_size,
+                num_layers=len(channels),
                 translator_dim=translator_dim,
                 translator_heads=translator_heads,
                 translator_depth=translator_depth,
@@ -346,20 +347,12 @@ class LayerWindowTranslatorPool(nn.Module):
             )
         self.adapters = nn.ModuleDict(adapters)
 
-    def _get_channels(self, edge_id: str) -> List[Channel]:
-        channels = self.cm.get_channels(edge_id)
-        if len(channels) != self.injection_window_size:
-            raise ValueError(
-                f"edge={edge_id} expected {self.injection_window_size} channels, got {len(channels)}"
-            )
-        return channels
-
     def _extract_channel_blocks(
         self,
         past_key_values: PastKeyValues,
         edge_id: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        channels = self._get_channels(edge_id)
+        channels = self.cm.get_channels(edge_id)
         selected_past = tuple(past_key_values[channel.src_layer_idx] for channel in channels)
         return past_key_values_to_blocks(selected_past)
 
@@ -458,6 +451,16 @@ def build_channel_map(
                 src_layer_idx=src_layer_start_idx + offset,
                 dst_layer_idx=tgt_layer_start_idx + offset,
             )
+
+
+def resolve_channels(ctx: Context) -> None:
+    config = ctx.config
+    if config.layer_alignment == "injection":
+        build_channel_map(ctx, ctx.edges)
+        return
+
+    profiler = ctx.cp
+    profiler.profile_all_edges()
 
 
 
@@ -654,11 +657,9 @@ def build_translator_pool(
     ctx: Context,
 ) -> LayerWindowTranslatorPool:
     config = ctx.config
-    edges = ctx.edges
-    build_channel_map(ctx, edges)
+    resolve_channels(ctx)
     translator_pool = LayerWindowTranslatorPool(
         ctx=ctx,
-        injection_window_size=config.injection_window_size,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
         translator_depth=config.translator_depth,
@@ -703,6 +704,9 @@ def load_translator_pool_from_checkpoint(
         tokenizer,
         ChannelManager(edges),
     )
+    if config.layer_alignment == "terminal":
+        profile_config_path = Path(checkpoint_dir_path_obj) / "channel_profile.json"
+        ctx.cp = ChannelProfiler(ctx, load_channel_profile_config(profile_config_path))
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
@@ -721,9 +725,15 @@ def run_train(
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    cp = None
+    if config.layer_alignment == "terminal":
+        cp = require_channel_profiler(ctx)
 
     config_path = get_train_config_path(output_path)
     write_json(str(config_path), asdict(config))
+    if cp is not None:
+        from core.channel_profiler import save_channel_profile_config
+        save_channel_profile_config(output_path, cp.profile_config)
 
     log_path = get_train_log_path(output_path)
     logger = setup_logger(f"{config.alg}_train", log_path)

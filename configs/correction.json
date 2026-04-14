@@ -17,7 +17,7 @@
   "shuffle_buffer": 50000,
   "injection_layer_start_idx": 0,
   "injection_window_size": 6,
-  "layer_alignment": "terminal",
+  "layer_alignment": "injection",
   "translator_dim": 1024,
   "translator_heads": 16,
   "translator_depth": 2,

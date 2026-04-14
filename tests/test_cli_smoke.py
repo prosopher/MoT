@@ -26,30 +26,30 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
     timestamp = f"pytest_{alg}"
     train_config_path = CONFIGS_PATH / train_config_name
     eval_config_path = CONFIGS_PATH / "eval_smoke.json"
+    channel_profile_config_path = CONFIGS_PATH / "channel_profile_smoke.json"
 
     output_path = outputs_path / f"{alg}_{timestamp}"
     checkpoint_dir_path = output_path
     checkpoint_path = checkpoint_dir_path / "checkpoint.pt"
     train_log_path = output_path / "train.log"
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "train.py",
-            alg,
-            "--default-config-path",
-            str(train_config_path),
-            "--output-path",
-            str(output_path),
-            "--timestamp",
-            timestamp,
-            "--device",
-            "cpu",
-            "--max-steps",
-            "1",
-        ],
-    )
+    train_argv = [
+        "train.py",
+        alg,
+        "--default-config-path",
+        str(train_config_path),
+        "--output-path",
+        str(output_path),
+        "--timestamp",
+        timestamp,
+        "--device",
+        "cpu",
+        "--max-steps",
+        "1",
+    ]
+    if alg == "mot":
+        train_argv.extend(["--channel-profile-config-path", str(channel_profile_config_path)])
+    monkeypatch.setattr(sys, "argv", train_argv)
     train_entry.main()
     train_stdout = capsys.readouterr().out
 

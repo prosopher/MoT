@@ -56,6 +56,7 @@ def evaluate_dataset(
             }
 
             for edge in edges:
+                edge_channels = ctx.cm.get_channels(edge.id)
                 mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
@@ -69,7 +70,7 @@ def evaluate_dataset(
                     *extract_layer_window_blocks(
                         past_key_values=past_by_node_id[edge.tgt_id],
                         start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                        num_layers=train_config.injection_window_size,
+                        num_layers=len(edge_channels),
                     ),
                     num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
                     head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
@@ -184,6 +185,7 @@ def evaluate_generation_dataset(
             }
 
             for edge in edges:
+                edge_channels = ctx.cm.get_channels(edge.id)
                 mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
@@ -197,7 +199,7 @@ def evaluate_generation_dataset(
                     *extract_layer_window_blocks(
                         past_key_values=past_by_node_id[edge.tgt_id],
                         start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                        num_layers=train_config.injection_window_size,
+                        num_layers=len(edge_channels),
                     ),
                     num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
                     head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
@@ -273,8 +275,17 @@ def run_eval(
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
     logger.info("edges=%s", [edge.id for edge in edges])
-    logger.info("injection_layer_start_idx=%d", train_config.injection_layer_start_idx)
-    logger.info("injection_window_size=%d", train_config.injection_window_size)
+    logger.info(
+        "resolved_channels=%s",
+        {
+            edge.id: {
+                "src": [ctx.cm.get_src_layer_start_idx(edge.id), ctx.cm.get_src_layer_end_idx(edge.id)],
+                "tgt": [ctx.cm.get_tgt_layer_start_idx(edge.id), ctx.cm.get_tgt_layer_end_idx(edge.id)],
+                "num_layers": len(ctx.cm.get_channels(edge.id)),
+            }
+            for edge in edges
+        },
+    )
     logger.info("translation_mode=translate_window_and_replay_target_prefill")
     logger.info("qa_eval_log_path=%s", log_path)
 
