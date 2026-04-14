@@ -261,7 +261,7 @@ def evaluate_openwebtext_validation_loss(
         key_block, value_block = extract_layer_window_blocks(
             past_key_values=past_by_node_id[edge.src_id],
             start_layer_idx=ctx.cm.get_src_layer_start_idx(edge.id),
-            num_layers=train_config.injection_window_size,
+            num_layers=len(ctx.cm.get_channels(edge.id)),
         )
         return blocks_to_partial_past_key_values(
             key_block=key_block,
@@ -274,7 +274,7 @@ def evaluate_openwebtext_validation_loss(
         key_block, value_block = extract_layer_window_blocks(
             past_key_values=past_by_node_id[edge.tgt_id],
             start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-            num_layers=train_config.injection_window_size,
+            num_layers=len(ctx.cm.get_channels(edge.id)),
         )
         return blocks_to_partial_past_key_values(
             key_block=key_block,
