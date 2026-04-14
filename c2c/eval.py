@@ -278,8 +278,8 @@ def run_eval(
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("top_layers_to_translate=%d", get_top_layers_to_translate(train_config))
     logger.info("edges=%s", [edge.id for edge in edges])
+    logger.info("top_layers_to_translate=%d", get_top_layers_to_translate(train_config))
     logger.info("translation_mode=%s", get_translation_mode_name(train_config))
     logger.info("qa_eval_log_path=%s", log_path)
 
