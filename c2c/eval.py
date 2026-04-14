@@ -9,7 +9,6 @@ from core.context import Context
 from core.eval_util import *
 from c2c.train import (
     get_top_layers_to_translate,
-    get_translation_loss_name,
     get_translation_mode_name,
     translate_top_layers,
 )
@@ -335,15 +334,12 @@ def run_eval(
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
-        translation_loss_name = get_translation_loss_name(train_config)
         logger.info(
-            "[OpenWebText/validation] %s | native_loss=%.6f | native_profile=%s | %s_loss=%.6f | %s_profile=%s | count=%d",
+            "[OpenWebText/validation] %s | native_loss=%.6f | native_profile=%s | translated_loss=%.6f | translated_profile=%s | count=%d",
             edge.id,
             row["native_loss"],
             build_openwebtext_profile_cell(row, prefix="native"),
-            translation_loss_name,
             row["loss"],
-            translation_loss_name,
             build_openwebtext_profile_cell(row),
             row["count"],
         )
