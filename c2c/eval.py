@@ -303,12 +303,34 @@ def run_eval(
             translated_top_past_key_values=translated_top_past,
         )
 
+    def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
+        return build_openwebtext_tsne_named_pasts(
+            source_top_past_key_values=slice_top_layers(
+                past_key_values=past_by_node_id[edge.src_id],
+                top_layers_to_translate=get_top_layers_to_translate(train_config),
+            ),
+            translated_past_key_values=translate_top_layers(
+                translator_pool=translator_pool,
+                train_config=train_config,
+                sharer_past_key_values=past_by_node_id[edge.src_id],
+                receiver_past_key_values=past_by_node_id[edge.tgt_id],
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
+                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            ),
+            target_top_past_key_values=slice_top_layers(
+                past_key_values=past_by_node_id[edge.tgt_id],
+                top_layers_to_translate=get_top_layers_to_translate(train_config),
+            ),
+        )
+
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
         logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
@@ -321,6 +343,12 @@ def run_eval(
             build_openwebtext_profile_cell(row),
             row["count"],
         )
+        if row.get("tsne_plot_path"):
+            logger.info(
+                "[OpenWebText/validation] %s | tsne_plot=%s",
+                edge.id,
+                row["tsne_plot_path"],
+            )
 
     logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:

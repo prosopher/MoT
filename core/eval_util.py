@@ -2,6 +2,8 @@ import importlib
 import time
 from typing import Callable, Tuple
 
+import numpy as np
+
 from core.common import *
 from core.config import Config
 from core.context import Context
@@ -30,6 +32,19 @@ class EvalConfig(Config):
     def __post_init__(self) -> None:
         super().__post_init__()
         initialize_eval_output_paths(self)
+
+
+OPENWEBTEXT_TSNE_LABEL_ORDER = (
+    "source_top",
+    "translated",
+    "target_top",
+)
+OPENWEBTEXT_TSNE_DISPLAY_NAMES = {
+    "source_top": "Source Top KV",
+    "translated": "Translated KV",
+    "target_top": "Target Top KV",
+}
+OPENWEBTEXT_TSNE_FILE_BASENAME = "openwebtext_validation_tsne"
 
 
 @dataclass
@@ -284,6 +299,252 @@ def build_openwebtext_eval_dataloader(
     return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
 
 
+def select_past_layers_by_indices(
+    past_key_values: PastKeyValues,
+    layer_indices: List[int],
+) -> PastKeyValues:
+    if not layer_indices:
+        raise ValueError("layer_indices must contain at least one layer index.")
+
+    selected_layers = []
+    num_layers = len(past_key_values)
+    for layer_idx in layer_indices:
+        normalized_idx = int(layer_idx)
+        if not (0 <= normalized_idx < num_layers):
+            raise ValueError(
+                f"layer_idx={normalized_idx} must be in [0, {num_layers - 1}]"
+            )
+        selected_layers.append(past_key_values[normalized_idx])
+    return tuple(selected_layers)
+
+
+def select_last_layer_past_key_values(
+    past_key_values: PastKeyValues,
+) -> PastKeyValues:
+    if len(past_key_values) < 1:
+        raise ValueError("past_key_values must contain at least one layer.")
+    return (past_key_values[-1],)
+
+
+def summarize_past_key_values_for_tsne(
+    past_key_values: PastKeyValues,
+) -> np.ndarray:
+    if len(past_key_values) < 1:
+        raise ValueError("past_key_values must contain at least one layer.")
+
+    last_layer_past_key_values = select_last_layer_past_key_values(past_key_values)
+    flat_features = flatten_past_key_values(last_layer_past_key_values)
+    return flat_features.detach().to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+
+
+def build_openwebtext_tsne_named_pasts(
+    *,
+    source_top_past_key_values: PastKeyValues,
+    translated_past_key_values: PastKeyValues,
+    target_top_past_key_values: PastKeyValues,
+) -> Dict[str, PastKeyValues]:
+    return {
+        "source_top": source_top_past_key_values,
+        "translated": translated_past_key_values,
+        "target_top": target_top_past_key_values,
+    }
+
+def _load_openwebtext_tsne_plotting_deps():
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        from sklearn.manifold import TSNE
+    except ModuleNotFoundError as exc:
+        missing_name = exc.name or "optional plotting dependency"
+        raise ModuleNotFoundError(
+            "OpenWebText t-SNE plotting requires optional dependency "
+            f"'{missing_name}'. Install matplotlib and scikit-learn to enable plotting."
+        ) from exc
+    return plt, TSNE
+
+
+def _build_openwebtext_tsne_output_dir(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "tsne" / "openwebtext_validation"
+
+
+def _sanitize_edge_id_for_filename(edge_id: str) -> str:
+    allowed = []
+    for char in edge_id:
+        if char.isalnum() or char in {"-", "_"}:
+            allowed.append(char)
+        else:
+            allowed.append("_")
+    return "".join(allowed)
+
+
+def _build_openwebtext_tsne_plot_path(output_path: Union[str, Path], edge_id: str) -> Path:
+    safe_edge_id = _sanitize_edge_id_for_filename(edge_id)
+    return _build_openwebtext_tsne_output_dir(output_path) / f"{OPENWEBTEXT_TSNE_FILE_BASENAME}_{safe_edge_id}.png"
+
+
+def _accumulate_openwebtext_tsne_samples(
+    features_by_edge_and_group: Dict[str, Dict[str, List[np.ndarray]]],
+    *,
+    edge_id: str,
+    named_pasts: Dict[str, PastKeyValues],
+) -> None:
+    group_store = features_by_edge_and_group[edge_id]
+    reference_batch_size = None
+
+    for label in OPENWEBTEXT_TSNE_LABEL_ORDER:
+        past_key_values = named_pasts.get(label)
+        if past_key_values is None:
+            continue
+
+        features = summarize_past_key_values_for_tsne(past_key_values)
+        if reference_batch_size is None:
+            reference_batch_size = features.shape[0]
+        elif reference_batch_size != features.shape[0]:
+            raise ValueError(
+                "All OpenWebText t-SNE groups must share the same batch size, "
+                f"got {reference_batch_size} vs {features.shape[0]} for edge {edge_id}."
+            )
+        group_store[label].append(features)
+
+
+def _finalize_openwebtext_tsne_plots(
+    *,
+    output_path: Union[str, Path],
+    seed: int,
+    logger: logging.Logger,
+    features_by_edge_and_group: Dict[str, Dict[str, List[np.ndarray]]],
+    perplexity: float = 50.0,
+    max_iter: int = 1000,
+) -> Dict[str, str]:
+    try:
+        plt, TSNE = _load_openwebtext_tsne_plotting_deps()
+    except ModuleNotFoundError as exc:
+        logger.warning("Skipping OpenWebText t-SNE plots: %s", exc)
+        return {}
+
+    output_dir = _build_openwebtext_tsne_output_dir(output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    visible_labels = OPENWEBTEXT_TSNE_LABEL_ORDER
+
+    saved_paths: Dict[str, str] = {}
+    for edge_id, group_store in features_by_edge_and_group.items():
+        ordered_features = []
+        ordered_labels = []
+        group_counts = {}
+
+        for label in visible_labels:
+            feature_batches = group_store.get(label, [])
+            if not feature_batches:
+                continue
+            group_features = np.concatenate(feature_batches, axis=0)
+            ordered_features.append(group_features)
+            ordered_labels.extend([label] * group_features.shape[0])
+            group_counts[label] = int(group_features.shape[0])
+
+        if len(ordered_features) < 2:
+            logger.warning(
+                "Skipping OpenWebText t-SNE for %s because fewer than two visible groups were collected.",
+                edge_id,
+            )
+            continue
+
+        max_feature_dim = max(features.shape[1] for features in ordered_features)
+        padded_features = []
+        for features in ordered_features:
+            if features.shape[1] < max_feature_dim:
+                features = np.pad(
+                    features,
+                    pad_width=((0, 0), (0, max_feature_dim - features.shape[1])),
+                    mode="constant",
+                    constant_values=0.0,
+                )
+            padded_features.append(features)
+
+        feature_matrix = np.concatenate(padded_features, axis=0)
+        if feature_matrix.shape[0] < 3:
+            logger.warning(
+                "Skipping OpenWebText t-SNE for %s because only %d total samples were collected.",
+                edge_id,
+                feature_matrix.shape[0],
+            )
+            continue
+
+        feature_mean = feature_matrix.mean(axis=0, keepdims=True)
+        feature_std = feature_matrix.std(axis=0, keepdims=True)
+        feature_matrix = (feature_matrix - feature_mean) / np.clip(feature_std, 1e-6, None)
+
+        effective_perplexity = float(perplexity)
+        if feature_matrix.shape[0] <= effective_perplexity:
+            effective_perplexity = float(max(1, feature_matrix.shape[0] - 1))
+            logger.warning(
+                "Adjusted OpenWebText t-SNE perplexity for %s from %.1f to %.1f because only %d total samples were collected.",
+                edge_id,
+                float(perplexity),
+                effective_perplexity,
+                feature_matrix.shape[0],
+            )
+
+        embedding = TSNE(
+            n_components=2,
+            perplexity=effective_perplexity,
+            max_iter=max_iter,
+            init="pca",
+            learning_rate="auto",
+            random_state=seed,
+        ).fit_transform(feature_matrix)
+
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=160)
+        scatter_style = {
+            "source_top": {"s": 44, "alpha": 0.62, "zorder": 2},
+            "translated": {"s": 68, "alpha": 0.90, "zorder": 4},
+            "target_top": {"s": 44, "alpha": 0.62, "zorder": 2},
+        }
+        for label in visible_labels:
+            display_name = OPENWEBTEXT_TSNE_DISPLAY_NAMES[label]
+            mask = np.asarray([row_label == label for row_label in ordered_labels], dtype=bool)
+            if not np.any(mask):
+                continue
+            style = scatter_style.get(label, {"s": 36, "alpha": 0.60, "zorder": 1})
+            ax.scatter(
+                embedding[mask, 0],
+                embedding[mask, 1],
+                s=style["s"],
+                alpha=style["alpha"],
+                zorder=style["zorder"],
+                linewidths=0.0,
+                label=display_name,
+            )
+
+        ax.set_title(
+            f"OpenWebText validation t-SNE ({edge_id})\n"
+            f"last-layer raw flattened KV | perplexity={int(round(effective_perplexity))}, max_iter={max_iter}",
+            fontsize=14,
+        )
+        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+
+        plot_path = _build_openwebtext_tsne_plot_path(output_path, edge_id)
+        fig.tight_layout()
+        fig.savefig(plot_path, bbox_inches="tight")
+        plt.close(fig)
+
+        saved_paths[edge_id] = str(plot_path)
+        count_summary = ", ".join(
+            f"{label}={group_counts.get(label, 0)}"
+            for label in visible_labels
+            if label in group_counts
+        )
+        logger.info(
+            "Saved OpenWebText t-SNE plot for %s to %s (%s)",
+            edge_id,
+            plot_path,
+            count_summary,
+        )
+
+    return saved_paths
+
 
 def summarize_openwebtext_named_losses(
     average_losses: Dict[str, float],
@@ -355,6 +616,7 @@ def summarize_openwebtext_named_losses(
 def evaluate_openwebtext_validation_loss_metrics(
     *,
     ctx: Context,
+    output_path: Union[str, Path],
     batch_size: int,
     num_workers: int,
     shuffle: bool,
@@ -363,6 +625,7 @@ def evaluate_openwebtext_validation_loss_metrics(
     max_examples: int,
     logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
         tokenizer=ctx.tokenizer,
@@ -379,6 +642,12 @@ def evaluate_openwebtext_validation_loss_metrics(
     loss_sums = {edge.id: {} for edge in ctx.edges}
     counts = {edge.id: 0 for edge in ctx.edges}
     profile_accumulators = {edge.id: {} for edge in ctx.edges}
+    tsne_features = None
+    if build_visualization_pasts_fn is not None:
+        tsne_features = {
+            edge.id: {label: [] for label in OPENWEBTEXT_TSNE_LABEL_ORDER}
+            for edge in ctx.edges
+        }
 
     processed_examples = 0
     for batch_idx, input_ids in enumerate(dataloader, start=1):
@@ -428,6 +697,22 @@ def evaluate_openwebtext_validation_loss_metrics(
                 )
             counts[edge.id] += batch_examples
 
+            if tsne_features is not None:
+                named_pasts = build_visualization_pasts_fn(
+                    edge_id=edge.id,
+                    edge=edge,
+                    prefix_cache_ids=prefix_cache_ids,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                    past_by_node_id=past_by_node_id,
+                )
+                if named_pasts:
+                    _accumulate_openwebtext_tsne_samples(
+                        tsne_features,
+                        edge_id=edge.id,
+                        named_pasts=named_pasts,
+                    )
+
         processed_examples += batch_examples
         if batch_idx % 25 == 0:
             logger.info(
@@ -463,6 +748,19 @@ def evaluate_openwebtext_validation_loss_metrics(
             },
         )
 
+    if tsne_features is not None:
+        tsne_paths = _finalize_openwebtext_tsne_plots(
+            output_path=output_path,
+            seed=seed,
+            logger=logger,
+            features_by_edge_and_group=tsne_features,
+            perplexity=50.0,
+            max_iter=1000,
+        )
+        for edge in ctx.edges:
+            if edge.id in tsne_paths:
+                summaries[edge.id]["tsne_plot_path"] = tsne_paths[edge.id]
+
     return summaries
 
 
@@ -473,7 +771,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
     translator_pool,
     logger: logging.Logger,
     *,
-    build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
+    build_translated_target_past_fn: Callable[..., PastKeyValues],
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     profiler = InferenceProfiler(train_config.device)
@@ -534,6 +833,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
 
     return evaluate_openwebtext_validation_loss_metrics(
         ctx=ctx,
+        output_path=eval_config.output_path,
         batch_size=eval_config.batch_size,
         num_workers=eval_config.num_workers,
         shuffle=eval_config.shuffle_eval_stream,
@@ -542,6 +842,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         max_examples=eval_config.max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 
@@ -551,6 +852,8 @@ def evaluate_openwebtext_validation_loss_replay(
     eval_config: EvalConfig,
     translator_pool,
     logger: logging.Logger,
+    *,
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     profiler = InferenceProfiler(train_config.device)
@@ -619,6 +922,7 @@ def evaluate_openwebtext_validation_loss_replay(
 
     return evaluate_openwebtext_validation_loss_metrics(
         ctx=ctx,
+        output_path=eval_config.output_path,
         batch_size=eval_config.batch_size,
         num_workers=eval_config.num_workers,
         shuffle=eval_config.shuffle_eval_stream,
@@ -627,6 +931,7 @@ def evaluate_openwebtext_validation_loss_replay(
         max_examples=eval_config.max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 
@@ -638,6 +943,7 @@ def evaluate_openwebtext_validation_loss(
     logger: logging.Logger,
     *,
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
@@ -645,6 +951,7 @@ def evaluate_openwebtext_validation_loss(
             eval_config=eval_config,
             translator_pool=translator_pool,
             logger=logger,
+            build_visualization_pasts_fn=build_visualization_pasts_fn,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
         ctx=ctx,
@@ -652,6 +959,7 @@ def evaluate_openwebtext_validation_loss(
         translator_pool=translator_pool,
         logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:

@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -293,11 +294,60 @@ def run_eval(
     all_generation_results = {}
 
     logger.info("Preparing validation dataloader for OpenWebText/validation")
+
+    def build_source_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
+        key_block, value_block = extract_layer_window_blocks(
+            past_key_values=past_by_node_id[edge.src_id],
+            start_layer_idx=ctx.cm.get_src_layer_start_idx(edge.id),
+            num_layers=len(ctx.cm.get_channels(edge.id)),
+        )
+        return blocks_to_partial_past_key_values(
+            key_block=key_block,
+            value_block=value_block,
+            num_heads=ctx.mm.get_model_spec(edge.src_id).num_heads,
+            head_dim=ctx.mm.get_model_spec(edge.src_id).head_dim,
+        )
+
+    def build_target_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
+        key_block, value_block = extract_layer_window_blocks(
+            past_key_values=past_by_node_id[edge.tgt_id],
+            start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+            num_layers=len(ctx.cm.get_channels(edge.id)),
+        )
+        return blocks_to_partial_past_key_values(
+            key_block=key_block,
+            value_block=value_block,
+            num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
+            head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
+        )
+
+    def build_visualization_pasts_fn(
+        *,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        past_by_node_id,
+        **_,
+    ) -> Dict[str, PastKeyValues]:
+        _, translated_window_past = translator_pool.build_replayed_target_past(
+            source_past_key_values=past_by_node_id[edge.src_id],
+            prefix_input_ids=prefix_cache_ids,
+            target_model=ctx.mm.get_model(edge.tgt_id),
+            src_node_id=edge.src_id,
+            tgt_node_id=edge.tgt_id,
+            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        )
+        return build_openwebtext_tsne_named_pasts(
+            source_top_past_key_values=build_source_window_past(edge, past_by_node_id),
+            translated_past_key_values=translated_window_past,
+            target_top_past_key_values=build_target_window_past(edge, past_by_node_id),
+        )
+
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
         logger=logger,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
@@ -310,6 +360,9 @@ def run_eval(
             build_openwebtext_profile_cell(row),
             row["count"],
         )
+        tsne_plot_path = row.get("tsne_plot_path")
+        if isinstance(tsne_plot_path, str) and tsne_plot_path:
+            logger.info("[OpenWebText/validation] %s | tsne_plot=%s", edge.id, tsne_plot_path)
 
     logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:

@@ -247,7 +247,14 @@ class TinyCausalLM(PreTrainedModel):
 
         self.to(dtype=torch_dtype)
 
-    def forward(self, input_ids: torch.Tensor, past_key_values=None, use_cache: bool = True):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values=None,
+        use_cache: bool = True,
+        output_attentions: bool = False,
+        **_: object,
+    ):
         batch_size, seq_len = input_ids.shape
         past_length = 0
         if past_key_values is not None and len(past_key_values) > 0:
@@ -263,6 +270,7 @@ class TinyCausalLM(PreTrainedModel):
         hidden_states = self.transformer.drop(hidden_states)
 
         presents = []
+        attentions = []
         for layer_idx, block in enumerate(self.transformer.h):
             layer_past = None if past_key_values is None else past_key_values[layer_idx]
             block_outputs = block(
@@ -273,11 +281,15 @@ class TinyCausalLM(PreTrainedModel):
                 encoder_hidden_states=None,
                 encoder_attention_mask=None,
                 use_cache=use_cache,
-                output_attentions=False,
+                output_attentions=output_attentions,
             )
             hidden_states = block_outputs[0]
+            next_index = 1
             if use_cache:
-                presents.append(block_outputs[1])
+                presents.append(block_outputs[next_index])
+                next_index += 1
+            if output_attentions:
+                attentions.append(block_outputs[next_index])
 
         hidden_states = self.transformer.ln_f(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -285,6 +297,7 @@ class TinyCausalLM(PreTrainedModel):
             logits=logits,
             past_key_values=tuple(presents) if use_cache else None,
             last_hidden_state=hidden_states,
+            attentions=tuple(attentions) if output_attentions else None,
         )
 
 
