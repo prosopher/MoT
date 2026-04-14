@@ -363,7 +363,6 @@ def evaluate_openwebtext_validation_loss_metrics(
     max_examples: int,
     logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
-    summarize_edge_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
         tokenizer=ctx.tokenizer,
@@ -451,7 +450,18 @@ def evaluate_openwebtext_validation_loss_metrics(
             metric_name: accumulator.summary()
             for metric_name, accumulator in profile_accumulators[edge.id].items()
         }
-        summaries[edge.id] = summarize_edge_fn(average_losses, count, profile_summaries)
+        summaries[edge.id] = summarize_openwebtext_named_losses(
+            average_losses,
+            count,
+            primary_name="translated",
+            loss_field_by_name={
+                "native": "native_loss",
+            },
+            profile_summary_by_name=profile_summaries,
+            profile_field_prefix_by_name={
+                "native": "native",
+            },
+        )
 
     return summaries
 
@@ -532,18 +542,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
         max_examples=eval_config.max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
-        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
-            average_losses,
-            count,
-            primary_name="translated",
-            loss_field_by_name={
-                "native": "native_loss",
-            },
-            profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={
-                "native": "native",
-            },
-        ),
     )
 
 
@@ -629,18 +627,6 @@ def evaluate_openwebtext_validation_loss_replay(
         max_examples=eval_config.max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
-        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
-            average_losses,
-            count,
-            primary_name="translated",
-            loss_field_by_name={
-                "native": "native_loss",
-            },
-            profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={
-                "native": "native",
-            },
-        ),
     )
 
 
