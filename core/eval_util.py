@@ -462,6 +462,8 @@ def evaluate_openwebtext_validation_loss_top_layers(
     eval_config: EvalConfig,
     translator_pool,
     logger: logging.Logger,
+    *,
+    build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     profiler = InferenceProfiler(train_config.device)
@@ -478,20 +480,14 @@ def evaluate_openwebtext_validation_loss_top_layers(
         profile_tokens = lm_labels.numel()
 
         def compute_translated_loss_value() -> float:
-            translated_top_past = translator_pool.translate_top_layers(
-                past_key_values=past_by_node_id[edge.src_id],
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            )
-            mixed_target_past = replace_top_layers(
-                base_past_key_values=past_by_node_id[edge.tgt_id],
-                translated_top_past_key_values=translated_top_past,
+            translated_target_past = build_translated_target_past_fn(
+                edge=edge,
+                past_by_node_id=past_by_node_id,
             )
             return float(
                 compute_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 ).item()
@@ -654,6 +650,8 @@ def evaluate_openwebtext_validation_loss(
     eval_config: EvalConfig,
     translator_pool,
     logger: logging.Logger,
+    *,
+    build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
@@ -667,6 +665,7 @@ def evaluate_openwebtext_validation_loss(
         eval_config=eval_config,
         translator_pool=translator_pool,
         logger=logger,
+        build_translated_target_past_fn=build_translated_target_past_fn,
     )
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:

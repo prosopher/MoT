@@ -284,11 +284,25 @@ def run_eval(
     all_generation_results = {}
 
     logger.info("Preparing validation dataloader for OpenWebText/validation")
+
+    def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
+        translated_top_past = translator_pool.translate_top_layers(
+            past_key_values=past_by_node_id[edge.src_id],
+            src_node_id=edge.src_id,
+            tgt_node_id=edge.tgt_id,
+            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        )
+        return replace_top_layers(
+            base_past_key_values=past_by_node_id[edge.tgt_id],
+            translated_top_past_key_values=translated_top_past,
+        )
+
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
         logger=logger,
+        build_translated_target_past_fn=build_translated_target_past_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
