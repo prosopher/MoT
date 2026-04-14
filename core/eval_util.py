@@ -625,7 +625,6 @@ def evaluate_openwebtext_validation_loss_metrics(
     max_examples: int,
     logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
-    summarize_edge_fn: Callable[[Dict[str, float], int, Dict[str, Dict[str, float]]], Dict[str, float]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     dataloader = build_openwebtext_eval_dataloader(
@@ -736,7 +735,18 @@ def evaluate_openwebtext_validation_loss_metrics(
             metric_name: accumulator.summary()
             for metric_name, accumulator in profile_accumulators[edge.id].items()
         }
-        summaries[edge.id] = summarize_edge_fn(average_losses, count, profile_summaries)
+        summaries[edge.id] = summarize_openwebtext_named_losses(
+            average_losses,
+            count,
+            primary_name="translated",
+            loss_field_by_name={
+                "native": "native_loss",
+            },
+            profile_summary_by_name=profile_summaries,
+            profile_field_prefix_by_name={
+                "native": "native",
+            },
+        )
 
     if tsne_features is not None:
         tsne_paths = _finalize_openwebtext_tsne_plots(
@@ -760,6 +770,9 @@ def evaluate_openwebtext_validation_loss_top_layers(
     eval_config: EvalConfig,
     translator_pool,
     logger: logging.Logger,
+    *,
+    build_translated_target_past_fn: Callable[..., PastKeyValues],
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     profiler = InferenceProfiler(train_config.device)
@@ -776,20 +789,14 @@ def evaluate_openwebtext_validation_loss_top_layers(
         profile_tokens = lm_labels.numel()
 
         def compute_translated_loss_value() -> float:
-            translated_top_past = translator_pool.translate_top_layers(
-                past_key_values=past_by_node_id[edge.src_id],
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            )
-            mixed_target_past = replace_top_layers(
-                base_past_key_values=past_by_node_id[edge.tgt_id],
-                translated_top_past_key_values=translated_top_past,
+            translated_target_past = build_translated_target_past_fn(
+                edge=edge,
+                past_by_node_id=past_by_node_id,
             )
             return float(
                 compute_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 ).item()
@@ -835,34 +842,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         max_examples=eval_config.max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
-        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
-            average_losses,
-            count,
-            primary_name="translated",
-            loss_field_by_name={
-                "native": "native_loss",
-            },
-            profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={
-                "native": "native",
-            },
-        ),
-        build_visualization_pasts_fn=lambda edge_id, edge, prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id: {
-            "source_top": slice_top_layers(
-                past_key_values=past_by_node_id[edge.src_id],
-                top_layers_to_translate=get_top_layers_to_translate(train_config),
-            ),
-            "translated": translator_pool.translate_top_layers(
-                past_key_values=past_by_node_id[edge.src_id],
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            ),
-            "target_top": slice_top_layers(
-                past_key_values=past_by_node_id[edge.tgt_id],
-                top_layers_to_translate=get_top_layers_to_translate(train_config),
-            ),
-        },
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 
@@ -872,6 +852,8 @@ def evaluate_openwebtext_validation_loss_replay(
     eval_config: EvalConfig,
     translator_pool,
     logger: logging.Logger,
+    *,
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     profiler = InferenceProfiler(train_config.device)
@@ -949,18 +931,7 @@ def evaluate_openwebtext_validation_loss_replay(
         max_examples=eval_config.max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
-        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
-            average_losses,
-            count,
-            primary_name="translated",
-            loss_field_by_name={
-                "native": "native_loss",
-            },
-            profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={
-                "native": "native",
-            },
-        ),
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 
@@ -970,6 +941,9 @@ def evaluate_openwebtext_validation_loss(
     eval_config: EvalConfig,
     translator_pool,
     logger: logging.Logger,
+    *,
+    build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
+    build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
@@ -977,12 +951,15 @@ def evaluate_openwebtext_validation_loss(
             eval_config=eval_config,
             translator_pool=translator_pool,
             logger=logger,
+            build_visualization_pasts_fn=build_visualization_pasts_fn,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
         logger=logger,
+        build_translated_target_past_fn=build_translated_target_past_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:

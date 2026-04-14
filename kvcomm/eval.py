@@ -226,127 +226,6 @@ def _predict_kvcomm_generation(
     )
 
 
-def evaluate_openwebtext_validation_loss(
-    *,
-    ctx: Context,
-    eval_config: EvalConfig,
-    translator_pool: KVCommSelectionPool,
-    logger,
-    eval_name: str,
-) -> Dict[str, Dict[str, float]]:
-    del eval_name
-    profiler = InferenceProfiler(ctx.config.device)
-
-    def evaluate_edge_losses_fn(
-        *,
-        edge_id: str,
-        edge,
-        prefix_cache_ids: torch.Tensor,
-        lm_input_ids: torch.Tensor,
-        lm_labels: torch.Tensor,
-        past_by_node_id,
-    ) -> tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        del prefix_cache_ids
-        profile_tokens = int(lm_labels.numel())
-        native_past = _ensure_model_cache(past_by_node_id[edge.tgt_id])
-
-        def compute_translated_loss_value() -> float:
-            translated_past = _ensure_model_cache(
-                translator_pool.build_replayed_target_past(
-                    edge_id=edge_id,
-                    source_past_key_values=past_by_node_id[edge.src_id],
-                )
-            )
-            return float(
-                compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=translated_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
-            )
-
-        def compute_native_loss_value() -> float:
-            return float(
-                compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=native_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
-            )
-
-        translated_loss, translated_profile = profiler.measure(
-            compute_translated_loss_value,
-            tokens=profile_tokens,
-        )
-        native_loss, native_profile = profiler.measure(
-            compute_native_loss_value,
-            tokens=profile_tokens,
-        )
-        return (
-            {
-                "translated": translated_loss,
-                "native": native_loss,
-            },
-            {
-                "translated": translated_profile,
-                "native": native_profile,
-            },
-        )
-
-    def build_visualization_pasts_fn(
-        edge_id: str,
-        edge,
-        prefix_cache_ids: torch.Tensor,
-        lm_input_ids: torch.Tensor,
-        lm_labels: torch.Tensor,
-        past_by_node_id,
-    ) -> Dict[str, PastKeyValues]:
-        del prefix_cache_ids, lm_input_ids, lm_labels
-        native_past = _ensure_model_cache(past_by_node_id[edge.tgt_id])
-        translated_past = _ensure_model_cache(
-            translator_pool.build_replayed_target_past(
-                edge_id=edge_id,
-                source_past_key_values=past_by_node_id[edge.src_id],
-            )
-        )
-        source_selected_past, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
-            translator_pool=translator_pool,
-            edge_id=edge_id,
-            source_past_key_values=past_by_node_id[edge.src_id],
-            target_past_key_values=native_past,
-            replayed_target_past_key_values=translated_past,
-        )
-        return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=source_selected_past,
-            translated_past_key_values=translated_selected_past,
-            target_top_past_key_values=target_selected_past,
-        )
-
-    return evaluate_openwebtext_validation_loss_metrics(
-        ctx=ctx,
-        output_path=eval_config.output_path,
-        batch_size=eval_config.batch_size,
-        num_workers=eval_config.num_workers,
-        shuffle=eval_config.shuffle_eval_stream,
-        seed=eval_config.seed,
-        shuffle_buffer=eval_config.shuffle_buffer,
-        max_examples=eval_config.max_examples_per_dataset,
-        logger=logger,
-        evaluate_edge_losses_fn=evaluate_edge_losses_fn,
-        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
-            average_losses,
-            count,
-            primary_name="translated",
-            loss_field_by_name={"native": "native_loss"},
-            profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={"native": "native"},
-        ),
-        build_visualization_pasts_fn=build_visualization_pasts_fn,
-    )
-
-
 def evaluate_dataset(
     *,
     ctx: Context,
@@ -624,12 +503,43 @@ def run_eval(
 
     calibration_eval_name = _build_calibration_eval_name(train_config)
     logger.info("Preparing validation dataloader for %s", calibration_eval_name)
+
+    def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
+        return _ensure_model_cache(
+            translator_pool.build_replayed_target_past(
+                edge_id=edge.id,
+                source_past_key_values=past_by_node_id[edge.src_id],
+            )
+        )
+
+    def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
+        native_past = _ensure_model_cache(past_by_node_id[edge.tgt_id])
+        translated_past = _ensure_model_cache(
+            translator_pool.build_replayed_target_past(
+                edge_id=edge.id,
+                source_past_key_values=past_by_node_id[edge.src_id],
+            )
+        )
+        source_selected_past, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
+            translator_pool=translator_pool,
+            edge_id=edge.id,
+            source_past_key_values=past_by_node_id[edge.src_id],
+            target_past_key_values=native_past,
+            replayed_target_past_key_values=translated_past,
+        )
+        return build_openwebtext_tsne_named_pasts(
+            source_top_past_key_values=source_selected_past,
+            translated_past_key_values=translated_selected_past,
+            target_top_past_key_values=target_selected_past,
+        )
+
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
         logger=logger,
-        eval_name=calibration_eval_name,
+        build_translated_target_past_fn=build_translated_target_past_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
