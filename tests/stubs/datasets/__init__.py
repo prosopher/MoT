@@ -49,23 +49,6 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
         ]
         return FakeMapDataset(items)
 
-    if key == ("cais/mmlu", "all", "validation"):
-        items = [
-            {
-                "question": "Which letter comes first?",
-                "choices": ["A", "B", "C", "D"],
-                "answer": 0,
-                "subject": "toy_subject",
-            },
-            {
-                "question": "Which number is even?",
-                "choices": ["1", "3", "4", "5"],
-                "answer": 2,
-                "subject": "toy_subject",
-            },
-        ]
-        return FakeMapDataset(items)
-
     if key == ("rajpurkar/squad", None, "validation"):
         long_prefix = " ".join(["context"] * 80)
         items = [

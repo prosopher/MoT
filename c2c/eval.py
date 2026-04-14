@@ -3,8 +3,7 @@ from pathlib import Path
 from typing import Dict
 
 import torch
-from torch.utils.data import DataLoader, IterableDataset
-from datasets import load_dataset
+from torch.utils.data import DataLoader
 
 from core.context import Context
 from core.eval_util import *
@@ -13,181 +12,6 @@ from c2c.train import (
     get_translation_mode_name,
     translate_top_layers,
 )
-
-
-MMLU_CHOICE_LABELS = ["A", "B", "C", "D"]
-
-
-def get_c2c_logit_qa_dataset_specs() -> List[HFDatasetSpec]:
-    specs = list(get_default_logit_qa_dataset_specs())
-    specs.append(
-        HFDatasetSpec(
-            name_for_log="MMLU/validation",
-            dataset_path="cais/mmlu",
-            dataset_name="all",
-            split="validation",
-            answer_mode="mmlu",
-            question_field="question",
-            subject_field="subject",
-            streaming=False,
-        )
-    )
-    return specs
-
-
-def extract_mmlu_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
-    question = example.get(spec.question_field, "")
-    if not isinstance(question, str) or not question.strip():
-        return None
-
-    choices = example.get("choices", None)
-    if not isinstance(choices, list) or len(choices) < 2:
-        return None
-    normalized_choices = []
-    for choice in choices:
-        if not isinstance(choice, str) or not choice.strip():
-            return None
-        normalized_choices.append(choice.strip())
-
-    answer_value = example.get("answer", None)
-    if not isinstance(answer_value, int) or not (0 <= answer_value < len(normalized_choices)):
-        return None
-
-    subject = None
-    if spec.subject_field:
-        raw_subject = example.get(spec.subject_field, None)
-        if isinstance(raw_subject, str) and raw_subject.strip():
-            subject = raw_subject.strip()
-
-    return {
-        "question": question.strip(),
-        "choices": normalized_choices,
-        "subject": subject,
-        "answer": MMLU_CHOICE_LABELS[answer_value],
-    }
-
-
-class C2CLogitExampleStream(IterableDataset):
-    def __init__(
-        self,
-        spec: HFDatasetSpec,
-        max_examples: int,
-        shuffle: bool,
-        seed: int,
-        shuffle_buffer: int,
-    ) -> None:
-        super().__init__()
-        self.spec = spec
-        self.max_examples = max_examples
-        self.shuffle = shuffle
-        self.seed = seed
-        self.shuffle_buffer = shuffle_buffer
-
-    def _load_dataset(self):
-        if self.spec.dataset_name is None:
-            return load_dataset(
-                self.spec.dataset_path,
-                split=self.spec.split,
-                streaming=self.spec.streaming,
-            )
-        return load_dataset(
-            self.spec.dataset_path,
-            self.spec.dataset_name,
-            split=self.spec.split,
-            streaming=self.spec.streaming,
-        )
-
-    def __iter__(self):
-        dataset = self._load_dataset()
-        if self.shuffle:
-            if self.spec.streaming:
-                dataset = dataset.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
-            else:
-                dataset = dataset.shuffle(seed=self.seed)
-
-        emitted = 0
-        for example in dataset:
-            if self.spec.answer_mode == "mmlu":
-                extracted = extract_mmlu_question_and_answer(self.spec, example)
-            else:
-                extracted = extract_question_and_answer(self.spec, example)
-
-            if extracted is None:
-                continue
-
-            yield extracted
-            emitted += 1
-            if emitted >= self.max_examples:
-                return
-
-
-def build_c2c_eval_dataloader(
-    spec: HFDatasetSpec,
-    eval_config: EvalConfig,
-) -> DataLoader:
-    dataset = C2CLogitExampleStream(
-        spec=spec,
-        max_examples=eval_config.max_examples_per_dataset,
-        shuffle=eval_config.shuffle_eval_stream,
-        seed=eval_config.seed,
-        shuffle_buffer=eval_config.shuffle_buffer,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=eval_config.batch_size,
-        num_workers=eval_config.num_workers,
-        collate_fn=lambda batch: batch,
-    )
-
-
-def prepare_c2c_logit_task_inputs(
-    spec: HFDatasetSpec,
-    tokenizer,
-    context: Optional[str],
-    question: str,
-    device: str,
-    choices: Optional[List[str]] = None,
-    subject: Optional[str] = None,
-) -> Dict[str, Any]:
-    if spec.answer_mode != "mmlu":
-        return prepare_logit_task_inputs(
-            spec=spec,
-            tokenizer=tokenizer,
-            context=context,
-            question=question,
-            device=device,
-        )
-
-    prefix = prepare_question_prefix(
-        tokenizer=tokenizer,
-        question=question,
-        choices=choices,
-        subject=subject,
-        device=device,
-        answer_mode=spec.answer_mode,
-    )
-    return {
-        "cache_input_ids": prefix["cache_ids"],
-        "question_cache_ids": None,
-        "seed_token": prefix["seed_token"],
-        "was_truncated": False,
-    }
-
-
-def build_c2c_logit_answer_candidates(
-    tokenizer,
-    spec: HFDatasetSpec,
-) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode != "mmlu":
-        return build_logit_answer_candidates(
-            tokenizer=tokenizer,
-            spec=spec,
-        )
-
-    return build_text_candidate_token_ids(
-        tokenizer,
-        {label: label for label in MMLU_CHOICE_LABELS},
-    )
 
 
 @torch.inference_mode()
@@ -213,23 +37,18 @@ def evaluate_dataset(
             question = example["question"]
             gold_answer = example["answer"]
             context_text = example.get("context")
-            choices = example.get("choices")
-            subject = example.get("subject")
-
-            prepared_inputs = prepare_c2c_logit_task_inputs(
+            prepared_inputs = prepare_logit_task_inputs(
                 spec=spec,
                 tokenizer=tokenizer,
                 context=context_text,
                 question=question,
                 device=device,
-                choices=choices,
-                subject=subject,
             )
             cache_input_ids = prepared_inputs["cache_input_ids"]
             question_cache_ids = prepared_inputs["question_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
 
-            candidate_token_ids = build_c2c_logit_answer_candidates(
+            candidate_token_ids = build_logit_answer_candidates(
                 tokenizer=tokenizer,
                 spec=spec,
             )
@@ -503,10 +322,10 @@ def run_eval(
             row["count"],
         )
 
-    logit_dataset_specs = get_c2c_logit_qa_dataset_specs()
+    logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:
         logger.info("Preparing dataloader for %s", spec.name_for_log)
-        dataloader = build_c2c_eval_dataloader(
+        dataloader = build_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
         )
