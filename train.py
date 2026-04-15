@@ -73,7 +73,7 @@ def main() -> None:
         tokenizer,
         ChannelManager(edges),
     )
-    if hasattr(train_module, "ChannelProfiler") and getattr(config, "layer_alignment", None) == "terminal":
+    if hasattr(train_module, "ChannelProfiler") and train_module.uses_channel_alignment(getattr(config, "layer_alignment", "")):
         profile_config = train_module.load_channel_profile_config(Path(args.channel_profile_config_path))
         ctx.cp = train_module.ChannelProfiler(ctx, profile_config)
 

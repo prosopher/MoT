@@ -533,7 +533,7 @@ def evaluate_correction(
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -547,7 +547,7 @@ def evaluate_correction(
                     random_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
                         prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),

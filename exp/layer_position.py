@@ -451,7 +451,7 @@ def run_train(
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=prefix_cache_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -462,7 +462,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                 )
 
             loss = total_direction_loss / config.grad_accum_steps
@@ -549,7 +549,7 @@ def evaluate_logit_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -557,7 +557,7 @@ def evaluate_logit_dataset(
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -565,7 +565,7 @@ def evaluate_logit_dataset(
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -753,7 +753,7 @@ def evaluate_generation_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -761,7 +761,7 @@ def evaluate_generation_dataset(
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -769,7 +769,7 @@ def evaluate_generation_dataset(
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
@@ -901,7 +901,7 @@ def compute_openwebtext_native_and_full_mix_losses(
     full_mix_past = replay_target_prefill_with_injected_window(
         target_model=ctx.mm.get_model(edge.tgt_id),
         prefix_input_ids=prefix_cache_ids,
-        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
         injected_key_block=translated_key,
         injected_value_block=translated_value,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),

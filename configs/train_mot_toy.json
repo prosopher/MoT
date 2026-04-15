@@ -15,7 +15,7 @@
   "log_every": 25,
   "seed": 42,
   "shuffle_buffer": 50000,
-  "layer_alignment": "terminal",
+  "layer_alignment": "depth-ratio",
   "translator_dim": 1024,
   "translator_heads": 16,
   "translator_depth": 2,

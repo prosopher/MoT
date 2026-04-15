@@ -1,6 +1,6 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -8,7 +8,34 @@ from torch.utils.data import DataLoader
 from core.context import Context
 from core.eval_util import *
 from core.train_util import blocks_to_partial_past_key_values
-from mot.train import extract_layer_window_blocks
+
+
+
+def extract_selected_layer_blocks(
+    past_key_values: PastKeyValues,
+    layer_indices: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    selected_past = tuple(past_key_values[layer_idx] for layer_idx in layer_indices)
+    return past_key_values_to_blocks(selected_past)
+
+
+def build_partial_past_from_layer_indices(
+    past_key_values: PastKeyValues,
+    layer_indices: List[int],
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> PastKeyValues:
+    key_block, value_block = extract_selected_layer_blocks(
+        past_key_values=past_key_values,
+        layer_indices=layer_indices,
+    )
+    return blocks_to_partial_past_key_values(
+        key_block=key_block,
+        value_block=value_block,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
 
 
 @torch.inference_mode()
@@ -67,12 +94,9 @@ def evaluate_dataset(
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
-                native_target_window = blocks_to_partial_past_key_values(
-                    *extract_layer_window_blocks(
-                        past_key_values=past_by_node_id[edge.tgt_id],
-                        start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                        num_layers=len(edge_channels),
-                    ),
+                native_target_window = build_partial_past_from_layer_indices(
+                    past_key_values=past_by_node_id[edge.tgt_id],
+                    layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
                     head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
                 )
@@ -196,12 +220,9 @@ def evaluate_generation_dataset(
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
-                native_target_window = blocks_to_partial_past_key_values(
-                    *extract_layer_window_blocks(
-                        past_key_values=past_by_node_id[edge.tgt_id],
-                        start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                        num_layers=len(edge_channels),
-                    ),
+                native_target_window = build_partial_past_from_layer_indices(
+                    past_key_values=past_by_node_id[edge.tgt_id],
+                    layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
                     head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
                 )
@@ -282,6 +303,8 @@ def run_eval(
             edge.id: {
                 "src": [ctx.cm.get_src_layer_start_idx(edge.id), ctx.cm.get_src_layer_end_idx(edge.id)],
                 "tgt": [ctx.cm.get_tgt_layer_start_idx(edge.id), ctx.cm.get_tgt_layer_end_idx(edge.id)],
+                "src_indices": ctx.cm.get_src_layer_indices(edge.id),
+                "tgt_indices": ctx.cm.get_tgt_layer_indices(edge.id),
                 "num_layers": len(ctx.cm.get_channels(edge.id)),
             }
             for edge in edges
@@ -296,27 +319,17 @@ def run_eval(
     logger.info("Preparing validation dataloader for OpenWebText/validation")
 
     def build_source_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
-        key_block, value_block = extract_layer_window_blocks(
+        return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.src_id],
-            start_layer_idx=ctx.cm.get_src_layer_start_idx(edge.id),
-            num_layers=len(ctx.cm.get_channels(edge.id)),
-        )
-        return blocks_to_partial_past_key_values(
-            key_block=key_block,
-            value_block=value_block,
+            layer_indices=ctx.cm.get_src_layer_indices(edge.id),
             num_heads=ctx.mm.get_model_spec(edge.src_id).num_heads,
             head_dim=ctx.mm.get_model_spec(edge.src_id).head_dim,
         )
 
     def build_target_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
-        key_block, value_block = extract_layer_window_blocks(
+        return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.tgt_id],
-            start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-            num_layers=len(ctx.cm.get_channels(edge.id)),
-        )
-        return blocks_to_partial_past_key_values(
-            key_block=key_block,
-            value_block=value_block,
+            layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
             num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
             head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
         )

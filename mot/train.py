@@ -19,9 +19,17 @@ from core.train_util import *
 MOT_VARIANTS = {"single", "mot"}
 
 
+CHANNEL_ALIGNED_LAYER_ALIGNMENTS = {"terminal", "depth-ratio"}
+
+
+def uses_channel_alignment(layer_alignment: str) -> bool:
+    return layer_alignment in CHANNEL_ALIGNED_LAYER_ALIGNMENTS
+
+
+
 def require_channel_profiler(ctx: Context) -> ChannelProfiler:
     if ctx.cp is None:
-        raise ValueError("Channel profiler is required when layer_alignment='terminal'.")
+        raise ValueError("Channel profiler is required when layer_alignment is 'terminal' or 'depth-ratio'.")
     return ctx.cp
 
 
@@ -53,8 +61,8 @@ class TrainConfig(Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.layer_alignment not in {"injection", "terminal"}:
-            raise ValueError("layer_alignment must be one of {'injection', 'terminal'}")
+        if self.layer_alignment not in {"injection", "terminal", "depth-ratio"}:
+            raise ValueError("layer_alignment must be one of {'injection', 'terminal', 'depth-ratio'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
         if self.variant not in MOT_VARIANTS:
@@ -400,7 +408,7 @@ class LayerWindowTranslatorPool(nn.Module):
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=prefix_input_ids,
-            target_start_layer_idx=self.cm.get_tgt_layer_start_idx(edge_id),
+            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
@@ -459,7 +467,7 @@ def resolve_channels(ctx: Context) -> None:
         build_channel_map(ctx, ctx.edges)
         return
 
-    profiler = ctx.cp
+    profiler = require_channel_profiler(ctx)
     profiler.profile_all_edges()
 
 
@@ -599,7 +607,7 @@ def run_gpt2_block_with_injected_layer(
 def replay_target_prefill_with_injected_window(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    target_start_layer_idx: int,
+    target_layer_indices: List[int],
     injected_key_block: torch.Tensor,
     injected_value_block: torch.Tensor,
     tgt_spec: ModelSpec,
@@ -612,16 +620,18 @@ def replay_target_prefill_with_injected_window(
     )
     translated_num_layers = len(injected_window)
 
-    transformer = require_gpt2_transformer(target_model)
-    target_end_layer_idx = target_start_layer_idx + translated_num_layers - 1
-    if not (0 <= target_start_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(transformer.h) - 1}]")
-    if target_end_layer_idx >= len(transformer.h):
+    # zip(target_layer_indices, injected_window) would silently truncate on mismatch,
+    # so this remains a correctness guard rather than a mere runtime-prevention check.
+    if len(target_layer_indices) != translated_num_layers:
         raise ValueError(
-            f"Injected window ending at layer {target_end_layer_idx} exceeds target stack with {len(transformer.h)} layers"
+            "Number of target_layer_indices must match translated window size, "
+            f"got {len(target_layer_indices)} vs {translated_num_layers}"
         )
 
+    transformer = require_gpt2_transformer(target_model)
+
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    target_start_layer_idx = target_layer_indices[0]
 
     if torch.is_grad_enabled():
         with torch.no_grad():
@@ -636,8 +646,11 @@ def replay_target_prefill_with_injected_window(
             hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
             rebuilt_past.append(present)
 
-    for offset, injected_present in enumerate(injected_window):
-        layer_idx = target_start_layer_idx + offset
+    previous_layer_idx = target_start_layer_idx - 1
+    for layer_idx, injected_present in zip(target_layer_indices, injected_window):
+        for native_layer_idx in range(previous_layer_idx + 1, layer_idx):
+            hidden_states, present = run_gpt2_block_with_cache(transformer.h[native_layer_idx], hidden_states)
+            rebuilt_past.append(present)
         hidden_states, present = run_gpt2_block_with_injected_layer(
             transformer.h[layer_idx],
             hidden_states,
@@ -645,8 +658,9 @@ def replay_target_prefill_with_injected_window(
             injected_present[1],
         )
         rebuilt_past.append(present)
+        previous_layer_idx = layer_idx
 
-    for upper_idx in range(target_end_layer_idx + 1, len(transformer.h)):
+    for upper_idx in range(previous_layer_idx + 1, len(transformer.h)):
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
         rebuilt_past.append(present)
 
@@ -704,7 +718,7 @@ def load_translator_pool_from_checkpoint(
         tokenizer,
         ChannelManager(edges),
     )
-    if config.layer_alignment == "terminal":
+    if uses_channel_alignment(config.layer_alignment):
         profile_config_path = Path(checkpoint_dir_path_obj) / "channel_profile.json"
         ctx.cp = ChannelProfiler(ctx, load_channel_profile_config(profile_config_path))
     translator_pool = build_translator_pool(ctx)
@@ -726,7 +740,7 @@ def run_train(
     output_path.mkdir(parents=True, exist_ok=True)
 
     cp = None
-    if config.layer_alignment == "terminal":
+    if uses_channel_alignment(config.layer_alignment):
         cp = require_channel_profiler(ctx)
 
     config_path = get_train_config_path(output_path)
@@ -811,7 +825,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 

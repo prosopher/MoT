@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union, get_args, get_origin
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin
 
 import torch
 import torch.nn as nn
@@ -140,18 +140,10 @@ def compute_prefix_correction_and_suffix_lm_loss(
     lm_input_ids: torch.Tensor,
     lm_labels: torch.Tensor,
     native_target_past_key_values: PastKeyValues,
-    target_start_layer_idx: int,
+    target_layer_indices: Sequence[int],
     prefix_correction_weight: float = 1.0,
 ) -> torch.Tensor:
-    if not (0 <= target_start_layer_idx < len(native_target_past_key_values)):
-        raise ValueError(
-            f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(native_target_past_key_values) - 1}]"
-        )
-    if len(past_key_values) != len(native_target_past_key_values):
-        raise ValueError(
-            "past_key_values and native_target_past_key_values must have the same number of layers, "
-            f"got {len(past_key_values)} vs {len(native_target_past_key_values)}"
-        )
+    correction_start_layer_idx = target_layer_indices[0]
 
     suffix_lm_loss = compute_suffix_lm_loss(
         target_model=target_model,
@@ -160,9 +152,9 @@ def compute_prefix_correction_and_suffix_lm_loss(
         lm_labels=lm_labels,
     )
 
-    mixed_key_block, mixed_value_block = past_key_values_to_blocks(past_key_values[target_start_layer_idx:])
+    mixed_key_block, mixed_value_block = past_key_values_to_blocks(past_key_values[correction_start_layer_idx:])
     native_key_block, native_value_block = past_key_values_to_blocks(
-        native_target_past_key_values[target_start_layer_idx:]
+        native_target_past_key_values[correction_start_layer_idx:]
     )
     if mixed_key_block.shape != native_key_block.shape:
         raise ValueError(
