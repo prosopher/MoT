@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import math
 import sys
 
 from pathlib import Path
@@ -1289,6 +1290,7 @@ def run_eval(
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         max_examples_per_dataset=config.eval_max_examples_per_dataset,
+        output_path=str(run_dir),
         seed=config.seed,
         shuffle_eval_stream=config.eval_shuffle_stream,
         shuffle_buffer=config.shuffle_buffer,
@@ -1317,10 +1319,14 @@ def run_eval(
             past_by_node_id=past_by_node_id,
             translator_pool=translator_pool,
         )
-        return edge_losses, {}
+        return {
+            "native": edge_losses["native"],
+            "translated": edge_losses["full_mix"],
+        }, {}
 
-    openwebtext_loss_by_edge = evaluate_openwebtext_validation_loss_metrics(
+    raw_openwebtext_loss_by_edge = evaluate_openwebtext_validation_loss_metrics(
         ctx=ctx,
+        output_path=eval_config.output_path,
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         shuffle=config.eval_shuffle_stream,
@@ -1329,20 +1335,21 @@ def run_eval(
         max_examples=config.eval_max_examples_per_dataset,
         logger=logger,
         evaluate_edge_losses_fn=evaluate_openwebtext_control_losses,
-        summarize_edge_fn=lambda average_losses, count, profile_summaries: summarize_openwebtext_named_losses(
-            average_losses,
-            count,
-            primary_name="full_mix",
-            loss_field_by_name={
-                "native": "native_loss",
-                "full_mix": "full_mix_loss",
-            },
-            loss_delta_reference_name="native",
-            loss_delta_field_by_name={
-                "full_mix": "delta_full_mix_loss",
-            },
-        ),
     )
+
+    openwebtext_loss_by_edge: Dict[str, Dict[str, float]] = {}
+    for edge in ctx.edges:
+        row = dict(raw_openwebtext_loss_by_edge[edge.id])
+        full_mix_loss = float(row.get("loss", float("nan")))
+        native_loss = float(row.get("native_loss", float("nan")))
+        row["full_mix_loss"] = full_mix_loss
+        row["delta_full_mix_loss"] = (
+            full_mix_loss - native_loss
+            if math.isfinite(full_mix_loss) and math.isfinite(native_loss)
+            else float("nan")
+        )
+        openwebtext_loss_by_edge[edge.id] = row
+
     for edge in ctx.edges:
         row = openwebtext_loss_by_edge[edge.id]
         logger.info(
