@@ -33,5 +33,6 @@
   "generation_max_new_tokens": 64,
   "variant": "mot",
   "mot_num_translators": 4,
-  "mot_top_k": 2
+  "mot_top_k": 2,
+  "kv_similarity_token_group_size": 8
 }
