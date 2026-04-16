@@ -8,7 +8,14 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.config import Config
-from core.channel_manager import Channel, ChannelManager
+from core.channel_manager import (
+    Channel,
+    ChannelManager,
+    build_resolved_channels_path,
+    has_resolved_channels,
+    load_resolved_channels,
+    save_resolved_channels,
+)
 from core.channel_profiler import ChannelProfiler, load_channel_profile_config
 from core.context import Context
 from core.model_manager import ModelManager
@@ -463,6 +470,8 @@ def build_channel_map(
 
 def resolve_channels(ctx: Context) -> None:
     config = ctx.config
+    if has_resolved_channels(ctx.cm, ctx.edges):
+        return
     if config.layer_alignment == "injection":
         build_channel_map(ctx, ctx.edges)
         return
@@ -721,6 +730,16 @@ def load_translator_pool_from_checkpoint(
     if uses_channel_alignment(config.layer_alignment):
         profile_config_path = Path(checkpoint_dir_path_obj) / "channel_profile.json"
         ctx.cp = ChannelProfiler(ctx, load_channel_profile_config(profile_config_path))
+
+    resolved_channels_path = build_resolved_channels_path(checkpoint_dir_path_obj)
+    if resolved_channels_path.exists():
+        load_resolved_channels(resolved_channels_path, ctx.cm, ctx.edges)
+    elif uses_channel_alignment(config.layer_alignment):
+        raise FileNotFoundError(
+            "Resolved channel map not found under checkpoint directory: "
+            f"{resolved_channels_path}. Re-run training with channel persistence enabled."
+        )
+
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
@@ -759,6 +778,7 @@ def run_train(
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
     translator_pool = build_translator_pool(ctx)
+    save_resolved_channels(output_path, ctx.cm, edges)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
