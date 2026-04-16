@@ -4,11 +4,11 @@
   "output_path": null,
   "checkpoint_dir_path": null,
   "device": "auto",
-  "batch_size": 1,
+  "batch_size": 4,
   "num_workers": 0,
-  "max_examples_per_dataset": 500,
+  "max_examples_per_dataset": 100,
   "seed": 42,
-  "shuffle_eval_stream": true,
-  "shuffle_buffer": 10000,
-  "generation_max_new_tokens": 32
+  "shuffle_eval_stream": false,
+  "shuffle_buffer": 50000,
+  "generation_max_new_tokens": 64
 }
