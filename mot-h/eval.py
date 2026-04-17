@@ -8,6 +8,10 @@ from torch.utils.data import DataLoader
 from core.context import Context
 from core.eval_util import *
 from core.train_util import blocks_to_partial_past_key_values
+from .train import (
+    extract_model_prefill_artifacts,
+    extract_selected_layer_canonical_attn_input_block,
+)
 
 
 
@@ -17,6 +21,7 @@ def extract_selected_layer_blocks(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     selected_past = tuple(past_key_values[layer_idx] for layer_idx in layer_indices)
     return past_key_values_to_blocks(selected_past)
+
 
 
 def build_partial_past_from_layer_indices(
@@ -78,13 +83,20 @@ def evaluate_dataset(
                 spec=spec,
             )
 
+            prefill_by_node_id = {
+                node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), cache_input_ids)
+                for node in nodes
+            }
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+                node.id: prefill_by_node_id[node.id][0]
+                for node in nodes
+            }
+            hidden_states_by_node_id = {
+                node.id: prefill_by_node_id[node.id][1]
                 for node in nodes
             }
 
             for edge in edges:
-                edge_channels = ctx.cm.get_channels(edge.id)
                 mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
@@ -92,6 +104,11 @@ def evaluate_dataset(
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                        ctx.mm.get_model(edge.src_id),
+                        hidden_states_by_node_id[edge.src_id],
+                        ctx.cm.get_src_layer_indices(edge.id),
+                    ),
                 )
 
                 native_target_window = build_partial_past_from_layer_indices(
@@ -204,13 +221,20 @@ def evaluate_generation_dataset(
                     get_answer_token_budget(eval_config),
                 )
 
+            prefill_by_node_id = {
+                node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), cache_input_ids)
+                for node in nodes
+            }
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+                node.id: prefill_by_node_id[node.id][0]
+                for node in nodes
+            }
+            hidden_states_by_node_id = {
+                node.id: prefill_by_node_id[node.id][1]
                 for node in nodes
             }
 
             for edge in edges:
-                edge_channels = ctx.cm.get_channels(edge.id)
                 mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
@@ -218,6 +242,11 @@ def evaluate_generation_dataset(
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                        ctx.mm.get_model(edge.src_id),
+                        hidden_states_by_node_id[edge.src_id],
+                        ctx.cm.get_src_layer_indices(edge.id),
+                    ),
                 )
 
                 native_target_window = build_partial_past_from_layer_indices(
@@ -310,7 +339,7 @@ def run_eval(
             for edge in edges
         },
     )
-    logger.info("translation_mode=translate_window_and_replay_target_prefill")
+    logger.info("translation_mode=translate_canonical_attn_input_window_and_restore_target_kv")
     logger.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
@@ -341,6 +370,10 @@ def run_eval(
         past_by_node_id,
         **_,
     ) -> PastKeyValues:
+        _, source_hidden_states = extract_model_prefill_artifacts(
+            ctx.mm.get_model(edge.src_id),
+            prefix_cache_ids,
+        )
         mixed_target_past, _ = translator_pool.build_replayed_target_past(
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
@@ -348,6 +381,11 @@ def run_eval(
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                ctx.mm.get_model(edge.src_id),
+                source_hidden_states,
+                ctx.cm.get_src_layer_indices(edge.id),
+            ),
         )
         return mixed_target_past
 
@@ -358,6 +396,10 @@ def run_eval(
         past_by_node_id,
         **_,
     ) -> Dict[str, PastKeyValues]:
+        _, source_hidden_states = extract_model_prefill_artifacts(
+            ctx.mm.get_model(edge.src_id),
+            prefix_cache_ids,
+        )
         _, translated_window_past = translator_pool.build_replayed_target_past(
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
@@ -365,6 +407,11 @@ def run_eval(
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                ctx.mm.get_model(edge.src_id),
+                source_hidden_states,
+                ctx.cm.get_src_layer_indices(edge.id),
+            ),
         )
         return build_openwebtext_tsne_named_pasts(
             source_top_past_key_values=build_source_window_past(edge, past_by_node_id),

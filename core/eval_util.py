@@ -791,6 +791,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         def compute_translated_loss_value() -> float:
             translated_target_past = build_translated_target_past_fn(
                 edge=edge,
+                prefix_cache_ids=prefix_cache_ids,
                 past_by_node_id=past_by_node_id,
             )
             return float(
@@ -853,6 +854,7 @@ def evaluate_openwebtext_validation_loss_replay(
     translator_pool,
     logger: logging.Logger,
     *,
+    build_translated_target_past_fn: Callable[..., PastKeyValues],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
@@ -870,13 +872,10 @@ def evaluate_openwebtext_validation_loss_replay(
         profile_tokens = lm_labels.numel()
 
         def compute_translated_loss_value() -> float:
-            mixed_target_past, _ = translator_pool.build_replayed_target_past(
-                source_past_key_values=past_by_node_id[edge.src_id],
-                prefix_input_ids=prefix_cache_ids,
-                target_model=ctx.mm.get_model(edge.tgt_id),
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            mixed_target_past = build_translated_target_past_fn(
+                edge=edge,
+                prefix_cache_ids=prefix_cache_ids,
+                past_by_node_id=past_by_node_id,
             )
             return float(
                 compute_prefix_correction_and_suffix_lm_loss(
@@ -945,12 +944,13 @@ def evaluate_openwebtext_validation_loss(
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    if eval_config.alg == "mot":
+    if eval_config.alg in {"mot", "mot-h"}:
         return evaluate_openwebtext_validation_loss_replay(
             ctx=ctx,
             eval_config=eval_config,
             translator_pool=translator_pool,
             logger=logger,
+            build_translated_target_past_fn=build_translated_target_past_fn,
             build_visualization_pasts_fn=build_visualization_pasts_fn,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
