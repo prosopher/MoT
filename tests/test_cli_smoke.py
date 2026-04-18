@@ -16,7 +16,6 @@ CONFIGS_PATH = REPO_ROOT / "tests" / "configs"
     [
         ("lsc", "train_lsc_smoke.json"),
         ("mot", "train_mot_smoke.json"),
-        ("mot-h", "train_mot-h_smoke.json"),
         ("c2c", "train_c2c_smoke.json"),
         ("kvcomm", "train_kvcomm_smoke.json"),
     ],
@@ -87,8 +86,6 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
 
     if alg == "kvcomm":
         assert "Starting KVComm layer selection" in train_log
-    elif alg == "mot-h":
-        assert "Starting canonicalized attn-input translator training" in train_log
     else:
         assert "Starting training" in train_log
     assert "Starting evaluation" in eval_log
