@@ -171,6 +171,10 @@ class HFDatasetSpec:
     context_field: Optional[str] = None
     answers_field: Optional[str] = None
     subject_field: Optional[str] = None
+    choices_field: Optional[str] = None
+    error_type_field: Optional[str] = None
+    corrected_answer_field: Optional[str] = None
+    dataset_names: Optional[List[str]] = None
     streaming: bool = False
 
 
@@ -190,8 +194,9 @@ class HFQAPairStream(IterableDataset):
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
 
-    def _load_dataset(self):
-        if self.spec.dataset_name is None:
+    def _load_dataset(self, dataset_name: Optional[str] = None):
+        resolved_dataset_name = self.spec.dataset_name if dataset_name is None else dataset_name
+        if resolved_dataset_name is None:
             return load_dataset(
                 self.spec.dataset_path,
                 split=self.spec.split,
@@ -199,12 +204,43 @@ class HFQAPairStream(IterableDataset):
             )
         return load_dataset(
             self.spec.dataset_path,
-            self.spec.dataset_name,
+            resolved_dataset_name,
             split=self.spec.split,
             streaming=self.spec.streaming,
         )
 
+    def _iter_multi_config_examples(self):
+        if not self.spec.dataset_names:
+            return
+        if self.spec.streaming:
+            raise ValueError("dataset_names multi-config loading does not support streaming datasets.")
+
+        extracted_examples: List[Dict[str, Any]] = []
+        for dataset_name in self.spec.dataset_names:
+            dataset = self._load_dataset(dataset_name)
+            for raw_example in dataset:
+                example = dict(raw_example)
+                subject_field = self.spec.subject_field or "subject"
+                example.setdefault(subject_field, dataset_name)
+                qa_pair = extract_question_and_answer(self.spec, example)
+                if qa_pair is not None:
+                    extracted_examples.append(qa_pair)
+
+        if self.shuffle:
+            random.Random(self.seed).shuffle(extracted_examples)
+
+        emitted = 0
+        for qa_pair in extracted_examples:
+            yield qa_pair
+            emitted += 1
+            if emitted >= self.max_examples:
+                return
+
     def __iter__(self):
+        if self.spec.dataset_names:
+            yield from self._iter_multi_config_examples()
+            return
+
         dataset = self._load_dataset()
         if self.shuffle:
             if self.spec.streaming:
@@ -226,6 +262,66 @@ class HFQAPairStream(IterableDataset):
 
 
 DEFAULT_MULTINEWS_SUMMARY_TASK = "Summarize the news articles above."
+MMLU_REDUX_SUBJECTS = [
+    "abstract_algebra",
+    "anatomy",
+    "astronomy",
+    "business_ethics",
+    "clinical_knowledge",
+    "college_biology",
+    "college_chemistry",
+    "college_computer_science",
+    "college_mathematics",
+    "college_medicine",
+    "college_physics",
+    "computer_security",
+    "conceptual_physics",
+    "econometrics",
+    "electrical_engineering",
+    "elementary_mathematics",
+    "formal_logic",
+    "global_facts",
+    "high_school_biology",
+    "high_school_chemistry",
+    "high_school_computer_science",
+    "high_school_european_history",
+    "high_school_geography",
+    "high_school_government_and_politics",
+    "high_school_macroeconomics",
+    "high_school_mathematics",
+    "high_school_microeconomics",
+    "high_school_physics",
+    "high_school_psychology",
+    "high_school_statistics",
+    "high_school_us_history",
+    "high_school_world_history",
+    "human_aging",
+    "human_sexuality",
+    "international_law",
+    "jurisprudence",
+    "logical_fallacies",
+    "machine_learning",
+    "management",
+    "marketing",
+    "medical_genetics",
+    "miscellaneous",
+    "moral_disputes",
+    "moral_scenarios",
+    "nutrition",
+    "philosophy",
+    "prehistory",
+    "professional_accounting",
+    "professional_law",
+    "professional_medicine",
+    "professional_psychology",
+    "public_relations",
+    "security_studies",
+    "sociology",
+    "us_foreign_policy",
+    "virology",
+    "world_religions",
+]
+MMLU_REDUX_LABELS = ("A", "B", "C", "D")
 
 
 def get_boolq_dataset_spec() -> HFDatasetSpec:
@@ -250,6 +346,23 @@ def get_pubmedqa_dataset_spec() -> HFDatasetSpec:
         answer_mode="pubmed_qa",
         question_field="question",
         context_field="context",
+        streaming=False,
+    )
+
+
+def get_mmlu_redux_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="MMLU-Redux/test",
+        dataset_path="edinburgh-dawg/mmlu-redux-2.0",
+        dataset_name=None,
+        dataset_names=MMLU_REDUX_SUBJECTS,
+        split="test",
+        answer_mode="mmlu_redux",
+        question_field="question",
+        choices_field="choices",
+        subject_field="subject",
+        error_type_field="error_type",
+        corrected_answer_field="correct_answer",
         streaming=False,
     )
 
@@ -298,6 +411,7 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
 LOGIT_QA_SPEC_GROUP_FACTORIES = [
     get_boolq_dataset_spec,
     get_pubmedqa_dataset_spec,
+    get_mmlu_redux_dataset_spec,
 ]
 
 GEN_QA_SPEC_GROUP_FACTORIES = [
@@ -1483,6 +1597,75 @@ def normalize_context_text(raw_value: Any) -> Optional[str]:
     return "\n".join(parts)
 
 
+def _normalize_choice_text_for_match(text: str) -> str:
+    value = text.strip().lower()
+    value = re.sub(r"^[a-d][\).:\-\s]+", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+
+def _match_mmlu_redux_choice_label(choices: List[str], candidate: str) -> Optional[str]:
+    normalized_candidate = _normalize_choice_text_for_match(candidate)
+    if not normalized_candidate:
+        return None
+
+    for idx, label in enumerate(MMLU_REDUX_LABELS):
+        if normalized_candidate == label.lower():
+            return label
+        if normalized_candidate == str(idx):
+            return label
+        if normalized_candidate == str(idx + 1):
+            return label
+        if idx < len(choices) and _normalize_choice_text_for_match(choices[idx]) == normalized_candidate:
+            return label
+    return None
+
+
+
+def _parse_mmlu_redux_correct_labels(
+    choices: List[str],
+    raw_correct_answer: Any,
+    *,
+    include_original_label: Optional[str] = None,
+) -> List[str]:
+    labels: List[str] = []
+    if include_original_label in MMLU_REDUX_LABELS:
+        labels.append(include_original_label)
+
+    if isinstance(raw_correct_answer, str) and raw_correct_answer.strip():
+        raw_text = raw_correct_answer.strip()
+        direct_label = _match_mmlu_redux_choice_label(choices, raw_text)
+        if direct_label is not None:
+            labels.append(direct_label)
+        else:
+            parts = [
+                part.strip()
+                for part in re.split(r"(?:,|/|;|\bor\b|\band\b)", raw_text, flags=re.IGNORECASE)
+                if part.strip()
+            ]
+            for part in parts:
+                matched_label = _match_mmlu_redux_choice_label(choices, part)
+                if matched_label is not None:
+                    labels.append(matched_label)
+
+    deduped: List[str] = []
+    for label in labels:
+        if label not in deduped:
+            deduped.append(label)
+    return deduped
+
+
+
+def is_logit_answer_correct(predicted_label: str, gold_answer: Any) -> bool:
+    if isinstance(gold_answer, str):
+        return predicted_label == gold_answer
+    if isinstance(gold_answer, (list, tuple, set)):
+        return predicted_label in set(gold_answer)
+    return False
+
+
+
 def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
@@ -1522,6 +1705,70 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             "question": question.strip(),
             "context": context,
             "answer": normalized_answer,
+        }
+
+    if spec.answer_mode == "mmlu_redux":
+        choices_field = spec.choices_field or "choices"
+        error_type_field = spec.error_type_field or "error_type"
+        corrected_answer_field = spec.corrected_answer_field or "correct_answer"
+        subject_field = spec.subject_field or "subject"
+
+        raw_choices = example.get(choices_field, None)
+        if not isinstance(raw_choices, list):
+            return None
+        choices = [choice.strip() for choice in raw_choices if isinstance(choice, str) and choice.strip()]
+        if len(choices) != 4:
+            return None
+
+        raw_answer_idx = example.get("answer", None)
+        if not isinstance(raw_answer_idx, int) or not (0 <= raw_answer_idx < len(MMLU_REDUX_LABELS)):
+            return None
+        original_label = MMLU_REDUX_LABELS[raw_answer_idx]
+
+        error_type = str(example.get(error_type_field, "ok") or "ok").strip().lower()
+        corrected_answer = example.get(corrected_answer_field, None)
+        if error_type == "expert":
+            return None
+
+        if error_type == "wrong_groundtruth":
+            acceptable_labels = _parse_mmlu_redux_correct_labels(
+                choices,
+                corrected_answer,
+                include_original_label=None,
+            )
+        elif error_type == "multiple_correct_answers":
+            acceptable_labels = _parse_mmlu_redux_correct_labels(
+                choices,
+                corrected_answer,
+                include_original_label=original_label,
+            )
+        elif error_type == "no_correct_answer":
+            acceptable_labels = _parse_mmlu_redux_correct_labels(
+                choices,
+                corrected_answer,
+                include_original_label=None,
+            )
+        else:
+            acceptable_labels = [original_label]
+
+        if not acceptable_labels:
+            return None
+
+        answer_value: Union[str, List[str]]
+        if len(acceptable_labels) == 1:
+            answer_value = acceptable_labels[0]
+        else:
+            answer_value = acceptable_labels
+
+        subject_value = example.get(subject_field, None)
+        subject = subject_value.strip() if isinstance(subject_value, str) and subject_value.strip() else None
+
+        return {
+            "question": question.strip(),
+            "choices": choices,
+            "subject": subject,
+            "answer": answer_value,
+            "error_type": error_type,
         }
 
     if spec.answer_mode == "squad":
@@ -1632,7 +1879,18 @@ def format_question_prefix(
     if not choices:
         return f"Question: {question}\nAnswer:"
 
-    prompt_lines = [f"Question: {question}", "Choices:"]
+    prompt_lines: List[str] = []
+    if answer_mode == "mmlu_redux":
+        if isinstance(subject, str) and subject.strip():
+            pretty_subject = subject.strip().replace("_", " ")
+            prompt_lines.append(
+                f"The following is a multiple choice question about {pretty_subject}."
+            )
+        else:
+            prompt_lines.append("The following is a multiple choice question.")
+        prompt_lines.append("")
+
+    prompt_lines.extend([f"Question: {question}", "Choices:"])
     for idx, choice in enumerate(choices):
         label = chr(ord("A") + idx)
         prompt_lines.append(f"{label}. {choice.strip()}")
@@ -1874,6 +2132,8 @@ def prepare_logit_task_inputs(
     context: Optional[str],
     question: str,
     device: str,
+    choices: Optional[List[str]] = None,
+    subject: Optional[str] = None,
 ) -> Dict[str, Any]:
     if spec.answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
@@ -1923,6 +2183,8 @@ def prepare_logit_task_inputs(
         tokenizer=tokenizer,
         question=question,
         device=device,
+        choices=choices,
+        subject=subject,
         context=context,
         answer_mode=spec.answer_mode,
     )
@@ -2074,6 +2336,12 @@ def build_logit_answer_candidates(
         return build_text_candidate_token_ids(
             tokenizer,
             {"yes": "yes", "no": "no", "maybe": "maybe"},
+        )
+
+    if spec.answer_mode == "mmlu_redux":
+        return build_text_candidate_token_ids(
+            tokenizer,
+            {label: label for label in MMLU_REDUX_LABELS},
         )
 
     raise ValueError(f"Unsupported answer_mode for logit scoring: {spec.answer_mode}")
@@ -2358,6 +2626,7 @@ def build_edge_summary_markdown_table(
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
+        ("MMLU-Redux", "MMLU-Redux/test"),
     ]
     generation_dataset_keys = [
         ("SQuAD", "SQuAD-v1.1/validation"),
@@ -2377,14 +2646,17 @@ def build_edge_summary_markdown_table(
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
         logit_rows["PubMedQA"].get("cosine", float("nan")),
+        logit_rows["MMLU-Redux"].get("cosine", float("nan")),
     ])
     translated_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("accuracy", float("nan")),
         logit_rows["PubMedQA"].get("accuracy", float("nan")),
+        logit_rows["MMLU-Redux"].get("accuracy", float("nan")),
     ])
     native_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("native_accuracy", float("nan")),
         logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
+        logit_rows["MMLU-Redux"].get("native_accuracy", float("nan")),
     ])
     translated_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("f1", float("nan")),
@@ -2409,12 +2681,13 @@ def build_edge_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(native_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
@@ -2429,6 +2702,7 @@ def build_edge_summary_markdown_table(
             f"{_format_summary_float(translated_cosine_avg)} | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(translated_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "

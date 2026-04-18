@@ -42,6 +42,8 @@ def evaluate_dataset(
                 context=context_text,
                 question=question,
                 device=device,
+                choices=example.get("choices"),
+                subject=example.get("subject"),
             )
             cache_input_ids = prepared_inputs["cache_input_ids"]
             question_cache_ids = prepared_inputs["question_cache_ids"]
@@ -109,8 +111,8 @@ def evaluate_dataset(
                 translated_pred = predict_answer_label(translated_scores)
                 native_pred = predict_answer_label(native_scores)
 
-                acc = 1.0 if translated_pred == gold_answer else 0.0
-                native_acc = 1.0 if native_pred == gold_answer else 0.0
+                acc = 1.0 if is_logit_answer_correct(translated_pred, gold_answer) else 0.0
+                native_acc = 1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0
 
                 path_metrics[edge.id].update(cosine_value, acc, native_acc, 1)
 

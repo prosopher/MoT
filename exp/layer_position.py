@@ -515,6 +515,8 @@ def evaluate_logit_dataset(
                 context=example.get("context"),
                 question=example["question"],
                 device=config.device,
+                choices=example.get("choices"),
+                subject=example.get("subject"),
             )
             candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
             gold_answer = example["answer"]
@@ -624,10 +626,10 @@ def evaluate_logit_dataset(
                 mag_only_pred = predict_answer_label(mag_only_scores)
                 full_mix_pred = predict_answer_label(full_mix_scores)
                 path_metrics[edge.id].update(
-                    native_value=1.0 if native_pred == gold_answer else 0.0,
-                    dir_only_value=1.0 if dir_only_pred == gold_answer else 0.0,
-                    mag_only_value=1.0 if mag_only_pred == gold_answer else 0.0,
-                    full_mix_value=1.0 if full_mix_pred == gold_answer else 0.0,
+                    native_value=1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0,
+                    dir_only_value=1.0 if is_logit_answer_correct(dir_only_pred, gold_answer) else 0.0,
+                    mag_only_value=1.0 if is_logit_answer_correct(mag_only_pred, gold_answer) else 0.0,
+                    full_mix_value=1.0 if is_logit_answer_correct(full_mix_pred, gold_answer) else 0.0,
                     n=1,
                 )
 

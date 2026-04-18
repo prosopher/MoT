@@ -83,13 +83,15 @@ def _openwebtext_prefix_tokens(config) -> int:
 
 
 @torch.inference_mode()
-def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str):
+def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str, *, choices=None, subject=None):
     prepared = prepare_logit_task_inputs(
         spec=spec,
         tokenizer=tokenizer,
         context=context,
         question=question,
         device=device,
+        choices=choices,
+        subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
     context_past = _ensure_model_cache(extract_past_key_values(model, prepared["cache_input_ids"]))
@@ -152,6 +154,8 @@ def _predict_kvcomm_logit(
     context: str,
     question: str,
     device: str,
+    choices=None,
+    subject=None,
 ):
     prepared = prepare_logit_task_inputs(
         spec=spec,
@@ -159,6 +163,8 @@ def _predict_kvcomm_logit(
         context=context,
         question=question,
         device=device,
+        choices=choices,
+        subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
     source_past = extract_past_key_values(source_model, prepared["cache_input_ids"])
@@ -256,6 +262,8 @@ def evaluate_dataset(
                 context=context_text,
                 question=question,
                 device=device,
+                choices=example.get("choices"),
+                subject=example.get("subject"),
             )
             cache_input_ids = prepared_inputs["cache_input_ids"]
             question_cache_ids = prepared_inputs["question_cache_ids"]
@@ -324,8 +332,8 @@ def evaluate_dataset(
                 pred_kvcomm = predict_answer_label(kvcomm_scores)
                 pred_native = predict_answer_label(native_scores)
 
-                acc = 1.0 if pred_kvcomm == gold_answer else 0.0
-                native_acc = 1.0 if pred_native == gold_answer else 0.0
+                acc = 1.0 if is_logit_answer_correct(pred_kvcomm, gold_answer) else 0.0
+                native_acc = 1.0 if is_logit_answer_correct(pred_native, gold_answer) else 0.0
                 path_metrics[edge_id].update(cosine_value, acc, native_acc, 1)
 
             processed_examples += 1
