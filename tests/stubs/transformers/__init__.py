@@ -253,7 +253,6 @@ class TinyCausalLM(PreTrainedModel):
         past_key_values=None,
         use_cache: bool = True,
         output_attentions: bool = False,
-        output_hidden_states: bool = False,
         **_: object,
     ):
         batch_size, seq_len = input_ids.shape
@@ -270,12 +269,9 @@ class TinyCausalLM(PreTrainedModel):
         hidden_states = self.transformer.wte(input_ids) + self.transformer.wpe(position_ids)
         hidden_states = self.transformer.drop(hidden_states)
 
-        all_hidden_states = () if output_hidden_states else None
         presents = []
         attentions = []
         for layer_idx, block in enumerate(self.transformer.h):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
             layer_past = None if past_key_values is None else past_key_values[layer_idx]
             block_outputs = block(
                 hidden_states,
@@ -296,14 +292,11 @@ class TinyCausalLM(PreTrainedModel):
                 attentions.append(block_outputs[next_index])
 
         hidden_states = self.transformer.ln_f(hidden_states)
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
         logits = self.lm_head(hidden_states)
         return SimpleNamespace(
             logits=logits,
             past_key_values=tuple(presents) if use_cache else None,
             last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
             attentions=tuple(attentions) if output_attentions else None,
         )
 
