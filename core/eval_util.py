@@ -213,10 +213,11 @@ class HFQAPairStream(IterableDataset):
     ) -> None:
         super().__init__()
         self.spec = spec
-        self.max_examples = max_examples
+        self.max_examples = resolve_max_examples_for_spec(spec, max_examples)
         self.shuffle = shuffle
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
+        self._cached_multi_config_examples: Optional[List[Dict[str, Any]]] = None
 
     def _load_dataset(self, dataset_name: Optional[str] = None):
         resolved_dataset_name = self.spec.dataset_name if dataset_name is None else dataset_name
@@ -233,32 +234,48 @@ class HFQAPairStream(IterableDataset):
             streaming=self.spec.streaming,
         )
 
-    def _iter_multi_config_examples(self):
+    def _collect_multi_config_examples(self) -> List[Dict[str, Any]]:
+        if self._cached_multi_config_examples is not None:
+            return self._cached_multi_config_examples
         if not self.spec.dataset_names:
-            return
+            return []
         if self.spec.streaming:
             raise ValueError("dataset_names multi-config loading does not support streaming datasets.")
 
         extracted_examples: List[Dict[str, Any]] = []
-        for dataset_name in self.spec.dataset_names:
+        for dataset_index, dataset_name in enumerate(self.spec.dataset_names):
             dataset = self._load_dataset(dataset_name)
+            if self.shuffle:
+                dataset = dataset.shuffle(seed=self.seed + dataset_index)
+
+            subject_examples: List[Dict[str, Any]] = []
             for raw_example in dataset:
                 example = dict(raw_example)
                 subject_field = self.spec.subject_field or "subject"
                 example.setdefault(subject_field, dataset_name)
                 qa_pair = extract_question_and_answer(self.spec, example)
-                if qa_pair is not None:
-                    extracted_examples.append(qa_pair)
+                if qa_pair is None:
+                    continue
+                subject_examples.append(qa_pair)
+                if len(subject_examples) >= self.max_examples:
+                    break
+
+            extracted_examples.extend(subject_examples)
 
         if self.shuffle:
             random.Random(self.seed).shuffle(extracted_examples)
 
-        emitted = 0
-        for qa_pair in extracted_examples:
+        self._cached_multi_config_examples = extracted_examples
+        return self._cached_multi_config_examples
+
+    def _iter_multi_config_examples(self):
+        for qa_pair in self._collect_multi_config_examples():
             yield qa_pair
-            emitted += 1
-            if emitted >= self.max_examples:
-                return
+
+    def __len__(self) -> int:
+        if self.spec.dataset_names:
+            return len(self._collect_multi_config_examples())
+        return self.max_examples
 
     def __iter__(self):
         if self.spec.dataset_names:
@@ -286,6 +303,7 @@ class HFQAPairStream(IterableDataset):
 
 
 DEFAULT_MULTINEWS_SUMMARY_TASK = "Summarize the news articles above."
+MMLU_REDUX_MAX_SUBJECT_EXAMPLES = 25
 MMLU_REDUX_SUBJECTS = [
     "abstract_algebra",
     "anatomy",
@@ -346,6 +364,102 @@ MMLU_REDUX_SUBJECTS = [
     "world_religions",
 ]
 MMLU_REDUX_LABELS = ("A", "B", "C", "D")
+MMLU_REDUX_SUBJECT_CATEGORIES = (
+    "math",
+    "physics",
+    "computer science",
+    "biology",
+    "chemistry",
+    "engineering",
+    "culture",
+    "psychology",
+    "politics",
+    "economics",
+    "geography",
+    "philosophy",
+    "history",
+    "law",
+    "health",
+    "other",
+    "business",
+)
+MMLU_REDUX_SUBJECT_TO_CATEGORY = {
+    "abstract_algebra": "math",
+    "anatomy": "health",
+    "astronomy": "physics",
+    "business_ethics": "business",
+    "clinical_knowledge": "health",
+    "college_biology": "biology",
+    "college_chemistry": "chemistry",
+    "college_computer_science": "computer science",
+    "college_mathematics": "math",
+    "college_medicine": "health",
+    "college_physics": "physics",
+    "computer_security": "computer science",
+    "conceptual_physics": "physics",
+    "econometrics": "economics",
+    "electrical_engineering": "engineering",
+    "elementary_mathematics": "math",
+    "formal_logic": "philosophy",
+    "global_facts": "other",
+    "high_school_biology": "biology",
+    "high_school_chemistry": "chemistry",
+    "high_school_computer_science": "computer science",
+    "high_school_european_history": "history",
+    "high_school_geography": "geography",
+    "high_school_government_and_politics": "politics",
+    "high_school_macroeconomics": "economics",
+    "high_school_mathematics": "math",
+    "high_school_microeconomics": "economics",
+    "high_school_physics": "physics",
+    "high_school_psychology": "psychology",
+    "high_school_statistics": "math",
+    "high_school_us_history": "history",
+    "high_school_world_history": "history",
+    "human_aging": "health",
+    "human_sexuality": "culture",
+    "international_law": "law",
+    "jurisprudence": "law",
+    "logical_fallacies": "philosophy",
+    "machine_learning": "computer science",
+    "management": "business",
+    "marketing": "business",
+    "medical_genetics": "health",
+    "miscellaneous": "other",
+    "moral_disputes": "philosophy",
+    "moral_scenarios": "philosophy",
+    "nutrition": "health",
+    "philosophy": "philosophy",
+    "prehistory": "history",
+    "professional_accounting": "other",
+    "professional_law": "law",
+    "professional_medicine": "health",
+    "professional_psychology": "psychology",
+    "public_relations": "politics",
+    "security_studies": "politics",
+    "sociology": "culture",
+    "us_foreign_policy": "politics",
+    "virology": "health",
+    "world_religions": "philosophy",
+}
+
+
+def resolve_max_examples_for_spec(spec: HFDatasetSpec, requested_max_examples: int) -> int:
+    resolved = int(requested_max_examples)
+    if resolved <= 0:
+        raise ValueError(f"requested_max_examples must be positive, got {requested_max_examples!r}")
+    if spec.answer_mode == "mmlu_redux":
+        return min(resolved, MMLU_REDUX_MAX_SUBJECT_EXAMPLES)
+    return resolved
+
+
+def resolve_progress_total_examples(spec: HFDatasetSpec, dataset: IterableDataset, requested_max_examples: int) -> int:
+    if spec.answer_mode == "mmlu_redux":
+        try:
+            return len(dataset)
+        except TypeError:
+            return len(MMLU_REDUX_SUBJECTS) * resolve_max_examples_for_spec(spec, requested_max_examples)
+    return resolve_max_examples_for_spec(spec, requested_max_examples)
 
 
 def get_boolq_dataset_spec() -> HFDatasetSpec:
@@ -1337,10 +1451,11 @@ class HFGenerationExampleStream(IterableDataset):
     ) -> None:
         super().__init__()
         self.spec = spec
-        self.max_examples = max_examples
+        self.max_examples = resolve_max_examples_for_spec(spec, max_examples)
         self.shuffle = shuffle
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
+        self._cached_multi_config_examples: Optional[List[Dict[str, Any]]] = None
 
     def _load_dataset(self):
         if self.spec.dataset_name is None:
@@ -1425,6 +1540,73 @@ class RunningAverage:
             "native_accuracy": self.native_accuracy_sum / self.count,
             "count": self.count,
         }
+
+
+class SubjectAccuracyAccumulator:
+    def __init__(self, category: str) -> None:
+        self.category = category
+        self.accuracy_sum = 0.0
+        self.native_accuracy_sum = 0.0
+        self.count = 0
+
+    def update(self, *, accuracy_value: float, native_accuracy_value: float) -> None:
+        self.accuracy_sum += float(accuracy_value)
+        self.native_accuracy_sum += float(native_accuracy_value)
+        self.count += 1
+
+    def summary(self) -> Dict[str, Any]:
+        if self.count <= 0:
+            raise ValueError("SubjectAccuracyAccumulator.summary() requires count > 0")
+        return {
+            "category": self.category,
+            "accuracy": self.accuracy_sum / self.count,
+            "native_accuracy": self.native_accuracy_sum / self.count,
+            "count": self.count,
+        }
+
+
+def build_mmlu_redux_subject_breakdown(
+    subject_accumulators_by_edge: Dict[str, Dict[str, SubjectAccuracyAccumulator]],
+    *,
+    algorithm_name: str,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "algorithm": algorithm_name,
+        "edges": {},
+    }
+    for edge_id, subject_accumulators in subject_accumulators_by_edge.items():
+        subject_accuracy: Dict[str, Dict[str, Any]] = {}
+        for subject in MMLU_REDUX_SUBJECTS:
+            accumulator = subject_accumulators.get(subject)
+            if accumulator is None or accumulator.count <= 0:
+                raise ValueError(
+                    f"MMLU-Redux subject breakdown is incomplete for edge={edge_id}: missing subject={subject}"
+                )
+            subject_accuracy[subject] = accumulator.summary()
+
+        subject_category_accuracy: Dict[str, Dict[str, Any]] = {}
+        for category in MMLU_REDUX_SUBJECT_CATEGORIES:
+            subject_rows = [
+                (subject, subject_accuracy[subject])
+                for subject in MMLU_REDUX_SUBJECTS
+                if subject_accuracy[subject]["category"] == category
+            ]
+            if not subject_rows:
+                raise ValueError(f"No MMLU-Redux subjects mapped to category={category}")
+            subject_category_accuracy[category] = {
+                "accuracy": sum(row["accuracy"] for _, row in subject_rows) / len(subject_rows),
+                "native_accuracy": sum(row["native_accuracy"] for _, row in subject_rows) / len(subject_rows),
+                "num_subjects_evaluated": len(subject_rows),
+                "total_count": sum(int(row["count"]) for _, row in subject_rows),
+                "subjects": [subject for subject, _ in subject_rows],
+            }
+
+        payload["edges"][edge_id] = {
+            "subject_accuracy": subject_accuracy,
+            "subject_category_accuracy": subject_category_accuracy,
+        }
+
+    return payload
 
 
 class GenerationRunningAverage:
@@ -2568,10 +2750,17 @@ def evaluate_dataset(
         tokenizer=tokenizer,
         spec=spec,
     )
+    subject_accumulators_by_edge: Optional[Dict[str, Dict[str, SubjectAccuracyAccumulator]]]
+    if spec.answer_mode == "mmlu_redux":
+        subject_accumulators_by_edge = {edge.id: {} for edge in edges}
+    else:
+        subject_accumulators_by_edge = None
 
     processed_examples = 0
+    progress_total_examples = resolve_progress_total_examples(spec, dataloader.dataset, eval_config.max_examples_per_dataset)
+    next_progress_examples = progress_interval if progress_interval > 0 else None
 
-    for batch_idx, batch in enumerate(dataloader, start=1):
+    for batch in dataloader:
         for example in batch:
             question = example["question"]
             gold_answer = example["answer"]
@@ -2645,17 +2834,38 @@ def evaluate_dataset(
                 native_acc = 1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0
                 path_metrics[edge.id].update(edge_artifacts.cosine_value, acc, native_acc, 1)
 
-            processed_examples += 1
+                if subject_accumulators_by_edge is not None:
+                    subject = example.get("subject")
+                    if not isinstance(subject, str) or not subject.strip():
+                        raise ValueError("MMLU-Redux examples must include a non-empty subject.")
+                    subject = subject.strip()
+                    if subject not in MMLU_REDUX_SUBJECT_TO_CATEGORY:
+                        raise ValueError(f"Unsupported MMLU-Redux subject: {subject}")
+                    subject_accumulator = subject_accumulators_by_edge[edge.id].setdefault(
+                        subject,
+                        SubjectAccuracyAccumulator(MMLU_REDUX_SUBJECT_TO_CATEGORY[subject]),
+                    )
+                    subject_accumulator.update(
+                        accuracy_value=acc,
+                        native_accuracy_value=native_acc,
+                    )
 
-        if progress_interval > 0 and batch_idx % progress_interval == 0:
-            logging.info(
-                "[%s] progress: %d/%d examples",
-                spec.name_for_log,
-                processed_examples,
-                eval_config.max_examples_per_dataset,
-            )
+            processed_examples += 1
+            while next_progress_examples is not None and processed_examples >= next_progress_examples:
+                logging.info(
+                    "[%s] progress: %d/%d examples",
+                    spec.name_for_log,
+                    next_progress_examples,
+                    progress_total_examples,
+                )
+                next_progress_examples += progress_interval
 
     summarized = summarize_path_metrics(path_metrics)
+    if subject_accumulators_by_edge is not None:
+        breakdown_payload = build_mmlu_redux_subject_breakdown(subject_accumulators_by_edge, algorithm_name=ctx.config.alg)
+        breakdown_path = Path(eval_config.output_path) / "mmlu_redux_subject_category_accuracy.json"
+        write_json(str(breakdown_path), breakdown_payload)
+        logging.info("Saved MMLU-Redux subject/category breakdown to %s", breakdown_path)
     if finalize_results_fn is not None:
         finalize_results_fn(ctx=ctx, spec=spec, results=summarized)
     return summarized
