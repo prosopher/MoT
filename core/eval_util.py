@@ -446,7 +446,6 @@ def _finalize_openwebtext_tsne_plots(
     *,
     output_path: Union[str, Path],
     seed: int,
-    logger: logging.Logger,
     features_by_edge_and_group: Dict[str, Dict[str, List[np.ndarray]]],
     perplexity: float = 50.0,
     max_iter: int = 1000,
@@ -454,7 +453,7 @@ def _finalize_openwebtext_tsne_plots(
     try:
         plt, TSNE = _load_openwebtext_tsne_plotting_deps()
     except ModuleNotFoundError as exc:
-        logger.warning("Skipping OpenWebText t-SNE plots: %s", exc)
+        logging.warning("Skipping OpenWebText t-SNE plots: %s", exc)
         return {}
 
     output_dir = _build_openwebtext_tsne_output_dir(output_path)
@@ -478,7 +477,7 @@ def _finalize_openwebtext_tsne_plots(
             group_counts[label] = int(group_features.shape[0])
 
         if len(ordered_features) < 2:
-            logger.warning(
+            logging.warning(
                 "Skipping OpenWebText t-SNE for %s because fewer than two visible groups were collected.",
                 edge_id,
             )
@@ -498,7 +497,7 @@ def _finalize_openwebtext_tsne_plots(
 
         feature_matrix = np.concatenate(padded_features, axis=0)
         if feature_matrix.shape[0] < 3:
-            logger.warning(
+            logging.warning(
                 "Skipping OpenWebText t-SNE for %s because only %d total samples were collected.",
                 edge_id,
                 feature_matrix.shape[0],
@@ -512,7 +511,7 @@ def _finalize_openwebtext_tsne_plots(
         effective_perplexity = float(perplexity)
         if feature_matrix.shape[0] <= effective_perplexity:
             effective_perplexity = float(max(1, feature_matrix.shape[0] - 1))
-            logger.warning(
+            logging.warning(
                 "Adjusted OpenWebText t-SNE perplexity for %s from %.1f to %.1f because only %d total samples were collected.",
                 edge_id,
                 float(perplexity),
@@ -570,7 +569,7 @@ def _finalize_openwebtext_tsne_plots(
             for label in visible_labels
             if label in group_counts
         )
-        logger.info(
+        logging.info(
             "Saved OpenWebText t-SNE plot for %s to %s (%s)",
             edge_id,
             plot_path,
@@ -687,7 +686,6 @@ def evaluate_openwebtext_validation_loss_metrics(
     seed: int,
     shuffle_buffer: int,
     max_examples: int,
-    logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
@@ -779,7 +777,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
         processed_examples += batch_examples
         if batch_idx % 25 == 0:
-            logger.info(
+            logging.info(
                 "[OpenWebText/validation] progress: %d/%d sequences",
                 processed_examples,
                 max_examples,
@@ -816,7 +814,6 @@ def evaluate_openwebtext_validation_loss_metrics(
         tsne_paths = _finalize_openwebtext_tsne_plots(
             output_path=output_path,
             seed=seed,
-            logger=logger,
             features_by_edge_and_group=tsne_features,
             perplexity=50.0,
             max_iter=1000,
@@ -833,7 +830,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
     *,
     build_translated_target_past_fn: Callable[..., PastKeyValues],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
@@ -923,7 +919,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
         seed=eval_config.seed,
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
-        logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
@@ -934,7 +929,6 @@ def evaluate_openwebtext_validation_loss_replay(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
     *,
     build_translated_target_past_fn: Callable[..., PastKeyValues],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
@@ -1030,7 +1024,6 @@ def evaluate_openwebtext_validation_loss_replay(
         seed=eval_config.seed,
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
-        logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
@@ -1041,7 +1034,6 @@ def evaluate_openwebtext_validation_loss(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
     *,
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
@@ -1051,7 +1043,6 @@ def evaluate_openwebtext_validation_loss(
             ctx=ctx,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
             build_translated_target_past_fn=build_translated_target_past_fn,
             build_visualization_pasts_fn=build_visualization_pasts_fn,
         )
@@ -1059,7 +1050,6 @@ def evaluate_openwebtext_validation_loss(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
@@ -2266,17 +2256,16 @@ def build_edge_pretty_name(edge_id: str, nodes: List[Node], edges: List[Edge]) -
 
 
 def log_dataset_result(
-    logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
     nodes: List[Node],
     edges: List[Edge],
 ) -> None:
-    logger.info("===== %s =====", dataset_name)
+    logging.info("===== %s =====", dataset_name)
     for edge in edges:
         row = results[edge.id]
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
-        logger.info(
+        logging.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_name,
             row["cosine"],
@@ -2287,17 +2276,16 @@ def log_dataset_result(
 
 
 def log_generation_dataset_result(
-    logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
     nodes: List[Node],
     edges: List[Edge],
 ) -> None:
-    logger.info("===== %s =====", dataset_name)
+    logging.info("===== %s =====", dataset_name)
     for edge in edges:
         row = results[edge.id]
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
-        logger.info(
+        logging.info(
             "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
             row["cosine"],

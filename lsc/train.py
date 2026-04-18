@@ -369,22 +369,21 @@ def run_train(
     write_json(str(config_path), asdict(config))
 
     log_path = get_train_log_path(output_path)
-    logger = setup_logger(f"{config.alg}_train", log_path)
-    logger.info("Starting training")
-    logger.info("train_config=%s", asdict(config))
+    logging.info("Starting training")
+    logging.info("train_config=%s", asdict(config))
 
-    logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("edges=%s", [edge.id for edge in edges])
+    logging.info("nodes=%s", [asdict(node) for node in nodes])
+    logging.info("edges=%s", [edge.id for edge in edges])
 
-    logger.info("[Setup] device=%s", config.device)
-    logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
+    logging.info("[Setup] device=%s", config.device)
+    logging.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
     translator_pool = build_translator_pool(ctx)
     translator_pool.train()
 
-    logger.info("[Setup] model specs used for translation")
+    logging.info("[Setup] model specs used for translation")
     for node in nodes:
         spec = ctx.mm.get_model_spec(node.id)
-        logger.info(
+        logging.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
             node.model_id,
@@ -392,7 +391,7 @@ def run_train(
             spec.hidden_size,
             spec.num_heads,
         )
-    logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
+    logging.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(ctx)
 
@@ -465,7 +464,7 @@ def run_train(
                 lr=f"{scheduler.lr:.2e}",
             )
             gpu_memory = gpu_memory_tracker.summary()
-            logger.info(
+            logging.info(
                 "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
@@ -481,12 +480,12 @@ def run_train(
         translator_pool=translator_pool,
     )
     final_gpu_memory = gpu_memory_tracker.summary()
-    logger.info(
+    logging.info(
         "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
         final_gpu_memory["avg_allocated_pretty"],
         final_gpu_memory["peak_allocated_pretty"],
         final_gpu_memory["num_samples"],
     )
-    logger.info("[Done] final checkpoint saved to %s", final_path)
-    logger.info("Saved train log to %s", log_path)
+    logging.info("[Done] final checkpoint saved to %s", final_path)
+    logging.info("Saved train log to %s", log_path)
     return final_path

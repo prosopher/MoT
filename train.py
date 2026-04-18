@@ -3,11 +3,11 @@ import importlib
 from pathlib import Path
 
 from core.channel_manager import ChannelManager
-from core.common import GPUMemoryTracker, add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
+from core.common import GPUMemoryTracker, add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, setup_logging
 from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import build_nodes_and_edges
-from core.train_util import build_models_and_tokenizer
+from core.train_util import build_models_and_tokenizer, get_train_log_path
 
 
 def load_train_module(alg: str):
@@ -62,6 +62,8 @@ def main() -> None:
         alg=args.alg,
         **config_kwargs,
     )
+
+    setup_logging(get_train_log_path(config.output_path))
 
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     models, tokenizer = build_models_and_tokenizer(config, nodes)

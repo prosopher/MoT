@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import logging
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from core.common import (  # noqa: E402
     load_tokenizer,
     parse_bool_arg,
     past_key_values_to_blocks,
-    setup_logger,
+    setup_logging,
     write_json,
 )
 from core.config import resolve_device
@@ -367,7 +368,7 @@ def get_model_spec_flexible(model) -> SimpleModelSpec:
 
 
 @torch.no_grad()
-def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, object], Dict[str, object], Dict[str, object]]:
+def collect_layer_features(config: LayerSimConfig) -> Tuple[Dict[str, object], Dict[str, object], Dict[str, object]]:
     tokenizer_a = load_tokenizer(config.tokenizer_a_id)
     tokenizer_b = load_tokenizer(config.tokenizer_b_id)
     model_a = load_frozen_model(config.model_a_id, device=config.device, dtype=config.dtype)
@@ -375,7 +376,7 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
 
     spec_a = get_model_spec_flexible(model_a)
     spec_b = get_model_spec_flexible(model_b)
-    logger.info(
+    logging.info(
         "Loaded models: A=%s (layers=%d, hidden=%d, arch=%s), B=%s (layers=%d, hidden=%d, arch=%s)",
         config.model_a_id,
         spec_a.num_layers,
@@ -386,7 +387,7 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
         spec_b.hidden_size,
         spec_b.architecture,
     )
-    logger.info(
+    logging.info(
         "Loaded tokenizers: A=%s, B=%s (same_tokenizer=%s)",
         config.tokenizer_a_id,
         config.tokenizer_b_id,
@@ -462,7 +463,7 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
         processed += input_ids_a.shape[0]
 
         if batch_idx == 1:
-            logger.info(
+            logging.info(
                 "First valid batch block shapes: A key=%s value=%s | B key=%s value=%s",
                 tuple(key_a.shape),
                 tuple(value_a.shape),
@@ -470,7 +471,7 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
                 tuple(value_b.shape),
             )
         if batch_idx % 10 == 0 or processed >= config.num_samples:
-            logger.info(
+            logging.info(
                 "Collected %d / %d valid samples on dataset=%s (seen_texts=%d, skipped_short=%d)",
                 processed,
                 config.num_samples,
@@ -480,7 +481,7 @@ def collect_layer_features(config: LayerSimConfig, logger) -> Tuple[Dict[str, ob
             )
 
     if processed < config.num_samples:
-        logger.warning(
+        logging.warning(
             "Dataset stream ended early. Requested %d samples, collected %d valid samples on dataset=%s "
             "(seen_texts=%d, skipped_short=%d).",
             config.num_samples,
@@ -632,10 +633,9 @@ def build_output_dir(config: LayerSimConfig) -> Path:
 
 def run_layer_similarity(config: LayerSimConfig) -> Path:
     output_dir = build_output_dir(config)
-    logger = setup_logger("layer_sim", output_dir / "layer_sim.log")
-    logger.info("Layer similarity config: %s", asdict(config))
+    logging.info("Layer similarity config: %s", asdict(config))
 
-    result_a, result_b, metadata = collect_layer_features(config=config, logger=logger)
+    result_a, result_b, metadata = collect_layer_features(config=config)
 
     key_matrix = compute_similarity_matrix(
         a_layers=result_a["key_features"],
@@ -721,14 +721,14 @@ def run_layer_similarity(config: LayerSimConfig) -> Path:
     }
     write_json(output_dir / "summary.json", summary)
 
-    logger.info(
+    logging.info(
         "Global best mean K/V pair on dataset=%s: A layer %d <-> B layer %d (score=%.6f)",
         config.dataset_name,
         summary["kv_alignment"]["global_best_pair"]["src_layer_idx"],
         summary["kv_alignment"]["global_best_pair"]["tgt_layer_idx"],
         summary["kv_alignment"]["global_best_pair"]["score"],
     )
-    logger.info("Saved artifacts to %s", output_dir)
+    logging.info("Saved artifacts to %s", output_dir)
     return output_dir
 
 
@@ -859,6 +859,7 @@ def main() -> None:
 
     for model_a_id, model_b_id in pair_list:
         pair_config = clone_config_for_pair(base_config, model_a_id=model_a_id, model_b_id=model_b_id)
+        setup_logging(build_output_dir(pair_config) / "layer_sim.log")
         output_dir = run_layer_similarity(pair_config)
         output_dirs.append(str(output_dir))
 

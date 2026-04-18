@@ -32,27 +32,32 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logger(name: str, log_path: Path) -> logging.Logger:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
+def setup_logging(log_path: Union[str, Path]) -> logging.Logger:
+    """Configure the process-wide root logger."""
+    resolved_log_path = Path(log_path)
+    resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler = logging.FileHandler(resolved_log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
 
     stream_handler = TqdmLoggingHandler()
     stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
 
-    return logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+    return root_logger
+
 
 
 PastKeyValues = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]

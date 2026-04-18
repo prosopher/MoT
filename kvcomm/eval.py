@@ -17,8 +17,7 @@ from core.common import (
     cosine_similarity_between_past,
     extract_past_key_values,
     set_seed,
-    setup_logger,
-    write_json,
+        write_json,
 )
 from core.context import Context
 from core.eval_util import *
@@ -233,7 +232,6 @@ def evaluate_dataset(
     dataloader: DataLoader,
     eval_config: EvalConfig,
     translator_pool: KVCommSelectionPool,
-    logger,
 ) -> Dict[str, Dict[str, float]]:
     device = ctx.config.device
     tokenizer = ctx.tokenizer
@@ -333,7 +331,7 @@ def evaluate_dataset(
             processed_examples += 1
 
         if batch_idx % 50 == 0:
-            logger.info(
+            logging.info(
                 "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -356,7 +354,6 @@ def evaluate_generation_dataset(
     dataloader: DataLoader,
     eval_config: EvalConfig,
     translator_pool: KVCommSelectionPool,
-    logger,
 ) -> Dict[str, Dict[str, float]]:
     device = ctx.config.device
     tokenizer = ctx.tokenizer
@@ -443,7 +440,7 @@ def evaluate_generation_dataset(
             processed_examples += 1
 
         if batch_idx % 25 == 0:
-            logger.info(
+            logging.info(
                 "[%s] generation progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -475,26 +472,25 @@ def run_eval(
     write_json(str(config_path), asdict(eval_config))
 
     log_path = get_eval_log_path(eval_config.output_path)
-    logger = setup_logger(f"{eval_config.alg}_eval", log_path)
-    logger.info("Starting evaluation")
-    logger.info("checkpoint_dir_path=%s", checkpoint_dir_path)
-    logger.info("eval_config=%s", asdict(eval_config))
+    logging.info("Starting evaluation")
+    logging.info("checkpoint_dir_path=%s", checkpoint_dir_path)
+    logging.info("eval_config=%s", asdict(eval_config))
 
     translator_pool.eval()
     for node in nodes:
         ctx.mm.get_model(node.id).eval()
 
-    logger.info("restored_train_config=%s", asdict(train_config))
-    logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("edges=%s", [edge.id for edge in edges])
-    logger.info(
+    logging.info("restored_train_config=%s", asdict(train_config))
+    logging.info("nodes=%s", [asdict(node) for node in nodes])
+    logging.info("edges=%s", [edge.id for edge in edges])
+    logging.info(
         "layer_selection_source=%s/train | selection_total_tokens=%d | selection_prefix_tokens=%d",
         train_config.calibration_dataset,
         _openwebtext_total_tokens(train_config),
         _openwebtext_prefix_tokens(train_config),
     )
     for edge in edges:
-        logger.info(
+        logging.info(
             "%s | selected_target_layers=%s | selected_source_layers=%s",
             edge.id,
             translator_pool.get_selected_target_layers(edge.id),
@@ -502,7 +498,7 @@ def run_eval(
         )
 
     calibration_eval_name = _build_calibration_eval_name(train_config)
-    logger.info("Preparing validation dataloader for %s", calibration_eval_name)
+    logging.info("Preparing validation dataloader for %s", calibration_eval_name)
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
         return _ensure_model_cache(
@@ -537,13 +533,12 @@ def run_eval(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
-        logger.info(
+        logging.info(
             "[%s] %s | native_loss=%.6f | native_profile=%s | kvcomm_loss=%.6f | kvcomm_profile=%s | count=%d",
             calibration_eval_name,
             edge.id,
@@ -554,13 +549,13 @@ def run_eval(
             row["count"],
         )
         if row.get("tsne_plot_path"):
-            logger.info("[%s] %s | tsne_plot=%s", calibration_eval_name, edge.id, row["tsne_plot_path"])
+            logging.info("[%s] %s | tsne_plot=%s", calibration_eval_name, edge.id, row["tsne_plot_path"])
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for spec in get_default_logit_qa_dataset_specs():
-        logger.info("Preparing dataloader for %s", spec.name_for_log)
+        logging.info("Preparing dataloader for %s", spec.name_for_log)
         dataloader = build_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
@@ -571,11 +566,9 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
         log_dataset_result(
-            logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
             nodes=nodes,
@@ -586,7 +579,7 @@ def run_eval(
 
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for spec in get_default_gen_qa_dataset_specs():
-        logger.info("Preparing generation dataloader for %s", spec.name_for_log)
+        logging.info("Preparing generation dataloader for %s", spec.name_for_log)
         dataloader = build_generation_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
@@ -597,11 +590,9 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
         )
         all_generation_results[spec.name_for_log] = results
         log_generation_dataset_result(
-            logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
             nodes=nodes,
@@ -652,8 +643,8 @@ def run_eval(
     summary_path = Path(eval_config.output_path) / "summary.md"
     summary_path.write_text(summary_markdown, encoding="utf-8")
 
-    logger.info("===== FINAL MARKDOWN SUMMARY =====\n%s", summary_markdown)
-    logger.info("Saved metrics to %s", metrics_path)
-    logger.info("Saved summary to %s", summary_path)
-    logger.info("Done. Saved log to %s", log_path)
+    logging.info("===== FINAL MARKDOWN SUMMARY =====\n%s", summary_markdown)
+    logging.info("Saved metrics to %s", metrics_path)
+    logging.info("Saved summary to %s", summary_path)
+    logging.info("Done. Saved log to %s", log_path)
     return log_path

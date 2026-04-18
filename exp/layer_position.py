@@ -389,15 +389,14 @@ def run_train(
     config = ctx.config
     nodes = ctx.nodes
     tokenizer = ctx.tokenizer
-    logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
-    logger.info("Starting layer-window position training with target-layer replay")
-    logger.info("experiment_config=%s", asdict(config))
+    logging.info("Starting layer-window position training with target-layer replay")
+    logging.info("experiment_config=%s", asdict(config))
 
     translator_pool = build_translator_pool(
         ctx=ctx,
     )
     translator_pool.train()
-    logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
+    logging.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = InfiniteDataLoader(
         DataLoader(
@@ -479,7 +478,7 @@ def run_train(
             avg_loss = running_loss / config.log_every
             progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.lr:.2e}")
             gpu_memory = gpu_memory_tracker.summary()
-            logger.info(
+            logging.info(
                 "[Step %04d] window_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
@@ -489,7 +488,7 @@ def run_train(
             )
             running_loss = 0.0
 
-    logger.info("[Done] training complete")
+    logging.info("[Done] training complete")
     return translator_pool
 
 
@@ -499,7 +498,6 @@ def evaluate_logit_dataset(
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     translator_pool: LayerWindowTranslatorPool,
-    logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
@@ -665,7 +663,7 @@ def evaluate_logit_dataset(
             processed_examples += 1
 
         if batch_idx % 50 == 0:
-            logger.info(
+            logging.info(
                 "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -683,7 +681,6 @@ def evaluate_generation_dataset(
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     translator_pool: LayerWindowTranslatorPool,
-    logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
@@ -719,7 +716,7 @@ def evaluate_generation_dataset(
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
                 question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
-                logger.info(
+                logging.info(
                     "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
                     cache_input_ids.shape[1],
@@ -869,7 +866,7 @@ def evaluate_generation_dataset(
             processed_examples += 1
 
         if batch_idx % 25 == 0:
-            logger.info(
+            logging.info(
                 "[%s] generation progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -1278,9 +1275,8 @@ def run_eval(
 ) -> Dict[str, Any]:
     config = ctx.config
     edges = ctx.edges
-    logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
-    logger.info("Starting layer-window position evaluation with target-layer replay")
-    logger.info("experiment_config=%s", asdict(config))
+    logging.info("Starting layer-window position evaluation with target-layer replay")
+    logging.info("experiment_config=%s", asdict(config))
 
     translator_pool.eval()
     for node in ctx.nodes:
@@ -1299,7 +1295,7 @@ def run_eval(
     dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
     dataset_logit_kl_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-    logger.info("Preparing validation dataloader for OpenWebText/validation")
+    logging.info("Preparing validation dataloader for OpenWebText/validation")
 
     def evaluate_openwebtext_control_losses(
         *,
@@ -1333,7 +1329,6 @@ def run_eval(
         seed=config.seed,
         shuffle_buffer=config.shuffle_buffer,
         max_examples=config.eval_max_examples_per_dataset,
-        logger=logger,
         evaluate_edge_losses_fn=evaluate_openwebtext_control_losses,
     )
 
@@ -1352,7 +1347,7 @@ def run_eval(
 
     for edge in ctx.edges:
         row = openwebtext_loss_by_edge[edge.id]
-        logger.info(
+        logging.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | count=%d",
             edge.id,
             row["native_loss"],
@@ -1396,14 +1391,13 @@ def run_eval(
             spec=spec,
             dataloader=dataloader,
             translator_pool=translator_pool,
-            logger=logger,
         )
         dataset_results_by_name[spec.name_for_log] = dataset_results
         dataset_logit_kl_by_name[spec.name_for_log] = dataset_logit_kl
         for edge in edges:
             metric_row = dataset_results[edge.id]
             logit_row = dataset_logit_kl[edge.id]
-            logger.info(
+            logging.info(
                 progress_log_template,
                 spec.name_for_log,
                 edge.id,
@@ -1440,7 +1434,7 @@ def run_eval(
     average_native_loss = compute_average_metric(openwebtext_loss_results, "native_loss")
     average_full_mix_loss = compute_average_metric(openwebtext_loss_results, "full_mix_loss")
 
-    logger.info(
+    logging.info(
         "[Summary] metric=%s | native=%.6f | dir_only=%.6f | mag_only=%.6f | full_mix=%.6f",
         metric_name,
         average_native_metric,
@@ -1448,13 +1442,13 @@ def run_eval(
         average_mag_only_metric,
         average_full_mix_metric,
     )
-    logger.info(
+    logging.info(
         "[Summary] delta_dir_only=%.6f | delta_mag_only=%.6f | delta_full_mix=%.6f",
         average_delta_dir_only,
         average_delta_mag_only,
         average_delta_full_mix,
     )
-    logger.info(
+    logging.info(
         "[Summary] avg_kl(native||dir)=%.6f | avg_kl(native||mag)=%.6f | avg_kl(native||full)=%.6f | avg_kl(full||dir)=%.6f | avg_kl(full||mag)=%.6f",
         average_native_to_dir_only_logit_kl,
         average_native_to_mag_only_logit_kl,
@@ -1462,7 +1456,7 @@ def run_eval(
         average_full_mix_to_dir_only_logit_kl,
         average_full_mix_to_mag_only_logit_kl,
     )
-    logger.info(
+    logging.info(
         "[Summary] OpenWebText/validation loss | native=%.6f | full_mix=%.6f",
         average_native_loss,
         average_full_mix_loss,
@@ -1551,10 +1545,12 @@ def main() -> None:
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    setup_logging(build_train_log_path(run_dir))
     translator_pool = run_train(
         ctx=ctx,
         run_dir=run_dir,
     )
+    setup_logging(build_eval_log_path(run_dir))
     combined_metrics = run_eval(
         ctx=ctx,
         run_dir=run_dir,

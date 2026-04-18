@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from core.channel_manager import ChannelManager
-from core.common import OpenWebTextSequenceStream, read_json, set_seed, setup_logger, write_json
+from core.common import OpenWebTextSequenceStream, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
 from core.model_manager import ModelManager
@@ -403,7 +403,6 @@ def _select_layers_for_edge(
     edge: Edge,
     config: TrainConfig,
     calibration_batches: List[torch.Tensor],
-    logger,
 ) -> EdgeCalibrationResult:
     target_spec = ctx.mm.get_model_spec(edge.tgt_id)
     source_spec = ctx.mm.get_model_spec(edge.src_id)
@@ -471,12 +470,12 @@ def _select_layers_for_edge(
             layer_score_samples.append(scores)
         processed += int(input_ids.shape[0])
         if batch_idx % log_interval == 0 or processed >= config.calib_size:
-            logger.info("%s | %s selection progress: %d/%d sequences", edge.id, config.calibration_dataset, processed, config.calib_size)
+            logging.info("%s | %s selection progress: %d/%d sequences", edge.id, config.calibration_dataset, processed, config.calib_size)
         if processed >= config.calib_size:
             break
 
     if not layer_score_samples:
-        logger.warning(
+        logging.warning(
             "No attention tensors were returned during KVComm %s layer selection for %s. Falling back to Gaussian prior only.",
             config.calibration_dataset,
             edge.id,
@@ -519,16 +518,15 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
     write_json(str(config_path), asdict(config))
 
     log_path = get_train_log_path(output_path)
-    logger = setup_logger(f"{config.alg}_train", log_path)
-    logger.info("Starting KVComm layer selection")
-    logger.info("train_config=%s", asdict(config))
-    logger.info("nodes=%s", [node.id for node in nodes])
-    logger.info("edges=%s", [edge.id for edge in edges])
-    logger.info(
+    logging.info("Starting KVComm layer selection")
+    logging.info("train_config=%s", asdict(config))
+    logging.info("nodes=%s", [node.id for node in nodes])
+    logging.info("edges=%s", [edge.id for edge in edges])
+    logging.info(
         "layer_selection_source=%s/train",
         config.calibration_dataset,
     )
-    logger.info(
+    logging.info(
         "selection_total_tokens=%d | selection_prefix_tokens=%d | calib_size=%d",
         _openwebtext_total_tokens(config),
         _openwebtext_prefix_tokens(config),
@@ -537,9 +535,9 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
 
     compatibility = inspect_kvcomm_model_compatibility(ctx)
     if not compatibility["is_compatible"]:
-        logger.error(compatibility["message"])
+        logging.error(compatibility["message"])
         raise SystemExit(compatibility["message"])
-    logger.info(compatibility["message"])
+    logging.info(compatibility["message"])
 
     calibration_batches = _build_openwebtext_calibration_batches(
         ctx=ctx,
@@ -547,7 +545,7 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
     )
     if not calibration_batches:
         raise RuntimeError(f"Failed to sample any {config.calibration_dataset} sequences for KVComm layer selection.")
-    logger.info("Collected %d %s batch(es) for layer selection", len(calibration_batches), config.calibration_dataset)
+    logging.info("Collected %d %s batch(es) for layer selection", len(calibration_batches), config.calibration_dataset)
 
     calibration_by_edge: Dict[str, EdgeCalibrationResult] = {}
     for edge in edges:
@@ -556,10 +554,9 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
             edge=edge,
             config=config,
             calibration_batches=calibration_batches,
-            logger=logger,
         )
         calibration_by_edge[edge.id] = result
-        logger.info(
+        logging.info(
             "%s | selected_target_layers=%s | selected_source_layers=%s | calibration_score=%s",
             edge.id,
             result.selected_target_layers,
@@ -567,7 +564,7 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
             "N/A" if result.calibration_score is None else f"{result.calibration_score:.6f}",
         )
         if result.layer_ranking is not None:
-            logger.info("%s | layer_ranking=%s", edge.id, result.layer_ranking)
+            logging.info("%s | layer_ranking=%s", edge.id, result.layer_ranking)
 
     checkpoint_payload = {
         "train_config": asdict(config),
@@ -601,7 +598,7 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
     }
     checkpoint_path = get_train_checkpoint_path(output_path)
     torch.save(checkpoint_payload, checkpoint_path)
-    logger.info("Saved KVComm layer-selection checkpoint to %s", checkpoint_path)
+    logging.info("Saved KVComm layer-selection checkpoint to %s", checkpoint_path)
     return checkpoint_path
 
 

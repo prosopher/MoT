@@ -16,7 +16,6 @@ def evaluate_dataset(
     dataloader: DataLoader,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     nodes = ctx.nodes
     edges = ctx.edges
@@ -110,7 +109,7 @@ def evaluate_dataset(
             processed_examples += 1
 
         if batch_idx % 50 == 0:
-            logger.info(
+            logging.info(
                 "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -127,7 +126,6 @@ def evaluate_generation_dataset(
     dataloader: DataLoader,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     nodes = ctx.nodes
     edges = ctx.edges
@@ -167,7 +165,7 @@ def evaluate_generation_dataset(
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
                 question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
-                logger.info(
+                logging.info(
                     "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
                     cache_input_ids.shape[1],
@@ -229,7 +227,7 @@ def evaluate_generation_dataset(
             processed_examples += 1
 
         if batch_idx % 25 == 0:
-            logger.info(
+            logging.info(
                 "[%s] generation progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -256,20 +254,19 @@ def run_eval(
     write_json(str(config_path), asdict(eval_config))
 
     log_path = get_eval_log_path(eval_config.output_path)
-    logger = setup_logger(f"{eval_config.alg}_eval", log_path)
-    logger.info("Starting evaluation")
-    logger.info("checkpoint_dir_path=%s", checkpoint_dir_path)
-    logger.info("eval_config=%s", asdict(eval_config))
+    logging.info("Starting evaluation")
+    logging.info("checkpoint_dir_path=%s", checkpoint_dir_path)
+    logging.info("eval_config=%s", asdict(eval_config))
 
     translator_pool.eval()
     for node in nodes:
         ctx.mm.get_model(node.id).eval()
 
-    logger.info("restored_train_config=%s", asdict(train_config))
-    logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("edges=%s", [edge.id for edge in edges])
+    logging.info("restored_train_config=%s", asdict(train_config))
+    logging.info("nodes=%s", [asdict(node) for node in nodes])
+    logging.info("edges=%s", [edge.id for edge in edges])
     for node in nodes:
-        logger.info(
+        logging.info(
             "translation_spec: %s layers=%d hidden=%d heads=%d (%s)",
             node.id,
             ctx.mm.get_model_spec(node.id).num_layers,
@@ -277,13 +274,13 @@ def run_eval(
             ctx.mm.get_model_spec(node.id).num_heads,
             node.model_id,
         )
-    logger.info("translation_mode=replace_top_layers_after_target_forward")
-    logger.info("qa_eval_log_path=%s", log_path)
+    logging.info("translation_mode=replace_top_layers_after_target_forward")
+    logging.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
     all_generation_results = {}
 
-    logger.info("Preparing validation dataloader for OpenWebText/validation")
+    logging.info("Preparing validation dataloader for OpenWebText/validation")
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
         translated_top_past = translator_pool.translate_top_layers(
@@ -321,13 +318,12 @@ def run_eval(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
-        logger.info(
+        logging.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | native_profile=%s | translated_loss=%.6f | translated_profile=%s | count=%d",
             edge.id,
             row["native_loss"],
@@ -338,11 +334,11 @@ def run_eval(
         )
         tsne_plot_path = row.get("tsne_plot_path")
         if isinstance(tsne_plot_path, str) and tsne_plot_path:
-            logger.info("[OpenWebText/validation] %s | tsne_plot=%s", edge.id, tsne_plot_path)
+            logging.info("[OpenWebText/validation] %s | tsne_plot=%s", edge.id, tsne_plot_path)
 
     logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:
-        logger.info("Preparing dataloader for %s", spec.name_for_log)
+        logging.info("Preparing dataloader for %s", spec.name_for_log)
         dataloader = build_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
@@ -354,12 +350,10 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
         )
         all_logit_results[spec.name_for_log] = results
 
         log_dataset_result(
-            logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
             nodes=nodes,
@@ -371,7 +365,7 @@ def run_eval(
 
     generation_dataset_specs = get_default_gen_qa_dataset_specs()
     for spec in generation_dataset_specs:
-        logger.info("Preparing generation dataloader for %s", spec.name_for_log)
+        logging.info("Preparing generation dataloader for %s", spec.name_for_log)
         dataloader = build_generation_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
@@ -383,12 +377,10 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
         )
         all_generation_results[spec.name_for_log] = results
 
         log_generation_dataset_result(
-            logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
             nodes=nodes,
@@ -406,7 +398,7 @@ def run_eval(
         all_generation_results=all_generation_results,
         openwebtext_loss_results=openwebtext_loss_results,
     )
-    logger.info("===== FINAL MARKDOWN SUMMARY =====\n%s", final_summary_markdown)
+    logging.info("===== FINAL MARKDOWN SUMMARY =====\n%s", final_summary_markdown)
 
-    logger.info("Done. Saved log to %s", log_path)
+    logging.info("Done. Saved log to %s", log_path)
     return log_path

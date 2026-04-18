@@ -91,26 +91,16 @@ class ChannelProfiler:
         self.profile_config = profile_config
         self.mm = ctx.mm
 
-    def _get_logger(self) -> logging.Logger:
-        train_logger = logging.getLogger(f"{self.config.alg}_train")
-        if train_logger.handlers:
-            return train_logger
-        eval_logger = logging.getLogger(f"{self.config.alg}_eval")
-        if eval_logger.handlers:
-            return eval_logger
-        return train_logger
-
     def profile_all_edges(self, edges: Optional[List[Edge]] = None) -> Dict[str, ChannelProfileResult]:
-        logger = self._get_logger()
         results: Dict[str, ChannelProfileResult] = {}
         target_edges = self.ctx.edges if edges is None else edges
         for edge in target_edges:
-            logger.info("[ChannelProfiler] profiling edge=%s (%s -> %s)", edge.id, edge.src_id, edge.tgt_id)
+            logging.info("[ChannelProfiler] profiling edge=%s (%s -> %s)", edge.id, edge.src_id, edge.tgt_id)
             result = self.profile_edge(edge)
             for channel in result.selected_channels:
                 self.ctx.cm.add_channel(edge.id, channel.src_layer_idx, channel.dst_layer_idx)
             results[edge.id] = result
-            logger.info(
+            logging.info(
                 "[ChannelProfiler] %s selected pairs=%s (win=%d, val_loss=%.6f)",
                 edge.id,
                 self._format_channels(result.selected_channels),
@@ -120,9 +110,8 @@ class ChannelProfiler:
         return results
 
     def profile_edge(self, edge: Edge) -> ChannelProfileResult:
-        logger = self._get_logger()
         candidate_channels = self._build_candidate_channels(edge)
-        logger.info(
+        logging.info(
             "[ChannelProfiler] %s initial %s candidates=%s (win=%d)",
             edge.id,
             self.config.layer_alignment,
@@ -141,7 +130,7 @@ class ChannelProfiler:
             split="train",
             seed_offset=10_000,
         )
-        logger.info(
+        logging.info(
             "[ChannelProfiler] %s profile bank train=%d val=%d proxy_steps=%d proxy_dim=%d heads=%d depth=%d",
             edge.id,
             len(train_bank),
@@ -192,10 +181,10 @@ class ChannelProfiler:
         )
         history.extend(expansion_history)
 
-        logger.info("")
-        logger.info("[ChannelProfiler] %s Sliding-window validation profile (win=%d)", edge.id, probe_window_size)
+        logging.info("")
+        logging.info("[ChannelProfiler] %s Sliding-window validation profile (win=%d)", edge.id, probe_window_size)
         for idx, (channels, score) in enumerate(zip(probe_windows, channel_scores)):
-            logger.info(
+            logging.info(
                 "[ChannelProfiler] %s Probe[%02d] pairs=%s native=%.6f translated=%.6f",
                 edge.id,
                 idx,
@@ -203,8 +192,8 @@ class ChannelProfiler:
                 score.native_loss,
                 score.translated_loss,
             )
-        logger.info("")
-        logger.info(
+        logging.info("")
+        logging.info(
             "[ChannelProfiler] %s lowest validation probe idx=%d pairs=%s native=%.6f translated=%.6f",
             edge.id,
             min_loss_idx,
@@ -212,7 +201,7 @@ class ChannelProfiler:
             channel_scores[min_loss_idx].native_loss,
             channel_scores[min_loss_idx].translated_loss,
         )
-        logger.info(
+        logging.info(
             "[ChannelProfiler] %s greedy seed pairs=%s (win=%d) native=%.6f translated=%.6f",
             edge.id,
             self._format_channels(probe_windows[min_loss_idx]),
@@ -221,7 +210,7 @@ class ChannelProfiler:
             channel_scores[min_loss_idx].translated_loss,
         )
         for step in expansion_history:
-            logger.info(
+            logging.info(
                 "[ChannelProfiler] %s %s pairs=%s (win=%d) translated=%.6f improvement=%.6f",
                 edge.id,
                 step.removed_side,
@@ -230,7 +219,7 @@ class ChannelProfiler:
                 step.validation_loss,
                 step.improvement,
             )
-        logger.info(
+        logging.info(
             "[ChannelProfiler] %s selected window pairs=%s (win=%d) native=%.6f translated=%.6f",
             edge.id,
             self._format_channels(selected_channels),
@@ -322,7 +311,6 @@ class ChannelProfiler:
         train_bank: List[Dict[str, Any]],
         val_bank: List[Dict[str, Any]],
     ) -> tuple[List[Channel], ProxyValidationScore, List[ChannelProfileStep]]:
-        logger = self._get_logger()
         start_search_radius = 2
         score_cache: Dict[tuple[int, int], ProxyValidationScore] = {
             (idx, len(window)): score
@@ -339,15 +327,15 @@ class ChannelProfiler:
             next_window_size = current_window_size + 1
             min_start_idx = max(0, current_start_idx - start_search_radius)
             max_start_idx = min(len(candidate_channels) - next_window_size, current_start_idx + start_search_radius)
-            logger.info("")
-            logger.info(
+            logging.info("")
+            logging.info(
                 "[ChannelProfiler] %s selected win=%d pairs=%s translated=%.6f",
                 edge.id,
                 current_window_size,
                 self._format_channels(current_channels),
                 current_score.translated_loss,
             )
-            logger.info(
+            logging.info(
                 "[ChannelProfiler] %s grow to win=%d search_start_idx=[%d,%d] (anchor_start=%d±%d)",
                 edge.id,
                 next_window_size,
@@ -545,7 +533,6 @@ class ChannelProfiler:
         channels: List[Channel],
         train_bank: List[Dict[str, Any]],
     ):
-        logger = self._get_logger()
         from mot.train import LayerWindowDirectionalTranslator
 
         random.seed(self.config.seed)
@@ -553,8 +540,8 @@ class ChannelProfiler:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.config.seed)
 
-        logger.info("")
-        logger.info(
+        logging.info("")
+        logging.info(
             "[ChannelProfiler] %s train proxy win=%d pairs=%s steps=%d",
             edge.id,
             len(channels),
@@ -594,7 +581,7 @@ class ChannelProfiler:
             if (
                 step_idx == 0 or step_idx + 1 == self.profile_config.max_steps or (step_idx + 1) % log_every == 0
             ):
-                logger.info(
+                logging.info(
                     "[ChannelProfiler] %s proxy train step=%d/%d loss=%.6f",
                     edge.id,
                     step_idx + 1,
@@ -602,7 +589,7 @@ class ChannelProfiler:
                     last_loss,
                 )
         if last_loss is not None:
-            logger.info(
+            logging.info(
                 "[ChannelProfiler] %s proxy train done final_loss=%.6f",
                 edge.id,
                 last_loss,
