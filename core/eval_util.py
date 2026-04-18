@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import importlib
 import time
 from typing import Callable, Tuple
@@ -90,6 +91,29 @@ class InferenceProfileAccumulator:
             "throughput_tokens_per_sec": throughput_tokens_per_sec,
             "peak_memory_gib": peak_memory_gib,
         }
+
+
+
+
+@contextmanager
+def temporarily_offload_module(module: Optional[torch.nn.Module], device: str):
+    if module is None or not isinstance(module, torch.nn.Module):
+        yield
+        return
+    if not (torch.cuda.is_available() and str(device).startswith("cuda")):
+        yield
+        return
+
+    device_obj = torch.device(device)
+    device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+
+    try:
+        module.to("cpu")
+        torch.cuda.synchronize(device_index)
+        yield
+    finally:
+        module.to(device)
+        torch.cuda.synchronize(device_index)
 
 
 class InferenceProfiler:
@@ -1009,10 +1033,11 @@ def evaluate_openwebtext_validation_loss_top_layers(
             run_translated_inference,
             tokens=profile_tokens,
         )
-        _, native_profile = profiler.measure(
-            run_native_inference,
-            tokens=profile_tokens,
-        )
+        with temporarily_offload_module(translator_pool, train_config.device):
+            _, native_profile = profiler.measure(
+                run_native_inference,
+                tokens=profile_tokens,
+            )
         return (
             {
                 "translated": translated_loss,
@@ -1114,10 +1139,11 @@ def evaluate_openwebtext_validation_loss_replay(
             run_translated_inference,
             tokens=profile_tokens,
         )
-        _, native_profile = profiler.measure(
-            run_native_inference,
-            tokens=profile_tokens,
-        )
+        with temporarily_offload_module(translator_pool, train_config.device):
+            _, native_profile = profiler.measure(
+                run_native_inference,
+                tokens=profile_tokens,
+            )
         return (
             {
                 "translated": translated_loss,
