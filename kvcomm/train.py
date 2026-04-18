@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -9,12 +10,18 @@ import torch
 from torch.utils.data import DataLoader
 
 from core.channel_manager import ChannelManager
-from core.common import OpenWebTextSequenceStream, read_json, set_seed, write_json
+from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import Edge, Node, build_edge_map
-from core.train_util import *
+from core.train_util import (
+    build_models_and_tokenizer,
+    get_train_checkpoint_path,
+    get_train_config_path,
+    get_train_log_path,
+    initialize_train_output_paths,
+)
 
 
 
@@ -636,7 +643,7 @@ def load_translator_pool_from_checkpoint(
     payload = torch.load(str(checkpoint_path), map_location="cpu")
     translator_pool = KVCommSelectionPool(
         ctx=ctx,
-        selected_target_layers_by_edge=payload.get("selected_target_layers_by_edge", {}),
-        selected_source_layers_by_edge=payload.get("selected_source_layers_by_edge", {}),
+        selected_target_layers_by_edge=payload["selected_target_layers_by_edge"],
+        selected_source_layers_by_edge=payload["selected_source_layers_by_edge"],
     )
     return ctx, translator_pool

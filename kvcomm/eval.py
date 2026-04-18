@@ -1,26 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
 
-try:
-    from transformers.cache_utils import DynamicCache
-except Exception:  # pragma: no cover
-    DynamicCache = None
-
 from core.common import (
-    compute_suffix_lm_loss,
+    PastKeyValues,
     cosine_similarity_between_past,
     extract_past_key_values,
     set_seed,
-        write_json,
+    write_json,
 )
 from core.context import Context
 from core.eval_util import *
+from core.topology import Edge
 from kvcomm.train import KVCommSelectionPool
 
 
@@ -64,16 +61,6 @@ def _compute_selected_layer_cosine(
     return cosine_similarity_between_past(translated_selected_past, target_selected_past)
 
 
-def _ensure_model_cache(past_key_values):
-    if past_key_values is None:
-        return None
-    if hasattr(past_key_values, "get_seq_length"):
-        return past_key_values
-    if isinstance(past_key_values, tuple) and DynamicCache is not None:
-        return DynamicCache.from_legacy_cache(past_key_values)
-    return past_key_values
-
-
 def _openwebtext_total_tokens(config) -> int:
     return max(8, int(getattr(config, "total_tokens", 128)))
 
@@ -94,13 +81,12 @@ def _predict_direct_context_logit(model, spec, tokenizer, context: str, question
         subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
-    context_past = _ensure_model_cache(extract_past_key_values(model, prepared["cache_input_ids"]))
+    context_past = extract_past_key_values(model, prepared["cache_input_ids"])
     scoring_past = prepare_answer_scoring_past(
         model=model,
         past_key_values=context_past,
         question_cache_ids=prepared["question_cache_ids"],
     )
-    scoring_past = _ensure_model_cache(scoring_past)
     scores = score_answer_choices(
         model=model,
         past_key_values=scoring_past,
@@ -130,8 +116,7 @@ def _predict_direct_context_generation(
         device=device,
         max_input_tokens=context_budget,
     )
-    context_past = _ensure_model_cache(extract_past_key_values(model, prepared["cache_input_ids"]))
-    context_past = _ensure_model_cache(context_past)
+    context_past = extract_past_key_values(model, prepared["cache_input_ids"])
     return predict_generation_task_answer(
         model=model,
         tokenizer=tokenizer,
@@ -168,18 +153,15 @@ def _predict_kvcomm_logit(
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
     source_past = extract_past_key_values(source_model, prepared["cache_input_ids"])
-    kvcomm_past = _ensure_model_cache(
-        pool.build_replayed_target_past(
-            edge_id=edge_id,
-            source_past_key_values=source_past,
-        )
+    kvcomm_past = pool.build_replayed_target_past(
+        edge_id=edge_id,
+        source_past_key_values=source_past,
     )
     scoring_past = prepare_answer_scoring_past(
         model=target_model,
         past_key_values=kvcomm_past,
         question_cache_ids=prepared["question_cache_ids"],
     )
-    scoring_past = _ensure_model_cache(scoring_past)
     scores = score_answer_choices(
         model=target_model,
         past_key_values=scoring_past,
@@ -214,13 +196,10 @@ def _predict_kvcomm_generation(
         max_input_tokens=context_budget,
     )
     source_past = extract_past_key_values(source_model, prepared["cache_input_ids"])
-    kvcomm_past = _ensure_model_cache(
-        pool.build_replayed_target_past(
-            edge_id=edge_id,
-            source_past_key_values=source_past,
-        )
+    kvcomm_past = pool.build_replayed_target_past(
+        edge_id=edge_id,
+        source_past_key_values=source_past,
     )
-    kvcomm_past = _ensure_model_cache(kvcomm_past)
     return predict_generation_task_answer(
         model=target_model,
         tokenizer=tokenizer,
@@ -239,9 +218,7 @@ def _build_logit_example_state(
 ):
     return {
         "past_by_node_id": {
-            node.id: _ensure_model_cache(
-                extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
-            )
+            node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
             for node in ctx.nodes
         }
     }
@@ -255,11 +232,9 @@ def _build_logit_edge_artifacts(
     **_,
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
-    kvcomm_past = _ensure_model_cache(
-        translator_pool.build_replayed_target_past(
-            edge_id=edge.id,
-            source_past_key_values=past_by_node_id[edge.src_id],
-        )
+    kvcomm_past = translator_pool.build_replayed_target_past(
+        edge_id=edge.id,
+        source_past_key_values=past_by_node_id[edge.src_id],
     )
     return LogitEvalEdgeArtifacts(
         translated_past_key_values=kvcomm_past,
@@ -275,12 +250,10 @@ def _build_logit_edge_artifacts(
 
 
 def _prepare_kvcomm_scoring_past(*, model, past_key_values, question_cache_ids):
-    return _ensure_model_cache(
-        prepare_answer_scoring_past(
-            model=model,
-            past_key_values=past_key_values,
-            question_cache_ids=question_cache_ids,
-        )
+    return prepare_answer_scoring_past(
+        model=model,
+        past_key_values=past_key_values,
+        question_cache_ids=question_cache_ids,
     )
 
 
@@ -361,14 +334,12 @@ def evaluate_generation_dataset(
                     context_budget=context_budget,
                 )
 
-                kvcomm_source_past = _ensure_model_cache(extract_past_key_values(source_model, cache_input_ids))
-                kvcomm_replayed_past = _ensure_model_cache(
-                    translator_pool.build_replayed_target_past(
-                        edge_id=edge.id,
-                        source_past_key_values=kvcomm_source_past,
-                    )
+                kvcomm_source_past = extract_past_key_values(source_model, cache_input_ids)
+                kvcomm_replayed_past = translator_pool.build_replayed_target_past(
+                    edge_id=edge.id,
+                    source_past_key_values=kvcomm_source_past,
                 )
-                native_target_past = _ensure_model_cache(extract_past_key_values(target_model, cache_input_ids))
+                native_target_past = extract_past_key_values(target_model, cache_input_ids)
                 cosine_value = _compute_selected_layer_cosine(
                     translator_pool=translator_pool,
                     edge_id=edge.id,
@@ -445,20 +416,16 @@ def run_eval(
     logging.info("Preparing validation dataloader for %s", calibration_eval_name)
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        return _ensure_model_cache(
-            translator_pool.build_replayed_target_past(
-                edge_id=edge.id,
-                source_past_key_values=past_by_node_id[edge.src_id],
-            )
+        return translator_pool.build_replayed_target_past(
+            edge_id=edge.id,
+            source_past_key_values=past_by_node_id[edge.src_id],
         )
 
     def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
-        native_past = _ensure_model_cache(past_by_node_id[edge.tgt_id])
-        translated_past = _ensure_model_cache(
-            translator_pool.build_replayed_target_past(
-                edge_id=edge.id,
-                source_past_key_values=past_by_node_id[edge.src_id],
-            )
+        native_past = past_by_node_id[edge.tgt_id]
+        translated_past = translator_pool.build_replayed_target_past(
+            edge_id=edge.id,
+            source_past_key_values=past_by_node_id[edge.src_id],
         )
         source_selected_past, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
             translator_pool=translator_pool,
