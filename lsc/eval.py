@@ -33,23 +33,17 @@ def _build_logit_edge_artifacts(
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
 
-    translated_top_past = translator_pool.translate_top_layers(
+    translated_past = translator_pool.translate_layers(
         past_key_values=past_by_node_id[edge.src_id],
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
     )
-    target_top = slice_top_layers(
-        past_key_values=past_by_node_id[edge.tgt_id],
-        top_layers_to_translate=ctx.mm.get_model_spec(edge.tgt_id).num_layers,
-    )
+    native_past = past_by_node_id[edge.tgt_id]
     return LogitEvalEdgeArtifacts(
-        translated_past_key_values=replace_top_layers(
-            base_past_key_values=past_by_node_id[edge.tgt_id],
-            translated_top_past_key_values=translated_top_past,
-        ),
-        native_past_key_values=past_by_node_id[edge.tgt_id],
-        cosine_value=cosine_similarity_between_past(translated_top_past, target_top),
+        translated_past_key_values=translated_past,
+        native_past_key_values=native_past,
+        cosine_value=cosine_similarity_between_past(translated_past, native_past),
     )
 
 
@@ -113,28 +107,20 @@ def evaluate_generation_dataset(
             }
 
             for edge in edges:
-                translated_top_past = translator_pool.translate_top_layers(
+                translated_past = translator_pool.translate_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
-                target_top = slice_top_layers(
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    top_layers_to_translate=ctx.mm.get_model_spec(edge.tgt_id).num_layers,
-                )
-                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
-
-                mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.tgt_id],
-                    translated_top_past_key_values=translated_top_past,
-                )
+                native_past = past_by_node_id[edge.tgt_id]
+                cosine_value = cosine_similarity_between_past(translated_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     question_cache_ids=question_cache_ids,
@@ -208,7 +194,7 @@ def run_eval(
             ctx.mm.get_model_spec(node.id).num_heads,
             node.model_id,
         )
-    logging.info("translation_mode=replace_top_layers_after_target_forward")
+    logging.info("translation_mode=translate_all_layers")
     logging.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
@@ -217,35 +203,25 @@ def run_eval(
     logging.info("Preparing validation dataloader for OpenWebText/validation")
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        translated_top_past = translator_pool.translate_top_layers(
+        return translator_pool.translate_layers(
             past_key_values=past_by_node_id[edge.src_id],
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-        )
-        return replace_top_layers(
-            base_past_key_values=past_by_node_id[edge.tgt_id],
-            translated_top_past_key_values=translated_top_past,
         )
 
     def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
         source_past = past_by_node_id[edge.src_id]
         target_past = past_by_node_id[edge.tgt_id]
         return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=slice_top_layers(
-                past_key_values=source_past,
-                top_layers_to_translate=ctx.mm.get_model_spec(edge.src_id).num_layers,
-            ),
-            translated_past_key_values=translator_pool.translate_top_layers(
+            source_top_past_key_values=source_past,
+            translated_past_key_values=translator_pool.translate_layers(
                 past_key_values=source_past,
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
                 tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
             ),
-            target_top_past_key_values=slice_top_layers(
-                past_key_values=target_past,
-                top_layers_to_translate=ctx.mm.get_model_spec(edge.tgt_id).num_layers,
-            ),
+            target_top_past_key_values=target_past,
         )
 
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(

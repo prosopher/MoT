@@ -248,19 +248,14 @@ class SharedKVTranslatorPool(nn.Module):
         shared_cache = self.adapters[src_node_id].to_shared(key_block, value_block)
         return self.adapters[tgt_node_id].from_shared(shared_cache)
 
-    def translate_top_layers(
+    def translate_layers(
         self,
         past_key_values: PastKeyValues,
         src_node_id: str,
         tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> PastKeyValues:
-        src_top_layers = self.mm.get_model_spec(src_node_id).num_layers
-        src_top_past = slice_top_layers(
-            past_key_values=past_key_values,
-            top_layers_to_translate=src_top_layers,
-        )
-        key_block, value_block = past_key_values_to_blocks(src_top_past)
+        key_block, value_block = past_key_values_to_blocks(past_key_values)
         translated_key, translated_value = self.translate_blocks(
             key_block=key_block,
             value_block=value_block,
@@ -429,19 +424,15 @@ def run_train(
 
             total_direction_loss = 0.0
             for edge in edges:
-                translated_top_past = translator_pool.translate_top_layers(
+                translated_past = translator_pool.translate_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
-                mixed_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.tgt_id],
-                    translated_top_past_key_values=translated_top_past,
-                )
                 direction_loss = compute_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 )
