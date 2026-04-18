@@ -368,7 +368,6 @@ def run_eval(
         edge: Edge,
         prefix_cache_ids: torch.Tensor,
         past_by_node_id,
-        **_,
     ) -> PastKeyValues:
         _, source_hidden_states = extract_model_prefill_artifacts(
             ctx.mm.get_model(edge.src_id),

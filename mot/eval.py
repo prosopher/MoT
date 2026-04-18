@@ -339,7 +339,6 @@ def run_eval(
         edge: Edge,
         prefix_cache_ids: torch.Tensor,
         past_by_node_id,
-        **_,
     ) -> PastKeyValues:
         mixed_target_past, _ = translator_pool.build_replayed_target_past(
             source_past_key_values=past_by_node_id[edge.src_id],
