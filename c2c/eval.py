@@ -49,18 +49,15 @@ def _build_logit_edge_artifacts(
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
     )
 
-    target_top = slice_top_layers(
-        past_key_values=past_by_node_id[edge.tgt_id],
-        top_layers_to_translate=get_top_layers_to_translate(train_config),
-    )
+    native_past = past_by_node_id[edge.tgt_id]
     translated_target_past = replace_top_layers(
-        base_past_key_values=past_by_node_id[edge.tgt_id],
+        base_past_key_values=native_past,
         translated_top_past_key_values=translated_top_past,
     )
     return LogitEvalEdgeArtifacts(
         translated_past_key_values=translated_target_past,
-        native_past_key_values=past_by_node_id[edge.tgt_id],
-        cosine_value=cosine_similarity_between_past(translated_top_past, target_top),
+        native_past_key_values=native_past,
+        cosine_value=cosine_similarity_between_past(translated_target_past, native_past),
     )
 
 
@@ -135,16 +132,12 @@ def evaluate_generation_dataset(
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
-                target_top = slice_top_layers(
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    top_layers_to_translate=get_top_layers_to_translate(train_config),
-                )
-                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
-
+                native_past = past_by_node_id[edge.tgt_id]
                 translated_target_past = replace_top_layers(
-                    base_past_key_values=past_by_node_id[edge.tgt_id],
+                    base_past_key_values=native_past,
                     translated_top_past_key_values=translated_top_past,
                 )
+                cosine_value = cosine_similarity_between_past(translated_target_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),

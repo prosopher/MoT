@@ -62,7 +62,7 @@ def _build_logit_edge_artifacts(
     **_,
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
-    mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
+    mixed_target_past, _ = translator_pool.build_replayed_target_past(
         source_past_key_values=past_by_node_id[edge.src_id],
         prefix_input_ids=cache_input_ids,
         target_model=ctx.mm.get_model(edge.tgt_id),
@@ -70,16 +70,11 @@ def _build_logit_edge_artifacts(
         tgt_node_id=edge.tgt_id,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
     )
-    native_target_window = build_partial_past_from_layer_indices(
-        past_key_values=past_by_node_id[edge.tgt_id],
-        layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-        num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
-        head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
-    )
+    native_past = past_by_node_id[edge.tgt_id]
     return LogitEvalEdgeArtifacts(
         translated_past_key_values=mixed_target_past,
-        native_past_key_values=past_by_node_id[edge.tgt_id],
-        cosine_value=cosine_similarity_between_past(translated_window_past, native_target_window),
+        native_past_key_values=native_past,
+        cosine_value=cosine_similarity_between_past(mixed_target_past, native_past),
     )
 
 
@@ -143,8 +138,7 @@ def evaluate_generation_dataset(
             }
 
             for edge in edges:
-                edge_channels = ctx.cm.get_channels(edge.id)
-                mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
+                mixed_target_past, _ = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=cache_input_ids,
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -153,13 +147,8 @@ def evaluate_generation_dataset(
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
 
-                native_target_window = build_partial_past_from_layer_indices(
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-                    num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
-                    head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
-                )
-                cosine_value = cosine_similarity_between_past(translated_window_past, native_target_window)
+                native_past = past_by_node_id[edge.tgt_id]
+                cosine_value = cosine_similarity_between_past(mixed_target_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),

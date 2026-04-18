@@ -26,41 +26,6 @@ def _build_calibration_eval_name(config) -> str:
     return f"{str(config.calibration_dataset).strip()}/validation"
 
 
-def _build_kvcomm_selected_layer_views(
-    *,
-    translator_pool: KVCommSelectionPool,
-    edge_id: str,
-    source_past_key_values,
-    target_past_key_values,
-    replayed_target_past_key_values,
-):
-    selected_source_layers = translator_pool.get_selected_source_layers(edge_id)
-    selected_target_layers = translator_pool.get_selected_target_layers(edge_id)
-    return (
-        select_past_layers_by_indices(source_past_key_values, selected_source_layers),
-        select_past_layers_by_indices(replayed_target_past_key_values, selected_target_layers),
-        select_past_layers_by_indices(target_past_key_values, selected_target_layers),
-    )
-
-
-def _compute_selected_layer_cosine(
-    *,
-    translator_pool: KVCommSelectionPool,
-    edge_id: str,
-    source_past_key_values,
-    target_past_key_values,
-    replayed_target_past_key_values,
-) -> float:
-    _, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
-        translator_pool=translator_pool,
-        edge_id=edge_id,
-        source_past_key_values=source_past_key_values,
-        target_past_key_values=target_past_key_values,
-        replayed_target_past_key_values=replayed_target_past_key_values,
-    )
-    return cosine_similarity_between_past(translated_selected_past, target_selected_past)
-
-
 def _openwebtext_total_tokens(config) -> int:
     return max(8, int(getattr(config, "total_tokens", 128)))
 
@@ -236,16 +201,17 @@ def _build_logit_edge_artifacts(
         edge_id=edge.id,
         source_past_key_values=past_by_node_id[edge.src_id],
     )
+    native_past = past_by_node_id[edge.tgt_id]
+    kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
+        edge=edge,
+        translator_pool=translator_pool,
+        replayed_past=kvcomm_past,
+        native_target_past=native_past,
+    )
     return LogitEvalEdgeArtifacts(
         translated_past_key_values=kvcomm_past,
-        native_past_key_values=past_by_node_id[edge.tgt_id],
-        cosine_value=_compute_selected_layer_cosine(
-            translator_pool=translator_pool,
-            edge_id=edge.id,
-            source_past_key_values=past_by_node_id[edge.src_id],
-            target_past_key_values=past_by_node_id[edge.tgt_id],
-            replayed_target_past_key_values=kvcomm_past,
-        ),
+        native_past_key_values=native_past,
+        cosine_value=cosine_similarity_between_past(kvcomm_past_for_cosine, native_past),
     )
 
 
@@ -255,6 +221,33 @@ def _prepare_kvcomm_scoring_past(*, model, past_key_values, question_cache_ids):
         past_key_values=past_key_values,
         question_cache_ids=question_cache_ids,
     )
+
+
+def _build_full_length_kvcomm_past_for_cosine(
+    *,
+    edge: Edge,
+    translator_pool: KVCommSelectionPool,
+    replayed_past: PastKeyValues,
+    native_target_past: PastKeyValues,
+) -> PastKeyValues:
+    selected_target_layers = set(translator_pool.get_selected_target_layers(edge.id))
+    selected_target_layers.add(0)
+    full_length_past = []
+    for layer_idx, (replayed_layer, native_layer) in enumerate(zip(replayed_past, native_target_past)):
+        if layer_idx in selected_target_layers:
+            full_length_past.append(replayed_layer)
+            continue
+
+        replayed_key, replayed_value = replayed_layer
+        native_key, native_value = native_layer
+        target_seq_len = native_key.shape[2]
+        full_length_past.append(
+            (
+                replayed_key.expand(-1, -1, target_seq_len, -1).contiguous(),
+                replayed_value.expand(-1, -1, target_seq_len, -1).contiguous(),
+            )
+        )
+    return tuple(full_length_past)
 
 
 def _finalize_logit_results(*, ctx: Context, results, **_) -> None:
@@ -340,13 +333,13 @@ def evaluate_generation_dataset(
                     source_past_key_values=kvcomm_source_past,
                 )
                 native_target_past = extract_past_key_values(target_model, cache_input_ids)
-                cosine_value = _compute_selected_layer_cosine(
+                kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
+                    edge=edge,
                     translator_pool=translator_pool,
-                    edge_id=edge.id,
-                    source_past_key_values=kvcomm_source_past,
-                    target_past_key_values=native_target_past,
-                    replayed_target_past_key_values=kvcomm_replayed_past,
+                    replayed_past=kvcomm_replayed_past,
+                    native_target_past=native_target_past,
                 )
+                cosine_value = cosine_similarity_between_past(kvcomm_past_for_cosine, native_target_past)
 
                 f1_value = compute_generation_f1(pred_kvcomm, gold_answers)
                 native_f1_value = compute_generation_f1(pred_direct, gold_answers)
@@ -427,17 +420,13 @@ def run_eval(
             edge_id=edge.id,
             source_past_key_values=past_by_node_id[edge.src_id],
         )
-        source_selected_past, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
-            translator_pool=translator_pool,
-            edge_id=edge.id,
-            source_past_key_values=past_by_node_id[edge.src_id],
-            target_past_key_values=native_past,
-            replayed_target_past_key_values=translated_past,
-        )
         return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=source_selected_past,
-            translated_past_key_values=translated_selected_past,
-            target_top_past_key_values=target_selected_past,
+            source_top_past_key_values=select_past_layers_by_indices(
+                past_by_node_id[edge.src_id],
+                translator_pool.get_selected_source_layers(edge.id),
+            ),
+            translated_past_key_values=translated_past,
+            target_top_past_key_values=native_past,
         )
 
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
