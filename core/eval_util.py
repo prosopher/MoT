@@ -791,7 +791,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
         def compute_translated_loss_value() -> float:
             translated_target_past = build_translated_target_past_fn(
                 edge=edge,
-                prefix_cache_ids=prefix_cache_ids,
                 past_by_node_id=past_by_node_id,
             )
             return float(
