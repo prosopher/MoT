@@ -4,6 +4,8 @@ import logging
 import math
 import random
 import string
+import threading
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
@@ -312,38 +314,74 @@ def format_memory_gib(num_bytes: float) -> str:
     return f"{gib:.2f} GiB"
 
 
-class GPUMemoryTracker:
+class CurrentProcessGPUMemoryReader:
     def __init__(self, device: str) -> None:
         self.device = device
         self.enabled = torch.cuda.is_available() and device.startswith("cuda")
+        if self.enabled:
+            device_index = torch.device(device).index
+            self.device_index = torch.cuda.current_device() if device_index is None else device_index
+        else:
+            self.device_index = None
+
+    def read_allocated_bytes(self) -> Optional[int]:
+        if not self.enabled:
+            return None
+        return int(torch.cuda.memory_allocated(self.device_index))
+
+
+class GPUMemoryTracker:
+    def __init__(self, device: str, *, sample_interval_sec: float = 0.02) -> None:
+        self.device = device
+        self.reader = CurrentProcessGPUMemoryReader(device)
+        self.enabled = self.reader.enabled
         self.total_allocated_bytes = 0.0
         self.num_samples = 0
         self.peak_allocated_bytes = 0
+        self.sample_interval_sec = max(float(sample_interval_sec), 0.001)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
         if self.enabled:
-            self.device_index = torch.device(device).index
-            if self.device_index is None:
-                self.device_index = torch.cuda.current_device()
-            torch.cuda.reset_peak_memory_stats(self.device_index)
-        else:
-            self.device_index = None
+            self._thread = threading.Thread(
+                target=self._sample_loop,
+                name="gpu-memory-tracker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _record_sample(self, allocated: Optional[int]) -> None:
+        if allocated is None:
+            return
+        with self._lock:
+            self.total_allocated_bytes += float(allocated)
+            self.num_samples += 1
+            self.peak_allocated_bytes = max(self.peak_allocated_bytes, int(allocated))
+
+    def _sample_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._record_sample(self.reader.read_allocated_bytes())
+            self._stop_event.wait(self.sample_interval_sec)
 
     def update(self) -> None:
         if not self.enabled:
             return
+        self._record_sample(self.reader.read_allocated_bytes())
 
-        allocated = torch.cuda.memory_allocated(self.device_index)
-        peak = torch.cuda.max_memory_allocated(self.device_index)
-
-        self.total_allocated_bytes += float(allocated)
-        self.num_samples += 1
-        self.peak_allocated_bytes = max(self.peak_allocated_bytes, peak)
+    def close(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=max(1.0, self.sample_interval_sec * 4.0))
+        self._thread = None
 
     @property
     def avg_allocated_bytes(self) -> float:
-        if self.num_samples == 0:
-            return 0.0
-        return self.total_allocated_bytes / self.num_samples
+        with self._lock:
+            if self.num_samples == 0:
+                return 0.0
+            return self.total_allocated_bytes / self.num_samples
 
     def summary(self) -> Dict[str, object]:
         if not self.enabled:
@@ -356,13 +394,18 @@ class GPUMemoryTracker:
                 "num_samples": 0,
             }
 
+        with self._lock:
+            avg_allocated_bytes = 0.0 if self.num_samples == 0 else self.total_allocated_bytes / self.num_samples
+            peak_allocated_bytes = self.peak_allocated_bytes
+            num_samples = self.num_samples
+
         return {
             "enabled": True,
-            "avg_allocated_bytes": self.avg_allocated_bytes,
-            "peak_allocated_bytes": self.peak_allocated_bytes,
-            "avg_allocated_pretty": format_memory_gib(self.avg_allocated_bytes),
-            "peak_allocated_pretty": format_memory_gib(self.peak_allocated_bytes),
-            "num_samples": self.num_samples,
+            "avg_allocated_bytes": avg_allocated_bytes,
+            "peak_allocated_bytes": peak_allocated_bytes,
+            "avg_allocated_pretty": format_memory_gib(avg_allocated_bytes),
+            "peak_allocated_pretty": format_memory_gib(peak_allocated_bytes),
+            "num_samples": num_samples,
         }
 
 

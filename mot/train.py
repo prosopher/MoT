@@ -750,6 +750,7 @@ def load_translator_pool_from_checkpoint(
 
 def run_train(
     ctx: Context,
+    gpu_memory_tracker: GPUMemoryTracker,
 ) -> Path:
     config = ctx.config
     nodes = ctx.nodes
@@ -807,7 +808,6 @@ def run_train(
         total_steps=config.max_steps,
     )
 
-    gpu_memory_tracker = GPUMemoryTracker(config.device)
 
     running_loss = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")

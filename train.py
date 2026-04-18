@@ -3,7 +3,7 @@ import importlib
 from pathlib import Path
 
 from core.channel_manager import ChannelManager
-from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
+from core.common import GPUMemoryTracker, add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import build_nodes_and_edges
@@ -77,7 +77,11 @@ def main() -> None:
         profile_config = train_module.load_channel_profile_config(Path(args.channel_profile_config_path))
         ctx.cp = train_module.ChannelProfiler(ctx, profile_config)
 
-    final_checkpoint = Path(train_module.run_train(ctx))
+    gpu_memory_tracker = GPUMemoryTracker(config.device)
+    try:
+        final_checkpoint = Path(train_module.run_train(ctx, gpu_memory_tracker))
+    finally:
+        gpu_memory_tracker.close()
 
     print(f"Saved outputs to {final_checkpoint.parent}")
     print(f"Final checkpoint: {final_checkpoint}")

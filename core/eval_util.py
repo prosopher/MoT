@@ -93,31 +93,65 @@ class InferenceProfileAccumulator:
 
 
 class InferenceProfiler:
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, *, sample_interval_sec: float = 0.005) -> None:
         self.device = device
-        self.enabled = torch.cuda.is_available() and self.device.startswith("cuda")
+        self.reader = CurrentProcessGPUMemoryReader(device)
+        self.enabled = self.reader.enabled
+        self.sample_interval_sec = max(float(sample_interval_sec), 0.001)
         if self.enabled:
             device_index = torch.device(self.device).index
             self.device_index = torch.cuda.current_device() if device_index is None else device_index
         else:
             self.device_index = None
 
-    def measure(self, fn: Callable[[], float], *, tokens: int) -> Tuple[float, Dict[str, Optional[float]]]:
+    def _measure_peak_allocated_bytes(self, fn: Callable[[], T]) -> Tuple[T, Optional[int]]:
+        if not self.enabled:
+            return fn(), None
+
+        peak_memory_bytes = 0
+        stop_event = threading.Event()
+        peak_lock = threading.Lock()
+
+        def sample_memory() -> None:
+            nonlocal peak_memory_bytes
+            while not stop_event.is_set():
+                allocated = self.reader.read_allocated_bytes()
+                if allocated is not None:
+                    with peak_lock:
+                        peak_memory_bytes = max(peak_memory_bytes, int(allocated))
+                stop_event.wait(self.sample_interval_sec)
+
+        sampler = threading.Thread(
+            target=sample_memory,
+            name="inference-memory-profiler",
+            daemon=True,
+        )
+
+        initial_allocated = self.reader.read_allocated_bytes()
+        if initial_allocated is not None:
+            peak_memory_bytes = max(peak_memory_bytes, int(initial_allocated))
+
+        sampler.start()
+        try:
+            result = fn()
+            torch.cuda.synchronize(self.device_index)
+        finally:
+            stop_event.set()
+            sampler.join(timeout=max(1.0, self.sample_interval_sec * 4.0))
+
+        final_allocated = self.reader.read_allocated_bytes()
+        if final_allocated is not None:
+            peak_memory_bytes = max(peak_memory_bytes, int(final_allocated))
+
+        return result, peak_memory_bytes
+
+    def measure(self, fn: Callable[[], T], *, tokens: int) -> Tuple[T, Dict[str, Optional[float]]]:
         if self.enabled:
             torch.cuda.synchronize(self.device_index)
-            torch.cuda.reset_peak_memory_stats(self.device_index)
 
         started_at = time.perf_counter()
-        result = fn()
-        if self.enabled:
-            torch.cuda.synchronize(self.device_index)
+        result, peak_memory_bytes = self._measure_peak_allocated_bytes(fn)
         latency_sec = time.perf_counter() - started_at
-
-        peak_memory_bytes: Optional[int]
-        if self.enabled:
-            peak_memory_bytes = torch.cuda.max_memory_allocated(self.device_index)
-        else:
-            peak_memory_bytes = None
 
         return result, {
             "latency_sec": float(latency_sec),
@@ -613,6 +647,36 @@ def summarize_openwebtext_named_losses(
 
 
 @torch.inference_mode()
+def run_openwebtext_greedy_inference(
+    *,
+    model,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+    max_new_tokens: int,
+) -> int:
+    if max_new_tokens <= 0:
+        return 0
+
+    current_input_ids = seed_token
+    current_past = past_key_values
+    total_generated_tokens = 0
+
+    for _ in range(max_new_tokens):
+        outputs = model(
+            input_ids=current_input_ids,
+            past_key_values=current_past,
+            use_cache=True,
+        )
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        total_generated_tokens += int(next_token.numel())
+        current_input_ids = next_token
+        current_past = outputs.past_key_values
+
+    return total_generated_tokens
+
+
+
+@torch.inference_mode()
 def evaluate_openwebtext_validation_loss_metrics(
     *,
     ctx: Context,
@@ -786,38 +850,57 @@ def evaluate_openwebtext_validation_loss_top_layers(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = lm_labels.numel()
+        profile_tokens = int(lm_labels.numel())
+        seed_token = lm_input_ids[:, :1]
+        generation_steps = int(lm_labels.shape[1])
 
-        def compute_translated_loss_value() -> float:
+        translated_target_past_for_loss = build_translated_target_past_fn(
+            edge=edge,
+            past_by_node_id=past_by_node_id,
+        )
+        translated_loss = float(
+            compute_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=translated_target_past_for_loss,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        native_loss = float(
+            compute_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+
+        def run_translated_inference() -> int:
             translated_target_past = build_translated_target_past_fn(
                 edge=edge,
                 past_by_node_id=past_by_node_id,
             )
-            return float(
-                compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=translated_target_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=translated_target_past,
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        def compute_native_loss_value() -> float:
-            return float(
-                compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
+        def run_native_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        translated_loss, translated_profile = profiler.measure(
-            compute_translated_loss_value,
+        _, translated_profile = profiler.measure(
+            run_translated_inference,
             tokens=profile_tokens,
         )
-        native_loss, native_profile = profiler.measure(
-            compute_native_loss_value,
+        _, native_profile = profiler.measure(
+            run_native_inference,
             tokens=profile_tokens,
         )
         return (
@@ -868,43 +951,63 @@ def evaluate_openwebtext_validation_loss_replay(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = lm_labels.numel()
+        profile_tokens = int(lm_labels.numel())
+        seed_token = lm_input_ids[:, :1]
+        generation_steps = int(lm_labels.shape[1])
 
-        def compute_translated_loss_value() -> float:
+        mixed_target_past_for_loss = build_translated_target_past_fn(
+            edge=edge,
+            prefix_cache_ids=prefix_cache_ids,
+            past_by_node_id=past_by_node_id,
+        )
+        translated_loss = float(
+            compute_prefix_correction_and_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=mixed_target_past_for_loss,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+                native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+            ).item()
+        )
+        native_loss = float(
+            compute_prefix_correction_and_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+                native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+            ).item()
+        )
+
+        def run_translated_inference() -> int:
             mixed_target_past = build_translated_target_past_fn(
                 edge=edge,
                 prefix_cache_ids=prefix_cache_ids,
                 past_by_node_id=past_by_node_id,
             )
-            return float(
-                compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-                ).item()
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=mixed_target_past,
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        def compute_native_loss_value() -> float:
-            return float(
-                compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-                ).item()
+        def run_native_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        translated_loss, translated_profile = profiler.measure(
-            compute_translated_loss_value,
+        _, translated_profile = profiler.measure(
+            run_translated_inference,
             tokens=profile_tokens,
         )
-        native_loss, native_profile = profiler.measure(
-            compute_native_loss_value,
+        _, native_profile = profiler.measure(
+            run_native_inference,
             tokens=profile_tokens,
         )
         return (
@@ -960,6 +1063,7 @@ def evaluate_openwebtext_validation_loss(
         build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
+
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
     try:

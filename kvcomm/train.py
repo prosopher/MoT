@@ -507,7 +507,7 @@ def _select_layers_for_edge(
     )
 
 
-def run_train(ctx: Context) -> Path:
+def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
