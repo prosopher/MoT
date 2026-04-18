@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 import importlib
 import time
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 import numpy as np
 
@@ -2536,6 +2536,129 @@ def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningA
         results[path_name] = meter.summary()
 
     return results
+
+
+@dataclass
+class LogitEvalEdgeArtifacts:
+    translated_past_key_values: PastKeyValues
+    native_past_key_values: PastKeyValues
+    cosine_value: float
+
+
+@torch.inference_mode()
+def evaluate_dataset(
+    *,
+    ctx: Context,
+    spec: HFDatasetSpec,
+    dataloader: DataLoader,
+    eval_config: EvalConfig,
+    translator_pool,
+    build_example_state_fn: Callable[..., Any],
+    build_edge_artifacts_fn: Callable[..., LogitEvalEdgeArtifacts],
+    prepare_scoring_past_fn: Callable[..., PastKeyValues] = prepare_answer_scoring_past,
+    finalize_results_fn: Optional[Callable[..., None]] = None,
+    progress_interval: int = 50,
+) -> Dict[str, Dict[str, float]]:
+    nodes = ctx.nodes
+    edges = ctx.edges
+    device = ctx.config.device
+    tokenizer = ctx.tokenizer
+    path_metrics = {edge.id: RunningAverage() for edge in edges}
+    candidate_token_ids = build_logit_answer_candidates(
+        tokenizer=tokenizer,
+        spec=spec,
+    )
+
+    processed_examples = 0
+
+    for batch_idx, batch in enumerate(dataloader, start=1):
+        for example in batch:
+            question = example["question"]
+            gold_answer = example["answer"]
+            context_text = example.get("context")
+
+            prepared_inputs = prepare_logit_task_inputs(
+                spec=spec,
+                tokenizer=tokenizer,
+                context=context_text,
+                question=question,
+                device=device,
+                choices=example.get("choices"),
+                subject=example.get("subject"),
+            )
+            cache_input_ids = prepared_inputs["cache_input_ids"]
+            question_cache_ids = prepared_inputs["question_cache_ids"]
+            seed_token = prepared_inputs["seed_token"]
+
+            example_state = build_example_state_fn(
+                ctx=ctx,
+                spec=spec,
+                example=example,
+                cache_input_ids=cache_input_ids,
+                prepared_inputs=prepared_inputs,
+                translator_pool=translator_pool,
+            )
+
+            for edge in edges:
+                edge_artifacts = build_edge_artifacts_fn(
+                    ctx=ctx,
+                    spec=spec,
+                    edge=edge,
+                    example=example,
+                    cache_input_ids=cache_input_ids,
+                    prepared_inputs=prepared_inputs,
+                    example_state=example_state,
+                    translator_pool=translator_pool,
+                )
+
+                target_model = ctx.mm.get_model(edge.tgt_id)
+                translated_scoring_past = prepare_scoring_past_fn(
+                    model=target_model,
+                    past_key_values=edge_artifacts.translated_past_key_values,
+                    question_cache_ids=question_cache_ids,
+                )
+                native_scoring_past = prepare_scoring_past_fn(
+                    model=target_model,
+                    past_key_values=edge_artifacts.native_past_key_values,
+                    question_cache_ids=question_cache_ids,
+                )
+
+                translated_scores = score_answer_choices(
+                    model=target_model,
+                    past_key_values=translated_scoring_past,
+                    seed_token=seed_token,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+                native_scores = score_answer_choices(
+                    model=target_model,
+                    past_key_values=native_scoring_past,
+                    seed_token=seed_token,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+
+                translated_pred = predict_answer_label(translated_scores)
+                native_pred = predict_answer_label(native_scores)
+
+                acc = 1.0 if is_logit_answer_correct(translated_pred, gold_answer) else 0.0
+                native_acc = 1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0
+                path_metrics[edge.id].update(edge_artifacts.cosine_value, acc, native_acc, 1)
+
+            processed_examples += 1
+
+        if progress_interval > 0 and batch_idx % progress_interval == 0:
+            logging.info(
+                "[%s] progress: %d/%d examples",
+                spec.name_for_log,
+                processed_examples,
+                eval_config.max_examples_per_dataset,
+            )
+
+    summarized = summarize_path_metrics(path_metrics)
+    if finalize_results_fn is not None:
+        finalize_results_fn(ctx=ctx, spec=spec, results=summarized)
+    return summarized
 
 
 def build_edge_pretty_name(edge_id: str, nodes: List[Node], edges: List[Edge]) -> str:

@@ -231,128 +231,64 @@ def _predict_kvcomm_generation(
     )
 
 
-def evaluate_dataset(
+def _build_logit_example_state(
     *,
     ctx: Context,
-    spec,
-    dataloader: DataLoader,
-    eval_config: EvalConfig,
-    translator_pool: KVCommSelectionPool,
-) -> Dict[str, Dict[str, float]]:
-    device = ctx.config.device
-    tokenizer = ctx.tokenizer
-    edge_map = {edge.id: edge for edge in ctx.edges}
-
-    path_metrics = {
-        edge.id: RunningAverage()
-        for edge in ctx.edges
+    cache_input_ids: torch.Tensor,
+    **_,
+):
+    return {
+        "past_by_node_id": {
+            node.id: _ensure_model_cache(
+                extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+            )
+            for node in ctx.nodes
+        }
     }
 
-    processed_examples = 0
 
-    for batch_idx, batch in enumerate(dataloader, start=1):
-        for example in batch:
-            question = example["question"]
-            gold_answer = example["answer"]
-            context_text = example.get("context")
+def _build_logit_edge_artifacts(
+    *,
+    edge: Edge,
+    example_state,
+    translator_pool: KVCommSelectionPool,
+    **_,
+) -> LogitEvalEdgeArtifacts:
+    past_by_node_id = example_state["past_by_node_id"]
+    kvcomm_past = _ensure_model_cache(
+        translator_pool.build_replayed_target_past(
+            edge_id=edge.id,
+            source_past_key_values=past_by_node_id[edge.src_id],
+        )
+    )
+    return LogitEvalEdgeArtifacts(
+        translated_past_key_values=kvcomm_past,
+        native_past_key_values=past_by_node_id[edge.tgt_id],
+        cosine_value=_compute_selected_layer_cosine(
+            translator_pool=translator_pool,
+            edge_id=edge.id,
+            source_past_key_values=past_by_node_id[edge.src_id],
+            target_past_key_values=past_by_node_id[edge.tgt_id],
+            replayed_target_past_key_values=kvcomm_past,
+        ),
+    )
 
-            prepared_inputs = prepare_logit_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context_text,
-                question=question,
-                device=device,
-                choices=example.get("choices"),
-                subject=example.get("subject"),
-            )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
-            seed_token = prepared_inputs["seed_token"]
 
-            candidate_token_ids = build_logit_answer_candidates(
-                tokenizer=tokenizer,
-                spec=spec,
-            )
+def _prepare_kvcomm_scoring_past(*, model, past_key_values, question_cache_ids):
+    return _ensure_model_cache(
+        prepare_answer_scoring_past(
+            model=model,
+            past_key_values=past_key_values,
+            question_cache_ids=question_cache_ids,
+        )
+    )
 
-            past_by_node_id = {
-                node.id: _ensure_model_cache(
-                    extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
-                )
-                for node in ctx.nodes
-            }
 
-            for edge_id, edge in edge_map.items():
-                target_model = ctx.mm.get_model(edge.tgt_id)
-
-                kvcomm_past = _ensure_model_cache(
-                    translator_pool.build_replayed_target_past(
-                        edge_id=edge_id,
-                        source_past_key_values=past_by_node_id[edge.src_id],
-                    )
-                )
-
-                cosine_value = _compute_selected_layer_cosine(
-                    translator_pool=translator_pool,
-                    edge_id=edge_id,
-                    source_past_key_values=past_by_node_id[edge.src_id],
-                    target_past_key_values=past_by_node_id[edge.tgt_id],
-                    replayed_target_past_key_values=kvcomm_past,
-                )
-
-                kvcomm_scoring_past = _ensure_model_cache(
-                    prepare_answer_scoring_past(
-                        model=target_model,
-                        past_key_values=kvcomm_past,
-                        question_cache_ids=question_cache_ids,
-                    )
-                )
-                native_scoring_past = _ensure_model_cache(
-                    prepare_answer_scoring_past(
-                        model=target_model,
-                        past_key_values=past_by_node_id[edge.tgt_id],
-                        question_cache_ids=question_cache_ids,
-                    )
-                )
-
-                kvcomm_scores = score_answer_choices(
-                    model=target_model,
-                    past_key_values=kvcomm_scoring_past,
-                    seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
-                )
-                native_scores = score_answer_choices(
-                    model=target_model,
-                    past_key_values=native_scoring_past,
-                    seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
-                )
-
-                pred_kvcomm = predict_answer_label(kvcomm_scores)
-                pred_native = predict_answer_label(native_scores)
-
-                acc = 1.0 if is_logit_answer_correct(pred_kvcomm, gold_answer) else 0.0
-                native_acc = 1.0 if is_logit_answer_correct(pred_native, gold_answer) else 0.0
-                path_metrics[edge_id].update(cosine_value, acc, native_acc, 1)
-
-            processed_examples += 1
-
-        if batch_idx % 50 == 0:
-            logging.info(
-                "[%s] progress: %d/%d examples",
-                spec.name_for_log,
-                processed_examples,
-                eval_config.max_examples_per_dataset,
-            )
-
-    summarized = summarize_path_metrics(path_metrics)
+def _finalize_logit_results(*, ctx: Context, results, **_) -> None:
     for edge in ctx.edges:
-        row = summarized[edge.id]
+        row = results[edge.id]
         row["direct_context_accuracy"] = row["native_accuracy"]
         row["kvcomm_accuracy"] = row["accuracy"]
-    return summarized
-
 
 
 def evaluate_generation_dataset(
@@ -574,6 +510,10 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
+            build_example_state_fn=_build_logit_example_state,
+            build_edge_artifacts_fn=_build_logit_edge_artifacts,
+            prepare_scoring_past_fn=_prepare_kvcomm_scoring_past,
+            finalize_results_fn=_finalize_logit_results,
         )
         all_logit_results[spec.name_for_log] = results
         log_dataset_result(

@@ -43,128 +43,63 @@ def build_partial_past_from_layer_indices(
     )
 
 
-@torch.inference_mode()
-def evaluate_dataset(
+def _build_logit_example_state(
+    *,
     ctx: Context,
-    spec: HFDatasetSpec,
-    dataloader: DataLoader,
-    eval_config: EvalConfig,
+    cache_input_ids: torch.Tensor,
+    **_,
+):
+    prefill_by_node_id = {
+        node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), cache_input_ids)
+        for node in ctx.nodes
+    }
+    return {
+        "past_by_node_id": {
+            node.id: prefill_by_node_id[node.id][0]
+            for node in ctx.nodes
+        },
+        "hidden_states_by_node_id": {
+            node.id: prefill_by_node_id[node.id][1]
+            for node in ctx.nodes
+        },
+    }
+
+
+def _build_logit_edge_artifacts(
+    *,
+    ctx: Context,
+    edge: Edge,
+    cache_input_ids: torch.Tensor,
+    example_state,
     translator_pool,
-) -> Dict[str, Dict[str, float]]:
-    train_config = ctx.config
-    nodes = ctx.nodes
-    edges = ctx.edges
-    device = train_config.device
-    tokenizer = ctx.tokenizer
-    path_metrics = {edge.id: RunningAverage() for edge in edges}
-
-    processed_examples = 0
-
-    for batch_idx, batch in enumerate(dataloader, start=1):
-        for example in batch:
-            question = example["question"]
-            gold_answer = example["answer"]
-            context_text = example.get("context")
-
-            prepared_inputs = prepare_logit_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context_text,
-                question=question,
-                device=device,
-                choices=example.get("choices"),
-                subject=example.get("subject"),
-            )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
-            seed_token = prepared_inputs["seed_token"]
-
-            candidate_token_ids = build_logit_answer_candidates(
-                tokenizer=tokenizer,
-                spec=spec,
-            )
-
-            prefill_by_node_id = {
-                node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), cache_input_ids)
-                for node in nodes
-            }
-            past_by_node_id = {
-                node.id: prefill_by_node_id[node.id][0]
-                for node in nodes
-            }
-            hidden_states_by_node_id = {
-                node.id: prefill_by_node_id[node.id][1]
-                for node in nodes
-            }
-
-            for edge in edges:
-                mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
-                    source_past_key_values=past_by_node_id[edge.src_id],
-                    prefix_input_ids=cache_input_ids,
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-                    source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
-                        ctx.mm.get_model(edge.src_id),
-                        hidden_states_by_node_id[edge.src_id],
-                        ctx.cm.get_src_layer_indices(edge.id),
-                    ),
-                )
-
-                native_target_window = build_partial_past_from_layer_indices(
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-                    num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
-                    head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
-                )
-                cosine_value = cosine_similarity_between_past(translated_window_past, native_target_window)
-
-                translated_scoring_past = prepare_answer_scoring_past(
-                    model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
-                    question_cache_ids=question_cache_ids,
-                )
-                native_scoring_past = prepare_answer_scoring_past(
-                    model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    question_cache_ids=question_cache_ids,
-                )
-
-                translated_scores = score_answer_choices(
-                    model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=translated_scoring_past,
-                    seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
-                )
-                native_scores = score_answer_choices(
-                    model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=native_scoring_past,
-                    seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
-                )
-
-                translated_pred = predict_answer_label(translated_scores)
-                native_pred = predict_answer_label(native_scores)
-
-                acc = 1.0 if is_logit_answer_correct(translated_pred, gold_answer) else 0.0
-                native_acc = 1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0
-
-                path_metrics[edge.id].update(cosine_value, acc, native_acc, 1)
-
-            processed_examples += 1
-
-        if batch_idx % 50 == 0:
-            logging.info(
-                "[%s] progress: %d/%d examples",
-                spec.name_for_log,
-                processed_examples,
-                eval_config.max_examples_per_dataset,
-            )
-
-    return summarize_path_metrics(path_metrics)
+    **_,
+) -> LogitEvalEdgeArtifacts:
+    past_by_node_id = example_state["past_by_node_id"]
+    hidden_states_by_node_id = example_state["hidden_states_by_node_id"]
+    mixed_target_past, translated_window_past = translator_pool.build_replayed_target_past(
+        source_past_key_values=past_by_node_id[edge.src_id],
+        prefix_input_ids=cache_input_ids,
+        target_model=ctx.mm.get_model(edge.tgt_id),
+        src_node_id=edge.src_id,
+        tgt_node_id=edge.tgt_id,
+        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+            ctx.mm.get_model(edge.src_id),
+            hidden_states_by_node_id[edge.src_id],
+            ctx.cm.get_src_layer_indices(edge.id),
+        ),
+    )
+    native_target_window = build_partial_past_from_layer_indices(
+        past_key_values=past_by_node_id[edge.tgt_id],
+        layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+        num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
+        head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
+    )
+    return LogitEvalEdgeArtifacts(
+        translated_past_key_values=mixed_target_past,
+        native_past_key_values=past_by_node_id[edge.tgt_id],
+        cosine_value=cosine_similarity_between_past(translated_window_past, native_target_window),
+    )
 
 
 @torch.inference_mode()
@@ -453,6 +388,8 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
+            build_example_state_fn=_build_logit_example_state,
+            build_edge_artifacts_fn=_build_logit_edge_artifacts,
         )
         all_logit_results[spec.name_for_log] = results
 
