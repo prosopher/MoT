@@ -85,15 +85,21 @@ class OpenWebTextRawStream(IterableDataset):
         shuffle_buffer: int,
     ) -> None:
         super().__init__()
+        if split != "train":
+            raise ValueError(f"Unsupported OpenWebText split: {split}")
         self.split = split
         self.shuffle = shuffle
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
 
-    def __iter__(self) -> Iterable[str]:
+    def _build_stream(self):
         stream = load_dataset("openwebtext", split=self.split, streaming=True)
         if self.shuffle:
             stream = stream.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
+        return stream
+
+    def __iter__(self) -> Iterable[str]:
+        stream = self._build_stream()
         for example in stream:
             text = str(example.get("text", "") or "")
             if text and not text.isspace():
@@ -213,6 +219,27 @@ def extract_last_hidden_states(model, input_ids: torch.Tensor) -> torch.Tensor:
     return outputs.hidden_states[-1]
 
 
+def get_model_context_limit(model) -> int:
+    config = getattr(model, "config", None)
+    candidates = [
+        getattr(config, "n_positions", None),
+        getattr(config, "max_position_embeddings", None),
+        getattr(config, "n_ctx", None),
+    ]
+    limits = [value for value in candidates if isinstance(value, int) and value > 0]
+    if not limits:
+        return 1024
+    return min(limits)
+
+
+def trim_input_ids_from_left(input_ids: torch.Tensor, *, max_length: int) -> torch.Tensor:
+    if max_length < 1:
+        raise ValueError(f"max_length must be >= 1, got {max_length}")
+    if input_ids.shape[1] <= max_length:
+        return input_ids
+    return input_ids[:, -max_length:]
+
+
 @torch.no_grad()
 def build_latent_conditioned_past(
     model,
@@ -220,6 +247,16 @@ def build_latent_conditioned_past(
     prefix_input_ids: torch.Tensor,
     latent_prefix: torch.Tensor,
 ) -> PastKeyValues:
+    model_context_limit = get_model_context_limit(model)
+    latent_tokens = int(latent_prefix.shape[1])
+    if latent_tokens >= model_context_limit:
+        raise ValueError(
+            f"latent_prefix length ({latent_tokens}) must be smaller than model context limit ({model_context_limit})"
+        )
+
+    max_prefix_tokens = model_context_limit - latent_tokens
+    prefix_input_ids = trim_input_ids_from_left(prefix_input_ids, max_length=max_prefix_tokens)
+
     token_embeds = model.get_input_embeddings()(prefix_input_ids)
     combined_embeds = torch.cat([latent_prefix.to(token_embeds.dtype), token_embeds], dim=1)
     attention_mask = torch.ones(
@@ -468,6 +505,16 @@ def run_train(
                 tgt_prefix_ids = target_input_ids[:, : config.prefix_tokens - 1]
                 lm_input_ids = target_input_ids[:, config.prefix_tokens - 1 : -1]
                 lm_labels = target_input_ids[:, config.prefix_tokens:]
+
+                tgt_model_context_limit = get_model_context_limit(ctx.mm.get_model(edge.tgt_id))
+                translated_prefix_budget = tgt_model_context_limit - config.latent_tokens - lm_input_ids.shape[1]
+                if translated_prefix_budget < 1:
+                    raise ValueError(
+                        "InterLat training sequence does not fit target model context window: "
+                        f"target={edge.tgt_id}, model_context_limit={tgt_model_context_limit}, "
+                        f"latent_tokens={config.latent_tokens}, lm_input_tokens={lm_input_ids.shape[1]}"
+                    )
+                tgt_prefix_ids = trim_input_ids_from_left(tgt_prefix_ids, max_length=translated_prefix_budget)
 
                 with torch.no_grad():
                     source_hidden_states = extract_last_hidden_states(
