@@ -555,7 +555,7 @@ LOGIT_QA_SPEC_GROUP_FACTORIES = [
 GEN_QA_SPEC_GROUP_FACTORIES = [
     get_squad_v11_dataset_spec,
     get_newsqa_generation_dataset_spec,
-    get_multinews_generation_dataset_spec,
+    # get_multinews_generation_dataset_spec,
 ]
 
 EVAL_SPEC_GROUP_FACTORIES = {
@@ -1414,29 +1414,29 @@ def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) ->
         return generation_examples
 
 
-    if spec.answer_mode == "multinews":
-        question_value = example.get(spec.question_field, None)
-        if isinstance(question_value, str) and question_value.strip():
-            question = question_value.strip()
-        else:
-            question = DEFAULT_MULTINEWS_SUMMARY_TASK
+    # if spec.answer_mode == "multinews":
+    #     question_value = example.get(spec.question_field, None)
+    #     if isinstance(question_value, str) and question_value.strip():
+    #         question = question_value.strip()
+    #     else:
+    #         question = DEFAULT_MULTINEWS_SUMMARY_TASK
 
-        context_field = spec.context_field or "document"
-        answers_field = spec.answers_field or "summary"
+    #     context_field = spec.context_field or "document"
+    #     answers_field = spec.answers_field or "summary"
 
-        context = normalize_multinews_context_text(example.get(context_field, None))
-        if context is None:
-            return []
+    #     context = normalize_multinews_context_text(example.get(context_field, None))
+    #     if context is None:
+    #         return []
 
-        answer_texts = _normalize_answer_texts(example.get(answers_field, None))
-        if not answer_texts:
-            return []
+    #     answer_texts = _normalize_answer_texts(example.get(answers_field, None))
+    #     if not answer_texts:
+    #         return []
 
-        return [{
-            "question": question,
-            "context": context,
-            "answers": answer_texts,
-        }]
+    #     return [{
+    #         "question": question,
+    #         "context": context,
+    #         "answers": answer_texts,
+    #     }]
 
     raise ValueError(f"Unsupported generation answer_mode: {spec.answer_mode}")
 
@@ -2322,12 +2322,12 @@ def prepare_generation_task_question_prefix(
             question=question,
             device=device,
         )
-    if spec.answer_mode == "multinews":
-        return prepare_multinews_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
+    # if spec.answer_mode == "multinews":
+    #     return prepare_multinews_question_prefix(
+    #         tokenizer=tokenizer,
+    #         question=question,
+    #         device=device,
+    #     )
     return prepare_generation_question_prefix(
         tokenizer=tokenizer,
         question=question,
@@ -2434,26 +2434,26 @@ def prepare_generation_task_inputs(
             "was_truncated": context_prefix.get("was_truncated", False),
         }
 
-    if spec.answer_mode == "multinews":
-        context_prefix = prepare_multinews_context_inputs(
-            tokenizer=tokenizer,
-            context=context,
-            device=device,
-            max_input_tokens=max_input_tokens,
-        )
-        question_prefix = prepare_multinews_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
-        return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
-            "was_truncated": bool(context_prefix.get("was_truncated", False)),
-        }
+    # if spec.answer_mode == "multinews":
+    #     context_prefix = prepare_multinews_context_inputs(
+    #         tokenizer=tokenizer,
+    #         context=context,
+    #         device=device,
+    #         max_input_tokens=max_input_tokens,
+    #     )
+    #     question_prefix = prepare_multinews_question_prefix(
+    #         tokenizer=tokenizer,
+    #         question=question,
+    #         device=device,
+    #     )
+    #     return {
+    #         "context_prefix": context_prefix,
+    #         "question_prefix": question_prefix,
+    #         "cache_input_ids": context_prefix["input_ids"],
+    #         "question_cache_ids": question_prefix["cache_ids"],
+    #         "seed_token": question_prefix["seed_token"],
+    #         "was_truncated": bool(context_prefix.get("was_truncated", False)),
+    #     }
 
     prefix = prepare_generation_prefix(
         tokenizer=tokenizer,
@@ -2657,7 +2657,7 @@ def generate_greedy_answer(
 
 def postprocess_generated_answer(text: str) -> str:
     cleaned = text.strip()
-    for stopper in ["\n", "\r", "Question:", "Context:", "Answer:", "Task:", "Articles:", "Summary:"]:
+    for stopper in ["\n", "\r", "Question:", "Context:", "Answer:"]:
         if stopper in cleaned:
             cleaned = cleaned.split(stopper, 1)[0].strip()
     return cleaned
@@ -2991,7 +2991,7 @@ def build_edge_summary_markdown_table(
     generation_dataset_keys = [
         ("SQuAD", "SQuAD-v1.1/validation"),
         ("NewsQA", "NewsQA/validation"),
-        ("MultiNews", "MultiNews/validation"),
+        # ("MultiNews", "MultiNews/validation"),
     ]
 
     logit_rows = {
@@ -3022,12 +3022,12 @@ def build_edge_summary_markdown_table(
     translated_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("f1", float("nan")),
         generation_rows["NewsQA"].get("f1", float("nan")),
-        generation_rows["MultiNews"].get("f1", float("nan")),
+        # generation_rows["MultiNews"].get("f1", float("nan")),
     ])
     native_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("native_f1", float("nan")),
         generation_rows["NewsQA"].get("native_f1", float("nan")),
-        generation_rows["MultiNews"].get("native_f1", float("nan")),
+        # generation_rows["MultiNews"].get("native_f1", float("nan")),
     ])
 
     if edge is None:
@@ -3044,8 +3044,8 @@ def build_edge_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | MultiNews | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
@@ -3054,7 +3054,6 @@ def build_edge_summary_markdown_table(
             f"{_format_summary_percent(native_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
-            f"{_format_summary_float(generation_rows['MultiNews'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(native_generation_f1_avg)} | "
             f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} | "
             f"{native_latency_text} | "
@@ -3070,7 +3069,6 @@ def build_edge_summary_markdown_table(
             f"{_format_summary_percent(translated_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
-            f"{_format_summary_float(generation_rows['MultiNews'].get('f1', float('nan')))} | "
             f"{_format_summary_float(translated_generation_f1_avg)} | "
             f"{_format_summary_float(loss_row.get('loss', float('nan')))} | "
             f"{translated_latency_text} | "

@@ -253,7 +253,7 @@ def build_teacher_forcing_answer_token_ids(
         token_ids = choice_ids.get(answer_value.strip().lower())
         return None if token_ids is None else token_ids.clone()
 
-    if spec.answer_mode in {"squad", "newsqa", "multinews"}:
+    if spec.answer_mode in {"squad", "newsqa"}:
         answers = example.get("answers", None)
         if not isinstance(answers, list) or not answers:
             return None
