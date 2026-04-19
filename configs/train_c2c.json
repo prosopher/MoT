@@ -3,7 +3,7 @@
   "output_path": null,
   "model_ids": "gpt2-medium,gpt2",
   "model_directions": "A_to_B,B_to_A",
-  "max_steps": 10000,
+  "max_steps": 5000,
   "batch_size": 4,
   "grad_accum_steps": 4,
   "total_tokens": 128,
