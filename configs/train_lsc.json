@@ -1,9 +1,9 @@
 {
   "timestamp": null,
   "output_path": null,
-  "model_ids": "gpt2-medium,gpt2",
+  "model_ids": "gpt2,gpt2",
   "model_directions": "all",
-  "max_steps": 1000,
+  "max_steps": 500,
   "batch_size": 4,
   "grad_accum_steps": 4,
   "total_tokens": 128,
