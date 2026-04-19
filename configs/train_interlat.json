@@ -23,7 +23,8 @@
   "curriculum_token_mix_start": 1.0,
   "curriculum_token_mix_end": 0.0,
   "conditional_jsd_weight": 0.1,
-  "native_align_weight": 0.05,
   "device": "auto",
-  "dtype": "float32"
+  "dtype": "float32",
+  "plan_align_weight": 0.05,
+  "contrastive_margin_bits": 0.69
 }

@@ -44,7 +44,8 @@ class TrainConfig(Config):
     curriculum_token_mix_start: float
     curriculum_token_mix_end: float
     conditional_jsd_weight: float
-    native_align_weight: float
+    plan_align_weight: float
+    contrastive_margin_bits: float
     dtype: str
 
     def __post_init__(self) -> None:
@@ -333,33 +334,67 @@ def trim_communication_prefix_from_past(
 
 
 
-def compute_jsd_from_logits(
+def _masked_positions(labels: torch.Tensor) -> torch.Tensor:
+    return labels.reshape(-1).ne(-100)
+
+
+
+def compute_jsd_bits_from_logits(
     positive_logits: torch.Tensor,
     negative_logits: torch.Tensor,
+    lm_labels: torch.Tensor,
 ) -> torch.Tensor:
-    positive_log_probs = F.log_softmax(positive_logits, dim=-1)
-    negative_log_probs = F.log_softmax(negative_logits, dim=-1)
-    positive_probs = positive_log_probs.exp()
-    negative_probs = negative_log_probs.exp()
+    mask = _masked_positions(lm_labels)
+    if not torch.any(mask):
+        return torch.zeros((), device=positive_logits.device, dtype=positive_logits.dtype)
+    positive_probs = F.softmax(positive_logits.reshape(-1, positive_logits.shape[-1])[mask], dim=-1).clamp_min(1e-8)
+    negative_probs = F.softmax(negative_logits.reshape(-1, negative_logits.shape[-1])[mask], dim=-1).clamp_min(1e-8)
     mixture_probs = 0.5 * (positive_probs + negative_probs)
-    mixture_log_probs = torch.log(mixture_probs.clamp_min(1e-8))
-    jsd_positive = F.kl_div(mixture_log_probs, positive_probs, reduction="batchmean", log_target=False)
-    jsd_negative = F.kl_div(mixture_log_probs, negative_probs, reduction="batchmean", log_target=False)
-    return 0.5 * (jsd_positive + jsd_negative)
+    js_nats = 0.5 * F.kl_div(positive_probs.log(), mixture_probs, reduction="batchmean")
+    js_nats = js_nats + 0.5 * F.kl_div(negative_probs.log(), mixture_probs, reduction="batchmean")
+    return js_nats / torch.log(torch.tensor(2.0, device=positive_logits.device, dtype=positive_logits.dtype))
 
 
 
-def compute_symmetric_kl_from_logits(
-    lhs_logits: torch.Tensor,
-    rhs_logits: torch.Tensor,
+def compute_margin_jsd_separation_loss(
+    *,
+    positive_logits: torch.Tensor,
+    negative_logits: torch.Tensor,
+    lm_labels: torch.Tensor,
+    margin_bits: float,
 ) -> torch.Tensor:
-    lhs_log_probs = F.log_softmax(lhs_logits, dim=-1)
-    rhs_log_probs = F.log_softmax(rhs_logits, dim=-1)
-    lhs_probs = lhs_log_probs.exp()
-    rhs_probs = rhs_log_probs.exp()
-    lhs_to_rhs = F.kl_div(lhs_log_probs, rhs_probs, reduction="batchmean", log_target=False)
-    rhs_to_lhs = F.kl_div(rhs_log_probs, lhs_probs, reduction="batchmean", log_target=False)
-    return 0.5 * (lhs_to_rhs + rhs_to_lhs)
+    jsd_bits = compute_jsd_bits_from_logits(
+        positive_logits=positive_logits,
+        negative_logits=negative_logits,
+        lm_labels=lm_labels,
+    )
+    margin_tensor = torch.tensor(margin_bits, device=positive_logits.device, dtype=positive_logits.dtype)
+    return torch.clamp(margin_tensor - jsd_bits, min=0.0)
+
+
+
+def compute_plan_alignment_loss(
+    *,
+    positive_logits: torch.Tensor,
+    plan_logits: torch.Tensor,
+    lm_labels: torch.Tensor,
+    kl_weight: float = 0.7,
+    cos_weight: float = 0.3,
+) -> torch.Tensor:
+    mask = _masked_positions(lm_labels)
+    if not torch.any(mask):
+        return torch.zeros((), device=positive_logits.device, dtype=positive_logits.dtype)
+    positive_selected = positive_logits.reshape(-1, positive_logits.shape[-1])[mask]
+    plan_selected = plan_logits.reshape(-1, plan_logits.shape[-1])[mask]
+    kl_loss = F.kl_div(
+        F.log_softmax(positive_selected, dim=-1),
+        F.softmax(plan_selected, dim=-1).clamp_min(1e-8),
+        reduction="batchmean",
+    )
+    positive_probs = F.softmax(positive_selected, dim=-1).clamp_min(1e-8).reshape(-1)
+    plan_probs = F.softmax(plan_selected, dim=-1).clamp_min(1e-8).reshape(-1)
+    cos_loss = 1.0 - F.cosine_similarity(positive_probs, plan_probs, dim=0)
+    return (kl_weight * kl_loss) + (cos_weight * cos_loss)
 
 
 
@@ -383,11 +418,12 @@ def compute_interlat_training_losses(
     target_model: nn.Module,
     positive_past_key_values: PastKeyValues,
     negative_past_key_values: PastKeyValues,
-    native_past_key_values: PastKeyValues,
+    plan_past_key_values: PastKeyValues,
     lm_input_ids: torch.Tensor,
     lm_labels: torch.Tensor,
     conditional_jsd_weight: float,
-    native_align_weight: float,
+    plan_align_weight: float,
+    contrastive_margin_bits: float,
 ) -> Dict[str, torch.Tensor]:
     positive_logits = forward_target_logits(
         target_model=target_model,
@@ -398,6 +434,7 @@ def compute_interlat_training_losses(
     ce_loss = F.cross_entropy(
         positive_logits.reshape(-1, vocab_size),
         lm_labels.reshape(-1),
+        ignore_index=-100,
         reduction="mean",
     )
 
@@ -406,22 +443,32 @@ def compute_interlat_training_losses(
         past_key_values=negative_past_key_values,
         lm_input_ids=lm_input_ids,
     )
-    jsd = compute_jsd_from_logits(positive_logits, negative_logits)
 
     with torch.no_grad():
-        native_logits = forward_target_logits(
+        plan_logits = forward_target_logits(
             target_model=target_model,
-            past_key_values=native_past_key_values,
+            past_key_values=plan_past_key_values,
             lm_input_ids=lm_input_ids,
         )
-    native_align = compute_symmetric_kl_from_logits(positive_logits, native_logits)
 
-    total_loss = ce_loss - (conditional_jsd_weight * jsd) + (native_align_weight * native_align)
+    random_contrast = compute_margin_jsd_separation_loss(
+        positive_logits=positive_logits,
+        negative_logits=negative_logits,
+        lm_labels=lm_labels,
+        margin_bits=contrastive_margin_bits,
+    )
+    plan_align = compute_plan_alignment_loss(
+        positive_logits=positive_logits,
+        plan_logits=plan_logits,
+        lm_labels=lm_labels,
+    )
+
+    total_loss = ce_loss + (conditional_jsd_weight * random_contrast) + (plan_align_weight * plan_align)
     return {
         "total": total_loss,
         "ce": ce_loss.detach(),
-        "jsd": jsd.detach(),
-        "native_align": native_align.detach(),
+        "jsd": random_contrast.detach(),
+        "plan_align": plan_align.detach(),
     }
 
 
@@ -564,10 +611,6 @@ def run_train(
                     node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), prefix_cache_ids)
                     for node in nodes
                 }
-                native_past_by_node_id = {
-                    node.id: prefill_by_node_id[node.id][0]
-                    for node in nodes
-                }
                 last_hidden_by_node_id = {
                     node.id: prefill_by_node_id[node.id][1]
                     for node in nodes
@@ -597,20 +640,30 @@ def run_train(
                     source_input_ids_for_curriculum=None,
                     curriculum_token_mix_rate=0.0,
                 )
+                plan_past = translator_pool.build_target_past_from_source_latents(
+                    source_last_hidden_state=last_hidden_by_node_id[edge.src_id],
+                    prefix_input_ids=prefix_cache_ids,
+                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
+                    source_input_ids_for_curriculum=prefix_cache_ids,
+                    curriculum_token_mix_rate=1.0,
+                )
                 losses = compute_interlat_training_losses(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     positive_past_key_values=positive_past,
                     negative_past_key_values=negative_past,
-                    native_past_key_values=native_past_by_node_id[edge.tgt_id],
+                    plan_past_key_values=plan_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     conditional_jsd_weight=config.conditional_jsd_weight,
-                    native_align_weight=config.native_align_weight,
+                    plan_align_weight=config.plan_align_weight,
+                    contrastive_margin_bits=config.contrastive_margin_bits,
                 )
                 total_direction_loss = total_direction_loss + losses["total"]
                 total_direction_ce = total_direction_ce + losses["ce"]
                 total_direction_jsd = total_direction_jsd + losses["jsd"]
-                total_direction_align = total_direction_align + losses["native_align"]
+                total_direction_align = total_direction_align + losses["plan_align"]
 
             loss = total_direction_loss / config.grad_accum_steps
             loss.backward()
@@ -641,7 +694,7 @@ def run_train(
             )
             gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] total_loss=%.4f | ce=%.4f | jsd=%.4f | native_align=%.4f | token_mix=%.3f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] total_loss=%.4f | ce=%.4f | jsd_margin=%.4f | plan_align=%.4f | token_mix=%.3f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_total_loss,
                 avg_ce_loss,
