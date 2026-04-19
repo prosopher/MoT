@@ -28,5 +28,5 @@
   "variant": "c2c-pr",
   "projector_dim": 1024,
   "projector_depth": 2,
-  "projector_mlp_ratio": 2
+  "projector_mlp_ratio": 4
 }
