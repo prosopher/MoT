@@ -104,6 +104,23 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
         ]
         return FakeMapDataset(items)
 
+    if key == ("Awesome075/multi_news_parquet", None, "validation"):
+        long_prefix = " ||||| ".join([
+            " ".join(["multinews"] * 45),
+            "A coalition of editors produced a concise validation summary.",
+        ])
+        items = [
+            {
+                "document": long_prefix,
+                "summary": "Editors produced a concise validation summary.",
+            },
+            {
+                "document": "Report one describes the launch. ||||| Report two describes the reaction.",
+                "summary": "The reports cover a launch and the reaction.",
+            },
+        ]
+        return FakeMapDataset(items)
+
     raise ValueError(
         f"Unsupported fake dataset request: dataset_path={dataset_path!r}, dataset_name={dataset_name!r}, split={split!r}, streaming={streaming!r}"
     )
