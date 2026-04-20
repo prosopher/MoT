@@ -801,7 +801,7 @@ def run_train(
             gpu_memory = gpu_memory_tracker.summary()
             if is_projection_only_variant(config):
                 logging.info(
-                    "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                    "[Step %04d] loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                     step,
                     avg_loss,
                     scheduler.lr,
@@ -810,7 +810,7 @@ def run_train(
                 )
             else:
                 logging.info(
-                    "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gate_temp=%.4f | mean_gate_prob=%.4f | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                    "[Step %04d] loss=%.4f | lr=%.2e | gate_temp=%.4f | mean_gate_prob=%.4f | gpu_mem_avg=%s | gpu_mem_peak=%s",
                     step,
                     avg_loss,
                     scheduler.lr,

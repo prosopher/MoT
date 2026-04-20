@@ -592,7 +592,7 @@ def run_train(
             )
             gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] total_loss=%.4f | ce=%.4f | plan=%.4f | random=%.4f | positive_cosine=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] loss=%.4f | ce=%.4f | plan=%.4f | random=%.4f | positive_cosine=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_total_loss,
                 avg_ce_loss,
