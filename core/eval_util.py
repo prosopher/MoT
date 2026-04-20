@@ -363,7 +363,8 @@ MMLU_REDUX_SUBJECTS = [
     "virology",
     "world_religions",
 ]
-MMLU_REDUX_LABELS = ("A", "B", "C", "D")
+MMLU_REDUX_CHOICE_MARKERS = ("①", "②", "③", "④")
+MMLU_REDUX_LABELS = MMLU_REDUX_CHOICE_MARKERS
 MMLU_REDUX_SUBJECT_CATEGORIES = (
     "math",
     "physics",
@@ -1806,47 +1807,57 @@ def normalize_context_text(raw_value: Any) -> Optional[str]:
     return "\n".join(parts)
 
 
-def _normalize_choice_text_for_match(text: str) -> str:
-    value = text.strip().lower()
-    value = re.sub(r"^[a-d][\).:\-\s]+", "", value)
-    value = re.sub(r"\s+", " ", value)
-    return value
+def _normalize_logit_qa_choice_text(text: str) -> str:
+    return " ".join(text.strip().lower().split())
 
 
 
-def _match_mmlu_redux_choice_label(choices: List[str], candidate: str) -> Optional[str]:
-    normalized_candidate = _normalize_choice_text_for_match(candidate)
+def _match_logit_qa_choice(choices: List[str], candidate: str) -> Optional[str]:
+    normalized_candidate = _normalize_logit_qa_choice_text(candidate)
     if not normalized_candidate:
         return None
 
-    for idx, label in enumerate(MMLU_REDUX_LABELS):
-        if normalized_candidate == label.lower():
-            return label
-        if normalized_candidate == str(idx):
-            return label
-        if normalized_candidate == str(idx + 1):
-            return label
-        if idx < len(choices) and _normalize_choice_text_for_match(choices[idx]) == normalized_candidate:
-            return label
+    normalized_choices: List[Tuple[str, str]] = []
+    for choice in choices:
+        if not isinstance(choice, str):
+            continue
+        normalized_choice = _normalize_logit_qa_choice_text(choice)
+        if normalized_choice:
+            normalized_choices.append((choice.strip(), normalized_choice))
+
+    for canonical_choice, normalized_choice in normalized_choices:
+        if normalized_candidate == normalized_choice:
+            return canonical_choice
+
+    for canonical_choice, normalized_choice in normalized_choices:
+        if re.fullmatch(r"[a-z0-9]+(?:\s+[a-z0-9]+)*", normalized_choice):
+            pattern = rf"(?<!\w){re.escape(normalized_choice)}(?!\w)"
+        else:
+            pattern = re.escape(normalized_choice)
+        if re.search(pattern, normalized_candidate, flags=re.IGNORECASE):
+            return canonical_choice
+
     return None
 
 
 
-def _parse_mmlu_redux_correct_labels(
+def _parse_logit_qa_correct_answers(
     choices: List[str],
     raw_correct_answer: Any,
     *,
-    include_original_label: Optional[str] = None,
+    include_original_choice: Optional[str] = None,
 ) -> List[str]:
-    labels: List[str] = []
-    if include_original_label in MMLU_REDUX_LABELS:
-        labels.append(include_original_label)
+    answers: List[str] = []
+    if isinstance(include_original_choice, str) and include_original_choice.strip():
+        matched_original_choice = _match_logit_qa_choice(choices, include_original_choice)
+        if matched_original_choice is not None:
+            answers.append(matched_original_choice)
 
     if isinstance(raw_correct_answer, str) and raw_correct_answer.strip():
         raw_text = raw_correct_answer.strip()
-        direct_label = _match_mmlu_redux_choice_label(choices, raw_text)
-        if direct_label is not None:
-            labels.append(direct_label)
+        direct_answer = _match_logit_qa_choice(choices, raw_text)
+        if direct_answer is not None:
+            answers.append(direct_answer)
         else:
             parts = [
                 part.strip()
@@ -1854,14 +1865,14 @@ def _parse_mmlu_redux_correct_labels(
                 if part.strip()
             ]
             for part in parts:
-                matched_label = _match_mmlu_redux_choice_label(choices, part)
-                if matched_label is not None:
-                    labels.append(matched_label)
+                matched_answer = _match_logit_qa_choice(choices, part)
+                if matched_answer is not None:
+                    answers.append(matched_answer)
 
     deduped: List[str] = []
-    for label in labels:
-        if label not in deduped:
-            deduped.append(label)
+    for answer in answers:
+        if answer not in deduped:
+            deduped.append(answer)
     return deduped
 
 
@@ -1893,6 +1904,7 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         return {
             "question": question.strip(),
             "context": context,
+            "choices": ["yes", "no"],
             "answer": "yes" if answer_value else "no",
         }
 
@@ -1913,6 +1925,7 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         return {
             "question": question.strip(),
             "context": context,
+            "choices": ["yes", "no", "maybe"],
             "answer": normalized_answer,
         }
 
@@ -1922,17 +1935,18 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         corrected_answer_field = spec.corrected_answer_field or "correct_answer"
         subject_field = spec.subject_field or "subject"
 
-        raw_choices = example.get(choices_field, None)
-        if not isinstance(raw_choices, list):
+        raw_choice_texts = example.get(choices_field, None)
+        if not isinstance(raw_choice_texts, list):
             return None
-        choices = [choice.strip() for choice in raw_choices if isinstance(choice, str) and choice.strip()]
-        if len(choices) != 4:
+        choice_texts = [choice.strip() for choice in raw_choice_texts if isinstance(choice, str) and choice.strip()]
+        if len(choice_texts) != 4:
             return None
 
+        choices = list(MMLU_REDUX_CHOICE_MARKERS)
         raw_answer_idx = example.get("answer", None)
-        if not isinstance(raw_answer_idx, int) or not (0 <= raw_answer_idx < len(MMLU_REDUX_LABELS)):
+        if not isinstance(raw_answer_idx, int) or not (0 <= raw_answer_idx < len(choices)):
             return None
-        original_label = MMLU_REDUX_LABELS[raw_answer_idx]
+        original_choice = choices[raw_answer_idx]
 
         error_type = str(example.get(error_type_field, "ok") or "ok").strip().lower()
         corrected_answer = example.get(corrected_answer_field, None)
@@ -1940,34 +1954,34 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             return None
 
         if error_type == "wrong_groundtruth":
-            acceptable_labels = _parse_mmlu_redux_correct_labels(
+            acceptable_answers = _parse_logit_qa_correct_answers(
                 choices,
                 corrected_answer,
-                include_original_label=None,
+                include_original_choice=None,
             )
         elif error_type == "multiple_correct_answers":
-            acceptable_labels = _parse_mmlu_redux_correct_labels(
+            acceptable_answers = _parse_logit_qa_correct_answers(
                 choices,
                 corrected_answer,
-                include_original_label=original_label,
+                include_original_choice=original_choice,
             )
         elif error_type == "no_correct_answer":
-            acceptable_labels = _parse_mmlu_redux_correct_labels(
+            acceptable_answers = _parse_logit_qa_correct_answers(
                 choices,
                 corrected_answer,
-                include_original_label=None,
+                include_original_choice=None,
             )
         else:
-            acceptable_labels = [original_label]
+            acceptable_answers = [original_choice]
 
-        if not acceptable_labels:
+        if not acceptable_answers:
             return None
 
         answer_value: Union[str, List[str]]
-        if len(acceptable_labels) == 1:
-            answer_value = acceptable_labels[0]
+        if len(acceptable_answers) == 1:
+            answer_value = acceptable_answers[0]
         else:
-            answer_value = acceptable_labels
+            answer_value = acceptable_answers
 
         subject_value = example.get(subject_field, None)
         subject = subject_value.strip() if isinstance(subject_value, str) and subject_value.strip() else None
@@ -1975,6 +1989,7 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         return {
             "question": question.strip(),
             "choices": choices,
+            "choice_texts": choice_texts,
             "subject": subject,
             "answer": answer_value,
             "error_type": error_type,
@@ -2032,9 +2047,19 @@ def format_boolq_question_prefix(question: str) -> str:
     )
 
 
-def prepare_boolq_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def prepare_boolq_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_boolq_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def prepare_boolq_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
@@ -2056,9 +2081,42 @@ def format_pubmed_qa_question_prefix(question: str) -> str:
     )
 
 
-def prepare_pubmed_qa_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def format_mmlu_redux_question_context(question: str, subject: Optional[str] = None) -> str:
+    prompt_lines: List[str] = []
+    if isinstance(subject, str) and subject.strip():
+        pretty_subject = subject.strip().replace("_", " ")
+        prompt_lines.append(f"Subject: {pretty_subject}")
+    prompt_lines.append(f"Question: {question.strip()}")
+    return "\n".join(prompt_lines) + "\n"
+
+
+def format_mmlu_redux_answer_prefix(
+    choices: List[str],
+    choice_texts: List[str],
+) -> str:
+    if len(choice_texts) != len(choices):
+        raise ValueError("choices and choice_texts must have the same length.")
+
+    prompt_lines: List[str] = ["Choices:"]
+    for choice, choice_text in zip(choices, choice_texts):
+        prompt_lines.append(f"{choice.strip()} {choice_text.strip()}")
+    prompt_lines.append("Answer:")
+    return "\n".join(prompt_lines)
+
+
+def prepare_pubmed_qa_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_pubmed_qa_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def prepare_pubmed_qa_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
@@ -2066,9 +2124,39 @@ def prepare_pubmed_qa_question_prefix(tokenizer, question: str, device: str) -> 
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
+def prepare_mmlu_redux_question_inputs(
+    tokenizer,
+    question: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+    subject: Optional[str] = None,
+) -> Dict[str, Any]:
+    prefix_text = format_mmlu_redux_question_context(question=question, subject=subject)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
+
+
+def prepare_mmlu_redux_answer_prefix(
+    tokenizer,
+    choices: List[str],
+    choice_texts: List[str],
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    prefix_text = format_mmlu_redux_answer_prefix(
+        choices=choices,
+        choice_texts=choice_texts,
+    )
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
 def format_question_prefix(
     question: str,
     choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
     context: Optional[str] = None,
     answer_mode: Optional[str] = None,
@@ -2088,21 +2176,26 @@ def format_question_prefix(
     if not choices:
         return f"Question: {question}\nAnswer:"
 
-    prompt_lines: List[str] = []
     if answer_mode == "mmlu_redux":
-        if isinstance(subject, str) and subject.strip():
-            pretty_subject = subject.strip().replace("_", " ")
-            prompt_lines.append(
-                f"The following is a multiple choice question about {pretty_subject}."
+        if choice_texts is None:
+            raise ValueError("MMLU-Redux requires choice_texts.")
+        return (
+            format_mmlu_redux_question_context(question=question, subject=subject)
+            + format_mmlu_redux_answer_prefix(
+                choices=choices,
+                choice_texts=choice_texts,
             )
-        else:
-            prompt_lines.append("The following is a multiple choice question.")
-        prompt_lines.append("")
+        )
 
-    prompt_lines.extend([f"Question: {question}", "Choices:"])
-    for idx, choice in enumerate(choices):
-        label = chr(ord("A") + idx)
-        prompt_lines.append(f"{label}. {choice.strip()}")
+    prompt_lines: List[str] = [f"Question: {question}", "Choices:"]
+    if choice_texts is None:
+        for choice in choices:
+            prompt_lines.append(choice.strip())
+    else:
+        if len(choice_texts) != len(choices):
+            raise ValueError("choices and choice_texts must have the same length.")
+        for choice, choice_text in zip(choices, choice_texts):
+            prompt_lines.append(f"{choice.strip()} {choice_text.strip()}")
     prompt_lines.append("Answer:")
     return "\n".join(prompt_lines)
 
@@ -2184,9 +2277,30 @@ def format_generation_prompt(context: str, question: str) -> str:
     )
 
 
-def prepare_text_prefix(tokenizer, prefix_text: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_text_prefix(
+    tokenizer,
+    prefix_text: str,
+    device: str,
+    max_prefix_tokens: Optional[int] = None,
+    truncation_side: str = "left",
+) -> Dict[str, torch.Tensor]:
     tokenized = tokenizer(prefix_text, return_tensors="pt")
-    input_ids = tokenized.input_ids.to(device)
+    input_ids = tokenized.input_ids
+    was_truncated = False
+
+    if max_prefix_tokens is not None:
+        if max_prefix_tokens < 2:
+            raise ValueError("max_prefix_tokens must be >= 2")
+        if input_ids.shape[1] > max_prefix_tokens:
+            was_truncated = True
+            if truncation_side == "left":
+                input_ids = input_ids[:, -max_prefix_tokens:]
+            elif truncation_side == "right":
+                input_ids = input_ids[:, :max_prefix_tokens]
+            else:
+                raise ValueError(f"Unsupported truncation_side: {truncation_side}")
+
+    input_ids = input_ids.to(device)
     if input_ids.shape[1] < 2:
         raise ValueError("Prefix must tokenize to at least 2 tokens.")
     cache_ids = input_ids[:, :-1]
@@ -2196,6 +2310,7 @@ def prepare_text_prefix(tokenizer, prefix_text: str, device: str) -> Dict[str, t
         "full_prefix_ids": input_ids,
         "cache_ids": cache_ids,
         "seed_token": seed_token,
+        "was_truncated": was_truncated,
     }
 
 
@@ -2204,18 +2319,28 @@ def prepare_question_prefix(
     question: str,
     device: str,
     choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
     context: Optional[str] = None,
     answer_mode: Optional[str] = None,
+    max_prefix_tokens: Optional[int] = None,
+    truncation_side: str = "left",
 ) -> Dict[str, torch.Tensor]:
     prefix_text = format_question_prefix(
         question,
         choices=choices,
+        choice_texts=choice_texts,
         subject=subject,
         context=context,
         answer_mode=answer_mode,
     )
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+    return prepare_text_prefix(
+        tokenizer=tokenizer,
+        prefix_text=prefix_text,
+        device=device,
+        max_prefix_tokens=max_prefix_tokens,
+        truncation_side=truncation_side,
+    )
 
 
 def prepare_generation_prefix(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
@@ -2310,6 +2435,93 @@ def compute_benchmark_context_budget(
     return budget
 
 
+def compute_logit_task_token_budgets(
+    ctx: Context,
+    spec: HFDatasetSpec,
+    question: str,
+    eval_config,
+    *,
+    choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+) -> Dict[str, Optional[int]]:
+    shared_limit = min(
+        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
+        for node in ctx.nodes
+    )
+    answer_budget = get_answer_token_budget(eval_config)
+
+    if spec.answer_mode == "boolq":
+        question_prefix = prepare_boolq_question_prefix(
+            tokenizer=ctx.tokenizer,
+            question=question,
+            device="cpu",
+        )
+        reserved_tokens = (
+            question_prefix["cache_ids"].shape[1]
+            + question_prefix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    if spec.answer_mode == "pubmed_qa":
+        question_prefix = prepare_pubmed_qa_question_prefix(
+            tokenizer=ctx.tokenizer,
+            question=question,
+            device="cpu",
+        )
+        reserved_tokens = (
+            question_prefix["cache_ids"].shape[1]
+            + question_prefix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    if spec.answer_mode == "mmlu_redux":
+        if not choices:
+            raise ValueError("MMLU-Redux requires choices for prompt budgeting.")
+        if not choice_texts:
+            raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
+        answer_prefix = prepare_mmlu_redux_answer_prefix(
+            tokenizer=ctx.tokenizer,
+            choices=choices,
+            choice_texts=choice_texts,
+            device="cpu",
+        )
+        reserved_tokens = (
+            answer_prefix["cache_ids"].shape[1]
+            + answer_prefix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    prompt_budget = shared_limit - answer_budget
+    if prompt_budget < 16:
+        raise ValueError(
+            f"Insufficient prompt budget for {spec.name_for_log}: "
+            f"shared_limit={shared_limit}, answer_budget={answer_budget}"
+        )
+    return {"max_context_tokens": None, "max_prefix_tokens": prompt_budget}
+
+
 def prepare_generation_task_question_prefix(
     spec: HFDatasetSpec,
     tokenizer,
@@ -2342,7 +2554,10 @@ def prepare_logit_task_inputs(
     question: str,
     device: str,
     choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
+    max_context_tokens: Optional[int] = None,
+    max_prefix_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     if spec.answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
@@ -2351,6 +2566,7 @@ def prepare_logit_task_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
+            max_input_tokens=max_context_tokens,
         )
         question_prefix = prepare_boolq_question_prefix(
             tokenizer=tokenizer,
@@ -2363,7 +2579,7 @@ def prepare_logit_task_inputs(
             "cache_input_ids": context_prefix["input_ids"],
             "question_cache_ids": question_prefix["cache_ids"],
             "seed_token": question_prefix["seed_token"],
-            "was_truncated": False,
+            "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
     if spec.answer_mode == "pubmed_qa":
@@ -2373,6 +2589,7 @@ def prepare_logit_task_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
+            max_input_tokens=max_context_tokens,
         )
         question_prefix = prepare_pubmed_qa_question_prefix(
             tokenizer=tokenizer,
@@ -2385,7 +2602,34 @@ def prepare_logit_task_inputs(
             "cache_input_ids": context_prefix["input_ids"],
             "question_cache_ids": question_prefix["cache_ids"],
             "seed_token": question_prefix["seed_token"],
-            "was_truncated": False,
+            "was_truncated": bool(context_prefix.get("was_truncated", False)),
+        }
+
+    if spec.answer_mode == "mmlu_redux":
+        if not choices:
+            raise ValueError("MMLU-Redux requires choices.")
+        if not choice_texts:
+            raise ValueError("MMLU-Redux requires choice_texts.")
+        question_context = prepare_mmlu_redux_question_inputs(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+            max_input_tokens=max_context_tokens,
+            subject=subject,
+        )
+        answer_prefix = prepare_mmlu_redux_answer_prefix(
+            tokenizer=tokenizer,
+            choices=choices,
+            choice_texts=choice_texts,
+            device=device,
+        )
+        return {
+            "context_prefix": question_context,
+            "question_prefix": answer_prefix,
+            "cache_input_ids": question_context["input_ids"],
+            "question_cache_ids": answer_prefix["cache_ids"],
+            "seed_token": answer_prefix["seed_token"],
+            "was_truncated": bool(question_context.get("was_truncated", False)),
         }
 
     prefix = prepare_question_prefix(
@@ -2393,15 +2637,18 @@ def prepare_logit_task_inputs(
         question=question,
         device=device,
         choices=choices,
+        choice_texts=choice_texts,
         subject=subject,
         context=context,
         answer_mode=spec.answer_mode,
+        max_prefix_tokens=max_prefix_tokens,
+        truncation_side="left",
     )
     return {
         "cache_input_ids": prefix["cache_ids"],
         "question_cache_ids": None,
         "seed_token": prefix["seed_token"],
-        "was_truncated": False,
+        "was_truncated": bool(prefix.get("was_truncated", False)),
     }
 
 
@@ -2622,6 +2869,32 @@ def predict_answer_label(choice_scores: Dict[str, float]) -> str:
     return max(choice_scores.items(), key=lambda item: item[1])[0]
 
 
+def parse_generated_logit_answer(
+    spec: HFDatasetSpec,
+    prediction: str,
+    *,
+    choices: Optional[List[str]] = None,
+) -> Optional[str]:
+    if not choices:
+        raise ValueError(f"{spec.answer_mode} generative parsing requires choices.")
+
+    cleaned = postprocess_generated_answer(prediction)
+    if not cleaned:
+        return None
+
+    direct_answer = _match_logit_qa_choice(choices, cleaned)
+    if direct_answer is not None:
+        return direct_answer
+
+    parts = [part.strip() for part in re.split(r"[\n\r]|(?:\.\s+)|;|:", cleaned) if part.strip()]
+    for part in parts:
+        matched_answer = _match_logit_qa_choice(choices, part)
+        if matched_answer is not None:
+            return matched_answer
+
+    return None
+
+
 @torch.inference_mode()
 def generate_greedy_answer(
     model,
@@ -2747,10 +3020,6 @@ def evaluate_dataset(
     device = ctx.config.device
     tokenizer = ctx.tokenizer
     path_metrics = {edge.id: RunningAverage() for edge in edges}
-    candidate_token_ids = build_logit_answer_candidates(
-        tokenizer=tokenizer,
-        spec=spec,
-    )
     subject_accumulators_by_edge: Optional[Dict[str, Dict[str, SubjectAccuracyAccumulator]]]
     if spec.answer_mode == "mmlu_redux":
         subject_accumulators_by_edge = {edge.id: {} for edge in edges}
@@ -2766,19 +3035,43 @@ def evaluate_dataset(
             question = example["question"]
             gold_answer = example["answer"]
             context_text = example.get("context")
+            choices = example.get("choices")
+            choice_texts = example.get("choice_texts")
 
+            token_budgets = compute_logit_task_token_budgets(
+                ctx=ctx,
+                spec=spec,
+                question=question,
+                eval_config=eval_config,
+                choices=choices,
+                choice_texts=choice_texts,
+                subject=example.get("subject"),
+            )
             prepared_inputs = prepare_logit_task_inputs(
                 spec=spec,
                 tokenizer=tokenizer,
                 context=context_text,
                 question=question,
                 device=device,
-                choices=example.get("choices"),
+                choices=choices,
+                choice_texts=choice_texts,
                 subject=example.get("subject"),
+                max_context_tokens=token_budgets["max_context_tokens"],
+                max_prefix_tokens=token_budgets["max_prefix_tokens"],
             )
             cache_input_ids = prepared_inputs["cache_input_ids"]
             question_cache_ids = prepared_inputs["question_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
+
+            if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
+                logging.info(
+                    "[%s] truncated logit-qa prompt to fit model context window (cache_tokens=%d, question_cache_tokens=%d, answer_token_budget=%d)",
+                    spec.name_for_log,
+                    cache_input_ids.shape[1],
+                    question_cache_tokens,
+                    get_answer_token_budget(eval_config),
+                )
 
             example_state = build_example_state_fn(
                 ctx=ctx,
@@ -2802,37 +3095,45 @@ def evaluate_dataset(
                 )
 
                 target_model = ctx.mm.get_model(edge.tgt_id)
-                translated_scoring_past = prepare_scoring_past_fn(
+                translated_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.translated_past_key_values,
                     question_cache_ids=question_cache_ids,
                 )
-                native_scoring_past = prepare_scoring_past_fn(
+                native_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.native_past_key_values,
                     question_cache_ids=question_cache_ids,
                 )
 
-                translated_scores = score_answer_choices(
+                translated_answer = generate_greedy_answer(
                     model=target_model,
-                    past_key_values=translated_scoring_past,
+                    tokenizer=tokenizer,
+                    past_key_values=translated_generation_past,
                     seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
+                    max_new_tokens=eval_config.generation_max_new_tokens,
                 )
-                native_scores = score_answer_choices(
+                native_answer = generate_greedy_answer(
                     model=target_model,
-                    past_key_values=native_scoring_past,
+                    tokenizer=tokenizer,
+                    past_key_values=native_generation_past,
                     seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
+                    max_new_tokens=eval_config.generation_max_new_tokens,
                 )
 
-                translated_pred = predict_answer_label(translated_scores)
-                native_pred = predict_answer_label(native_scores)
+                translated_pred = parse_generated_logit_answer(
+                    spec,
+                    translated_answer,
+                    choices=choices,
+                )
+                native_pred = parse_generated_logit_answer(
+                    spec,
+                    native_answer,
+                    choices=choices,
+                )
 
-                acc = 1.0 if is_logit_answer_correct(translated_pred, gold_answer) else 0.0
-                native_acc = 1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0
+                acc = 1.0 if translated_pred is not None and is_logit_answer_correct(translated_pred, gold_answer) else 0.0
+                native_acc = 1.0 if native_pred is not None and is_logit_answer_correct(native_pred, gold_answer) else 0.0
                 path_metrics[edge.id].update(edge_artifacts.cosine_value, acc, native_acc, 1)
 
                 if subject_accumulators_by_edge is not None:

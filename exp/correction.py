@@ -282,6 +282,9 @@ def build_prepared_inputs(
             context=example.get("context", None),
             question=example["question"],
             device=config.device,
+            choices=example.get("choices"),
+            choice_texts=example.get("choice_texts"),
+            subject=example.get("subject"),
         )
     if config.benchmark_mode == "gen_qa":
         context_budget = compute_benchmark_context_budget(

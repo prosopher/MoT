@@ -308,10 +308,6 @@ def _evaluate_logit_dataset(
     translator_pool,
     node_tokenizers: NodeTokenizerPool,
 ) -> Dict[str, Dict[str, float]]:
-    max_candidate_len = _max_candidate_token_length(
-        build_logit_answer_candidates(ctx.tokenizer, spec)
-    )
-
     def build_example_state_fn(
         *,
         ctx: Context,
@@ -320,6 +316,15 @@ def _evaluate_logit_dataset(
         **_,
     ):
         source_hidden_by_edge: Dict[str, torch.Tensor] = {}
+        token_budgets = compute_logit_task_token_budgets(
+            ctx=ctx,
+            spec=spec,
+            question=example["question"],
+            eval_config=eval_config,
+            choices=example.get("choices"),
+            choice_texts=example.get("choice_texts"),
+            subject=example.get("subject"),
+        )
         for edge in ctx.edges:
             source_prepared = prepare_logit_task_inputs(
                 spec=spec,
@@ -328,7 +333,10 @@ def _evaluate_logit_dataset(
                 question=example["question"],
                 device=ctx.config.device,
                 choices=example.get("choices"),
+                choice_texts=example.get("choice_texts"),
                 subject=example.get("subject"),
+                max_context_tokens=token_budgets["max_context_tokens"],
+                max_prefix_tokens=token_budgets["max_prefix_tokens"],
             )
             source_hidden_by_edge[edge.id] = extract_last_hidden_states(
                 ctx.mm.get_model(edge.src_id),
@@ -349,7 +357,7 @@ def _evaluate_logit_dataset(
         reserved_tail_tokens = (
             ctx.config.latent_tokens
             + (0 if question_cache_ids is None else int(question_cache_ids.shape[1]))
-            + max_candidate_len
+            + get_answer_token_budget(eval_config)
         )
         translated_cache_input_ids = _fit_cache_input_ids_to_model_limit(
             model=target_model,

@@ -35,7 +35,7 @@ def _openwebtext_prefix_tokens(config) -> int:
 
 
 @torch.inference_mode()
-def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str, *, choices=None, subject=None):
+def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str, *, choices=None, choice_texts=None, subject=None):
     prepared = prepare_logit_task_inputs(
         spec=spec,
         tokenizer=tokenizer,
@@ -43,6 +43,7 @@ def _predict_direct_context_logit(model, spec, tokenizer, context: str, question
         question=question,
         device=device,
         choices=choices,
+        choice_texts=choice_texts,
         subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
@@ -105,6 +106,7 @@ def _predict_kvcomm_logit(
     question: str,
     device: str,
     choices=None,
+    choice_texts=None,
     subject=None,
 ):
     prepared = prepare_logit_task_inputs(
@@ -114,6 +116,7 @@ def _predict_kvcomm_logit(
         question=question,
         device=device,
         choices=choices,
+        choice_texts=choice_texts,
         subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)

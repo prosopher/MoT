@@ -516,6 +516,7 @@ def evaluate_logit_dataset(
                 question=example["question"],
                 device=config.device,
                 choices=example.get("choices"),
+                choice_texts=example.get("choice_texts"),
                 subject=example.get("subject"),
             )
             candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
