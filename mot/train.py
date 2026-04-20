@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -170,6 +170,7 @@ class MixtureOfTranslators(nn.Module):
         mlp_ratio: int,
         num_translators: int,
         top_k: int,
+        translator_cls: Type[nn.Module] = CrossLayerWindowTranslator,
     ) -> None:
         super().__init__()
         if num_translators < 1:
@@ -182,7 +183,7 @@ class MixtureOfTranslators(nn.Module):
         self.top_k = top_k
         self.translators = nn.ModuleList(
             [
-                CrossLayerWindowTranslator(
+                translator_cls(
                     src_hidden_size=src_hidden_size,
                     tgt_hidden_size=tgt_hidden_size,
                     num_layers=num_layers,
@@ -202,6 +203,8 @@ class MixtureOfTranslators(nn.Module):
             nn.GELU(),
             nn.Linear(router_hidden_dim, num_translators),
         )
+        self.last_mixture_weights: Optional[torch.Tensor] = None
+        self.last_router_logits: Optional[torch.Tensor] = None
 
     def _compute_mixture_weights(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         router_input = layer_window_cache.reshape(layer_window_cache.shape[0], layer_window_cache.shape[1], -1)
@@ -211,7 +214,10 @@ class MixtureOfTranslators(nn.Module):
             topk_mask = torch.zeros_like(router_logits, dtype=torch.bool)
             topk_mask.scatter_(-1, topk_indices, True)
             router_logits = router_logits.masked_fill(~topk_mask, float("-inf"))
-        return torch.softmax(router_logits, dim=-1)
+        mixture_weights = torch.softmax(router_logits, dim=-1)
+        self.last_router_logits = router_logits.detach()
+        self.last_mixture_weights = mixture_weights.detach()
+        return mixture_weights
 
     def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         expert_outputs = [translator(layer_window_cache) for translator in self.translators]
@@ -220,6 +226,42 @@ class MixtureOfTranslators(nn.Module):
         mixture_weights = self._compute_mixture_weights(layer_window_cache)
         stacked_outputs = torch.stack(expert_outputs, dim=2)
         return (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+
+    def get_balance_metrics(self) -> Optional[Dict[str, float]]:
+        if self.last_mixture_weights is None:
+            return None
+        weights = self.last_mixture_weights
+        token_importance = weights.sum(dim=(0, 1))
+        token_load = (weights > 0).to(weights.dtype).sum(dim=(0, 1))
+        eps = torch.finfo(weights.dtype).eps
+
+        def squared_cv(values: torch.Tensor) -> torch.Tensor:
+            mean = values.mean()
+            variance = ((values - mean) ** 2).mean()
+            return variance / (mean.square() + eps)
+
+        return {
+            "gate_importance_cv2": float(squared_cv(token_importance).item()),
+            "gate_load_cv2": float(squared_cv(token_load).item()),
+            "gate_importance_entropy": float((-(token_importance / token_importance.sum().clamp_min(eps)) * (token_importance / token_importance.sum().clamp_min(eps)).clamp_min(eps).log()).sum().item()),
+        }
+
+
+def collect_mot_balance_metrics(module: nn.Module) -> Dict[str, float]:
+    summed_metrics: Dict[str, float] = {}
+    num_mot_modules = 0
+    for submodule in module.modules():
+        if not isinstance(submodule, MixtureOfTranslators):
+            continue
+        metrics = submodule.get_balance_metrics()
+        if metrics is None:
+            continue
+        num_mot_modules += 1
+        for name, value in metrics.items():
+            summed_metrics[name] = summed_metrics.get(name, 0.0) + value
+    if num_mot_modules == 0:
+        return {}
+    return {name: value / num_mot_modules for name, value in summed_metrics.items()}
 
 
 def build_window_translator(
@@ -234,9 +276,10 @@ def build_window_translator(
     mlp_ratio: int,
     mot_num_translators: int,
     mot_top_k: int,
+    translator_cls: Type[nn.Module] = CrossLayerWindowTranslator,
 ) -> nn.Module:
     if variant == "single":
-        return CrossLayerWindowTranslator(
+        return translator_cls(
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
             num_layers=num_layers,
@@ -256,6 +299,7 @@ def build_window_translator(
             mlp_ratio=mlp_ratio,
             num_translators=mot_num_translators,
             top_k=mot_top_k,
+            translator_cls=translator_cls,
         )
     raise ValueError(f"Unsupported MOT variant: {variant}")
 
@@ -290,6 +334,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            translator_cls=CrossLayerWindowTranslator,
         )
         self.value_translator = build_window_translator(
             variant=variant,
@@ -302,6 +347,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            translator_cls=CrossLayerWindowTranslator,
         )
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -809,6 +855,9 @@ def run_train(
 
 
     running_loss = 0.0
+    running_gate_importance_cv2 = 0.0
+    running_gate_load_cv2 = 0.0
+    running_gate_importance_entropy = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
     for step in progress_bar:
@@ -858,22 +907,36 @@ def run_train(
         gpu_memory_tracker.update()
 
         running_loss += step_loss_value
+        gate_metrics = collect_mot_balance_metrics(translator_pool)
+        running_gate_importance_cv2 += gate_metrics.get("gate_importance_cv2", 0.0)
+        running_gate_load_cv2 += gate_metrics.get("gate_load_cv2", 0.0)
+        running_gate_importance_entropy += gate_metrics.get("gate_importance_entropy", 0.0)
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
+            avg_gate_importance_cv2 = running_gate_importance_cv2 / config.log_every
+            avg_gate_load_cv2 = running_gate_load_cv2 / config.log_every
+            avg_gate_importance_entropy = running_gate_importance_entropy / config.log_every
             progress_bar.set_postfix(
                 loss=f"{avg_loss:.4f}",
+                gate_load_cv2=f"{avg_gate_load_cv2:.4f}",
                 lr=f"{scheduler.lr:.2e}",
             )
             gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] window_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] window_suffix_lm_loss=%.4f | gate_importance_cv2=%.4f | gate_load_cv2=%.4f | gate_importance_entropy=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
+                avg_gate_importance_cv2,
+                avg_gate_load_cv2,
+                avg_gate_importance_entropy,
                 scheduler.lr,
                 gpu_memory["avg_allocated_pretty"],
                 gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
+            running_gate_importance_cv2 = 0.0
+            running_gate_load_cv2 = 0.0
+            running_gate_importance_entropy = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(

@@ -20,6 +20,8 @@ from core.model_spec import ModelSpec
 from core.train_util import *
 from mot.train import (
     TrainConfig,
+    build_window_translator,
+    collect_mot_balance_metrics,
     require_channel_profiler,
     require_gpt2_transformer,
     replay_target_prefill_with_injected_window,
@@ -168,106 +170,6 @@ class PerLayerPerHeadKVAdapter(nn.Module):
         )
 
 
-class MixtureOfTranslators(nn.Module):
-    def __init__(
-        self,
-        src_hidden_size: int,
-        tgt_hidden_size: int,
-        num_layers: int,
-        translator_dim: int,
-        translator_heads: int,
-        translator_depth: int,
-        mlp_ratio: int,
-        num_translators: int,
-        top_k: int,
-    ) -> None:
-        super().__init__()
-        if num_translators < 1:
-            raise ValueError("num_translators must be >= 1")
-        if top_k < 1:
-            raise ValueError("top_k must be >= 1")
-        if top_k > num_translators:
-            raise ValueError("top_k must be <= num_translators")
-        self.num_translators = num_translators
-        self.top_k = top_k
-        self.translators = nn.ModuleList(
-            [
-                CrossLayerWindowTranslator(
-                    src_hidden_size=src_hidden_size,
-                    tgt_hidden_size=tgt_hidden_size,
-                    num_layers=num_layers,
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(num_translators)
-            ]
-        )
-        router_input_dim = num_layers * src_hidden_size
-        router_hidden_dim = max(64, min(translator_dim, router_input_dim))
-        self.router = nn.Sequential(
-            nn.LayerNorm(router_input_dim),
-            nn.Linear(router_input_dim, router_hidden_dim),
-            nn.GELU(),
-            nn.Linear(router_hidden_dim, num_translators),
-        )
-
-    def _compute_mixture_weights(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
-        router_input = layer_window_cache.reshape(layer_window_cache.shape[0], layer_window_cache.shape[1], -1)
-        router_logits = self.router(router_input)
-        if self.top_k < self.num_translators:
-            topk_indices = torch.topk(router_logits, k=self.top_k, dim=-1).indices
-            topk_mask = torch.zeros_like(router_logits, dtype=torch.bool)
-            topk_mask.scatter_(-1, topk_indices, True)
-            router_logits = router_logits.masked_fill(~topk_mask, float("-inf"))
-        return torch.softmax(router_logits, dim=-1)
-
-    def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
-        expert_outputs = [translator(layer_window_cache) for translator in self.translators]
-        if len(expert_outputs) == 1:
-            return expert_outputs[0]
-        mixture_weights = self._compute_mixture_weights(layer_window_cache)
-        stacked_outputs = torch.stack(expert_outputs, dim=2)
-        return (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
-
-
-def build_hidden_state_window_translator(
-    *,
-    variant: str,
-    src_hidden_size: int,
-    tgt_hidden_size: int,
-    num_layers: int,
-    translator_dim: int,
-    translator_heads: int,
-    translator_depth: int,
-    mlp_ratio: int,
-    mot_num_translators: int,
-    mot_top_k: int,
-) -> nn.Module:
-    if variant == "single":
-        return CrossLayerWindowTranslator(
-            src_hidden_size=src_hidden_size,
-            tgt_hidden_size=tgt_hidden_size,
-            num_layers=num_layers,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            translator_depth=translator_depth,
-            mlp_ratio=mlp_ratio,
-        )
-    if variant == "mot":
-        return MixtureOfTranslators(
-            src_hidden_size=src_hidden_size,
-            tgt_hidden_size=tgt_hidden_size,
-            num_layers=num_layers,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            translator_depth=translator_depth,
-            mlp_ratio=mlp_ratio,
-            num_translators=mot_num_translators,
-            top_k=mot_top_k,
-        )
-    raise ValueError(f"Unsupported MOT variant: {variant}")
 
 class LayerWindowAttnInputTranslator(nn.Module):
     """
@@ -294,7 +196,7 @@ class LayerWindowAttnInputTranslator(nn.Module):
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         self.num_layers = num_layers
-        self.attn_input_translator = build_hidden_state_window_translator(
+        self.attn_input_translator = build_window_translator(
             variant=variant,
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
@@ -305,6 +207,7 @@ class LayerWindowAttnInputTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            translator_cls=CrossLayerWindowTranslator,
         )
 
     def forward(self, attn_input_block: torch.Tensor) -> torch.Tensor:
@@ -719,6 +622,9 @@ def run_train(
 
 
     running_loss = 0.0
+    running_gate_importance_cv2 = 0.0
+    running_gate_load_cv2 = 0.0
+    running_gate_importance_entropy = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
     for step in progress_bar:
@@ -782,22 +688,36 @@ def run_train(
         gpu_memory_tracker.update()
 
         running_loss += step_loss_value
+        gate_metrics = collect_mot_balance_metrics(translator_pool)
+        running_gate_importance_cv2 += gate_metrics.get("gate_importance_cv2", 0.0)
+        running_gate_load_cv2 += gate_metrics.get("gate_load_cv2", 0.0)
+        running_gate_importance_entropy += gate_metrics.get("gate_importance_entropy", 0.0)
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
+            avg_gate_importance_cv2 = running_gate_importance_cv2 / config.log_every
+            avg_gate_load_cv2 = running_gate_load_cv2 / config.log_every
+            avg_gate_importance_entropy = running_gate_importance_entropy / config.log_every
             progress_bar.set_postfix(
                 loss=f"{avg_loss:.4f}",
+                gate_load_cv2=f"{avg_gate_load_cv2:.4f}",
                 lr=f"{scheduler.lr:.2e}",
             )
             gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] attn_input_window_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] attn_input_window_suffix_lm_loss=%.4f | gate_importance_cv2=%.4f | gate_load_cv2=%.4f | gate_importance_entropy=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
+                avg_gate_importance_cv2,
+                avg_gate_load_cv2,
+                avg_gate_importance_entropy,
                 scheduler.lr,
                 gpu_memory["avg_allocated_pretty"],
                 gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
+            running_gate_importance_cv2 = 0.0
+            running_gate_load_cv2 = 0.0
+            running_gate_importance_entropy = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
