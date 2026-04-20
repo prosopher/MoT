@@ -38,6 +38,36 @@ def _fit_cache_input_ids_to_model_limit(
     return trim_input_ids_from_left(cache_input_ids, max_length=max_cache_tokens)
 
 
+def _apply_interlat_extra_reserve_to_budget(*, budget: int, extra_reserved_tokens: int, dataset_name: str) -> int:
+    adjusted_budget = int(budget) - int(extra_reserved_tokens)
+    if adjusted_budget < 16:
+        raise ValueError(
+            f"Insufficient InterLat context budget for {dataset_name}: "
+            f"budget={budget}, extra_reserved_tokens={extra_reserved_tokens}"
+        )
+    return adjusted_budget
+
+
+def _compute_interlat_generation_context_budget(
+    *,
+    ctx: Context,
+    spec: HFDatasetSpec,
+    question: str,
+    eval_config: EvalConfig,
+) -> int:
+    base_budget = compute_benchmark_context_budget(
+        ctx=ctx,
+        spec=spec,
+        question=question,
+        eval_config=eval_config,
+    )
+    return _apply_interlat_extra_reserve_to_budget(
+        budget=base_budget,
+        extra_reserved_tokens=ctx.config.latent_tokens,
+        dataset_name=spec.name_for_log,
+    )
+
+
 def _max_candidate_token_length(choice_token_ids: Dict[str, torch.Tensor]) -> int:
     if not choice_token_ids:
         return 1
@@ -311,36 +341,31 @@ def _evaluate_logit_dataset(
     def build_example_state_fn(
         *,
         ctx: Context,
-        spec: HFDatasetSpec,
-        example: Dict[str, Any],
+        cache_input_ids: torch.Tensor,
         **_,
     ):
         source_hidden_by_edge: Dict[str, torch.Tensor] = {}
-        token_budgets = compute_logit_task_token_budgets(
-            ctx=ctx,
-            spec=spec,
-            question=example["question"],
-            eval_config=eval_config,
-            choices=example.get("choices"),
-            choice_texts=example.get("choice_texts"),
-            subject=example.get("subject"),
+        prefix_text = ctx.tokenizer.decode(
+            cache_input_ids[0].detach().cpu(),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
         )
         for edge in ctx.edges:
-            source_prepared = prepare_logit_task_inputs(
-                spec=spec,
-                tokenizer=node_tokenizers[edge.src_id],
-                context=example.get("context"),
-                question=example["question"],
-                device=ctx.config.device,
-                choices=example.get("choices"),
-                choice_texts=example.get("choice_texts"),
-                subject=example.get("subject"),
-                max_context_tokens=token_budgets["max_context_tokens"],
-                max_prefix_tokens=token_budgets["max_prefix_tokens"],
+            source_model = ctx.mm.get_model(edge.src_id)
+            source_tokenizer = node_tokenizers[edge.src_id]
+            source_encoded = source_tokenizer(
+                prefix_text,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )
+            source_input_ids = source_encoded["input_ids"].to(ctx.config.device)
+            source_input_ids = trim_input_ids_from_left(
+                source_input_ids,
+                max_length=get_model_context_limit(source_model),
             )
             source_hidden_by_edge[edge.id] = extract_last_hidden_states(
-                ctx.mm.get_model(edge.src_id),
-                source_prepared["cache_input_ids"],
+                source_model,
+                source_input_ids,
             )
         return {"source_hidden_by_edge": source_hidden_by_edge}
 
@@ -357,6 +382,7 @@ def _evaluate_logit_dataset(
         reserved_tail_tokens = (
             ctx.config.latent_tokens
             + (0 if question_cache_ids is None else int(question_cache_ids.shape[1]))
+            + int(prepared_inputs["seed_token"].shape[1])
             + get_answer_token_budget(eval_config)
         )
         translated_cache_input_ids = _fit_cache_input_ids_to_model_limit(
@@ -412,7 +438,7 @@ def _evaluate_generation_dataset(
 
             context_budget = None
             if spec.answer_mode in {"squad", "newsqa"}:
-                context_budget = compute_benchmark_context_budget(
+                context_budget = _compute_interlat_generation_context_budget(
                     ctx=ctx,
                     spec=spec,
                     question=question,
@@ -459,6 +485,7 @@ def _evaluate_generation_dataset(
                 reserved_tail_tokens = (
                     ctx.config.latent_tokens
                     + (0 if question_cache_ids is None else int(question_cache_ids.shape[1]))
+                    + int(seed_token.shape[1])
                     + get_answer_token_budget(eval_config)
                 )
                 translated_cache_input_ids = _fit_cache_input_ids_to_model_limit(
