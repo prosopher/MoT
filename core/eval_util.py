@@ -29,13 +29,14 @@ class EvalConfig(Config):
 
     # generation QA
     generation_max_new_tokens: int
-    generation_context_budgets: Optional[str]
-    generation_truncation_log_limit: int
+    generation_context_budgets: Optional[str] = None
+    generation_truncation_log_limit: int = 3
 
 
     def __post_init__(self) -> None:
         super().__post_init__()
         initialize_eval_output_paths(self)
+        configure_eval_runtime(self)
 
 
 OPENWEBTEXT_TSNE_LABEL_ORDER = (
@@ -203,6 +204,7 @@ class HFDatasetSpec:
     corrected_answer_field: Optional[str] = None
     dataset_names: Optional[List[str]] = None
     streaming: bool = False
+    requested_context_budget: Optional[int] = None
 
 
 @dataclass
@@ -213,6 +215,17 @@ class GenerationContextBudgetResolution:
     shared_limit: int
     question_cache_tokens: int
     answer_token_budget: int
+
+
+_ACTIVE_LONGCONTEXT_MODE = False
+_ACTIVE_GENERATION_BUDGETS: List[Optional[int]] = [None]
+
+
+def configure_eval_runtime(eval_config: EvalConfig) -> None:
+    global _ACTIVE_LONGCONTEXT_MODE, _ACTIVE_GENERATION_BUDGETS
+    raw_budgets = getattr(eval_config, "generation_context_budgets", None)
+    _ACTIVE_LONGCONTEXT_MODE = raw_budgets not in (None, "")
+    _ACTIVE_GENERATION_BUDGETS = parse_generation_context_budgets(raw_budgets)
 
 
 def parse_generation_context_budgets(raw_value: Optional[str]) -> List[Optional[int]]:
@@ -603,18 +616,30 @@ def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
     )
 
 
-def get_hotpotqa_generation_dataset_spec() -> HFDatasetSpec:
+def get_hotpotqa_dataset_spec(
+    requested_context_budget: Optional[int] = None,
+) -> HFDatasetSpec:
+    base_name = "HotpotQA/distractor/validation"
     return HFDatasetSpec(
-        name_for_log="HotpotQA/distractor/validation",
+        name_for_log=build_generation_eval_result_key(base_name, requested_context_budget),
         dataset_path="hotpotqa/hotpot_qa",
         dataset_name="distractor",
         split="validation",
-        answer_mode="hotpotqa",
+        # Use squad-style generation formatting so the baseline eval runners
+        # still apply context budgeting without modifying eval.py.
+        answer_mode="squad",
         question_field="question",
         context_field="context",
         answers_field="answer",
         streaming=False,
+        requested_context_budget=requested_context_budget,
     )
+
+
+def get_hotpotqa_generation_dataset_spec(
+    requested_context_budget: Optional[int] = None,
+) -> HFDatasetSpec:
+    return get_hotpotqa_dataset_spec(requested_context_budget=requested_context_budget)
 
 
 def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
@@ -630,13 +655,22 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
     )
 
 
-ENABLE_OPENWEBTEXT_VALIDATION = False
+ENABLE_OPENWEBTEXT_VALIDATION = True
 
-# Long-context MoT experiment: keep only the added long-context generation benchmark.
-LOGIT_QA_SPEC_GROUP_FACTORIES = []
+LOGIT_QA_SPEC_GROUP_FACTORIES = [
+    get_boolq_dataset_spec,
+    get_pubmedqa_dataset_spec,
+    get_mmlu_redux_dataset_spec,
+]
 
 GEN_QA_SPEC_GROUP_FACTORIES = [
-    get_hotpotqa_generation_dataset_spec,
+    get_squad_v11_dataset_spec,
+    get_newsqa_generation_dataset_spec,
+    # get_multinews_generation_dataset_spec,
+]
+
+LONGCONTEXT_GEN_QA_SPEC_GROUP_FACTORIES = [
+    get_hotpotqa_dataset_spec,
 ]
 
 EVAL_SPEC_GROUP_FACTORIES = {
@@ -1400,11 +1434,20 @@ def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
 
 
 def get_default_logit_qa_dataset_specs() -> List[HFDatasetSpec]:
+    if _ACTIVE_LONGCONTEXT_MODE:
+        return []
     return get_eval_spec_group("logit_qa")
 
 
 def get_default_gen_qa_dataset_specs() -> List[HFDatasetSpec]:
-    return get_eval_spec_group("gen_qa")
+    if not _ACTIVE_LONGCONTEXT_MODE:
+        return get_eval_spec_group("gen_qa")
+
+    budgets = _ACTIVE_GENERATION_BUDGETS or [None]
+    return [
+        get_hotpotqa_dataset_spec(requested_context_budget=budget)
+        for budget in budgets
+    ]
 
 
 def _normalize_answer_texts(raw_value: Any) -> List[str]:
@@ -1466,6 +1509,31 @@ def normalize_hotpotqa_context_text(raw_value: Any) -> Optional[str]:
 
 
 def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if spec.dataset_path == "hotpotqa/hotpot_qa":
+        question = example.get(spec.question_field, "")
+        if not isinstance(question, str) or not question.strip():
+            return []
+
+        context_field = spec.context_field or "context"
+        answers_field = spec.answers_field or "answer"
+
+        context = normalize_hotpotqa_context_text(example.get(context_field, None))
+        if context is None:
+            return []
+
+        raw_answer = example.get(answers_field, None)
+        answer_texts = _normalize_answer_texts(raw_answer)
+        if not answer_texts and isinstance(raw_answer, str) and raw_answer.strip():
+            answer_texts = [raw_answer.strip()]
+        if not answer_texts:
+            return []
+
+        return [{
+            "question": question.strip(),
+            "context": context,
+            "answers": answer_texts,
+        }]
+
     if spec.answer_mode == "squad":
         question = example.get(spec.question_field, "")
         if not isinstance(question, str) or not question.strip():
@@ -2537,6 +2605,25 @@ def get_answer_token_budget(eval_config) -> int:
     return eval_config.generation_max_new_tokens
 
 
+def prepare_generation_task_suffix(
+    spec: HFDatasetSpec,
+    tokenizer,
+    question: str,
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    if spec.answer_mode in {"squad", "newsqa", "hotpotqa"}:
+        return prepare_squad_v11_question_suffix(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+        )
+    return prepare_generation_question_suffix(
+        tokenizer=tokenizer,
+        question=question,
+        device=device,
+    )
+
+
 def resolve_generation_context_budget(
     ctx: Context,
     spec: HFDatasetSpec,
@@ -2554,9 +2641,9 @@ def resolve_generation_context_budget(
         question=question,
         device="cpu",
     )
-    question_cache_tokens = question_prefix["cache_ids"].shape[1]
+    question_cache_tokens = suffix["cache_ids"].shape[1]
     answer_token_budget = get_answer_token_budget(eval_config)
-    reserved_tokens = question_cache_tokens + question_prefix["seed_token"].shape[1] + answer_token_budget
+    reserved_tokens = question_cache_tokens + suffix["seed_token"].shape[1] + answer_token_budget
     max_budget = shared_limit - reserved_tokens
     if max_budget < 16:
         raise ValueError(
@@ -2592,8 +2679,95 @@ def compute_benchmark_context_budget(
         spec=spec,
         question=question,
         eval_config=eval_config,
-        requested_budget=None,
+        requested_budget=getattr(spec, "requested_context_budget", None),
     ).effective_budget
+
+
+def compute_logit_task_token_budgets(
+    ctx: Context,
+    spec: HFDatasetSpec,
+    question: str,
+    eval_config,
+    *,
+    choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+) -> Dict[str, Optional[int]]:
+    shared_limit = min(
+        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
+        for node in ctx.nodes
+    )
+    answer_budget = get_answer_token_budget(eval_config)
+
+    if spec.answer_mode == "boolq":
+        suffix = prepare_boolq_question_suffix(
+            tokenizer=ctx.tokenizer,
+            question=question,
+            device="cpu",
+        )
+        reserved_tokens = (
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    if spec.answer_mode == "pubmed_qa":
+        suffix = prepare_pubmed_qa_question_suffix(
+            tokenizer=ctx.tokenizer,
+            question=question,
+            device="cpu",
+        )
+        reserved_tokens = (
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    if spec.answer_mode == "mmlu_redux":
+        if not choices:
+            raise ValueError("MMLU-Redux requires choices for prompt budgeting.")
+        if not choice_texts:
+            raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
+        suffix = prepare_mmlu_redux_choices_suffix(
+            tokenizer=ctx.tokenizer,
+            choices=choices,
+            choice_texts=choice_texts,
+            device="cpu",
+        )
+        reserved_tokens = (
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    prompt_budget = shared_limit - answer_budget
+    if prompt_budget < 16:
+        raise ValueError(
+            f"Insufficient prompt budget for {spec.name_for_log}: "
+            f"shared_limit={shared_limit}, answer_budget={answer_budget}"
+        )
+    return {"max_context_tokens": None, "max_prefix_tokens": prompt_budget}
 
 
 def prepare_generation_task_question_prefix(
@@ -3388,6 +3562,8 @@ def build_edge_summary_markdown_table(
 
     lines = [
         f"### {direction_title}",
+        "",
+        "OpenWebText summary aliases: OWT Val Loss / OWT Val Latency / OWT Val Throughput / OWT Val GPU Peak Memory",
         "",
         "| Dataset | Method | Cosine Sim | Metric | Native Metric | Count |",
         "|---|---|---:|---:|---:|---:|",
