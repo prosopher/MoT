@@ -4,12 +4,14 @@ import logging
 import math
 import random
 import string
+import threading
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union, get_args, get_origin
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin
 
 import torch
 import torch.nn as nn
@@ -30,27 +32,32 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logger(name: str, log_path: Path) -> logging.Logger:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
+def setup_logging(log_path: Union[str, Path]) -> logging.Logger:
+    """Configure the process-wide root logger."""
+    resolved_log_path = Path(log_path)
+    resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler = logging.FileHandler(resolved_log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
 
     stream_handler = TqdmLoggingHandler()
     stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
 
-    return logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+    return root_logger
+
 
 
 PastKeyValues = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
@@ -140,18 +147,10 @@ def compute_prefix_correction_and_suffix_lm_loss(
     lm_input_ids: torch.Tensor,
     lm_labels: torch.Tensor,
     native_target_past_key_values: PastKeyValues,
-    target_start_layer_idx: int,
+    target_layer_indices: Sequence[int],
     prefix_correction_weight: float = 1.0,
 ) -> torch.Tensor:
-    if not (0 <= target_start_layer_idx < len(native_target_past_key_values)):
-        raise ValueError(
-            f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(native_target_past_key_values) - 1}]"
-        )
-    if len(past_key_values) != len(native_target_past_key_values):
-        raise ValueError(
-            "past_key_values and native_target_past_key_values must have the same number of layers, "
-            f"got {len(past_key_values)} vs {len(native_target_past_key_values)}"
-        )
+    correction_start_layer_idx = target_layer_indices[0]
 
     suffix_lm_loss = compute_suffix_lm_loss(
         target_model=target_model,
@@ -160,9 +159,9 @@ def compute_prefix_correction_and_suffix_lm_loss(
         lm_labels=lm_labels,
     )
 
-    mixed_key_block, mixed_value_block = past_key_values_to_blocks(past_key_values[target_start_layer_idx:])
+    mixed_key_block, mixed_value_block = past_key_values_to_blocks(past_key_values[correction_start_layer_idx:])
     native_key_block, native_value_block = past_key_values_to_blocks(
-        native_target_past_key_values[target_start_layer_idx:]
+        native_target_past_key_values[correction_start_layer_idx:]
     )
     if mixed_key_block.shape != native_key_block.shape:
         raise ValueError(
@@ -320,38 +319,74 @@ def format_memory_gib(num_bytes: float) -> str:
     return f"{gib:.2f} GiB"
 
 
-class GPUMemoryTracker:
+class CurrentProcessGPUMemoryReader:
     def __init__(self, device: str) -> None:
         self.device = device
         self.enabled = torch.cuda.is_available() and device.startswith("cuda")
+        if self.enabled:
+            device_index = torch.device(device).index
+            self.device_index = torch.cuda.current_device() if device_index is None else device_index
+        else:
+            self.device_index = None
+
+    def read_allocated_bytes(self) -> Optional[int]:
+        if not self.enabled:
+            return None
+        return int(torch.cuda.memory_allocated(self.device_index))
+
+
+class GPUMemoryTracker:
+    def __init__(self, device: str, *, sample_interval_sec: float = 0.02) -> None:
+        self.device = device
+        self.reader = CurrentProcessGPUMemoryReader(device)
+        self.enabled = self.reader.enabled
         self.total_allocated_bytes = 0.0
         self.num_samples = 0
         self.peak_allocated_bytes = 0
+        self.sample_interval_sec = max(float(sample_interval_sec), 0.001)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
         if self.enabled:
-            self.device_index = torch.device(device).index
-            if self.device_index is None:
-                self.device_index = torch.cuda.current_device()
-            torch.cuda.reset_peak_memory_stats(self.device_index)
-        else:
-            self.device_index = None
+            self._thread = threading.Thread(
+                target=self._sample_loop,
+                name="gpu-memory-tracker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _record_sample(self, allocated: Optional[int]) -> None:
+        if allocated is None:
+            return
+        with self._lock:
+            self.total_allocated_bytes += float(allocated)
+            self.num_samples += 1
+            self.peak_allocated_bytes = max(self.peak_allocated_bytes, int(allocated))
+
+    def _sample_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._record_sample(self.reader.read_allocated_bytes())
+            self._stop_event.wait(self.sample_interval_sec)
 
     def update(self) -> None:
         if not self.enabled:
             return
+        self._record_sample(self.reader.read_allocated_bytes())
 
-        allocated = torch.cuda.memory_allocated(self.device_index)
-        peak = torch.cuda.max_memory_allocated(self.device_index)
-
-        self.total_allocated_bytes += float(allocated)
-        self.num_samples += 1
-        self.peak_allocated_bytes = max(self.peak_allocated_bytes, peak)
+    def close(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=max(1.0, self.sample_interval_sec * 4.0))
+        self._thread = None
 
     @property
     def avg_allocated_bytes(self) -> float:
-        if self.num_samples == 0:
-            return 0.0
-        return self.total_allocated_bytes / self.num_samples
+        with self._lock:
+            if self.num_samples == 0:
+                return 0.0
+            return self.total_allocated_bytes / self.num_samples
 
     def summary(self) -> Dict[str, object]:
         if not self.enabled:
@@ -364,13 +399,18 @@ class GPUMemoryTracker:
                 "num_samples": 0,
             }
 
+        with self._lock:
+            avg_allocated_bytes = 0.0 if self.num_samples == 0 else self.total_allocated_bytes / self.num_samples
+            peak_allocated_bytes = self.peak_allocated_bytes
+            num_samples = self.num_samples
+
         return {
             "enabled": True,
-            "avg_allocated_bytes": self.avg_allocated_bytes,
-            "peak_allocated_bytes": self.peak_allocated_bytes,
-            "avg_allocated_pretty": format_memory_gib(self.avg_allocated_bytes),
-            "peak_allocated_pretty": format_memory_gib(self.peak_allocated_bytes),
-            "num_samples": self.num_samples,
+            "avg_allocated_bytes": avg_allocated_bytes,
+            "peak_allocated_bytes": peak_allocated_bytes,
+            "avg_allocated_pretty": format_memory_gib(avg_allocated_bytes),
+            "peak_allocated_pretty": format_memory_gib(peak_allocated_bytes),
+            "num_samples": num_samples,
         }
 
 

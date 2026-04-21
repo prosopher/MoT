@@ -58,6 +58,8 @@ class ChannelProfileStep:
     src_layer_end_idx: int
     tgt_layer_start_idx: int
     tgt_layer_end_idx: int
+    src_layer_indices: List[int]
+    tgt_layer_indices: List[int]
 
 
 @dataclass(frozen=True)
@@ -89,48 +91,32 @@ class ChannelProfiler:
         self.profile_config = profile_config
         self.mm = ctx.mm
 
-    def _get_logger(self) -> logging.Logger:
-        train_logger = logging.getLogger(f"{self.config.alg}_train")
-        if train_logger.handlers:
-            return train_logger
-        eval_logger = logging.getLogger(f"{self.config.alg}_eval")
-        if eval_logger.handlers:
-            return eval_logger
-        return train_logger
-
     def profile_all_edges(self, edges: Optional[List[Edge]] = None) -> Dict[str, ChannelProfileResult]:
-        logger = self._get_logger()
         results: Dict[str, ChannelProfileResult] = {}
         target_edges = self.ctx.edges if edges is None else edges
         for edge in target_edges:
-            logger.info("[ChannelProfiler] profiling edge=%s (%s -> %s)", edge.id, edge.src_id, edge.tgt_id)
+            logging.info("[ChannelProfiler] profiling edge=%s (%s -> %s)", edge.id, edge.src_id, edge.tgt_id)
             result = self.profile_edge(edge)
             for channel in result.selected_channels:
                 self.ctx.cm.add_channel(edge.id, channel.src_layer_idx, channel.dst_layer_idx)
             results[edge.id] = result
-            logger.info(
-                "[ChannelProfiler] %s selected src=L%d-L%d -> tgt=L%d-L%d (win=%d, val_loss=%.6f)",
+            logging.info(
+                "[ChannelProfiler] %s selected pairs=%s (win=%d, val_loss=%.6f)",
                 edge.id,
-                result.selected_channels[0].src_layer_idx,
-                result.selected_channels[-1].src_layer_idx,
-                result.selected_channels[0].dst_layer_idx,
-                result.selected_channels[-1].dst_layer_idx,
+                self._format_channels(result.selected_channels),
                 len(result.selected_channels),
                 result.best_validation_loss,
             )
         return results
 
     def profile_edge(self, edge: Edge) -> ChannelProfileResult:
-        logger = self._get_logger()
-        terminal_channels = self._build_terminal_channels(edge)
-        logger.info(
-            "[ChannelProfiler] %s initial terminal window src=L%d-L%d -> tgt=L%d-L%d (win=%d)",
+        candidate_channels = self._build_candidate_channels(edge)
+        logging.info(
+            "[ChannelProfiler] %s initial %s candidates=%s (win=%d)",
             edge.id,
-            terminal_channels[0].src_layer_idx,
-            terminal_channels[-1].src_layer_idx,
-            terminal_channels[0].dst_layer_idx,
-            terminal_channels[-1].dst_layer_idx,
-            len(terminal_channels),
+            self.config.layer_alignment,
+            self._format_channels(candidate_channels),
+            len(candidate_channels),
         )
         train_bank = self._build_profile_bank(
             edge,
@@ -144,7 +130,7 @@ class ChannelProfiler:
             split="train",
             seed_offset=10_000,
         )
-        logger.info(
+        logging.info(
             "[ChannelProfiler] %s profile bank train=%d val=%d proxy_steps=%d proxy_dim=%d heads=%d depth=%d",
             edge.id,
             len(train_bank),
@@ -155,10 +141,17 @@ class ChannelProfiler:
             self.profile_config.translator_depth,
         )
 
-        probe_window_size = min(2, len(terminal_channels))
+        min_model_layers = min(
+            self.mm.get_model_spec(edge.src_id).num_layers,
+            self.mm.get_model_spec(edge.tgt_id).num_layers,
+        )
+        probe_window_size = max(1, min_model_layers // 3)
+        probe_window_size = min(probe_window_size, len(candidate_channels))
+        max_probe_window_size = max(probe_window_size, min_model_layers // 2)
+        max_probe_window_size = min(max_probe_window_size, len(candidate_channels))
         probe_windows = [
-            terminal_channels[idx : idx + probe_window_size]
-            for idx in range(len(terminal_channels) - probe_window_size + 1)
+            candidate_channels[idx : idx + probe_window_size]
+            for idx in range(len(candidate_channels) - probe_window_size + 1)
         ]
         channel_scores: List[ProxyValidationScore] = []
         history: List[ChannelProfileStep] = []
@@ -176,76 +169,60 @@ class ChannelProfiler:
 
         translated_losses = [score.translated_loss for score in channel_scores]
         min_loss_idx = min(range(len(translated_losses)), key=translated_losses.__getitem__)
-        lower_window_start_idx = self._find_lower_elbow_index(translated_losses, min_loss_idx)
-        upper_window_start_idx = self._find_upper_elbow_index(translated_losses, min_loss_idx)
-        lower_elbow_idx = lower_window_start_idx
-        upper_elbow_idx = upper_window_start_idx + probe_window_size - 1
-        lower_elbow_idx, upper_elbow_idx = self._enforce_min_window(
-            lower_elbow_idx,
-            upper_elbow_idx,
-            anchor_idx=min_loss_idx,
-            max_idx=len(terminal_channels) - 1,
+        selected_channels, selected_score, expansion_history = self._expand_channels_greedily(
+            edge=edge,
+            candidate_channels=candidate_channels,
+            probe_windows=probe_windows,
+            probe_scores=channel_scores,
+            best_probe_idx=min_loss_idx,
+            max_probe_window_size=max_probe_window_size,
+            train_bank=train_bank,
+            val_bank=val_bank,
         )
-        selected_channels = terminal_channels[lower_elbow_idx : upper_elbow_idx + 1]
-        selected_score = self._score_channels(edge, selected_channels, train_bank, val_bank)
-        history.append(
-            self._build_history_step(
-                removed_side="selected",
-                channels=selected_channels,
-                validation_loss=selected_score.translated_loss,
-                improvement=0.0,
-            )
-        )
+        history.extend(expansion_history)
 
-        logger.info("")
-        logger.info("[ChannelProfiler] %s Sliding-window validation profile (win=2)", edge.id)
+        logging.info("")
+        logging.info("[ChannelProfiler] %s Sliding-window validation profile (win=%d)", edge.id, probe_window_size)
         for idx, (channels, score) in enumerate(zip(probe_windows, channel_scores)):
-            logger.info(
-                "[ChannelProfiler] %s Probe[%02d] src=L%d-L%d tgt=L%d-L%d native=%.6f translated=%.6f",
+            logging.info(
+                "[ChannelProfiler] %s Probe[%02d] pairs=%s native=%.6f translated=%.6f",
                 edge.id,
                 idx,
-                channels[0].src_layer_idx,
-                channels[-1].src_layer_idx,
-                channels[0].dst_layer_idx,
-                channels[-1].dst_layer_idx,
+                self._format_channels(channels),
                 score.native_loss,
                 score.translated_loss,
             )
-        logger.info("")
-        logger.info(
-            "[ChannelProfiler] %s lowest validation probe idx=%d src=L%d-L%d tgt=L%d-L%d native=%.6f translated=%.6f",
+        logging.info("")
+        logging.info(
+            "[ChannelProfiler] %s lowest validation probe idx=%d pairs=%s native=%.6f translated=%.6f",
             edge.id,
             min_loss_idx,
-            probe_windows[min_loss_idx][0].src_layer_idx,
-            probe_windows[min_loss_idx][-1].src_layer_idx,
-            probe_windows[min_loss_idx][0].dst_layer_idx,
-            probe_windows[min_loss_idx][-1].dst_layer_idx,
+            self._format_channels(probe_windows[min_loss_idx]),
             channel_scores[min_loss_idx].native_loss,
             channel_scores[min_loss_idx].translated_loss,
         )
-        logger.info(
-            "[ChannelProfiler] %s lower elbow idx=%d src=L%d tgt=L%d translated=%.6f",
+        logging.info(
+            "[ChannelProfiler] %s greedy seed pairs=%s (win=%d) native=%.6f translated=%.6f",
             edge.id,
-            lower_elbow_idx,
-            terminal_channels[lower_elbow_idx].src_layer_idx,
-            terminal_channels[lower_elbow_idx].dst_layer_idx,
-            channel_scores[lower_window_start_idx].translated_loss,
+            self._format_channels(probe_windows[min_loss_idx]),
+            len(probe_windows[min_loss_idx]),
+            channel_scores[min_loss_idx].native_loss,
+            channel_scores[min_loss_idx].translated_loss,
         )
-        logger.info(
-            "[ChannelProfiler] %s upper elbow idx=%d src=L%d tgt=L%d translated=%.6f",
+        for step in expansion_history:
+            logging.info(
+                "[ChannelProfiler] %s %s pairs=%s (win=%d) translated=%.6f improvement=%.6f",
+                edge.id,
+                step.removed_side,
+                self._format_channels(self._channels_from_history_step(step)),
+                step.window_size,
+                step.validation_loss,
+                step.improvement,
+            )
+        logging.info(
+            "[ChannelProfiler] %s selected window pairs=%s (win=%d) native=%.6f translated=%.6f",
             edge.id,
-            upper_elbow_idx,
-            terminal_channels[upper_elbow_idx].src_layer_idx,
-            terminal_channels[upper_elbow_idx].dst_layer_idx,
-            channel_scores[upper_window_start_idx].translated_loss,
-        )
-        logger.info(
-            "[ChannelProfiler] %s selected window src=L%d-L%d -> tgt=L%d-L%d (win=%d) native=%.6f translated=%.6f",
-            edge.id,
-            selected_channels[0].src_layer_idx,
-            selected_channels[-1].src_layer_idx,
-            selected_channels[0].dst_layer_idx,
-            selected_channels[-1].dst_layer_idx,
+            self._format_channels(selected_channels),
             len(selected_channels),
             selected_score.native_loss,
             selected_score.translated_loss,
@@ -268,6 +245,151 @@ class ChannelProfiler:
             Channel(src_layer_idx=src_start + offset, dst_layer_idx=tgt_start + offset)
             for offset in range(window_size)
         ]
+
+    def _build_candidate_channels(self, edge: Edge) -> List[Channel]:
+        if self.config.layer_alignment == "terminal":
+            return self._build_terminal_channels(edge)
+        if self.config.layer_alignment == "depth-ratio":
+            return self._build_depth_ratio_channels(edge)
+        raise ValueError(f"Unsupported layer_alignment for profiling: {self.config.layer_alignment}")
+
+    def _build_depth_ratio_channels(self, edge: Edge) -> List[Channel]:
+        src_spec = self.mm.get_model_spec(edge.src_id)
+        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
+        num_pairs = min(src_spec.num_layers, tgt_spec.num_layers)
+        src_layer_indices = self._build_depth_ratio_indices(src_spec.num_layers, num_pairs)
+        tgt_layer_indices = self._build_depth_ratio_indices(tgt_spec.num_layers, num_pairs)
+        return [
+            Channel(src_layer_idx=src_layer_idx, dst_layer_idx=tgt_layer_idx)
+            for src_layer_idx, tgt_layer_idx in zip(src_layer_indices, tgt_layer_indices)
+        ]
+
+    def _exclude_edge_probe_channels(self, edge: Edge, channels: List[Channel]) -> List[Channel]:
+        src_spec = self.mm.get_model_spec(edge.src_id)
+        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
+        if len(channels) <= 2 or min(src_spec.num_layers, tgt_spec.num_layers) <= 2:
+            return channels
+
+        filtered_channels = [
+            channel
+            for channel in channels
+            if channel.src_layer_idx not in {0, src_spec.num_layers - 1}
+            and channel.dst_layer_idx not in {0, tgt_spec.num_layers - 1}
+        ]
+        return filtered_channels or channels
+
+    def _build_depth_ratio_indices(self, total_layers: int, num_pairs: int) -> List[int]:
+        if num_pairs == 1:
+            return [total_layers - 1]
+
+        indices: List[int] = []
+        for pos in range(num_pairs):
+            ratio = pos / (num_pairs - 1)
+            proposed_idx = int(round(ratio * (total_layers - 1)))
+            remaining = num_pairs - pos - 1
+            min_allowed = 0 if not indices else indices[-1] + 1
+            max_allowed = total_layers - 1 - remaining
+            indices.append(min(max(proposed_idx, min_allowed), max_allowed))
+        return indices
+
+    def _format_channels(self, channels: List[Channel]) -> str:
+        return ", ".join(
+            f"L{channel.src_layer_idx}->L{channel.dst_layer_idx}"
+            for channel in channels
+        )
+
+
+    def _expand_channels_greedily(
+        self,
+        *,
+        edge: Edge,
+        candidate_channels: List[Channel],
+        probe_windows: List[List[Channel]],
+        probe_scores: List[ProxyValidationScore],
+        best_probe_idx: int,
+        max_probe_window_size: int,
+        train_bank: List[Dict[str, Any]],
+        val_bank: List[Dict[str, Any]],
+    ) -> tuple[List[Channel], ProxyValidationScore, List[ChannelProfileStep]]:
+        start_search_radius = 2
+        score_cache: Dict[tuple[int, int], ProxyValidationScore] = {
+            (idx, len(window)): score
+            for idx, (window, score) in enumerate(zip(probe_windows, probe_scores))
+        }
+
+        current_start_idx = best_probe_idx
+        current_window_size = len(probe_windows[best_probe_idx])
+        current_channels = probe_windows[best_probe_idx]
+        current_score = probe_scores[best_probe_idx]
+        history: List[ChannelProfileStep] = []
+
+        while current_window_size < max_probe_window_size:
+            next_window_size = current_window_size + 1
+            min_start_idx = max(0, current_start_idx - start_search_radius)
+            max_start_idx = min(len(candidate_channels) - next_window_size, current_start_idx + start_search_radius)
+            logging.info("")
+            logging.info(
+                "[ChannelProfiler] %s selected win=%d pairs=%s translated=%.6f",
+                edge.id,
+                current_window_size,
+                self._format_channels(current_channels),
+                current_score.translated_loss,
+            )
+            logging.info(
+                "[ChannelProfiler] %s grow to win=%d search_start_idx=[%d,%d] (anchor_start=%d±%d)",
+                edge.id,
+                next_window_size,
+                min_start_idx,
+                max_start_idx,
+                current_start_idx,
+                start_search_radius,
+            )
+            local_candidates: List[tuple[int, List[Channel], ProxyValidationScore]] = []
+            for start_idx in range(min_start_idx, max_start_idx + 1):
+                channels = candidate_channels[start_idx : start_idx + next_window_size]
+                window_key = (start_idx, next_window_size)
+                if window_key in score_cache:
+                    score = score_cache[window_key]
+                else:
+                    score = self._score_channels(edge, channels, train_bank, val_bank)
+                    score_cache[window_key] = score
+                local_candidates.append((start_idx, channels, score))
+
+            if not local_candidates:
+                break
+
+            best_local_start_idx, best_local_channels, best_local_score = min(
+                local_candidates,
+                key=lambda candidate: (
+                    candidate[2].translated_loss,
+                    -candidate[1][0].src_layer_idx,
+                    -candidate[1][0].dst_layer_idx,
+                ),
+            )
+
+            current_start_idx = best_local_start_idx
+            current_window_size = next_window_size
+            current_channels = best_local_channels
+            previous_score = current_score
+            current_score = best_local_score
+            history.append(
+                self._build_history_step(
+                    removed_side=f"expand-win-{current_window_size}",
+                    channels=current_channels,
+                    validation_loss=current_score.translated_loss,
+                    improvement=previous_score.translated_loss - current_score.translated_loss,
+                )
+            )
+
+        history.append(
+            self._build_history_step(
+                removed_side="selected",
+                channels=current_channels,
+                validation_loss=current_score.translated_loss,
+                improvement=0.0,
+            )
+        )
+        return current_channels, current_score, history
 
     def _find_lower_elbow_index(self, losses: List[float], min_loss_idx: int) -> int:
         if len(losses) >= 2 and losses[0] < losses[1]:
@@ -411,7 +533,6 @@ class ChannelProfiler:
         channels: List[Channel],
         train_bank: List[Dict[str, Any]],
     ):
-        logger = self._get_logger()
         from mot.train import LayerWindowDirectionalTranslator
 
         random.seed(self.config.seed)
@@ -419,19 +540,13 @@ class ChannelProfiler:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.config.seed)
 
-        logger.info("")
-        logger.info(
-            "[ChannelProfiler] %s train proxy win=%d src=L%d-L%d -> tgt=L%d-L%d steps=%d dim=%d heads=%d depth=%d",
+        logging.info("")
+        logging.info(
+            "[ChannelProfiler] %s train proxy win=%d pairs=%s steps=%d",
             edge.id,
             len(channels),
-            channels[0].src_layer_idx,
-            channels[-1].src_layer_idx,
-            channels[0].dst_layer_idx,
-            channels[-1].dst_layer_idx,
+            self._format_channels(channels),
             self.profile_config.max_steps,
-            self.profile_config.translator_dim,
-            self.profile_config.translator_heads,
-            self.profile_config.translator_depth,
         )
         proxy = LayerWindowDirectionalTranslator(
             src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
@@ -466,7 +581,7 @@ class ChannelProfiler:
             if (
                 step_idx == 0 or step_idx + 1 == self.profile_config.max_steps or (step_idx + 1) % log_every == 0
             ):
-                logger.info(
+                logging.info(
                     "[ChannelProfiler] %s proxy train step=%d/%d loss=%.6f",
                     edge.id,
                     step_idx + 1,
@@ -474,12 +589,29 @@ class ChannelProfiler:
                     last_loss,
                 )
         if last_loss is not None:
-            logger.info(
+            logging.info(
                 "[ChannelProfiler] %s proxy train done final_loss=%.6f",
                 edge.id,
                 last_loss,
             )
         return proxy
+
+    def _get_src_layer_indices(self, channels: List[Channel]) -> List[int]:
+        src_layer_indices = [channel.src_layer_idx for channel in channels]
+        self._validate_strictly_increasing_non_negative_indices(src_layer_indices, name="src_layer_indices")
+        return src_layer_indices
+
+    def _get_tgt_layer_indices(self, channels: List[Channel]) -> List[int]:
+        tgt_layer_indices = [channel.dst_layer_idx for channel in channels]
+        self._validate_strictly_increasing_non_negative_indices(tgt_layer_indices, name="target_layer_indices")
+        return tgt_layer_indices
+
+    def _validate_strictly_increasing_non_negative_indices(self, indices: List[int], *, name: str) -> None:
+        if indices[0] < 0:
+            raise ValueError(f"{name} must be >= 0, got {indices}")
+        for prev_idx, next_idx in zip(indices, indices[1:]):
+            if next_idx <= prev_idx:
+                raise ValueError(f"{name} must be strictly increasing, got {indices}")
 
     def _compute_proxy_loss(
         self,
@@ -491,7 +623,9 @@ class ChannelProfiler:
         from .common import compute_prefix_correction_and_suffix_lm_loss, past_key_values_to_blocks
         from mot.train import replay_target_prefill_with_injected_window
 
-        selected_past = tuple(sample["source_past_key_values"][channel.src_layer_idx] for channel in channels)
+        src_layer_indices = self._get_src_layer_indices(channels)
+        target_layer_indices = self._get_tgt_layer_indices(channels)
+        selected_past = tuple(sample["source_past_key_values"][layer_idx] for layer_idx in src_layer_indices)
         key_block, value_block = past_key_values_to_blocks(selected_past)
         translated_key, translated_value = proxy(key_block, value_block)
         tgt_spec = self.mm.get_model_spec(edge.tgt_id)
@@ -499,7 +633,7 @@ class ChannelProfiler:
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=sample["prefix_cache_ids"],
-            target_start_layer_idx=channels[0].dst_layer_idx,
+            target_layer_indices=target_layer_indices,
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
@@ -510,7 +644,7 @@ class ChannelProfiler:
             lm_input_ids=sample["lm_input_ids"],
             lm_labels=sample["lm_labels"],
             native_target_past_key_values=sample["native_target_past_key_values"],
-            target_start_layer_idx=channels[0].dst_layer_idx,
+            target_layer_indices=target_layer_indices,
         )
 
     def _compute_translated_validation_loss(
@@ -523,7 +657,9 @@ class ChannelProfiler:
         from .common import compute_prefix_correction_and_suffix_lm_loss, past_key_values_to_blocks
         from mot.train import replay_target_prefill_with_injected_window
 
-        selected_past = tuple(sample["source_past_key_values"][channel.src_layer_idx] for channel in channels)
+        src_layer_indices = self._get_src_layer_indices(channels)
+        target_layer_indices = self._get_tgt_layer_indices(channels)
+        selected_past = tuple(sample["source_past_key_values"][layer_idx] for layer_idx in src_layer_indices)
         key_block, value_block = past_key_values_to_blocks(selected_past)
         translated_key, translated_value = proxy(key_block, value_block)
         tgt_spec = self.mm.get_model_spec(edge.tgt_id)
@@ -531,7 +667,7 @@ class ChannelProfiler:
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=sample["prefix_cache_ids"],
-            target_start_layer_idx=channels[0].dst_layer_idx,
+            target_layer_indices=target_layer_indices,
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
@@ -542,7 +678,7 @@ class ChannelProfiler:
             lm_input_ids=sample["lm_input_ids"],
             lm_labels=sample["lm_labels"],
             native_target_past_key_values=sample["native_target_past_key_values"],
-            target_start_layer_idx=channels[0].dst_layer_idx,
+            target_layer_indices=target_layer_indices,
         )
 
     def _compute_native_validation_loss(
@@ -553,13 +689,14 @@ class ChannelProfiler:
     ) -> torch.Tensor:
         from .common import compute_prefix_correction_and_suffix_lm_loss
 
+        target_layer_indices = self._get_tgt_layer_indices(channels)
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=self.mm.get_model(edge.tgt_id),
             past_key_values=sample["native_target_past_key_values"],
             lm_input_ids=sample["lm_input_ids"],
             lm_labels=sample["lm_labels"],
             native_target_past_key_values=sample["native_target_past_key_values"],
-            target_start_layer_idx=channels[0].dst_layer_idx,
+            target_layer_indices=target_layer_indices,
         )
 
     def _build_history_step(
@@ -579,12 +716,14 @@ class ChannelProfiler:
             src_layer_end_idx=channels[-1].src_layer_idx,
             tgt_layer_start_idx=channels[0].dst_layer_idx,
             tgt_layer_end_idx=channels[-1].dst_layer_idx,
+            src_layer_indices=[channel.src_layer_idx for channel in channels],
+            tgt_layer_indices=[channel.dst_layer_idx for channel in channels],
         )
 
     def _channels_from_history_step(self, step: ChannelProfileStep) -> List[Channel]:
         return [
-            Channel(src_layer_idx=step.src_layer_start_idx + offset, dst_layer_idx=step.tgt_layer_start_idx + offset)
-            for offset in range(step.window_size)
+            Channel(src_layer_idx=src_layer_idx, dst_layer_idx=tgt_layer_idx)
+            for src_layer_idx, tgt_layer_idx in zip(step.src_layer_indices, step.tgt_layer_indices)
         ]
 
 

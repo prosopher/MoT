@@ -1,12 +1,46 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
 from core.context import Context
 from core.eval_util import *
+from core.train_util import blocks_to_partial_past_key_values
+from .train import (
+    extract_model_prefill_artifacts,
+    extract_selected_layer_canonical_attn_input_block,
+)
+
+
+
+def extract_selected_layer_blocks(
+    past_key_values: PastKeyValues,
+    layer_indices: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    selected_past = tuple(past_key_values[layer_idx] for layer_idx in layer_indices)
+    return past_key_values_to_blocks(selected_past)
+
+
+
+def build_partial_past_from_layer_indices(
+    past_key_values: PastKeyValues,
+    layer_indices: List[int],
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> PastKeyValues:
+    key_block, value_block = extract_selected_layer_blocks(
+        past_key_values=past_key_values,
+        layer_indices=layer_indices,
+    )
+    return blocks_to_partial_past_key_values(
+        key_block=key_block,
+        value_block=value_block,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
 
 
 def _build_logit_example_state(
@@ -15,11 +49,19 @@ def _build_logit_example_state(
     prefix_input_ids: torch.Tensor,
     **_,
 ):
+    prefill_by_node_id = {
+        node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), prefix_input_ids)
+        for node in ctx.nodes
+    }
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            node.id: prefill_by_node_id[node.id][0]
             for node in ctx.nodes
-        }
+        },
+        "hidden_states_by_node_id": {
+            node.id: prefill_by_node_id[node.id][1]
+            for node in ctx.nodes
+        },
     }
 
 
@@ -27,23 +69,31 @@ def _build_logit_edge_artifacts(
     *,
     ctx: Context,
     edge: Edge,
+    prefix_input_ids: torch.Tensor,
     example_state,
     translator_pool,
     **_,
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
-
-    translated_past = translator_pool.translate_layers(
-        past_key_values=past_by_node_id[edge.src_id],
+    hidden_states_by_node_id = example_state["hidden_states_by_node_id"]
+    mixed_target_past, _ = translator_pool.build_replayed_target_past(
+        source_past_key_values=past_by_node_id[edge.src_id],
+        prefix_input_ids=prefix_input_ids,
+        target_model=ctx.mm.get_model(edge.tgt_id),
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+            ctx.mm.get_model(edge.src_id),
+            hidden_states_by_node_id[edge.src_id],
+            ctx.cm.get_src_layer_indices(edge.id),
+        ),
     )
     native_past = past_by_node_id[edge.tgt_id]
     return LogitEvalEdgeArtifacts(
-        translated_past_key_values=translated_past,
+        translated_past_key_values=mixed_target_past,
         native_past_key_values=native_past,
-        cosine_value=cosine_similarity_between_past(translated_past, native_past),
+        cosine_value=cosine_similarity_between_past(mixed_target_past, native_past),
     )
 
 
@@ -55,9 +105,9 @@ def evaluate_generation_dataset(
     eval_config: EvalConfig,
     translator_pool,
 ) -> Dict[str, Dict[str, float]]:
+    train_config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
-    train_config = ctx.config
     device = train_config.device
     tokenizer = ctx.tokenizer
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
@@ -101,26 +151,41 @@ def evaluate_generation_dataset(
                     get_answer_token_budget(eval_config),
                 )
 
+            prefill_by_node_id = {
+                node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), prefix_input_ids)
+                for node in nodes
+            }
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+                node.id: prefill_by_node_id[node.id][0]
+                for node in nodes
+            }
+            hidden_states_by_node_id = {
+                node.id: prefill_by_node_id[node.id][1]
                 for node in nodes
             }
 
             for edge in edges:
-                translated_past = translator_pool.translate_layers(
-                    past_key_values=past_by_node_id[edge.src_id],
+                mixed_target_past, _ = translator_pool.build_replayed_target_past(
+                    source_past_key_values=past_by_node_id[edge.src_id],
+                    prefix_input_ids=prefix_input_ids,
+                    target_model=ctx.mm.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                        ctx.mm.get_model(edge.src_id),
+                        hidden_states_by_node_id[edge.src_id],
+                        ctx.cm.get_src_layer_indices(edge.id),
+                    ),
                 )
 
                 native_past = past_by_node_id[edge.tgt_id]
-                cosine_value = cosine_similarity_between_past(translated_past, native_past)
+                cosine_value = cosine_similarity_between_past(mixed_target_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
-                    past_key_values=translated_past,
+                    past_key_values=mixed_target_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
@@ -185,16 +250,20 @@ def run_eval(
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
     logging.info("edges=%s", [edge.id for edge in edges])
-    for node in nodes:
-        logging.info(
-            "translation_spec: %s layers=%d hidden=%d heads=%d (%s)",
-            node.id,
-            ctx.mm.get_model_spec(node.id).num_layers,
-            ctx.mm.get_model_spec(node.id).hidden_size,
-            ctx.mm.get_model_spec(node.id).num_heads,
-            node.model_id,
-        )
-    logging.info("translation_mode=translate_all_layers")
+    logging.info(
+        "resolved_channels=%s",
+        {
+            edge.id: {
+                "src": [ctx.cm.get_src_layer_start_idx(edge.id), ctx.cm.get_src_layer_end_idx(edge.id)],
+                "tgt": [ctx.cm.get_tgt_layer_start_idx(edge.id), ctx.cm.get_tgt_layer_end_idx(edge.id)],
+                "src_indices": ctx.cm.get_src_layer_indices(edge.id),
+                "tgt_indices": ctx.cm.get_tgt_layer_indices(edge.id),
+                "num_layers": len(ctx.cm.get_channels(edge.id)),
+            }
+            for edge in edges
+        },
+    )
+    logging.info("translation_mode=translate_canonical_attn_input_window_and_restore_target_kv")
     logging.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
@@ -202,26 +271,75 @@ def run_eval(
 
     logging.info("Preparing validation dataloader for OpenWebText/validation")
 
-    def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        return translator_pool.translate_layers(
+    def build_source_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
+        return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.src_id],
+            layer_indices=ctx.cm.get_src_layer_indices(edge.id),
+            num_heads=ctx.mm.get_model_spec(edge.src_id).num_heads,
+            head_dim=ctx.mm.get_model_spec(edge.src_id).head_dim,
+        )
+
+    def build_target_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
+        return build_partial_past_from_layer_indices(
+            past_key_values=past_by_node_id[edge.tgt_id],
+            layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+            num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
+            head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
+        )
+
+    def build_translated_target_past_fn(
+        *,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        past_by_node_id,
+    ) -> PastKeyValues:
+        _, source_hidden_states = extract_model_prefill_artifacts(
+            ctx.mm.get_model(edge.src_id),
+            prefix_cache_ids,
+        )
+        mixed_target_past, _ = translator_pool.build_replayed_target_past(
+            source_past_key_values=past_by_node_id[edge.src_id],
+            prefix_input_ids=prefix_cache_ids,
+            target_model=ctx.mm.get_model(edge.tgt_id),
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-        )
-
-    def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
-        source_past = past_by_node_id[edge.src_id]
-        target_past = past_by_node_id[edge.tgt_id]
-        return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=source_past,
-            translated_past_key_values=translator_pool.translate_layers(
-                past_key_values=source_past,
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                ctx.mm.get_model(edge.src_id),
+                source_hidden_states,
+                ctx.cm.get_src_layer_indices(edge.id),
             ),
-            target_top_past_key_values=target_past,
+        )
+        return mixed_target_past
+
+    def build_visualization_pasts_fn(
+        *,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        past_by_node_id,
+        **_,
+    ) -> Dict[str, PastKeyValues]:
+        _, source_hidden_states = extract_model_prefill_artifacts(
+            ctx.mm.get_model(edge.src_id),
+            prefix_cache_ids,
+        )
+        _, translated_window_past = translator_pool.build_replayed_target_past(
+            source_past_key_values=past_by_node_id[edge.src_id],
+            prefix_input_ids=prefix_cache_ids,
+            target_model=ctx.mm.get_model(edge.tgt_id),
+            src_node_id=edge.src_id,
+            tgt_node_id=edge.tgt_id,
+            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
+                ctx.mm.get_model(edge.src_id),
+                source_hidden_states,
+                ctx.cm.get_src_layer_indices(edge.id),
+            ),
+        )
+        return build_openwebtext_tsne_named_pasts(
+            source_top_past_key_values=build_source_window_past(edge, past_by_node_id),
+            translated_past_key_values=translated_window_past,
+            target_top_past_key_values=build_target_window_past(edge, past_by_node_id),
         )
 
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(

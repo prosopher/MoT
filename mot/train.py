@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -8,7 +8,14 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.config import Config
-from core.channel_manager import Channel, ChannelManager
+from core.channel_manager import (
+    Channel,
+    ChannelManager,
+    build_resolved_channels_path,
+    has_resolved_channels,
+    load_resolved_channels,
+    save_resolved_channels,
+)
 from core.channel_profiler import ChannelProfiler, load_channel_profile_config
 from core.context import Context
 from core.model_manager import ModelManager
@@ -19,9 +26,17 @@ from core.train_util import *
 MOT_VARIANTS = {"single", "mot"}
 
 
+CHANNEL_ALIGNED_LAYER_ALIGNMENTS = {"terminal", "depth-ratio"}
+
+
+def uses_channel_alignment(layer_alignment: str) -> bool:
+    return layer_alignment in CHANNEL_ALIGNED_LAYER_ALIGNMENTS
+
+
+
 def require_channel_profiler(ctx: Context) -> ChannelProfiler:
     if ctx.cp is None:
-        raise ValueError("Channel profiler is required when layer_alignment='terminal'.")
+        raise ValueError("Channel profiler is required when layer_alignment is 'terminal' or 'depth-ratio'.")
     return ctx.cp
 
 
@@ -53,8 +68,8 @@ class TrainConfig(Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.layer_alignment not in {"injection", "terminal"}:
-            raise ValueError("layer_alignment must be one of {'injection', 'terminal'}")
+        if self.layer_alignment not in {"injection", "terminal", "depth-ratio"}:
+            raise ValueError("layer_alignment must be one of {'injection', 'terminal', 'depth-ratio'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
         if self.variant not in MOT_VARIANTS:
@@ -155,6 +170,7 @@ class MixtureOfTranslators(nn.Module):
         mlp_ratio: int,
         num_translators: int,
         top_k: int,
+        translator_cls: Type[nn.Module] = CrossLayerWindowTranslator,
     ) -> None:
         super().__init__()
         if num_translators < 1:
@@ -167,7 +183,7 @@ class MixtureOfTranslators(nn.Module):
         self.top_k = top_k
         self.translators = nn.ModuleList(
             [
-                CrossLayerWindowTranslator(
+                translator_cls(
                     src_hidden_size=src_hidden_size,
                     tgt_hidden_size=tgt_hidden_size,
                     num_layers=num_layers,
@@ -187,6 +203,8 @@ class MixtureOfTranslators(nn.Module):
             nn.GELU(),
             nn.Linear(router_hidden_dim, num_translators),
         )
+        self.last_mixture_weights: Optional[torch.Tensor] = None
+        self.last_router_logits: Optional[torch.Tensor] = None
 
     def _compute_mixture_weights(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         router_input = layer_window_cache.reshape(layer_window_cache.shape[0], layer_window_cache.shape[1], -1)
@@ -196,7 +214,10 @@ class MixtureOfTranslators(nn.Module):
             topk_mask = torch.zeros_like(router_logits, dtype=torch.bool)
             topk_mask.scatter_(-1, topk_indices, True)
             router_logits = router_logits.masked_fill(~topk_mask, float("-inf"))
-        return torch.softmax(router_logits, dim=-1)
+        mixture_weights = torch.softmax(router_logits, dim=-1)
+        self.last_router_logits = router_logits.detach()
+        self.last_mixture_weights = mixture_weights.detach()
+        return mixture_weights
 
     def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         expert_outputs = [translator(layer_window_cache) for translator in self.translators]
@@ -205,6 +226,42 @@ class MixtureOfTranslators(nn.Module):
         mixture_weights = self._compute_mixture_weights(layer_window_cache)
         stacked_outputs = torch.stack(expert_outputs, dim=2)
         return (stacked_outputs * mixture_weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+
+    def get_balance_metrics(self) -> Optional[Dict[str, float]]:
+        if self.last_mixture_weights is None:
+            return None
+        weights = self.last_mixture_weights
+        token_importance = weights.sum(dim=(0, 1))
+        token_load = (weights > 0).to(weights.dtype).sum(dim=(0, 1))
+        eps = torch.finfo(weights.dtype).eps
+
+        def squared_cv(values: torch.Tensor) -> torch.Tensor:
+            mean = values.mean()
+            variance = ((values - mean) ** 2).mean()
+            return variance / (mean.square() + eps)
+
+        return {
+            "gate_importance_cv2": float(squared_cv(token_importance).item()),
+            "gate_load_cv2": float(squared_cv(token_load).item()),
+            "gate_importance_entropy": float((-(token_importance / token_importance.sum().clamp_min(eps)) * (token_importance / token_importance.sum().clamp_min(eps)).clamp_min(eps).log()).sum().item()),
+        }
+
+
+def collect_mot_balance_metrics(module: nn.Module) -> Dict[str, float]:
+    summed_metrics: Dict[str, float] = {}
+    num_mot_modules = 0
+    for submodule in module.modules():
+        if not isinstance(submodule, MixtureOfTranslators):
+            continue
+        metrics = submodule.get_balance_metrics()
+        if metrics is None:
+            continue
+        num_mot_modules += 1
+        for name, value in metrics.items():
+            summed_metrics[name] = summed_metrics.get(name, 0.0) + value
+    if num_mot_modules == 0:
+        return {}
+    return {name: value / num_mot_modules for name, value in summed_metrics.items()}
 
 
 def build_window_translator(
@@ -219,9 +276,10 @@ def build_window_translator(
     mlp_ratio: int,
     mot_num_translators: int,
     mot_top_k: int,
+    translator_cls: Type[nn.Module] = CrossLayerWindowTranslator,
 ) -> nn.Module:
     if variant == "single":
-        return CrossLayerWindowTranslator(
+        return translator_cls(
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
             num_layers=num_layers,
@@ -241,6 +299,7 @@ def build_window_translator(
             mlp_ratio=mlp_ratio,
             num_translators=mot_num_translators,
             top_k=mot_top_k,
+            translator_cls=translator_cls,
         )
     raise ValueError(f"Unsupported MOT variant: {variant}")
 
@@ -275,6 +334,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            translator_cls=CrossLayerWindowTranslator,
         )
         self.value_translator = build_window_translator(
             variant=variant,
@@ -287,6 +347,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             mlp_ratio=mlp_ratio,
             mot_num_translators=mot_num_translators,
             mot_top_k=mot_top_k,
+            translator_cls=CrossLayerWindowTranslator,
         )
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -400,7 +461,7 @@ class LayerWindowTranslatorPool(nn.Module):
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=prefix_input_ids,
-            target_start_layer_idx=self.cm.get_tgt_layer_start_idx(edge_id),
+            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
@@ -455,11 +516,13 @@ def build_channel_map(
 
 def resolve_channels(ctx: Context) -> None:
     config = ctx.config
+    if has_resolved_channels(ctx.cm, ctx.edges):
+        return
     if config.layer_alignment == "injection":
         build_channel_map(ctx, ctx.edges)
         return
 
-    profiler = ctx.cp
+    profiler = require_channel_profiler(ctx)
     profiler.profile_all_edges()
 
 
@@ -599,7 +662,7 @@ def run_gpt2_block_with_injected_layer(
 def replay_target_prefill_with_injected_window(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    target_start_layer_idx: int,
+    target_layer_indices: List[int],
     injected_key_block: torch.Tensor,
     injected_value_block: torch.Tensor,
     tgt_spec: ModelSpec,
@@ -612,16 +675,18 @@ def replay_target_prefill_with_injected_window(
     )
     translated_num_layers = len(injected_window)
 
-    transformer = require_gpt2_transformer(target_model)
-    target_end_layer_idx = target_start_layer_idx + translated_num_layers - 1
-    if not (0 <= target_start_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(transformer.h) - 1}]")
-    if target_end_layer_idx >= len(transformer.h):
+    # zip(target_layer_indices, injected_window) would silently truncate on mismatch,
+    # so this remains a correctness guard rather than a mere runtime-prevention check.
+    if len(target_layer_indices) != translated_num_layers:
         raise ValueError(
-            f"Injected window ending at layer {target_end_layer_idx} exceeds target stack with {len(transformer.h)} layers"
+            "Number of target_layer_indices must match translated window size, "
+            f"got {len(target_layer_indices)} vs {translated_num_layers}"
         )
 
+    transformer = require_gpt2_transformer(target_model)
+
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    target_start_layer_idx = target_layer_indices[0]
 
     if torch.is_grad_enabled():
         with torch.no_grad():
@@ -636,8 +701,11 @@ def replay_target_prefill_with_injected_window(
             hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
             rebuilt_past.append(present)
 
-    for offset, injected_present in enumerate(injected_window):
-        layer_idx = target_start_layer_idx + offset
+    previous_layer_idx = target_start_layer_idx - 1
+    for layer_idx, injected_present in zip(target_layer_indices, injected_window):
+        for native_layer_idx in range(previous_layer_idx + 1, layer_idx):
+            hidden_states, present = run_gpt2_block_with_cache(transformer.h[native_layer_idx], hidden_states)
+            rebuilt_past.append(present)
         hidden_states, present = run_gpt2_block_with_injected_layer(
             transformer.h[layer_idx],
             hidden_states,
@@ -645,8 +713,9 @@ def replay_target_prefill_with_injected_window(
             injected_present[1],
         )
         rebuilt_past.append(present)
+        previous_layer_idx = layer_idx
 
-    for upper_idx in range(target_end_layer_idx + 1, len(transformer.h)):
+    for upper_idx in range(previous_layer_idx + 1, len(transformer.h)):
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
         rebuilt_past.append(present)
 
@@ -704,9 +773,19 @@ def load_translator_pool_from_checkpoint(
         tokenizer,
         ChannelManager(edges),
     )
-    if config.layer_alignment == "terminal":
+    if uses_channel_alignment(config.layer_alignment):
         profile_config_path = Path(checkpoint_dir_path_obj) / "channel_profile.json"
         ctx.cp = ChannelProfiler(ctx, load_channel_profile_config(profile_config_path))
+
+    resolved_channels_path = build_resolved_channels_path(checkpoint_dir_path_obj)
+    if resolved_channels_path.exists():
+        load_resolved_channels(resolved_channels_path, ctx.cm, ctx.edges)
+    elif uses_channel_alignment(config.layer_alignment):
+        raise FileNotFoundError(
+            "Resolved channel map not found under checkpoint directory: "
+            f"{resolved_channels_path}. Re-run training with channel persistence enabled."
+        )
+
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
     translator_pool.to(config.device)
@@ -717,6 +796,7 @@ def load_translator_pool_from_checkpoint(
 
 def run_train(
     ctx: Context,
+    gpu_memory_tracker: GPUMemoryTracker,
 ) -> Path:
     config = ctx.config
     nodes = ctx.nodes
@@ -726,7 +806,7 @@ def run_train(
     output_path.mkdir(parents=True, exist_ok=True)
 
     cp = None
-    if config.layer_alignment == "terminal":
+    if uses_channel_alignment(config.layer_alignment):
         cp = require_channel_profiler(ctx)
 
     config_path = get_train_config_path(output_path)
@@ -736,21 +816,21 @@ def run_train(
         save_channel_profile_config(output_path, cp.profile_config)
 
     log_path = get_train_log_path(output_path)
-    logger = setup_logger(f"{config.alg}_train", log_path)
-    logger.info("Starting training")
-    logger.info("train_config=%s", asdict(config))
+    logging.info("Starting training")
+    logging.info("train_config=%s", asdict(config))
 
-    logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("edges=%s", [edge.id for edge in edges])
-    logger.info("[Setup] device=%s", config.device)
-    logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
+    logging.info("nodes=%s", [asdict(node) for node in nodes])
+    logging.info("edges=%s", [edge.id for edge in edges])
+    logging.info("[Setup] device=%s", config.device)
+    logging.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
     translator_pool = build_translator_pool(ctx)
+    save_resolved_channels(output_path, ctx.cm, edges)
     translator_pool.train()
 
-    logger.info("[Setup] full model specs")
+    logging.info("[Setup] full model specs")
     for node in nodes:
         spec = ctx.mm.get_model_spec(node.id)
-        logger.info(
+        logging.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
             node.model_id,
@@ -758,7 +838,7 @@ def run_train(
             spec.hidden_size,
             spec.num_heads,
         )
-    logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
+    logging.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(ctx)
 
@@ -773,9 +853,11 @@ def run_train(
         total_steps=config.max_steps,
     )
 
-    gpu_memory_tracker = GPUMemoryTracker(config.device)
 
     running_loss = 0.0
+    running_gate_importance_cv2 = 0.0
+    running_gate_load_cv2 = 0.0
+    running_gate_importance_entropy = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
     for step in progress_bar:
@@ -811,7 +893,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 
@@ -825,22 +907,36 @@ def run_train(
         gpu_memory_tracker.update()
 
         running_loss += step_loss_value
+        gate_metrics = collect_mot_balance_metrics(translator_pool)
+        running_gate_importance_cv2 += gate_metrics.get("gate_importance_cv2", 0.0)
+        running_gate_load_cv2 += gate_metrics.get("gate_load_cv2", 0.0)
+        running_gate_importance_entropy += gate_metrics.get("gate_importance_entropy", 0.0)
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
+            avg_gate_importance_cv2 = running_gate_importance_cv2 / config.log_every
+            avg_gate_load_cv2 = running_gate_load_cv2 / config.log_every
+            avg_gate_importance_entropy = running_gate_importance_entropy / config.log_every
             progress_bar.set_postfix(
                 loss=f"{avg_loss:.4f}",
+                gate_load_cv2=f"{avg_gate_load_cv2:.4f}",
                 lr=f"{scheduler.lr:.2e}",
             )
             gpu_memory = gpu_memory_tracker.summary()
-            logger.info(
-                "[Step %04d] window_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+            logging.info(
+                "[Step %04d] loss=%.4f | gate_importance_cv2=%.4f | gate_load_cv2=%.4f | gate_importance_entropy=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
+                avg_gate_importance_cv2,
+                avg_gate_load_cv2,
+                avg_gate_importance_entropy,
                 scheduler.lr,
                 gpu_memory["avg_allocated_pretty"],
                 gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
+            running_gate_importance_cv2 = 0.0
+            running_gate_load_cv2 = 0.0
+            running_gate_importance_entropy = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
@@ -848,12 +944,12 @@ def run_train(
         translator_pool=translator_pool,
     )
     final_gpu_memory = gpu_memory_tracker.summary()
-    logger.info(
+    logging.info(
         "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
         final_gpu_memory["avg_allocated_pretty"],
         final_gpu_memory["peak_allocated_pretty"],
         final_gpu_memory["num_samples"],
     )
-    logger.info("[Done] final checkpoint saved to %s", final_path)
-    logger.info("Saved train log to %s", log_path)
+    logging.info("[Done] final checkpoint saved to %s", final_path)
+    logging.info("Saved train log to %s", log_path)
     return final_path

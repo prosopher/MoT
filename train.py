@@ -3,11 +3,11 @@ import importlib
 from pathlib import Path
 
 from core.channel_manager import ChannelManager
-from core.common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
+from core.common import GPUMemoryTracker, add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, setup_logging
 from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import build_nodes_and_edges
-from core.train_util import build_models_and_tokenizer
+from core.train_util import build_models_and_tokenizer, get_train_log_path
 
 
 def load_train_module(alg: str):
@@ -63,6 +63,8 @@ def main() -> None:
         **config_kwargs,
     )
 
+    setup_logging(get_train_log_path(config.output_path))
+
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     models, tokenizer = build_models_and_tokenizer(config, nodes)
     ctx = Context(
@@ -73,11 +75,15 @@ def main() -> None:
         tokenizer,
         ChannelManager(edges),
     )
-    if hasattr(train_module, "ChannelProfiler") and getattr(config, "layer_alignment", None) == "terminal":
+    if hasattr(train_module, "ChannelProfiler") and train_module.uses_channel_alignment(getattr(config, "layer_alignment", "")):
         profile_config = train_module.load_channel_profile_config(Path(args.channel_profile_config_path))
         ctx.cp = train_module.ChannelProfiler(ctx, profile_config)
 
-    final_checkpoint = Path(train_module.run_train(ctx))
+    gpu_memory_tracker = GPUMemoryTracker(config.device)
+    try:
+        final_checkpoint = Path(train_module.run_train(ctx, gpu_memory_tracker))
+    finally:
+        gpu_memory_tracker.close()
 
     print(f"Saved outputs to {final_checkpoint.parent}")
     print(f"Final checkpoint: {final_checkpoint}")
