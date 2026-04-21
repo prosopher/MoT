@@ -2,27 +2,7 @@ from typing import Dict
 
 from transformers import PreTrainedModel
 
-from .model_spec import ModelSpec
-
-
-def get_model_spec(model: PreTrainedModel) -> ModelSpec:
-    config = model.config
-    try:
-        num_heads = config.n_head
-        hidden_size = config.n_embd
-        num_layers = config.n_layer
-    except AttributeError as exc:
-        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.") from exc
-    if hidden_size % num_heads != 0:
-        raise ValueError("hidden_size must be divisible by num_heads.")
-    model_id = config._name_or_path if hasattr(config, "_name_or_path") else "unknown"
-    return ModelSpec(
-        model_id=model_id,
-        num_layers=num_layers,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        head_dim=hidden_size // num_heads,
-    )
+from .model_spec import ModelSpec, infer_model_spec_from_config
 
 
 class ModelManager:
@@ -32,7 +12,7 @@ class ModelManager:
     ) -> None:
         self._models = dict(models)
         self._model_specs = {
-            node_id: get_model_spec(model)
+            node_id: infer_model_spec_from_config(model.config)
             for node_id, model in self._models.items()
         }
 

@@ -14,7 +14,7 @@ from core.common import *
 from core.channel_manager import ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
-from core.model_spec import ModelSpec
+from core.model_spec import ModelSpec, infer_model_spec_from_config
 from core.eval_util import *
 from mot.train import *
 from core.train_util import *
@@ -268,26 +268,6 @@ def sanitize_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "default"
 
 
-def load_model_spec_from_pretrained_config(model_id: str) -> ModelSpec:
-    config = AutoConfig.from_pretrained(model_id)
-    try:
-        num_heads = config.n_head
-        hidden_size = config.n_embd
-        num_layers = config.n_layer
-    except AttributeError as exc:
-        raise ValueError("This experiment expects GPT-2 style configs with n_head/n_embd/n_layer.") from exc
-    if hidden_size % num_heads != 0:
-        raise ValueError("hidden_size must be divisible by num_heads.")
-    resolved_model_id = config._name_or_path if hasattr(config, "_name_or_path") else model_id
-    return ModelSpec(
-        model_id=resolved_model_id,
-        num_layers=num_layers,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        head_dim=hidden_size // num_heads,
-    )
-
-
 
 def resolve_run_position_label(config: LayerPositionConfig) -> str:
     return f"injection_layer_start_idx_{config.injection_layer_start_idx:03d}"
@@ -304,7 +284,7 @@ def resolve_target_num_layers(
     node_map = build_node_map(nodes)
     reference_edge = edges[0]
     target_model_id = node_map[reference_edge.tgt_id].model_id
-    return load_model_spec_from_pretrained_config(target_model_id).num_layers
+    return infer_model_spec_from_config(AutoConfig.from_pretrained(target_model_id)).num_layers
 
 
 def build_control_window_variants(
