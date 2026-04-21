@@ -2040,7 +2040,7 @@ def format_boolq_context_prefix(context: str) -> str:
     )
 
 
-def format_boolq_question_prefix(question: str) -> str:
+def format_boolq_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
@@ -2062,9 +2062,9 @@ def prepare_boolq_context_inputs(
     )
 
 
-def prepare_boolq_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_boolq_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_boolq_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix_text = format_boolq_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix_text, device=device)
 
 
 def format_pubmed_qa_context_prefix(context: str) -> str:
@@ -2074,14 +2074,14 @@ def format_pubmed_qa_context_prefix(context: str) -> str:
     )
 
 
-def format_pubmed_qa_question_prefix(question: str) -> str:
+def format_pubmed_qa_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
     )
 
 
-def format_mmlu_redux_question_context(question: str, subject: Optional[str] = None) -> str:
+def format_mmlu_redux_question_prefix(question: str, subject: Optional[str] = None) -> str:
     prompt_lines: List[str] = []
     if isinstance(subject, str) and subject.strip():
         pretty_subject = subject.strip().replace("_", " ")
@@ -2090,7 +2090,7 @@ def format_mmlu_redux_question_context(question: str, subject: Optional[str] = N
     return "\n".join(prompt_lines) + "\n"
 
 
-def format_mmlu_redux_answer_prefix(
+def format_mmlu_redux_choices_suffix(
     choices: List[str],
     choice_texts: List[str],
 ) -> str:
@@ -2119,9 +2119,9 @@ def prepare_pubmed_qa_context_inputs(
     )
 
 
-def prepare_pubmed_qa_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_pubmed_qa_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_pubmed_qa_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_pubmed_qa_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
 def prepare_mmlu_redux_question_inputs(
@@ -2131,7 +2131,7 @@ def prepare_mmlu_redux_question_inputs(
     max_input_tokens: Optional[int] = None,
     subject: Optional[str] = None,
 ) -> Dict[str, Any]:
-    prefix_text = format_mmlu_redux_question_context(question=question, subject=subject)
+    prefix_text = format_mmlu_redux_question_prefix(question=question, subject=subject)
     return prepare_full_text_inputs(
         tokenizer=tokenizer,
         text=prefix_text,
@@ -2140,20 +2140,20 @@ def prepare_mmlu_redux_question_inputs(
     )
 
 
-def prepare_mmlu_redux_answer_prefix(
+def prepare_mmlu_redux_choices_suffix(
     tokenizer,
     choices: List[str],
     choice_texts: List[str],
     device: str,
 ) -> Dict[str, torch.Tensor]:
-    prefix_text = format_mmlu_redux_answer_prefix(
+    suffix = format_mmlu_redux_choices_suffix(
         choices=choices,
         choice_texts=choice_texts,
     )
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
-def format_question_prefix(
+def format_logit_task_prompt(
     question: str,
     choices: Optional[List[str]] = None,
     choice_texts: Optional[List[str]] = None,
@@ -2166,12 +2166,12 @@ def format_question_prefix(
     if answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("BoolQ requires passage context.")
-        return format_boolq_context_prefix(context=context) + format_boolq_question_prefix(question=question)
+        return format_boolq_context_prefix(context=context) + format_boolq_question_suffix(question=question)
 
     if answer_mode == "pubmed_qa":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("PubMedQA requires abstract context.")
-        return format_pubmed_qa_context_prefix(context=context) + format_pubmed_qa_question_prefix(question=question)
+        return format_pubmed_qa_context_prefix(context=context) + format_pubmed_qa_question_suffix(question=question)
 
     if not choices:
         return f"Question: {question}\nAnswer:"
@@ -2180,8 +2180,8 @@ def format_question_prefix(
         if choice_texts is None:
             raise ValueError("MMLU-Redux requires choice_texts.")
         return (
-            format_mmlu_redux_question_context(question=question, subject=subject)
-            + format_mmlu_redux_answer_prefix(
+            format_mmlu_redux_question_prefix(question=question, subject=subject)
+            + format_mmlu_redux_choices_suffix(
                 choices=choices,
                 choice_texts=choice_texts,
             )
@@ -2207,7 +2207,7 @@ def format_squad_v11_context_prefix(context: str) -> str:
     )
 
 
-def format_squad_v11_question_prefix(question: str) -> str:
+def format_squad_v11_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
@@ -2229,9 +2229,9 @@ def prepare_squad_v11_context_inputs(
     )
 
 
-def prepare_squad_v11_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_squad_v11_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_squad_v11_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_squad_v11_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
 def format_multinews_context_prefix(context: str) -> str:
@@ -2241,7 +2241,7 @@ def format_multinews_context_prefix(context: str) -> str:
     )
 
 
-def format_multinews_question_prefix(question: str) -> str:
+def format_multinews_question_suffix(question: str) -> str:
     return (
         f"Task: {question.strip()}\n"
         "Summary:"
@@ -2263,12 +2263,12 @@ def prepare_multinews_context_inputs(
     )
 
 
-def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_multinews_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_multinews_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_multinews_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
-def format_generation_prompt(context: str, question: str) -> str:
+def format_generation_task_prompt(context: str, question: str) -> str:
     return (
         "Read the passage and answer the question briefly.\n\n"
         f"Context: {context.strip()}\n"
@@ -2277,44 +2277,44 @@ def format_generation_prompt(context: str, question: str) -> str:
     )
 
 
-def prepare_text_prefix(
+def prepare_cache_text_inputs(
     tokenizer,
-    prefix_text: str,
+    text: str,
     device: str,
-    max_prefix_tokens: Optional[int] = None,
+    max_input_tokens: Optional[int] = None,
     truncation_side: str = "left",
 ) -> Dict[str, torch.Tensor]:
-    tokenized = tokenizer(prefix_text, return_tensors="pt")
+    tokenized = tokenizer(text, return_tensors="pt")
     input_ids = tokenized.input_ids
     was_truncated = False
 
-    if max_prefix_tokens is not None:
-        if max_prefix_tokens < 2:
-            raise ValueError("max_prefix_tokens must be >= 2")
-        if input_ids.shape[1] > max_prefix_tokens:
+    if max_input_tokens is not None:
+        if max_input_tokens < 2:
+            raise ValueError("max_input_tokens must be >= 2")
+        if input_ids.shape[1] > max_input_tokens:
             was_truncated = True
             if truncation_side == "left":
-                input_ids = input_ids[:, -max_prefix_tokens:]
+                input_ids = input_ids[:, -max_input_tokens:]
             elif truncation_side == "right":
-                input_ids = input_ids[:, :max_prefix_tokens]
+                input_ids = input_ids[:, :max_input_tokens]
             else:
                 raise ValueError(f"Unsupported truncation_side: {truncation_side}")
 
     input_ids = input_ids.to(device)
     if input_ids.shape[1] < 2:
-        raise ValueError("Prefix must tokenize to at least 2 tokens.")
+        raise ValueError("Cache text must tokenize to at least 2 tokens.")
     cache_ids = input_ids[:, :-1]
     seed_token = input_ids[:, -1:]
     return {
-        "prefix_text": prefix_text,
-        "full_prefix_ids": input_ids,
+        "text": text,
+        "input_ids": input_ids,
         "cache_ids": cache_ids,
         "seed_token": seed_token,
         "was_truncated": was_truncated,
     }
 
 
-def prepare_question_prefix(
+def prepare_logit_task_prompt(
     tokenizer,
     question: str,
     device: str,
@@ -2323,10 +2323,10 @@ def prepare_question_prefix(
     subject: Optional[str] = None,
     context: Optional[str] = None,
     answer_mode: Optional[str] = None,
-    max_prefix_tokens: Optional[int] = None,
+    max_input_tokens: Optional[int] = None,
     truncation_side: str = "left",
 ) -> Dict[str, torch.Tensor]:
-    prefix_text = format_question_prefix(
+    prompt_text = format_logit_task_prompt(
         question,
         choices=choices,
         choice_texts=choice_texts,
@@ -2334,21 +2334,21 @@ def prepare_question_prefix(
         context=context,
         answer_mode=answer_mode,
     )
-    return prepare_text_prefix(
+    return prepare_cache_text_inputs(
         tokenizer=tokenizer,
-        prefix_text=prefix_text,
+        text=prompt_text,
         device=device,
-        max_prefix_tokens=max_prefix_tokens,
+        max_input_tokens=max_input_tokens,
         truncation_side=truncation_side,
     )
 
 
-def prepare_generation_prefix(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_generation_prompt(context=context, question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_generation_task_prompt(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prompt_text = format_generation_task_prompt(context=context, question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=prompt_text, device=device)
 
 
-def format_generation_question_prefix(question: str) -> str:
+def format_generation_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
@@ -2378,9 +2378,9 @@ def prepare_full_text_inputs(
     }
 
 
-def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_generation_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_generation_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_generation_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
 def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> int:
@@ -2415,15 +2415,15 @@ def compute_benchmark_context_budget(
         get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
         for node in ctx.nodes
     )
-    question_prefix = prepare_generation_task_question_prefix(
+    suffix = prepare_generation_task_suffix(
         spec=spec,
         tokenizer=ctx.tokenizer,
         question=question,
         device="cpu",
     )
     reserved_tokens = (
-        question_prefix["cache_ids"].shape[1]
-        + question_prefix["seed_token"].shape[1]
+        suffix["cache_ids"].shape[1]
+        + suffix["seed_token"].shape[1]
         + get_answer_token_budget(eval_config)
     )
     budget = shared_limit - reserved_tokens
@@ -2452,14 +2452,14 @@ def compute_logit_task_token_budgets(
     answer_budget = get_answer_token_budget(eval_config)
 
     if spec.answer_mode == "boolq":
-        question_prefix = prepare_boolq_question_prefix(
+        suffix = prepare_boolq_question_suffix(
             tokenizer=ctx.tokenizer,
             question=question,
             device="cpu",
         )
         reserved_tokens = (
-            question_prefix["cache_ids"].shape[1]
-            + question_prefix["seed_token"].shape[1]
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
             + answer_budget
         )
         budget = shared_limit - reserved_tokens
@@ -2471,14 +2471,14 @@ def compute_logit_task_token_budgets(
         return {"max_context_tokens": budget, "max_prefix_tokens": None}
 
     if spec.answer_mode == "pubmed_qa":
-        question_prefix = prepare_pubmed_qa_question_prefix(
+        suffix = prepare_pubmed_qa_question_suffix(
             tokenizer=ctx.tokenizer,
             question=question,
             device="cpu",
         )
         reserved_tokens = (
-            question_prefix["cache_ids"].shape[1]
-            + question_prefix["seed_token"].shape[1]
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
             + answer_budget
         )
         budget = shared_limit - reserved_tokens
@@ -2494,15 +2494,15 @@ def compute_logit_task_token_budgets(
             raise ValueError("MMLU-Redux requires choices for prompt budgeting.")
         if not choice_texts:
             raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
-        answer_prefix = prepare_mmlu_redux_answer_prefix(
+        suffix = prepare_mmlu_redux_choices_suffix(
             tokenizer=ctx.tokenizer,
             choices=choices,
             choice_texts=choice_texts,
             device="cpu",
         )
         reserved_tokens = (
-            answer_prefix["cache_ids"].shape[1]
-            + answer_prefix["seed_token"].shape[1]
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
             + answer_budget
         )
         budget = shared_limit - reserved_tokens
@@ -2522,25 +2522,25 @@ def compute_logit_task_token_budgets(
     return {"max_context_tokens": None, "max_prefix_tokens": prompt_budget}
 
 
-def prepare_generation_task_question_prefix(
+def prepare_generation_task_suffix(
     spec: HFDatasetSpec,
     tokenizer,
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
     if spec.answer_mode in {"squad", "newsqa"}:
-        return prepare_squad_v11_question_prefix(
+        return prepare_squad_v11_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
     # if spec.answer_mode == "multinews":
-    #     return prepare_multinews_question_prefix(
+    #     return prepare_multinews_question_suffix(
     #         tokenizer=tokenizer,
     #         question=question,
     #         device=device,
     #     )
-    return prepare_generation_question_prefix(
+    return prepare_generation_question_suffix(
         tokenizer=tokenizer,
         question=question,
         device=device,
@@ -2568,17 +2568,17 @@ def prepare_logit_task_inputs(
             device=device,
             max_input_tokens=max_context_tokens,
         )
-        question_prefix = prepare_boolq_question_prefix(
+        suffix = prepare_boolq_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
         return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
+            "prefix": context_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": context_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
             "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
@@ -2591,17 +2591,17 @@ def prepare_logit_task_inputs(
             device=device,
             max_input_tokens=max_context_tokens,
         )
-        question_prefix = prepare_pubmed_qa_question_prefix(
+        suffix = prepare_pubmed_qa_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
         return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
+            "prefix": context_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": context_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
             "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
@@ -2610,29 +2610,29 @@ def prepare_logit_task_inputs(
             raise ValueError("MMLU-Redux requires choices.")
         if not choice_texts:
             raise ValueError("MMLU-Redux requires choice_texts.")
-        question_context = prepare_mmlu_redux_question_inputs(
+        question_prefix = prepare_mmlu_redux_question_inputs(
             tokenizer=tokenizer,
             question=question,
             device=device,
             max_input_tokens=max_context_tokens,
             subject=subject,
         )
-        answer_prefix = prepare_mmlu_redux_answer_prefix(
+        suffix = prepare_mmlu_redux_choices_suffix(
             tokenizer=tokenizer,
             choices=choices,
             choice_texts=choice_texts,
             device=device,
         )
         return {
-            "context_prefix": question_context,
-            "question_prefix": answer_prefix,
-            "cache_input_ids": question_context["input_ids"],
-            "question_cache_ids": answer_prefix["cache_ids"],
-            "seed_token": answer_prefix["seed_token"],
-            "was_truncated": bool(question_context.get("was_truncated", False)),
+            "prefix": question_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": question_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
+            "was_truncated": bool(question_prefix.get("was_truncated", False)),
         }
 
-    prefix = prepare_question_prefix(
+    prompt = prepare_logit_task_prompt(
         tokenizer=tokenizer,
         question=question,
         device=device,
@@ -2641,14 +2641,14 @@ def prepare_logit_task_inputs(
         subject=subject,
         context=context,
         answer_mode=spec.answer_mode,
-        max_prefix_tokens=max_prefix_tokens,
+        max_input_tokens=max_prefix_tokens,
         truncation_side="left",
     )
     return {
-        "cache_input_ids": prefix["cache_ids"],
-        "question_cache_ids": None,
-        "seed_token": prefix["seed_token"],
-        "was_truncated": bool(prefix.get("was_truncated", False)),
+        "prefix_input_ids": prompt["cache_ids"],
+        "suffix_cache_ids": None,
+        "seed_token": prompt["seed_token"],
+        "was_truncated": bool(prompt.get("was_truncated", False)),
     }
 
 
@@ -2667,17 +2667,17 @@ def prepare_generation_task_inputs(
             device=device,
             max_input_tokens=max_input_tokens,
         )
-        question_prefix = prepare_squad_v11_question_prefix(
+        suffix = prepare_squad_v11_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
         return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
+            "prefix": context_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": context_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
             "was_truncated": context_prefix.get("was_truncated", False),
         }
 
@@ -2688,30 +2688,30 @@ def prepare_generation_task_inputs(
     #         device=device,
     #         max_input_tokens=max_input_tokens,
     #     )
-    #     question_prefix = prepare_multinews_question_prefix(
+    #     suffix = prepare_multinews_question_suffix(
     #         tokenizer=tokenizer,
     #         question=question,
     #         device=device,
     #     )
     #     return {
-    #         "context_prefix": context_prefix,
-    #         "question_prefix": question_prefix,
-    #         "cache_input_ids": context_prefix["input_ids"],
-    #         "question_cache_ids": question_prefix["cache_ids"],
-    #         "seed_token": question_prefix["seed_token"],
+    #         "prefix": context_prefix,
+    #         "suffix": suffix,
+    #         "prefix_input_ids": context_prefix["input_ids"],
+    #         "suffix_cache_ids": suffix["cache_ids"],
+    #         "seed_token": suffix["seed_token"],
     #         "was_truncated": bool(context_prefix.get("was_truncated", False)),
     #     }
 
-    prefix = prepare_generation_prefix(
+    prompt = prepare_generation_task_prompt(
         tokenizer=tokenizer,
         context=context,
         question=question,
         device=device,
     )
     return {
-        "cache_input_ids": prefix["cache_ids"],
-        "question_cache_ids": None,
-        "seed_token": prefix["seed_token"],
+        "prefix_input_ids": prompt["cache_ids"],
+        "suffix_cache_ids": None,
+        "seed_token": prompt["seed_token"],
         "was_truncated": False,
     }
 
@@ -2722,14 +2722,14 @@ def predict_generation_task_answer(
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
     eval_config,
-    question_cache_ids: Optional[torch.Tensor] = None,
+    suffix_cache_ids: Optional[torch.Tensor] = None,
 ) -> str:
     generation_past = past_key_values
-    if question_cache_ids is not None:
+    if suffix_cache_ids is not None:
         generation_past = append_input_ids_to_past(
             model=model,
             past_key_values=past_key_values,
-            input_ids=question_cache_ids,
+            input_ids=suffix_cache_ids,
         )
 
     return generate_greedy_answer(
@@ -2854,14 +2854,14 @@ def score_answer_choices(
 def prepare_answer_scoring_past(
     model,
     past_key_values: PastKeyValues,
-    question_cache_ids: Optional[torch.Tensor] = None,
+    suffix_cache_ids: Optional[torch.Tensor] = None,
 ) -> PastKeyValues:
-    if question_cache_ids is None:
+    if suffix_cache_ids is None:
         return past_key_values
     return append_input_ids_to_past(
         model=model,
         past_key_values=past_key_values,
-        input_ids=question_cache_ids,
+        input_ids=suffix_cache_ids,
     )
 
 
@@ -3059,17 +3059,17 @@ def evaluate_dataset(
                 max_context_tokens=token_budgets["max_context_tokens"],
                 max_prefix_tokens=token_budgets["max_prefix_tokens"],
             )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            prefix_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
+                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
                 logging.info(
-                    "[%s] truncated logit-qa prompt to fit model context window (cache_tokens=%d, question_cache_tokens=%d, answer_token_budget=%d)",
+                    "[%s] truncated prefix to fit model context window (prefix_tokens=%d, suffix_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    cache_input_ids.shape[1],
-                    question_cache_tokens,
+                    prefix_input_ids.shape[1],
+                    suffix_cache_tokens,
                     get_answer_token_budget(eval_config),
                 )
 
@@ -3077,7 +3077,7 @@ def evaluate_dataset(
                 ctx=ctx,
                 spec=spec,
                 example=example,
-                cache_input_ids=cache_input_ids,
+                prefix_input_ids=prefix_input_ids,
                 prepared_inputs=prepared_inputs,
                 translator_pool=translator_pool,
             )
@@ -3088,7 +3088,7 @@ def evaluate_dataset(
                     spec=spec,
                     edge=edge,
                     example=example,
-                    cache_input_ids=cache_input_ids,
+                    prefix_input_ids=prefix_input_ids,
                     prepared_inputs=prepared_inputs,
                     example_state=example_state,
                     translator_pool=translator_pool,
@@ -3098,12 +3098,12 @@ def evaluate_dataset(
                 translated_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.translated_past_key_values,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 native_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.native_past_key_values,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 translated_answer = generate_greedy_answer(

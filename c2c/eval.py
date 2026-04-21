@@ -17,12 +17,12 @@ from c2c.train import (
 def _build_logit_example_state(
     *,
     ctx: Context,
-    cache_input_ids: torch.Tensor,
+    prefix_input_ids: torch.Tensor,
     **_,
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
             for node in ctx.nodes
         }
     }
@@ -101,22 +101,22 @@ def evaluate_generation_dataset(
                 device=device,
                 max_input_tokens=context_budget,
             )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            prefix_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
+                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
                 logging.info(
-                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
+                    "[%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    cache_input_ids.shape[1],
-                    question_cache_tokens,
+                    prefix_input_ids.shape[1],
+                    suffix_cache_tokens,
                     get_answer_token_budget(eval_config),
                 )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
                 for node in nodes
             }
 
@@ -145,7 +145,7 @@ def evaluate_generation_dataset(
                     past_key_values=translated_target_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
@@ -153,7 +153,7 @@ def evaluate_generation_dataset(
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)

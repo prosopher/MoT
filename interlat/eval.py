@@ -22,10 +22,10 @@ from interlat.train import (
 )
 
 
-def _fit_cache_input_ids_to_model_limit(
+def _fit_prefix_input_ids_to_model_limit(
     *,
     model,
-    cache_input_ids: torch.Tensor,
+    prefix_input_ids: torch.Tensor,
     reserved_tail_tokens: int,
 ) -> torch.Tensor:
     model_context_limit = get_model_context_limit(model)
@@ -35,7 +35,7 @@ def _fit_cache_input_ids_to_model_limit(
             "Insufficient context window for InterLat evaluation: "
             f"model_context_limit={model_context_limit}, reserved_tail_tokens={reserved_tail_tokens}"
         )
-    return trim_input_ids_from_left(cache_input_ids, max_length=max_cache_tokens)
+    return trim_input_ids_from_left(prefix_input_ids, max_length=max_cache_tokens)
 
 
 def _apply_interlat_extra_reserve_to_budget(*, budget: int, extra_reserved_tokens: int, dataset_name: str) -> int:
@@ -201,9 +201,9 @@ def _evaluate_openwebtext_validation(
                 edge_id=edge.id,
                 source_hidden_states=source_hidden,
             )
-            translated_prefix_ids = _fit_cache_input_ids_to_model_limit(
+            translated_prefix_ids = _fit_prefix_input_ids_to_model_limit(
                 model=target_model,
-                cache_input_ids=prefix_cache_ids,
+                prefix_input_ids=prefix_cache_ids,
                 reserved_tail_tokens=train_config.latent_tokens + int(lm_input_ids.shape[1]),
             )
             translated_past = build_latent_conditioned_past(
@@ -341,12 +341,12 @@ def _evaluate_logit_dataset(
     def build_example_state_fn(
         *,
         ctx: Context,
-        cache_input_ids: torch.Tensor,
+        prefix_input_ids: torch.Tensor,
         **_,
     ):
         source_hidden_by_edge: Dict[str, torch.Tensor] = {}
         prefix_text = ctx.tokenizer.decode(
-            cache_input_ids[0].detach().cpu(),
+            prefix_input_ids[0].detach().cpu(),
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
         )
@@ -378,16 +378,16 @@ def _evaluate_logit_dataset(
         **_,
     ) -> LogitEvalEdgeArtifacts:
         target_model = ctx.mm.get_model(edge.tgt_id)
-        question_cache_ids = prepared_inputs["question_cache_ids"]
+        suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
         reserved_tail_tokens = (
             ctx.config.latent_tokens
-            + (0 if question_cache_ids is None else int(question_cache_ids.shape[1]))
+            + (0 if suffix_cache_ids is None else int(suffix_cache_ids.shape[1]))
             + int(prepared_inputs["seed_token"].shape[1])
             + get_answer_token_budget(eval_config)
         )
-        translated_cache_input_ids = _fit_cache_input_ids_to_model_limit(
+        translated_prefix_input_ids = _fit_prefix_input_ids_to_model_limit(
             model=target_model,
-            cache_input_ids=prepared_inputs["cache_input_ids"],
+            prefix_input_ids=prepared_inputs["prefix_input_ids"],
             reserved_tail_tokens=reserved_tail_tokens,
         )
         translated_latents = translator_pool.translate_hidden_states(
@@ -396,10 +396,10 @@ def _evaluate_logit_dataset(
         )
         translated_past = build_latent_conditioned_past(
             target_model,
-            prefix_input_ids=translated_cache_input_ids,
+            prefix_input_ids=translated_prefix_input_ids,
             latent_prefix=translated_latents,
         )
-        native_past = extract_past_key_values(target_model, prepared_inputs["cache_input_ids"])
+        native_past = extract_past_key_values(target_model, prepared_inputs["prefix_input_ids"])
         return LogitEvalEdgeArtifacts(
             translated_past_key_values=translated_past,
             native_past_key_values=native_past,
@@ -453,17 +453,17 @@ def _evaluate_generation_dataset(
                 device=ctx.config.device,
                 max_input_tokens=context_budget,
             )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            prefix_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
+                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
                 logging.info(
-                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
+                    "[%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    cache_input_ids.shape[1],
-                    question_cache_tokens,
+                    prefix_input_ids.shape[1],
+                    suffix_cache_tokens,
                     get_answer_token_budget(eval_config),
                 )
 
@@ -478,19 +478,19 @@ def _evaluate_generation_dataset(
                 )
                 source_hidden = extract_last_hidden_states(
                     ctx.mm.get_model(edge.src_id),
-                    source_prepared["cache_input_ids"],
+                    source_prepared["prefix_input_ids"],
                 )
 
                 target_model = ctx.mm.get_model(edge.tgt_id)
                 reserved_tail_tokens = (
                     ctx.config.latent_tokens
-                    + (0 if question_cache_ids is None else int(question_cache_ids.shape[1]))
+                    + (0 if suffix_cache_ids is None else int(suffix_cache_ids.shape[1]))
                     + int(seed_token.shape[1])
                     + get_answer_token_budget(eval_config)
                 )
-                translated_cache_input_ids = _fit_cache_input_ids_to_model_limit(
+                translated_prefix_input_ids = _fit_prefix_input_ids_to_model_limit(
                     model=target_model,
-                    cache_input_ids=cache_input_ids,
+                    prefix_input_ids=prefix_input_ids,
                     reserved_tail_tokens=reserved_tail_tokens,
                 )
                 translated_latents = translator_pool.translate_hidden_states(
@@ -499,10 +499,10 @@ def _evaluate_generation_dataset(
                 )
                 translated_past = build_latent_conditioned_past(
                     target_model,
-                    prefix_input_ids=translated_cache_input_ids,
+                    prefix_input_ids=translated_prefix_input_ids,
                     latent_prefix=translated_latents,
                 )
-                native_past = extract_past_key_values(target_model, cache_input_ids)
+                native_past = extract_past_key_values(target_model, prefix_input_ids)
 
                 translated_answer = predict_generation_task_answer(
                     model=target_model,
@@ -510,7 +510,7 @@ def _evaluate_generation_dataset(
                     past_key_values=translated_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
                     model=target_model,
@@ -518,7 +518,7 @@ def _evaluate_generation_dataset(
                     past_key_values=native_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 path_metrics[edge.id].update(

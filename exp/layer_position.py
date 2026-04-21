@@ -521,8 +521,8 @@ def evaluate_logit_dataset(
             )
             candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
             gold_answer = example["answer"]
-            context_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            context_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
             past_by_node_id = {
                 node.id: extract_past_key_values(ctx.mm.get_model(node.id), context_input_ids)
@@ -575,22 +575,22 @@ def evaluate_logit_dataset(
                 native_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=native_target_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 dir_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=dir_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 mag_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mag_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 full_mix_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=full_mix_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 native_scores = score_answer_choices(
@@ -713,22 +713,22 @@ def evaluate_generation_dataset(
                 device=config.device,
                 max_input_tokens=context_budget,
             )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            prefix_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
+                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
                 logging.info(
-                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
+                    "[%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    cache_input_ids.shape[1],
-                    question_cache_tokens,
+                    prefix_input_ids.shape[1],
+                    suffix_cache_tokens,
                     get_answer_token_budget(config),
                 )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
                 for node in nodes
             }
 
@@ -752,7 +752,7 @@ def evaluate_generation_dataset(
                 )
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    prefix_input_ids=cache_input_ids,
+                    prefix_input_ids=prefix_input_ids,
                     target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
@@ -760,7 +760,7 @@ def evaluate_generation_dataset(
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    prefix_input_ids=cache_input_ids,
+                    prefix_input_ids=prefix_input_ids,
                     target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
@@ -768,7 +768,7 @@ def evaluate_generation_dataset(
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    prefix_input_ids=cache_input_ids,
+                    prefix_input_ids=prefix_input_ids,
                     target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
@@ -781,7 +781,7 @@ def evaluate_generation_dataset(
                     past_key_values=native_target_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 dir_only_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
@@ -789,7 +789,7 @@ def evaluate_generation_dataset(
                     past_key_values=dir_only_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 mag_only_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
@@ -797,7 +797,7 @@ def evaluate_generation_dataset(
                     past_key_values=mag_only_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 full_mix_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
@@ -805,7 +805,7 @@ def evaluate_generation_dataset(
                     past_key_values=full_mix_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 path_metrics[edge.id].update(
@@ -819,22 +819,22 @@ def evaluate_generation_dataset(
                 native_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=native_target_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 dir_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=dir_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 mag_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mag_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 full_mix_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=full_mix_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 native_log_probs = compute_next_token_log_probs(

@@ -511,11 +511,11 @@ def evaluate_correction(
                 if answer_token_ids is None or answer_token_ids.shape[0] < 1:
                     continue
                 answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
-                cache_input_ids = prepared_inputs["cache_input_ids"]
-                question_cache_ids = prepared_inputs.get("question_cache_ids", None)
+                prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                suffix_cache_ids = prepared_inputs.get("suffix_cache_ids", None)
                 seed_token = prepared_inputs["seed_token"]
                 try:
-                    past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids) for node in nodes}
+                    past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids) for node in nodes}
                 except Exception as exc:
                     logging.warning("Skipping example due to cache extraction error: %s", exc)
                     continue
@@ -534,7 +534,7 @@ def evaluate_correction(
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
-                        prefix_input_ids=cache_input_ids,
+                        prefix_input_ids=prefix_input_ids,
                         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
@@ -548,7 +548,7 @@ def evaluate_correction(
                     )
                     random_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
-                        prefix_input_ids=cache_input_ids,
+                        prefix_input_ids=prefix_input_ids,
                         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
@@ -556,9 +556,9 @@ def evaluate_correction(
                     )
 
                     target_model = ctx.mm.get_model(edge.tgt_id)
-                    native_past = maybe_append_input_ids(target_model, native_target_past, question_cache_ids)
-                    fullmix_past = maybe_append_input_ids(target_model, full_mix_past, question_cache_ids)
-                    random_past = maybe_append_input_ids(target_model, random_past, question_cache_ids)
+                    native_past = maybe_append_input_ids(target_model, native_target_past, suffix_cache_ids)
+                    fullmix_past = maybe_append_input_ids(target_model, full_mix_past, suffix_cache_ids)
+                    random_past = maybe_append_input_ids(target_model, random_past, suffix_cache_ids)
                     native_past = maybe_append_input_ids(target_model, native_past, seed_token)
                     fullmix_past = maybe_append_input_ids(target_model, fullmix_past, seed_token)
                     random_past = maybe_append_input_ids(target_model, random_past, seed_token)
