@@ -34,5 +34,6 @@
   "correction_max_analysis_tokens": 4,
   "variant": "mot",
   "mot_num_translators": 4,
-  "mot_top_k": 2
+  "mot_top_k": 2,
+  "kv_similarity_token_group_size": 8
 }
