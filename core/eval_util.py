@@ -2673,6 +2673,9 @@ def compute_benchmark_context_budget(
     spec: HFDatasetSpec,
     question: str,
     eval_config,
+    *,
+    tokenizer,
+    target_node_id: str,
 ) -> int:
     return resolve_generation_context_budget(
         ctx=ctx,
@@ -2680,6 +2683,8 @@ def compute_benchmark_context_budget(
         question=question,
         eval_config=eval_config,
         requested_budget=getattr(spec, "requested_context_budget", None),
+        tokenizer=tokenizer,
+        target_node_id=target_node_id,
     ).effective_budget
 
 
