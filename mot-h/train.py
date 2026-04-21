@@ -391,6 +391,7 @@ class LayerWindowTranslatorPool(nn.Module):
         self.edges = tuple(ctx.edges)
         self.edge_ids = tuple(edge.id for edge in ctx.edges)
         self.edges_by_id = build_edge_map(ctx.edges)
+        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
 
         adapters = {}
         kv_adapters = {}
@@ -482,6 +483,7 @@ class LayerWindowTranslatorPool(nn.Module):
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
+            target_model_id=self.node_model_ids.get(tgt_node_id),
         )
         return mixed_target_past, translated_window_past
 

@@ -472,6 +472,7 @@ def evaluate_correction(
 ) -> Dict[str, Any]:
     config = ctx.config
     nodes = ctx.nodes
+    node_map = build_node_map(nodes)
     edges = ctx.edges
     logging.info("Starting correction analysis")
     logging.info("experiment_config=%s", asdict(config))
@@ -548,6 +549,7 @@ def evaluate_correction(
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                        target_model_id=node_map[edge.tgt_id].model_id,
                     )
                     random_key_block, random_value_block = build_random_matched_window(
                         native_key_block=native_key_block,
@@ -562,6 +564,7 @@ def evaluate_correction(
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                        target_model_id=node_map[edge.tgt_id].model_id,
                     )
 
                     target_model = ctx.mm.get_model(edge.tgt_id)

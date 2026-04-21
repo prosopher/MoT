@@ -14,7 +14,7 @@ from .common import (
     write_json,
 )
 from .context import Context
-from .topology import Edge
+from .topology import Edge, build_node_map
 from .train_util import InfiniteDataLoader
 
 
@@ -90,6 +90,8 @@ class ChannelProfiler:
         self.config = ctx.config
         self.profile_config = profile_config
         self.mm = ctx.mm
+        self.cm = ctx.cm
+        self.node_map = build_node_map(ctx.nodes)
 
     def profile_all_edges(self, edges: Optional[List[Edge]] = None) -> Dict[str, ChannelProfileResult]:
         results: Dict[str, ChannelProfileResult] = {}
@@ -637,6 +639,7 @@ class ChannelProfiler:
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
+            target_model_id=self.node_map[edge.tgt_id].model_id,
         )
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=target_model,
@@ -671,6 +674,7 @@ class ChannelProfiler:
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
+            target_model_id=self.node_map[edge.tgt_id].model_id,
         )
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=target_model,

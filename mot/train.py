@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -390,6 +391,7 @@ class LayerWindowTranslatorPool(nn.Module):
         self.edges = tuple(ctx.edges)
         self.edge_ids = tuple(edge.id for edge in ctx.edges)
         self.edges_by_id = build_edge_map(ctx.edges)
+        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
 
         adapters = {}
         for edge in self.edges:
@@ -460,6 +462,7 @@ class LayerWindowTranslatorPool(nn.Module):
         )
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
+            target_model_id=self.node_model_ids.get(tgt_node_id),
             prefix_input_ids=prefix_input_ids,
             target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
             injected_key_block=translated_key,
@@ -545,6 +548,37 @@ def extract_layer_window_blocks(
 
 
 
+def normalize_model_family(model_id: str) -> Optional[str]:
+    normalized = str(model_id).strip().lower()
+    if "pythia" in normalized:
+        return "pythia"
+    if "gpt2" in normalized:
+        return "gpt2"
+    return None
+
+
+
+def resolve_target_model_family(
+    target_model: PreTrainedModel,
+    *,
+    target_model_id: Optional[str] = None,
+) -> str:
+    model_family = normalize_model_family(target_model_id or "")
+    if model_family is not None:
+        return model_family
+
+    if getattr(target_model, "transformer", None) is not None and hasattr(target_model.transformer, "h"):
+        return "gpt2"
+    if getattr(target_model, "gpt_neox", None) is not None and hasattr(target_model.gpt_neox, "layers"):
+        return "pythia"
+
+    raise ValueError(
+        "mot target-model replay supports GPT-2 and Pythia decoder stacks only "
+        f"(target_model_id={target_model_id!r})."
+    )
+
+
+
 def require_gpt2_transformer(model: PreTrainedModel):
     transformer = getattr(model, "transformer", None)
     if transformer is None or not hasattr(transformer, "h"):
@@ -553,6 +587,18 @@ def require_gpt2_transformer(model: PreTrainedModel):
             "(expected model.transformer.h to exist)."
         )
     return transformer
+
+
+
+def require_pythia_transformer(model: PreTrainedModel):
+    transformer = getattr(model, "gpt_neox", None)
+    if transformer is None or not hasattr(transformer, "layers"):
+        raise ValueError(
+            "mot currently supports Pythia/GPT-NeoX style decoder stacks only "
+            "(expected model.gpt_neox.layers to exist)."
+        )
+    return transformer
+
 
 
 def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
@@ -566,6 +612,43 @@ def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tens
     if drop is not None:
         hidden_states = drop(hidden_states)
     return hidden_states
+
+
+
+def resolve_pythia_rotary_embedding(transformer: nn.Module) -> nn.Module:
+    rotary_emb = getattr(transformer, "rotary_emb", None)
+    if rotary_emb is not None:
+        return rotary_emb
+    layers = getattr(transformer, "layers", None)
+    if layers:
+        first_layer_attention = getattr(layers[0], "attention", None)
+        rotary_emb = getattr(first_layer_attention, "rotary_emb", None)
+        if rotary_emb is not None:
+            return rotary_emb
+    raise ValueError(
+        "Pythia replay expects either model.gpt_neox.rotary_emb or "
+        "model.gpt_neox.layers[0].attention.rotary_emb to exist."
+    )
+
+
+
+def build_pythia_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    transformer = require_pythia_transformer(model)
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
+    batch_size, seq_len = input_ids.shape
+    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    hidden_states = transformer.embed_in(input_ids)
+    emb_dropout = getattr(transformer, "emb_dropout", None)
+    if emb_dropout is not None:
+        hidden_states = emb_dropout(hidden_states)
+    rotary_emb = resolve_pythia_rotary_embedding(transformer)
+    try:
+        position_embeddings = rotary_emb(hidden_states, position_ids=position_ids)
+    except TypeError:
+        position_embeddings = rotary_emb(hidden_states, seq_len=seq_len)
+    return hidden_states, position_ids, position_embeddings
+
 
 
 def unpack_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -586,6 +669,7 @@ def unpack_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor
     return hidden_states, present
 
 
+
 def run_gpt2_block_with_cache(block: nn.Module, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     outputs = block(
         hidden_states,
@@ -598,6 +682,7 @@ def run_gpt2_block_with_cache(block: nn.Module, hidden_states: torch.Tensor) -> 
         output_attentions=False,
     )
     return unpack_block_outputs(outputs)
+
 
 
 def run_gpt2_block_with_injected_layer(
@@ -659,6 +744,207 @@ def run_gpt2_block_with_injected_layer(
     return hidden_states, (injected_key, injected_value)
 
 
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+
+def apply_rotary_pos_emb(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if position_ids is not None and cos.ndim == 4:
+        gather_indices = position_ids[:, None, :, None].repeat(1, cos.shape[1], 1, cos.shape[3])
+        cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+        sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+    elif cos.ndim == 2:
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    elif cos.ndim == 3:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    rotary_dim = cos.shape[-1]
+    query_rot, query_pass = query[..., :rotary_dim], query[..., rotary_dim:]
+    key_rot, key_pass = key[..., :rotary_dim], key[..., rotary_dim:]
+    query_embed = torch.cat([(query_rot * cos) + (rotate_half(query_rot) * sin), query_pass], dim=-1)
+    key_embed = torch.cat([(key_rot * cos) + (rotate_half(key_rot) * sin), key_pass], dim=-1)
+    return query_embed, key_embed
+
+
+
+def build_causal_attention_mask(hidden_states: torch.Tensor) -> torch.Tensor:
+    batch_size, seq_len, _ = hidden_states.shape
+    mask = torch.full(
+        (seq_len, seq_len),
+        fill_value=torch.finfo(hidden_states.dtype).min,
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    mask = torch.triu(mask, diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+
+
+
+def _reshape_pythia_qkv(
+    qkv: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seq_len, _ = qkv.shape
+    qkv = qkv.view(batch_size, seq_len, num_heads, 3 * head_dim).permute(0, 2, 1, 3).contiguous()
+    query, key, value = qkv.chunk(3, dim=-1)
+    return query, key, value
+
+
+
+def resolve_pythia_attention_num_heads(attention: nn.Module) -> int:
+    num_heads = getattr(attention, "num_attention_heads", None)
+    if num_heads is not None:
+        return int(num_heads)
+    config = getattr(attention, "config", None)
+    num_heads = getattr(config, "num_attention_heads", None)
+    if num_heads is not None:
+        return int(num_heads)
+    raise ValueError("Unable to determine Pythia attention head count.")
+
+
+
+def resolve_pythia_attention_scaling(attention: nn.Module, head_dim: int) -> float:
+    scaling = getattr(attention, "scaling", None)
+    if scaling is not None:
+        return float(scaling)
+    norm_factor = getattr(attention, "norm_factor", None)
+    if norm_factor is not None:
+        return float(norm_factor)
+    return head_dim ** -0.5
+
+
+
+def resolve_pythia_attention_dropout_p(attention: nn.Module, training: bool) -> float:
+    if not training:
+        return 0.0
+    dropout = getattr(attention, "attention_dropout", 0.0)
+    if isinstance(dropout, nn.Dropout):
+        return float(dropout.p)
+    return float(dropout)
+
+
+
+def run_pythia_block_with_cache(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    attention = block.attention
+    batch_size, seq_len, _ = hidden_states.shape
+    num_heads = resolve_pythia_attention_num_heads(attention)
+    head_dim = getattr(attention, "head_size", hidden_states.shape[-1] // num_heads)
+
+    residual = hidden_states
+    attn_input = block.input_layernorm(hidden_states)
+    qkv = attention.query_key_value(attn_input)
+    query, key, value = _reshape_pythia_qkv(qkv, num_heads=num_heads, head_dim=head_dim)
+    query, key = apply_rotary_pos_emb(query, key, *position_embeddings, position_ids=position_ids)
+
+    attn_scores = torch.matmul(query, key.transpose(-1, -2)) * resolve_pythia_attention_scaling(attention, head_dim)
+    attn_scores = attn_scores + attention_mask
+    attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    dropout_p = resolve_pythia_attention_dropout_p(attention, block.training)
+    attn_weights = torch.dropout(attn_weights, p=dropout_p, train=block.training)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+    attn_output = attention.dense(attn_output)
+    post_attention_dropout = getattr(block, "post_attention_dropout", None)
+    if post_attention_dropout is not None:
+        attn_output = post_attention_dropout(attn_output)
+
+    if getattr(block, "use_parallel_residual", False):
+        mlp_output = block.mlp(block.post_attention_layernorm(hidden_states))
+        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
+        if post_mlp_dropout is not None:
+            mlp_output = post_mlp_dropout(mlp_output)
+        hidden_states = residual + attn_output + mlp_output
+    else:
+        attn_residual = residual + attn_output
+        mlp_output = block.mlp(block.post_attention_layernorm(attn_residual))
+        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
+        if post_mlp_dropout is not None:
+            mlp_output = post_mlp_dropout(mlp_output)
+        hidden_states = attn_residual + mlp_output
+    return hidden_states, (key, value)
+
+
+
+def run_pythia_block_with_injected_layer(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    injected_key: torch.Tensor,
+    injected_value: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if injected_key.shape != injected_value.shape:
+        raise ValueError(
+            "Injected key/value must have identical shapes, "
+            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
+        )
+
+    attention = block.attention
+    batch_size, seq_len, hidden_size = hidden_states.shape
+    num_heads = resolve_pythia_attention_num_heads(attention)
+    head_dim = getattr(attention, "head_size", hidden_size // num_heads)
+    expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
+    if tuple(injected_key.shape) != expected_cache_shape:
+        raise ValueError(
+            "Injected cache shape mismatch for Pythia layer replay: "
+            f"expected {expected_cache_shape}, got {tuple(injected_key.shape)}"
+        )
+
+    residual = hidden_states
+    attn_input = block.input_layernorm(hidden_states)
+    qkv = attention.query_key_value(attn_input)
+    query, key, _ = _reshape_pythia_qkv(qkv, num_heads=num_heads, head_dim=head_dim)
+    query, _ = apply_rotary_pos_emb(query, key, *position_embeddings, position_ids=position_ids)
+
+    attn_scores = torch.matmul(query, injected_key.transpose(-1, -2)) * resolve_pythia_attention_scaling(attention, head_dim)
+    attn_scores = attn_scores + attention_mask
+    attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    dropout_p = resolve_pythia_attention_dropout_p(attention, block.training)
+    attn_weights = torch.dropout(attn_weights, p=dropout_p, train=block.training)
+    attn_output = torch.matmul(attn_weights, injected_value)
+    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+    attn_output = attention.dense(attn_output)
+    post_attention_dropout = getattr(block, "post_attention_dropout", None)
+    if post_attention_dropout is not None:
+        attn_output = post_attention_dropout(attn_output)
+
+    if getattr(block, "use_parallel_residual", False):
+        mlp_output = block.mlp(block.post_attention_layernorm(hidden_states))
+        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
+        if post_mlp_dropout is not None:
+            mlp_output = post_mlp_dropout(mlp_output)
+        hidden_states = residual + attn_output + mlp_output
+    else:
+        attn_residual = residual + attn_output
+        mlp_output = block.mlp(block.post_attention_layernorm(attn_residual))
+        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
+        if post_mlp_dropout is not None:
+            mlp_output = post_mlp_dropout(mlp_output)
+        hidden_states = attn_residual + mlp_output
+    return hidden_states, (injected_key, injected_value)
+
+
 def replay_target_prefill_with_injected_window(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
@@ -666,6 +952,7 @@ def replay_target_prefill_with_injected_window(
     injected_key_block: torch.Tensor,
     injected_value_block: torch.Tensor,
     tgt_spec: ModelSpec,
+    target_model_id: Optional[str] = None,
 ) -> PastKeyValues:
     injected_window = blocks_to_partial_past_key_values(
         key_block=injected_key_block,
@@ -683,40 +970,130 @@ def replay_target_prefill_with_injected_window(
             f"got {len(target_layer_indices)} vs {translated_num_layers}"
         )
 
-    transformer = require_gpt2_transformer(target_model)
+    model_family = resolve_target_model_family(target_model, target_model_id=target_model_id)
+    if model_family == "gpt2":
+        transformer = require_gpt2_transformer(target_model)
+        target_blocks = transformer.h
+
+        def build_initial_hidden_states() -> Tuple[torch.Tensor, None, None, None]:
+            return build_gpt2_input_hidden_states(target_model, prefix_input_ids), None, None, None
+
+        def run_native_block(block: nn.Module, hidden_states: torch.Tensor, *_: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_gpt2_block_with_cache(block, hidden_states)
+
+        def run_injected_block(
+            block: nn.Module,
+            hidden_states: torch.Tensor,
+            injected_key: torch.Tensor,
+            injected_value: torch.Tensor,
+            *_: Any,
+        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_gpt2_block_with_injected_layer(block, hidden_states, injected_key, injected_value)
+
+    elif model_family == "pythia":
+        transformer = require_pythia_transformer(target_model)
+        target_blocks = transformer.layers
+
+        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            hidden_states, position_ids, position_embeddings = build_pythia_input_hidden_states(target_model, prefix_input_ids)
+            return hidden_states, position_ids, build_causal_attention_mask(hidden_states), position_embeddings
+
+        def run_native_block(
+            block: nn.Module,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_pythia_block_with_cache(
+                block,
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+
+        def run_injected_block(
+            block: nn.Module,
+            hidden_states: torch.Tensor,
+            injected_key: torch.Tensor,
+            injected_value: torch.Tensor,
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_pythia_block_with_injected_layer(
+                block,
+                hidden_states,
+                injected_key,
+                injected_value,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+
+    else:
+        raise ValueError(f"Unsupported replay target model family: {model_family}")
 
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
     target_start_layer_idx = target_layer_indices[0]
 
     if torch.is_grad_enabled():
         with torch.no_grad():
-            hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
+            hidden_states, position_ids, attention_mask, position_embeddings = build_initial_hidden_states()
             for lower_idx in range(target_start_layer_idx):
-                hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
+                hidden_states, present = run_native_block(
+                    target_blocks[lower_idx],
+                    hidden_states,
+                    position_ids,
+                    attention_mask,
+                    position_embeddings,
+                )
                 rebuilt_past.append((present[0].detach(), present[1].detach()))
         hidden_states = hidden_states.detach()
     else:
-        hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
+        hidden_states, position_ids, attention_mask, position_embeddings = build_initial_hidden_states()
         for lower_idx in range(target_start_layer_idx):
-            hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
+            hidden_states, present = run_native_block(
+                target_blocks[lower_idx],
+                hidden_states,
+                position_ids,
+                attention_mask,
+                position_embeddings,
+            )
             rebuilt_past.append(present)
 
     previous_layer_idx = target_start_layer_idx - 1
     for layer_idx, injected_present in zip(target_layer_indices, injected_window):
         for native_layer_idx in range(previous_layer_idx + 1, layer_idx):
-            hidden_states, present = run_gpt2_block_with_cache(transformer.h[native_layer_idx], hidden_states)
+            hidden_states, present = run_native_block(
+                target_blocks[native_layer_idx],
+                hidden_states,
+                position_ids,
+                attention_mask,
+                position_embeddings,
+            )
             rebuilt_past.append(present)
-        hidden_states, present = run_gpt2_block_with_injected_layer(
-            transformer.h[layer_idx],
+        hidden_states, present = run_injected_block(
+            target_blocks[layer_idx],
             hidden_states,
             injected_present[0],
             injected_present[1],
+            position_ids,
+            attention_mask,
+            position_embeddings,
         )
         rebuilt_past.append(present)
         previous_layer_idx = layer_idx
 
-    for upper_idx in range(previous_layer_idx + 1, len(transformer.h)):
-        hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
+    for upper_idx in range(previous_layer_idx + 1, len(target_blocks)):
+        hidden_states, present = run_native_block(
+            target_blocks[upper_idx],
+            hidden_states,
+            position_ids,
+            attention_mask,
+            position_embeddings,
+        )
         rebuilt_past.append(present)
 
     return tuple(rebuilt_past)
