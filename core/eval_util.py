@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import importlib
+import re
 import time
 from typing import Any, Callable, Tuple
 
@@ -28,6 +29,8 @@ class EvalConfig(Config):
 
     # generation QA
     generation_max_new_tokens: int
+    generation_context_budgets: Optional[str]
+    generation_truncation_log_limit: int
 
 
     def __post_init__(self) -> None:
@@ -200,6 +203,72 @@ class HFDatasetSpec:
     corrected_answer_field: Optional[str] = None
     dataset_names: Optional[List[str]] = None
     streaming: bool = False
+
+
+@dataclass
+class GenerationContextBudgetResolution:
+    requested_budget: Optional[int]
+    effective_budget: int
+    max_budget: int
+    shared_limit: int
+    question_cache_tokens: int
+    answer_token_budget: int
+
+
+def parse_generation_context_budgets(raw_value: Optional[str]) -> List[Optional[int]]:
+    if raw_value is None:
+        return [None]
+
+    normalized = str(raw_value).strip()
+    if not normalized:
+        return [None]
+
+    budgets: List[Optional[int]] = []
+    seen = set()
+    for chunk in normalized.split(','):
+        token = chunk.strip()
+        if not token:
+            continue
+        if token.lower() == 'auto':
+            value = None
+        else:
+            value = int(token)
+            if value < 1:
+                raise ValueError(f'generation_context_budgets must contain positive integers, got {value}')
+        if value not in seen:
+            budgets.append(value)
+            seen.add(value)
+
+    if not budgets:
+        return [None]
+    return budgets
+
+
+def format_generation_context_budget_label(requested_budget: Optional[int]) -> str:
+    if requested_budget is None:
+        return 'auto'
+    return str(int(requested_budget))
+
+
+def build_generation_eval_result_key(
+    spec_or_name,
+    requested_context_budget: Optional[int] = None,
+) -> str:
+    if isinstance(spec_or_name, str):
+        base_key = spec_or_name
+    else:
+        base_key = spec_or_name.name_for_log
+
+    if requested_context_budget is None:
+        return base_key
+    return f"{base_key} [ctx={requested_context_budget}]"
+
+
+def split_generation_eval_result_key(dataset_name: str) -> Tuple[str, Optional[str]]:
+    match = re.match(r'^(.*?)(?: \[ctx=(auto|\d+)\])?$', dataset_name)
+    if match is None:
+        return dataset_name, None
+    return match.group(1), match.group(2)
 
 
 class HFQAPairStream(IterableDataset):
@@ -534,6 +603,20 @@ def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
     )
 
 
+def get_hotpotqa_generation_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="HotpotQA/distractor/validation",
+        dataset_path="hotpotqa/hotpot_qa",
+        dataset_name="distractor",
+        split="validation",
+        answer_mode="hotpotqa",
+        question_field="question",
+        context_field="context",
+        answers_field="answer",
+        streaming=False,
+    )
+
+
 def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
         name_for_log="MultiNews/validation",
@@ -547,16 +630,13 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
     )
 
 
-LOGIT_QA_SPEC_GROUP_FACTORIES = [
-    get_boolq_dataset_spec,
-    get_pubmedqa_dataset_spec,
-    get_mmlu_redux_dataset_spec,
-]
+ENABLE_OPENWEBTEXT_VALIDATION = False
+
+# Long-context MoT experiment: keep only the added long-context generation benchmark.
+LOGIT_QA_SPEC_GROUP_FACTORIES = []
 
 GEN_QA_SPEC_GROUP_FACTORIES = [
-    get_squad_v11_dataset_spec,
-    get_newsqa_generation_dataset_spec,
-    # get_multinews_generation_dataset_spec,
+    get_hotpotqa_generation_dataset_spec,
 ]
 
 EVAL_SPEC_GROUP_FACTORIES = {
@@ -1359,6 +1439,32 @@ def normalize_multinews_context_text(raw_value: Any) -> Optional[str]:
     return normalized or None
 
 
+def normalize_hotpotqa_context_text(raw_value: Any) -> Optional[str]:
+    if not isinstance(raw_value, list):
+        return normalize_context_text(raw_value)
+
+    paragraphs: List[str] = []
+    for paragraph in raw_value:
+        if not isinstance(paragraph, dict):
+            continue
+
+        paragraph_lines: List[str] = []
+        title = paragraph.get("title", None)
+        if isinstance(title, str) and title.strip():
+            paragraph_lines.append(f"Title: {title.strip()}")
+
+        sentences_text = normalize_context_text(paragraph.get("sentences", None))
+        if sentences_text is not None:
+            paragraph_lines.append(sentences_text)
+
+        if paragraph_lines:
+            paragraphs.append("\n".join(paragraph_lines))
+
+    if not paragraphs:
+        return None
+    return "\n\n".join(paragraphs)
+
+
 def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) -> List[Dict[str, Any]]:
     if spec.answer_mode == "squad":
         question = example.get(spec.question_field, "")
@@ -1413,6 +1519,32 @@ def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) ->
                 "answers": answer_texts,
             })
         return generation_examples
+
+
+    if spec.answer_mode == "hotpotqa":
+        question = example.get(spec.question_field, "")
+        if not isinstance(question, str) or not question.strip():
+            return []
+
+        context_field = spec.context_field or "context"
+        answers_field = spec.answers_field or "answer"
+
+        context = normalize_hotpotqa_context_text(example.get(context_field, None))
+        if context is None:
+            return []
+
+        raw_answer = example.get(answers_field, None)
+        answer_texts = _normalize_answer_texts(raw_answer)
+        if not answer_texts and isinstance(raw_answer, str) and raw_answer.strip():
+            answer_texts = [raw_answer.strip()]
+        if not answer_texts:
+            return []
+
+        return [{
+            "question": question.strip(),
+            "context": context,
+            "answers": answer_texts,
+        }]
 
 
     # if spec.answer_mode == "multinews":
@@ -2405,12 +2537,13 @@ def get_answer_token_budget(eval_config) -> int:
     return eval_config.generation_max_new_tokens
 
 
-def compute_benchmark_context_budget(
+def resolve_generation_context_budget(
     ctx: Context,
     spec: HFDatasetSpec,
     question: str,
     eval_config,
-) -> int:
+    requested_budget: Optional[int] = None,
+) -> GenerationContextBudgetResolution:
     shared_limit = min(
         get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
         for node in ctx.nodes
@@ -2421,115 +2554,56 @@ def compute_benchmark_context_budget(
         question=question,
         device="cpu",
     )
-    reserved_tokens = (
-        suffix["cache_ids"].shape[1]
-        + suffix["seed_token"].shape[1]
-        + get_answer_token_budget(eval_config)
-    )
-    budget = shared_limit - reserved_tokens
-    if budget < 16:
+    question_cache_tokens = question_prefix["cache_ids"].shape[1]
+    answer_token_budget = get_answer_token_budget(eval_config)
+    reserved_tokens = question_cache_tokens + question_prefix["seed_token"].shape[1] + answer_token_budget
+    max_budget = shared_limit - reserved_tokens
+    if max_budget < 16:
         raise ValueError(
             f"Insufficient context budget for {spec.name_for_log}: "
             f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
         )
-    return budget
+
+    effective_budget = max_budget if requested_budget is None else min(int(requested_budget), max_budget)
+    if effective_budget < 16:
+        raise ValueError(
+            f"Context budget too small for {spec.name_for_log}: requested_budget={requested_budget}, "
+            f"effective_budget={effective_budget}, max_budget={max_budget}"
+        )
+
+    return GenerationContextBudgetResolution(
+        requested_budget=requested_budget,
+        effective_budget=effective_budget,
+        max_budget=max_budget,
+        shared_limit=shared_limit,
+        question_cache_tokens=question_cache_tokens,
+        answer_token_budget=answer_token_budget,
+    )
 
 
-def compute_logit_task_token_budgets(
+def compute_benchmark_context_budget(
     ctx: Context,
     spec: HFDatasetSpec,
     question: str,
     eval_config,
-    *,
-    choices: Optional[List[str]] = None,
-    choice_texts: Optional[List[str]] = None,
-    subject: Optional[str] = None,
-) -> Dict[str, Optional[int]]:
-    shared_limit = min(
-        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
-        for node in ctx.nodes
-    )
-    answer_budget = get_answer_token_budget(eval_config)
-
-    if spec.answer_mode == "boolq":
-        suffix = prepare_boolq_question_suffix(
-            tokenizer=ctx.tokenizer,
-            question=question,
-            device="cpu",
-        )
-        reserved_tokens = (
-            suffix["cache_ids"].shape[1]
-            + suffix["seed_token"].shape[1]
-            + answer_budget
-        )
-        budget = shared_limit - reserved_tokens
-        if budget < 16:
-            raise ValueError(
-                f"Insufficient context budget for {spec.name_for_log}: "
-                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
-            )
-        return {"max_context_tokens": budget, "max_prefix_tokens": None}
-
-    if spec.answer_mode == "pubmed_qa":
-        suffix = prepare_pubmed_qa_question_suffix(
-            tokenizer=ctx.tokenizer,
-            question=question,
-            device="cpu",
-        )
-        reserved_tokens = (
-            suffix["cache_ids"].shape[1]
-            + suffix["seed_token"].shape[1]
-            + answer_budget
-        )
-        budget = shared_limit - reserved_tokens
-        if budget < 16:
-            raise ValueError(
-                f"Insufficient context budget for {spec.name_for_log}: "
-                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
-            )
-        return {"max_context_tokens": budget, "max_prefix_tokens": None}
-
-    if spec.answer_mode == "mmlu_redux":
-        if not choices:
-            raise ValueError("MMLU-Redux requires choices for prompt budgeting.")
-        if not choice_texts:
-            raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
-        suffix = prepare_mmlu_redux_choices_suffix(
-            tokenizer=ctx.tokenizer,
-            choices=choices,
-            choice_texts=choice_texts,
-            device="cpu",
-        )
-        reserved_tokens = (
-            suffix["cache_ids"].shape[1]
-            + suffix["seed_token"].shape[1]
-            + answer_budget
-        )
-        budget = shared_limit - reserved_tokens
-        if budget < 16:
-            raise ValueError(
-                f"Insufficient context budget for {spec.name_for_log}: "
-                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
-            )
-        return {"max_context_tokens": budget, "max_prefix_tokens": None}
-
-    prompt_budget = shared_limit - answer_budget
-    if prompt_budget < 16:
-        raise ValueError(
-            f"Insufficient prompt budget for {spec.name_for_log}: "
-            f"shared_limit={shared_limit}, answer_budget={answer_budget}"
-        )
-    return {"max_context_tokens": None, "max_prefix_tokens": prompt_budget}
+) -> int:
+    return resolve_generation_context_budget(
+        ctx=ctx,
+        spec=spec,
+        question=question,
+        eval_config=eval_config,
+        requested_budget=None,
+    ).effective_budget
 
 
-def prepare_generation_task_suffix(
+def prepare_generation_task_question_prefix(
     spec: HFDatasetSpec,
     tokenizer,
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode in {"squad", "newsqa"}:
-        return prepare_squad_v11_question_suffix(
+    if spec.answer_mode in {"squad", "newsqa", "hotpotqa"}:
+        return prepare_squad_v11_question_prefix(
             tokenizer=tokenizer,
             question=question,
             device=device,
@@ -2660,7 +2734,7 @@ def prepare_generation_task_inputs(
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if spec.answer_mode in {"squad", "newsqa"}:
+    if spec.answer_mode in {"squad", "newsqa", "hotpotqa"}:
         context_prefix = prepare_squad_v11_context_inputs(
             tokenizer=tokenizer,
             context=context,
@@ -3271,6 +3345,23 @@ def build_openwebtext_profile_cell(row: Dict[str, float], *, prefix: str = "") -
     latency_text, throughput_text, peak_text = build_openwebtext_profile_fields(row, prefix=prefix)
     return f"{latency_text} · {throughput_text} · {peak_text}"
 
+def _dataset_display_name_from_log_name(dataset_name: str) -> str:
+    base_name, budget_label = split_generation_eval_result_key(dataset_name)
+    display_name_by_key = {
+        "BoolQ/validation": "BoolQ",
+        "PubMedQA/pqa_labeled/train": "PubMedQA",
+        "SQuAD-v1.1/validation": "SQuAD",
+        "NewsQA/validation": "NewsQA",
+        "HotpotQA/distractor/validation": "HotpotQA",
+        "MultiNews/validation": "MultiNews",
+        "OpenWebText/validation": "OpenWebText",
+    }
+    display_name = display_name_by_key.get(base_name, base_name)
+    if budget_label is None or budget_label == 'auto':
+        return display_name
+    return f"{display_name} @ctx={budget_label}"
+
+
 def build_edge_summary_markdown_table(
     alg: str,
     edge_id: str,
@@ -3284,99 +3375,69 @@ def build_edge_summary_markdown_table(
     edge_map = build_edge_map(edges)
     edge = edge_map.get(edge_id)
 
-    logit_dataset_keys = [
-        ("BoolQ", "BoolQ/validation"),
-        ("PubMedQA", "PubMedQA/pqa_labeled/train"),
-        ("MMLU-Redux", "MMLU-Redux/test"),
-    ]
-    generation_dataset_keys = [
-        ("SQuAD", "SQuAD-v1.1/validation"),
-        ("NewsQA", "NewsQA/validation"),
-        # ("MultiNews", "MultiNews/validation"),
-    ]
-
-    logit_rows = {
-        display_name: all_logit_results.get(dataset_key, {}).get(edge_id, {})
-        for display_name, dataset_key in logit_dataset_keys
-    }
-    generation_rows = {
-        display_name: all_generation_results.get(dataset_key, {}).get(edge_id, {})
-        for display_name, dataset_key in generation_dataset_keys
-    }
-    loss_row = (openwebtext_loss_results or {}).get(edge_id, {})
-
-    translated_cosine_avg = _summary_mean([
-        logit_rows["BoolQ"].get("cosine", float("nan")),
-        logit_rows["PubMedQA"].get("cosine", float("nan")),
-        logit_rows["MMLU-Redux"].get("cosine", float("nan")),
-    ])
-    translated_accuracy_avg = _summary_mean([
-        logit_rows["BoolQ"].get("accuracy", float("nan")),
-        logit_rows["PubMedQA"].get("accuracy", float("nan")),
-        logit_rows["MMLU-Redux"].get("accuracy", float("nan")),
-    ])
-    native_accuracy_avg = _summary_mean([
-        logit_rows["BoolQ"].get("native_accuracy", float("nan")),
-        logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
-        logit_rows["MMLU-Redux"].get("native_accuracy", float("nan")),
-    ])
-    translated_generation_f1_avg = _summary_mean([
-        generation_rows["SQuAD"].get("f1", float("nan")),
-        generation_rows["NewsQA"].get("f1", float("nan")),
-        # generation_rows["MultiNews"].get("f1", float("nan")),
-    ])
-    native_generation_f1_avg = _summary_mean([
-        generation_rows["SQuAD"].get("native_f1", float("nan")),
-        generation_rows["NewsQA"].get("native_f1", float("nan")),
-        # generation_rows["MultiNews"].get("native_f1", float("nan")),
-    ])
-
     if edge is None:
-        target_model_id = "target"
         direction_title = edge_id
+        baseline_name = "target (baseline)"
+        translated_name = alg
     else:
         src_model_id = node_map[edge.src_id].model_id
-        target_model_id = node_map[edge.tgt_id].model_id
-        direction_title = f"{edge.id} 방향 ({src_model_id} -> {target_model_id})"
-
-    native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(loss_row, prefix="native")
-    translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(loss_row)
+        tgt_model_id = node_map[edge.tgt_id].model_id
+        direction_title = f"{edge.id} 방향 ({src_model_id} -> {tgt_model_id})"
+        baseline_name = f"{tgt_model_id} (baseline)"
+        translated_name = alg
 
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        (
-            f"| {target_model_id} (baseline) | N/A | "
-            f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('native_accuracy', float('nan')))} | "
-            f"{_format_summary_percent(native_accuracy_avg)} | "
-            f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
-            f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
-            f"{_format_summary_float(native_generation_f1_avg)} | "
-            f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} | "
-            f"{native_latency_text} | "
-            f"{native_throughput_text} | "
-            f"{native_peak_text} |"
-        ),
-        (
-            f"| {alg} | "
-            f"{_format_summary_float(translated_cosine_avg)} | "
-            f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('accuracy', float('nan')))} | "
-            f"{_format_summary_percent(translated_accuracy_avg)} | "
-            f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
-            f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
-            f"{_format_summary_float(translated_generation_f1_avg)} | "
-            f"{_format_summary_float(loss_row.get('loss', float('nan')))} | "
-            f"{translated_latency_text} | "
-            f"{translated_throughput_text} | "
-            f"{translated_peak_text} |"
-        ),
+        "| Dataset | Method | Cosine Sim | Metric | Native Metric | Count |",
+        "|---|---|---:|---:|---:|---:|",
     ]
+
+    for dataset_name in sorted(all_logit_results):
+        row = all_logit_results.get(dataset_name, {}).get(edge_id)
+        if not row:
+            continue
+        display_name = _dataset_display_name_from_log_name(dataset_name)
+        lines.append(
+            f"| {display_name} | {baseline_name} | N/A | "
+            f"{_format_summary_percent(row.get('native_accuracy', float('nan')))} | N/A | {int(row.get('count', 0))} |"
+        )
+        lines.append(
+            f"| {display_name} | {translated_name} | {_format_summary_float(row.get('cosine', float('nan')))} | "
+            f"{_format_summary_percent(row.get('accuracy', float('nan')))} | "
+            f"{_format_summary_percent(row.get('native_accuracy', float('nan')))} | {int(row.get('count', 0))} |"
+        )
+
+    for dataset_name in sorted(all_generation_results):
+        row = all_generation_results.get(dataset_name, {}).get(edge_id)
+        if not row:
+            continue
+        display_name = _dataset_display_name_from_log_name(dataset_name)
+        lines.append(
+            f"| {display_name} | {baseline_name} | N/A | "
+            f"{_format_summary_float(row.get('native_f1', float('nan')))} | N/A | {int(row.get('count', 0))} |"
+        )
+        lines.append(
+            f"| {display_name} | {translated_name} | {_format_summary_float(row.get('cosine', float('nan')))} | "
+            f"{_format_summary_float(row.get('f1', float('nan')))} | "
+            f"{_format_summary_float(row.get('native_f1', float('nan')))} | {int(row.get('count', 0))} |"
+        )
+
+    loss_row = (openwebtext_loss_results or {}).get(edge_id)
+    if loss_row:
+        lines.append(
+            f"| OpenWebText | {baseline_name} | N/A | "
+            f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} | N/A | {int(loss_row.get('count', 0))} |"
+        )
+        lines.append(
+            f"| OpenWebText | {translated_name} | N/A | "
+            f"{_format_summary_float(loss_row.get('loss', float('nan')))} | "
+            f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} | {int(loss_row.get('count', 0))} |"
+        )
+
+    if len(lines) == 4:
+        lines.append("| N/A | N/A | N/A | N/A | N/A | 0 |")
+
     return "\n".join(lines)
 
 
@@ -3404,3 +3465,6 @@ def build_final_summary_markdown(
         )
 
     return "\n\n".join(sections)
+
+
+
