@@ -18,10 +18,10 @@ class InfiniteDataLoader:
             return next(self.iterator)
 
 
-def build_training_dataloader(ctx: Context) -> InfiniteDataLoader:
+def build_training_dataloader(ctx: Context, tokenizer: PreTrainedTokenizerBase) -> InfiniteDataLoader:
     config = ctx.config
     dataset = OpenWebTextSequenceStream(
-        tokenizer=ctx.tokenizer,
+        tokenizer=tokenizer,
         sequence_length=config.total_tokens,
         split="train",
         shuffle=True,
@@ -32,6 +32,12 @@ def build_training_dataloader(ctx: Context) -> InfiniteDataLoader:
     return InfiniteDataLoader(dataloader)
 
 
+def build_training_dataloaders_by_target(ctx: Context) -> Dict[str, InfiniteDataLoader]:
+    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+    return {
+        node_id: build_training_dataloader(ctx, ctx.mm.get_tokenizer(node_id))
+        for node_id in target_node_ids
+    }
 
 
 class CrossAttentionBlock(nn.Module):
@@ -102,16 +108,19 @@ class WarmupCosineScheduler:
         return self.optimizer.param_groups[0]["lr"]
 
 
-def build_models_and_tokenizer(
+def build_models_and_tokenizers(
     config,
     nodes: List[Node],
-) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase]:
-    tokenizer = load_tokenizer(nodes[0].model_id)
+) -> Tuple[Dict[str, PreTrainedModel], Dict[str, PreTrainedTokenizerBase]]:
+    tokenizers = {
+        node.id: load_tokenizer(node.model_id)
+        for node in nodes
+    }
     models = {
         node.id: load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
         for node in nodes
     }
-    return models, tokenizer
+    return models, tokenizers
 
 
 def save_checkpoint(

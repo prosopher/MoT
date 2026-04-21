@@ -474,7 +474,7 @@ class ChannelProfiler:
         from torch.utils.data import DataLoader
 
         dataset = OpenWebTextSequenceStream(
-            tokenizer=self.ctx.tokenizer,
+            tokenizer=self.ctx.mm.get_tokenizer(edge.tgt_id),
             sequence_length=self.config.total_tokens,
             split=split,
             shuffle=True,

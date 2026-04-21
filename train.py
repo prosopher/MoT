@@ -7,7 +7,7 @@ from core.common import GPUMemoryTracker, add_dataclass_arguments, build_datacla
 from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import build_nodes_and_edges
-from core.train_util import build_models_and_tokenizer, get_train_log_path
+from core.train_util import build_models_and_tokenizers, get_train_log_path
 
 
 def load_train_module(alg: str):
@@ -66,13 +66,12 @@ def main() -> None:
     setup_logging(get_train_log_path(config.output_path))
 
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    models, tokenizer = build_models_and_tokenizer(config, nodes)
+    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     if hasattr(train_module, "ChannelProfiler") and train_module.uses_channel_alignment(getattr(config, "layer_alignment", "")):

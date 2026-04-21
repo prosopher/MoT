@@ -16,7 +16,7 @@ from core.context import Context
 from core.model_manager import ModelManager
 from core.topology import Edge, Node, build_edge_map
 from core.train_util import (
-    build_models_and_tokenizer,
+    build_models_and_tokenizers,
     get_train_checkpoint_path,
     get_train_config_path,
     get_train_log_path,
@@ -325,6 +325,7 @@ def _build_openwebtext_calibration_batches(
     *,
     ctx: Context,
     config: TrainConfig,
+    tokenizer,
 ) -> List[torch.Tensor]:
     if not _is_openwebtext_dataset(config.calibration_dataset):
         raise ValueError(
@@ -332,7 +333,7 @@ def _build_openwebtext_calibration_batches(
         )
 
     dataset = OpenWebTextSequenceStream(
-        tokenizer=ctx.tokenizer,
+        tokenizer=tokenizer,
         sequence_length=_openwebtext_total_tokens(config),
         split="train",
         shuffle=True,
@@ -546,16 +547,22 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
         raise SystemExit(compatibility["message"])
     logging.info(compatibility["message"])
 
-    calibration_batches = _build_openwebtext_calibration_batches(
-        ctx=ctx,
-        config=config,
-    )
-    if not calibration_batches:
-        raise RuntimeError(f"Failed to sample any {config.calibration_dataset} sequences for KVComm layer selection.")
-    logging.info("Collected %d %s batch(es) for layer selection", len(calibration_batches), config.calibration_dataset)
+    calibration_batches_by_target = {
+        target_node_id: _build_openwebtext_calibration_batches(
+            ctx=ctx,
+            config=config,
+            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+        )
+        for target_node_id in sorted({edge.tgt_id for edge in edges})
+    }
+    for target_node_id, calibration_batches in calibration_batches_by_target.items():
+        if not calibration_batches:
+            raise RuntimeError(f"Failed to sample any {config.calibration_dataset} sequences for target {target_node_id}.")
+        logging.info("Collected %d %s batch(es) for target=%s layer selection", len(calibration_batches), config.calibration_dataset, target_node_id)
 
     calibration_by_edge: Dict[str, EdgeCalibrationResult] = {}
     for edge in edges:
+        calibration_batches = calibration_batches_by_target[edge.tgt_id]
         result = _select_layers_for_edge(
             ctx=ctx,
             edge=edge,
@@ -631,13 +638,12 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = resolve_device(device_override)
 
-    models, tokenizer = build_models_and_tokenizer(config, nodes)
+    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     payload = torch.load(str(checkpoint_path), map_location="cpu")

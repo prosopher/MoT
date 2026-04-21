@@ -57,7 +57,6 @@ def build_profiler(layer_alignment: str) -> tuple[DeterministicChannelProfiler, 
         nodes=[],
         edges=[edge],
         mm=DummyModelManager({"A": 2, "B": 4}),
-        tokenizer=SimpleNamespace(),
         cm=ChannelManager([edge]),
     )
     profiler = DeterministicChannelProfiler(
@@ -89,7 +88,6 @@ def build_scored_profiler(
         nodes=[],
         edges=[edge],
         mm=DummyModelManager({"A": layer_counts[0], "B": layer_counts[1]}),
-        tokenizer=SimpleNamespace(),
         cm=ChannelManager([edge]),
     )
     profiler = ScoreMappedChannelProfiler(

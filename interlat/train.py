@@ -29,7 +29,14 @@ from core.common import (
 from core.config import Config
 from core.context import Context
 from core.model_manager import ModelManager
-from core.train_util import WarmupCosineScheduler, get_train_checkpoint_path, get_train_config_path, get_train_log_path, initialize_train_output_paths
+from core.train_util import (
+    build_models_and_tokenizers,
+    WarmupCosineScheduler,
+    get_train_checkpoint_path,
+    get_train_config_path,
+    get_train_log_path,
+    initialize_train_output_paths
+)
 from core.topology import Edge, Node
 from interlat.vender import ModelArguments as VendorModelArguments
 from interlat.vender.hidden_model.custom_model import AdaptiveProjection, HiddenStateProcessor
@@ -347,18 +354,6 @@ def tokenize_valid_texts(
     return TokenizedBatch(input_ids=input_ids), valid_mask
 
 
-def build_models_and_reference_tokenizer(
-    config: TrainConfig,
-    nodes: Sequence[Node],
-):
-    reference_tokenizer = load_tokenizer(nodes[0].model_id)
-    models = {
-        node.id: load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
-        for node in nodes
-    }
-    return models, reference_tokenizer
-
-
 def build_translator_pool(ctx: Context) -> InterLatTranslatorPool:
     pool = InterLatTranslatorPool(ctx)
     pool.to(ctx.config.device)
@@ -382,13 +377,12 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
-    models, tokenizer = build_models_and_reference_tokenizer(config, nodes)
+    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)

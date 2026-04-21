@@ -59,7 +59,6 @@ def evaluate_generation_dataset(
     edges = ctx.edges
     train_config = ctx.config
     device = train_config.device
-    tokenizer = ctx.tokenizer
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -70,50 +69,53 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            context_budget = None
-            if spec.answer_mode in {"squad", "newsqa"}:
-                context_budget = compute_benchmark_context_budget(
-                    ctx=ctx,
-                    spec=spec,
-                    question=question,
-                    eval_config=eval_config,
-                )
-
-            prepared_inputs = prepare_generation_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context_text,
-                question=question,
-                device=device,
-                max_input_tokens=context_budget,
-            )
-            prefix_input_ids = prepared_inputs["prefix_input_ids"]
-            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
-            seed_token = prepared_inputs["seed_token"]
-
-            if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
-                logging.info(
-                    "[%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
-                    spec.name_for_log,
-                    prefix_input_ids.shape[1],
-                    suffix_cache_tokens,
-                    get_answer_token_budget(eval_config),
-                )
-
-            past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
-                for node in nodes
-            }
-
             for edge in edges:
+                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                context_budget = None
+                if spec.answer_mode in {"squad", "newsqa"}:
+                    context_budget = compute_benchmark_context_budget(
+                        ctx=ctx,
+                        spec=spec,
+                        question=question,
+                        eval_config=eval_config,
+                        tokenizer=tokenizer,
+                        target_node_id=edge.tgt_id,
+                    )
+
+                prepared_inputs = prepare_generation_task_inputs(
+                    spec=spec,
+                    tokenizer=tokenizer,
+                    context=context_text,
+                    question=question,
+                    device=device,
+                    max_input_tokens=context_budget,
+                )
+                prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
+                seed_token = prepared_inputs["seed_token"]
+
+                if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                    logging.info(
+                        "[%s][%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
+                        spec.name_for_log,
+                        edge.id,
+                        prefix_input_ids.shape[1],
+                        suffix_cache_tokens,
+                        get_answer_token_budget(eval_config),
+                    )
+
+                past_by_node_id = {
+                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+                    for node in nodes
+                }
+
                 translated_past = translator_pool.translate_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
-
                 native_past = past_by_node_id[edge.tgt_id]
                 cosine_value = cosine_similarity_between_past(translated_past, native_past)
 
@@ -155,7 +157,6 @@ def evaluate_generation_dataset(
             )
 
     return summarize_generation_path_metrics(path_metrics)
-
 
 
 def run_eval(

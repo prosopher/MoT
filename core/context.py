@@ -1,8 +1,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-from transformers import PreTrainedTokenizerBase
-
 from .channel_manager import ChannelManager
 from .config import Config
 from .model_manager import ModelManager
@@ -19,6 +17,5 @@ class Context:
     nodes: List[Node]
     edges: List[Edge]
     mm: ModelManager
-    tokenizer: PreTrainedTokenizerBase
     cm: ChannelManager
     cp: Optional["ChannelProfiler"] = None
