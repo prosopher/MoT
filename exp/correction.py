@@ -272,9 +272,11 @@ def build_prepared_inputs(
     ctx: Context,
     spec: HFDatasetSpec,
     example: Dict[str, Any],
+    *,
+    tokenizer,
+    target_node_id: str,
 ) -> Dict[str, Any]:
     config = ctx.config
-    tokenizer = ctx.tokenizer
     if config.benchmark_mode == "logit_qa":
         return prepare_logit_task_inputs(
             spec=spec,
@@ -292,6 +294,8 @@ def build_prepared_inputs(
             spec=spec,
             question=example["question"],
             eval_config=SimpleNamespace(generation_max_new_tokens=config.generation_max_new_tokens),
+            tokenizer=tokenizer,
+            target_node_id=target_node_id,
         )
         return prepare_generation_task_inputs(
             spec=spec,
@@ -469,7 +473,6 @@ def evaluate_correction(
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
-    tokenizer = ctx.tokenizer
     logging.info("Starting correction analysis")
     logging.info("experiment_config=%s", asdict(config))
 
@@ -502,25 +505,31 @@ def evaluate_correction(
         dataloader = dataloader_builder(spec=spec, eval_config=eval_config)
         for batch in dataloader:
             for example in batch:
-                try:
-                    prepared_inputs = build_prepared_inputs(ctx=ctx, spec=spec, example=example)
-                except Exception as exc:
-                    logging.warning("Skipping example due to input preparation error: %s", exc)
-                    continue
-                answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, tokenizer=tokenizer)
-                if answer_token_ids is None or answer_token_ids.shape[0] < 1:
-                    continue
-                answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
-                prefix_input_ids = prepared_inputs["prefix_input_ids"]
-                suffix_cache_ids = prepared_inputs.get("suffix_cache_ids", None)
-                seed_token = prepared_inputs["seed_token"]
-                try:
-                    past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids) for node in nodes}
-                except Exception as exc:
-                    logging.warning("Skipping example due to cache extraction error: %s", exc)
-                    continue
-
                 for edge in edges:
+                    tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                    try:
+                        prepared_inputs = build_prepared_inputs(
+                            ctx=ctx,
+                            spec=spec,
+                            example=example,
+                            tokenizer=tokenizer,
+                            target_node_id=edge.tgt_id,
+                        )
+                    except Exception as exc:
+                        logging.warning("Skipping example due to input preparation error: %s", exc)
+                        continue
+                    answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, tokenizer=tokenizer)
+                    if answer_token_ids is None or answer_token_ids.shape[0] < 1:
+                        continue
+                    answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
+                    prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                    suffix_cache_ids = prepared_inputs.get("suffix_cache_ids", None)
+                    seed_token = prepared_inputs["seed_token"]
+                    try:
+                        past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids) for node in nodes}
+                    except Exception as exc:
+                        logging.warning("Skipping example due to cache extraction error: %s", exc)
+                        continue
                     translated_key, translated_value = translator_pool.translate_layer_window(
                         past_key_values=past_by_node_id[edge.src_id],
                         src_node_id=edge.src_id,
@@ -1020,13 +1029,12 @@ def main() -> None:
 
     set_seed(config.seed)
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    models, tokenizer = lp.build_models_for_experiment(config, nodes)
+    models, tokenizers = lp.build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)

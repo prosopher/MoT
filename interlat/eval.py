@@ -54,12 +54,16 @@ def _compute_interlat_generation_context_budget(
     spec: HFDatasetSpec,
     question: str,
     eval_config: EvalConfig,
+    tokenizer,
+    target_node_id: str,
 ) -> int:
     base_budget = compute_benchmark_context_budget(
         ctx=ctx,
         spec=spec,
         question=question,
         eval_config=eval_config,
+        tokenizer=tokenizer,
+        target_node_id=target_node_id,
     )
     return _apply_interlat_extra_reserve_to_budget(
         budget=base_budget,
@@ -127,15 +131,6 @@ def _evaluate_openwebtext_validation(
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
     profiler = InferenceProfiler(train_config.device)
-    dataloader = build_openwebtext_eval_dataloader(
-        tokenizer=ctx.tokenizer,
-        config=train_config,
-        batch_size=eval_config.batch_size,
-        num_workers=eval_config.num_workers,
-        shuffle=eval_config.shuffle_eval_stream,
-        seed=eval_config.seed,
-        shuffle_buffer=eval_config.shuffle_buffer,
-    )
 
     loss_sums = {edge.id: {"translated": 0.0, "native": 0.0} for edge in ctx.edges}
     cosine_sums = {edge.id: 0.0 for edge in ctx.edges}
@@ -156,137 +151,155 @@ def _evaluate_openwebtext_validation(
         for edge in ctx.edges
     }
 
-    processed_examples = 0
-    for batch_idx, input_ids in enumerate(dataloader, start=1):
-        if processed_examples >= eval_config.max_examples_per_dataset:
-            break
+    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+    edges_by_target = {
+        target_node_id: [edge for edge in ctx.edges if edge.tgt_id == target_node_id]
+        for target_node_id in target_node_ids
+    }
 
-        remaining_examples = eval_config.max_examples_per_dataset - processed_examples
-        if input_ids.shape[0] > remaining_examples:
-            input_ids = input_ids[:remaining_examples]
-        input_ids = input_ids.to(train_config.device)
-
-        prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-            input_ids=input_ids,
-            prefix_tokens=train_config.prefix_tokens,
+    for target_node_id in target_node_ids:
+        target_tokenizer = node_tokenizers[target_node_id]
+        dataloader = build_openwebtext_eval_dataloader(
+            tokenizer=target_tokenizer,
+            config=train_config,
+            batch_size=eval_config.batch_size,
+            num_workers=eval_config.num_workers,
+            shuffle=eval_config.shuffle_eval_stream,
+            seed=eval_config.seed,
+            shuffle_buffer=eval_config.shuffle_buffer,
         )
+        processed_examples = 0
+        for batch_idx, input_ids in enumerate(dataloader, start=1):
+            if processed_examples >= eval_config.max_examples_per_dataset:
+                break
 
-        batch_examples = int(input_ids.shape[0])
-        processed_examples += batch_examples
+            remaining_examples = eval_config.max_examples_per_dataset - processed_examples
+            if input_ids.shape[0] > remaining_examples:
+                input_ids = input_ids[:remaining_examples]
+            input_ids = input_ids.to(train_config.device)
 
-        decoded_texts = ctx.tokenizer.batch_decode(
-            input_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-
-        for edge in ctx.edges:
-            source_tokenizer = node_tokenizers[edge.src_id]
-            source_encoded = source_tokenizer(
-                list(decoded_texts),
-                add_special_tokens=False,
-                truncation=True,
-                max_length=train_config.total_tokens,
-                padding="max_length",
-                return_tensors="pt",
+            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                input_ids=input_ids,
+                prefix_tokens=train_config.prefix_tokens,
             )
-            source_input_ids = source_encoded["input_ids"].to(train_config.device)
-            source_prefix_ids = source_input_ids[:, : train_config.prefix_tokens - 1]
 
-            source_model = ctx.mm.get_model(edge.src_id)
-            target_model = ctx.mm.get_model(edge.tgt_id)
+            batch_examples = int(input_ids.shape[0])
+            processed_examples += batch_examples
 
-            source_hidden = extract_last_hidden_states(source_model, source_prefix_ids)
-            translated_latents = translator_pool.translate_hidden_states(
-                edge_id=edge.id,
-                source_hidden_states=source_hidden,
+            decoded_texts = target_tokenizer.batch_decode(
+                input_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
             )
-            translated_prefix_ids = _fit_prefix_input_ids_to_model_limit(
-                model=target_model,
-                prefix_input_ids=prefix_cache_ids,
-                reserved_tail_tokens=train_config.latent_tokens + int(lm_input_ids.shape[1]),
-            )
-            translated_past = build_latent_conditioned_past(
-                target_model,
-                prefix_input_ids=translated_prefix_ids,
-                latent_prefix=translated_latents,
-            )
-            native_past = extract_past_key_values(target_model, prefix_cache_ids)
 
-            translated_loss = float(
-                compute_suffix_lm_loss(
-                    target_model=target_model,
-                    past_key_values=translated_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
-            )
-            native_loss = float(
-                compute_suffix_lm_loss(
-                    target_model=target_model,
-                    past_key_values=native_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
-            )
-            cosine_value = _cosine_similarity_for_interlat_past(translated_past, native_past)
+            for edge in edges_by_target[target_node_id]:
+                source_tokenizer = node_tokenizers[edge.src_id]
+                source_encoded = source_tokenizer(
+                    list(decoded_texts),
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=train_config.total_tokens,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                source_input_ids = source_encoded["input_ids"].to(train_config.device)
+                source_prefix_ids = source_input_ids[:, : train_config.prefix_tokens - 1]
 
-            profile_tokens = int(lm_labels.numel())
-            seed_token = lm_input_ids[:, :1]
-            generation_steps = int(lm_labels.shape[1])
+                source_model = ctx.mm.get_model(edge.src_id)
+                target_model = ctx.mm.get_model(edge.tgt_id)
 
-            def run_translated_inference() -> int:
-                return run_openwebtext_greedy_inference(
+                source_hidden = extract_last_hidden_states(source_model, source_prefix_ids)
+                translated_latents = translator_pool.translate_hidden_states(
+                    edge_id=edge.id,
+                    source_hidden_states=source_hidden,
+                )
+                translated_prefix_ids = _fit_prefix_input_ids_to_model_limit(
                     model=target_model,
-                    past_key_values=translated_past,
-                    seed_token=seed_token,
-                    max_new_tokens=generation_steps,
+                    prefix_input_ids=prefix_cache_ids,
+                    reserved_tail_tokens=train_config.latent_tokens + int(lm_input_ids.shape[1]),
+                )
+                translated_past = build_latent_conditioned_past(
+                    target_model,
+                    prefix_input_ids=translated_prefix_ids,
+                    latent_prefix=translated_latents,
+                )
+                native_past = extract_past_key_values(target_model, prefix_cache_ids)
+
+                translated_loss = float(
+                    compute_suffix_lm_loss(
+                        target_model=target_model,
+                        past_key_values=translated_past,
+                        lm_input_ids=lm_input_ids,
+                        lm_labels=lm_labels,
+                    ).item()
+                )
+                native_loss = float(
+                    compute_suffix_lm_loss(
+                        target_model=target_model,
+                        past_key_values=native_past,
+                        lm_input_ids=lm_input_ids,
+                        lm_labels=lm_labels,
+                    ).item()
+                )
+                cosine_value = _cosine_similarity_for_interlat_past(translated_past, native_past)
+
+                profile_tokens = int(lm_labels.numel())
+                seed_token = lm_input_ids[:, :1]
+                generation_steps = int(lm_labels.shape[1])
+
+                def run_translated_inference() -> int:
+                    return run_openwebtext_greedy_inference(
+                        model=target_model,
+                        past_key_values=translated_past,
+                        seed_token=seed_token,
+                        max_new_tokens=generation_steps,
+                    )
+
+                def run_native_inference() -> int:
+                    return run_openwebtext_greedy_inference(
+                        model=target_model,
+                        past_key_values=native_past,
+                        seed_token=seed_token,
+                        max_new_tokens=generation_steps,
+                    )
+
+                _, translated_profile = profiler.measure(run_translated_inference, tokens=profile_tokens)
+                with temporarily_offload_module(translator_pool, train_config.device):
+                    _, native_profile = profiler.measure(run_native_inference, tokens=profile_tokens)
+
+                loss_sums[edge.id]["translated"] += translated_loss * batch_examples
+                loss_sums[edge.id]["native"] += native_loss * batch_examples
+                cosine_sums[edge.id] += cosine_value * batch_examples
+                counts[edge.id] += batch_examples
+                profile_accumulators[edge.id]["translated"].update(
+                    latency_sec=float(translated_profile.get("latency_sec", 0.0)),
+                    tokens=int(translated_profile.get("tokens", 0)),
+                    peak_memory_bytes=translated_profile.get("peak_memory_bytes"),
+                )
+                profile_accumulators[edge.id]["native"].update(
+                    latency_sec=float(native_profile.get("latency_sec", 0.0)),
+                    tokens=int(native_profile.get("tokens", 0)),
+                    peak_memory_bytes=native_profile.get("peak_memory_bytes"),
                 )
 
-            def run_native_inference() -> int:
-                return run_openwebtext_greedy_inference(
-                    model=target_model,
-                    past_key_values=native_past,
-                    seed_token=seed_token,
-                    max_new_tokens=generation_steps,
+                named_pasts = build_openwebtext_tsne_named_pasts(
+                    source_top_past_key_values=extract_past_key_values(source_model, source_prefix_ids),
+                    translated_past_key_values=translated_past,
+                    target_top_past_key_values=native_past,
+                )
+                _accumulate_openwebtext_tsne_samples(
+                    tsne_features,
+                    edge_id=edge.id,
+                    named_pasts=named_pasts,
                 )
 
-            _, translated_profile = profiler.measure(run_translated_inference, tokens=profile_tokens)
-            with temporarily_offload_module(translator_pool, train_config.device):
-                _, native_profile = profiler.measure(run_native_inference, tokens=profile_tokens)
-
-            loss_sums[edge.id]["translated"] += translated_loss * batch_examples
-            loss_sums[edge.id]["native"] += native_loss * batch_examples
-            cosine_sums[edge.id] += cosine_value * batch_examples
-            counts[edge.id] += batch_examples
-            profile_accumulators[edge.id]["translated"].update(
-                latency_sec=float(translated_profile.get("latency_sec", 0.0)),
-                tokens=int(translated_profile.get("tokens", 0)),
-                peak_memory_bytes=translated_profile.get("peak_memory_bytes"),
-            )
-            profile_accumulators[edge.id]["native"].update(
-                latency_sec=float(native_profile.get("latency_sec", 0.0)),
-                tokens=int(native_profile.get("tokens", 0)),
-                peak_memory_bytes=native_profile.get("peak_memory_bytes"),
-            )
-
-            named_pasts = build_openwebtext_tsne_named_pasts(
-                source_top_past_key_values=extract_past_key_values(source_model, source_prefix_ids),
-                translated_past_key_values=translated_past,
-                target_top_past_key_values=native_past,
-            )
-            _accumulate_openwebtext_tsne_samples(
-                tsne_features,
-                edge_id=edge.id,
-                named_pasts=named_pasts,
-            )
-
-        if batch_idx % 25 == 0:
-            logging.info(
-                "[OpenWebText/validation] progress: %d/%d sequences",
-                processed_examples,
-                eval_config.max_examples_per_dataset,
-            )
+            if batch_idx % 25 == 0:
+                logging.info(
+                    "[OpenWebText/validation][target=%s] progress: %d/%d sequences",
+                    target_node_id,
+                    processed_examples,
+                    eval_config.max_examples_per_dataset,
+                )
 
     summaries: Dict[str, Dict[str, float]] = {}
     for edge in ctx.edges:
@@ -341,11 +354,12 @@ def _evaluate_logit_dataset(
     def build_example_state_fn(
         *,
         ctx: Context,
+        edge: Edge,
         prefix_input_ids: torch.Tensor,
         **_,
     ):
         source_hidden_by_edge: Dict[str, torch.Tensor] = {}
-        prefix_text = ctx.tokenizer.decode(
+        prefix_text = node_tokenizers[edge.tgt_id].decode(
             prefix_input_ids[0].detach().cpu(),
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
@@ -436,38 +450,42 @@ def _evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            context_budget = None
-            if spec.answer_mode in {"squad", "newsqa"}:
-                context_budget = _compute_interlat_generation_context_budget(
-                    ctx=ctx,
-                    spec=spec,
-                    question=question,
-                    eval_config=eval_config,
-                )
-
-            prepared_inputs = prepare_generation_task_inputs(
-                spec=spec,
-                tokenizer=ctx.tokenizer,
-                context=context_text,
-                question=question,
-                device=ctx.config.device,
-                max_input_tokens=context_budget,
-            )
-            prefix_input_ids = prepared_inputs["prefix_input_ids"]
-            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
-            seed_token = prepared_inputs["seed_token"]
-
-            if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
-                logging.info(
-                    "[%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
-                    spec.name_for_log,
-                    prefix_input_ids.shape[1],
-                    suffix_cache_tokens,
-                    get_answer_token_budget(eval_config),
-                )
-
             for edge in ctx.edges:
+                target_tokenizer = node_tokenizers[edge.tgt_id]
+                context_budget = None
+                if spec.answer_mode in {"squad", "newsqa"}:
+                    context_budget = _compute_interlat_generation_context_budget(
+                        ctx=ctx,
+                        spec=spec,
+                        question=question,
+                        eval_config=eval_config,
+                        tokenizer=target_tokenizer,
+                        target_node_id=edge.tgt_id,
+                    )
+
+                prepared_inputs = prepare_generation_task_inputs(
+                    spec=spec,
+                    tokenizer=target_tokenizer,
+                    context=context_text,
+                    question=question,
+                    device=ctx.config.device,
+                    max_input_tokens=context_budget,
+                )
+                prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
+                seed_token = prepared_inputs["seed_token"]
+
+                if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                    logging.info(
+                        "[%s][%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
+                        spec.name_for_log,
+                        edge.id,
+                        prefix_input_ids.shape[1],
+                        suffix_cache_tokens,
+                        get_answer_token_budget(eval_config),
+                    )
+
                 source_prepared = prepare_generation_task_inputs(
                     spec=spec,
                     tokenizer=node_tokenizers[edge.src_id],
@@ -506,7 +524,7 @@ def _evaluate_generation_dataset(
 
                 translated_answer = predict_generation_task_answer(
                     model=target_model,
-                    tokenizer=ctx.tokenizer,
+                    tokenizer=target_tokenizer,
                     past_key_values=translated_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
@@ -514,7 +532,7 @@ def _evaluate_generation_dataset(
                 )
                 native_answer = predict_generation_task_answer(
                     model=target_model,
-                    tokenizer=ctx.tokenizer,
+                    tokenizer=target_tokenizer,
                     past_key_values=native_past,
                     seed_token=seed_token,
                     eval_config=eval_config,

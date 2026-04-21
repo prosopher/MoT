@@ -764,13 +764,12 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = device_override
     translator_pool_state_dict = torch.load(str(checkpoint_path_obj), map_location="cpu")
-    models, tokenizer = build_models_and_tokenizer(config, nodes)
+    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     if uses_channel_alignment(config.layer_alignment):
@@ -840,7 +839,7 @@ def run_train(
         )
     logging.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(ctx)
+    dataloaders_by_target = build_training_dataloaders_by_target(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
@@ -865,20 +864,23 @@ def run_train(
         step_loss_value = 0.0
 
         for _ in range(config.grad_accum_steps):
-            input_ids = next(dataloader).to(config.device)
-            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                input_ids=input_ids,
-                prefix_tokens=config.prefix_tokens,
-            )
-
-            with torch.no_grad():
-                past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
-                    for node in nodes
-                }
+            target_batches = {}
+            for target_node_id, dataloader in dataloaders_by_target.items():
+                input_ids = next(dataloader).to(config.device)
+                prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                    input_ids=input_ids,
+                    prefix_tokens=config.prefix_tokens,
+                )
+                with torch.no_grad():
+                    past_by_node_id = {
+                        node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                        for node in nodes
+                    }
+                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
 
             total_direction_loss = 0.0
             for edge in edges:
+                prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
                 mixed_target_past, _ = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,

@@ -349,26 +349,12 @@ def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
 
 
-def build_models_for_experiment(
-    config: LayerPositionConfig,
-    nodes: List[Node],
-) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase]:
-    return build_models_and_tokenizer(
-        SimpleNamespace(
-            device=config.device,
-            dtype=config.dtype,
-        ),
-        nodes,
-    )
-
-
 def run_train(
     ctx: Context,
     run_dir: Path,
 ) -> LayerWindowTranslatorPool:
     config = ctx.config
     nodes = ctx.nodes
-    tokenizer = ctx.tokenizer
     logging.info("Starting layer-window position training with target-layer replay")
     logging.info("experiment_config=%s", asdict(config))
 
@@ -378,20 +364,7 @@ def run_train(
     translator_pool.train()
     logging.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = InfiniteDataLoader(
-        DataLoader(
-            OpenWebTextSequenceStream(
-                tokenizer=tokenizer,
-                sequence_length=config.total_tokens,
-                split="train",
-                shuffle=True,
-                shuffle_buffer=config.shuffle_buffer,
-                seed=config.seed,
-            ),
-            batch_size=config.batch_size,
-            num_workers=0,
-        )
-    )
+    dataloaders_by_target = build_training_dataloaders_by_target(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
@@ -408,20 +381,23 @@ def run_train(
         step_loss_value = 0.0
 
         for _ in range(config.grad_accum_steps):
-            input_ids = next(dataloader).to(config.device)
-            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                input_ids=input_ids,
-                prefix_tokens=config.prefix_tokens,
-            )
-
-            with torch.no_grad():
-                past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
-                    for node in nodes
-                }
+            target_batches = {}
+            for target_node_id, dataloader in dataloaders_by_target.items():
+                input_ids = next(dataloader).to(config.device)
+                prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                    input_ids=input_ids,
+                    prefix_tokens=config.prefix_tokens,
+                )
+                with torch.no_grad():
+                    past_by_node_id = {
+                        node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                        for node in nodes
+                    }
+                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
 
             total_direction_loss = 0.0
             for edge in ctx.edges:
+                prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
                 translated_key, translated_value = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
@@ -481,7 +457,6 @@ def evaluate_logit_dataset(
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
-    tokenizer = ctx.tokenizer
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -491,7 +466,7 @@ def evaluate_logit_dataset(
         for example in batch:
             prepared_inputs = prepare_logit_task_inputs(
                 spec=spec,
-                tokenizer=tokenizer,
+                tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id),
                 context=example.get("context"),
                 question=example["question"],
                 device=config.device,
@@ -499,7 +474,7 @@ def evaluate_logit_dataset(
                 choice_texts=example.get("choice_texts"),
                 subject=example.get("subject"),
             )
-            candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
+            candidate_token_ids = build_logit_answer_candidates(tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id), spec=spec)
             gold_answer = example["answer"]
             context_input_ids = prepared_inputs["prefix_input_ids"]
             suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
@@ -667,7 +642,6 @@ def evaluate_generation_dataset(
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
-    tokenizer = ctx.tokenizer
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -684,10 +658,12 @@ def evaluate_generation_dataset(
                 spec=spec,
                 question=question,
                 eval_config=config,
+                tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id),
+                target_node_id=edges[0].tgt_id,
             )
             prepared_inputs = prepare_generation_task_inputs(
                 spec=spec,
-                tokenizer=tokenizer,
+                tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id),
                 context=context_text,
                 question=question,
                 device=config.device,
@@ -757,7 +733,7 @@ def evaluate_generation_dataset(
 
                 native_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=native_target_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -765,7 +741,7 @@ def evaluate_generation_dataset(
                 )
                 dir_only_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=dir_only_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -773,7 +749,7 @@ def evaluate_generation_dataset(
                 )
                 mag_only_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=mag_only_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -781,7 +757,7 @@ def evaluate_generation_dataset(
                 )
                 full_mix_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=full_mix_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -1516,13 +1492,12 @@ def main() -> None:
 
     set_seed(config.seed)
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    models, tokenizer = build_models_for_experiment(config, nodes)
+    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)

@@ -943,15 +943,6 @@ def evaluate_openwebtext_validation_loss_metrics(
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    dataloader = build_openwebtext_eval_dataloader(
-        tokenizer=ctx.tokenizer,
-        config=ctx.config,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=shuffle,
-        seed=seed,
-        shuffle_buffer=shuffle_buffer,
-    )
     device = ctx.config.device
     max_examples = max(1, max_examples)
 
@@ -965,56 +956,44 @@ def evaluate_openwebtext_validation_loss_metrics(
             for edge in ctx.edges
         }
 
-    processed_examples = 0
-    for batch_idx, input_ids in enumerate(dataloader, start=1):
-        if processed_examples >= max_examples:
-            break
+    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+    edges_by_target = {
+        target_node_id: [edge for edge in ctx.edges if edge.tgt_id == target_node_id]
+        for target_node_id in target_node_ids
+    }
 
-        remaining_examples = max_examples - processed_examples
-        if input_ids.shape[0] > remaining_examples:
-            input_ids = input_ids[:remaining_examples]
-        input_ids = input_ids.to(device)
-
-        prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-            input_ids=input_ids,
-            prefix_tokens=ctx.config.prefix_tokens,
+    for target_node_id in target_node_ids:
+        dataloader = build_openwebtext_eval_dataloader(
+            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+            config=ctx.config,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=shuffle,
+            seed=seed,
+            shuffle_buffer=shuffle_buffer,
         )
-        past_by_node_id = {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
-            for node in ctx.nodes
-        }
+        processed_examples = 0
+        for batch_idx, input_ids in enumerate(dataloader, start=1):
+            if processed_examples >= max_examples:
+                break
 
-        batch_examples = input_ids.shape[0]
-        for edge in ctx.edges:
-            edge_losses, edge_profiles = evaluate_edge_losses_fn(
-                edge_id=edge.id,
-                edge=edge,
-                prefix_cache_ids=prefix_cache_ids,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-                past_by_node_id=past_by_node_id,
+            remaining_examples = max_examples - processed_examples
+            if input_ids.shape[0] > remaining_examples:
+                input_ids = input_ids[:remaining_examples]
+            input_ids = input_ids.to(device)
+
+            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                input_ids=input_ids,
+                prefix_tokens=ctx.config.prefix_tokens,
             )
-            if not edge_losses:
-                continue
-            for metric_name, loss_value in edge_losses.items():
-                loss_sums[edge.id][metric_name] = (
-                    float(loss_sums[edge.id].get(metric_name, 0.0))
-                    + float(loss_value) * batch_examples
-                )
-            for metric_name, profile_values in edge_profiles.items():
-                accumulator = profile_accumulators[edge.id].setdefault(
-                    metric_name,
-                    InferenceProfileAccumulator(),
-                )
-                accumulator.update(
-                    latency_sec=float(profile_values.get("latency_sec", 0.0)),
-                    tokens=profile_values.get("tokens", 0),
-                    peak_memory_bytes=profile_values.get("peak_memory_bytes"),
-                )
-            counts[edge.id] += batch_examples
+            past_by_node_id = {
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                for node in ctx.nodes
+            }
 
-            if tsne_features is not None:
-                named_pasts = build_visualization_pasts_fn(
+            batch_examples = input_ids.shape[0]
+            for edge in edges_by_target[target_node_id]:
+                edge_losses, edge_profiles = evaluate_edge_losses_fn(
                     edge_id=edge.id,
                     edge=edge,
                     prefix_cache_ids=prefix_cache_ids,
@@ -1022,20 +1001,49 @@ def evaluate_openwebtext_validation_loss_metrics(
                     lm_labels=lm_labels,
                     past_by_node_id=past_by_node_id,
                 )
-                if named_pasts:
-                    _accumulate_openwebtext_tsne_samples(
-                        tsne_features,
-                        edge_id=edge.id,
-                        named_pasts=named_pasts,
+                if not edge_losses:
+                    continue
+                for metric_name, loss_value in edge_losses.items():
+                    loss_sums[edge.id][metric_name] = (
+                        float(loss_sums[edge.id].get(metric_name, 0.0))
+                        + float(loss_value) * batch_examples
                     )
+                for metric_name, profile_values in edge_profiles.items():
+                    accumulator = profile_accumulators[edge.id].setdefault(
+                        metric_name,
+                        InferenceProfileAccumulator(),
+                    )
+                    accumulator.update(
+                        latency_sec=float(profile_values.get("latency_sec", 0.0)),
+                        tokens=profile_values.get("tokens", 0),
+                        peak_memory_bytes=profile_values.get("peak_memory_bytes"),
+                    )
+                counts[edge.id] += batch_examples
 
-        processed_examples += batch_examples
-        if batch_idx % 25 == 0:
-            logging.info(
-                "[OpenWebText/validation] progress: %d/%d sequences",
-                processed_examples,
-                max_examples,
-            )
+                if tsne_features is not None:
+                    named_pasts = build_visualization_pasts_fn(
+                        edge_id=edge.id,
+                        edge=edge,
+                        prefix_cache_ids=prefix_cache_ids,
+                        lm_input_ids=lm_input_ids,
+                        lm_labels=lm_labels,
+                        past_by_node_id=past_by_node_id,
+                    )
+                    if named_pasts:
+                        _accumulate_openwebtext_tsne_samples(
+                            tsne_features,
+                            edge_id=edge.id,
+                            named_pasts=named_pasts,
+                        )
+
+            processed_examples += batch_examples
+            if batch_idx % 25 == 0:
+                logging.info(
+                    "[OpenWebText/validation][target=%s] progress: %d/%d sequences",
+                    target_node_id,
+                    processed_examples,
+                    max_examples,
+                )
 
     summaries = {}
     for edge in ctx.edges:
@@ -1055,27 +1063,18 @@ def evaluate_openwebtext_validation_loss_metrics(
             average_losses,
             count,
             primary_name="translated",
-            loss_field_by_name={
-                "native": "native_loss",
-            },
+            loss_field_by_name={"native": "native_loss"},
+            loss_delta_reference_name="native",
             profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={
-                "native": "native",
-            },
+            profile_field_prefix_by_name={"native": "native"},
         )
 
     if tsne_features is not None:
-        tsne_paths = _finalize_openwebtext_tsne_plots(
+        _finalize_openwebtext_tsne_plots(
             output_path=output_path,
             seed=seed,
             features_by_edge_and_group=tsne_features,
-            perplexity=50.0,
-            max_iter=1000,
         )
-        for edge in ctx.edges:
-            if edge.id in tsne_paths:
-                summaries[edge.id]["tsne_plot_path"] = tsne_paths[edge.id]
-
     return summaries
 
 
@@ -1100,18 +1099,19 @@ def evaluate_openwebtext_validation_loss_top_layers(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
+        del edge_id, prefix_cache_ids
         profile_tokens = int(lm_labels.numel())
         seed_token = lm_input_ids[:, :1]
         generation_steps = int(lm_labels.shape[1])
 
-        translated_target_past_for_loss = build_translated_target_past_fn(
+        translated_target_past = build_translated_target_past_fn(
             edge=edge,
             past_by_node_id=past_by_node_id,
         )
         translated_loss = float(
             compute_suffix_lm_loss(
                 target_model=ctx.mm.get_model(edge.tgt_id),
-                past_key_values=translated_target_past_for_loss,
+                past_key_values=translated_target_past,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
             ).item()
@@ -1126,10 +1126,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
         )
 
         def run_translated_inference() -> int:
-            translated_target_past = build_translated_target_past_fn(
-                edge=edge,
-                past_by_node_id=past_by_node_id,
-            )
             return run_openwebtext_greedy_inference(
                 model=ctx.mm.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
@@ -1177,6 +1173,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
+
 
 
 @torch.inference_mode()
@@ -2410,14 +2407,17 @@ def compute_benchmark_context_budget(
     spec: HFDatasetSpec,
     question: str,
     eval_config,
+    *,
+    tokenizer,
+    target_node_id: str,
 ) -> int:
-    shared_limit = min(
-        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
-        for node in ctx.nodes
+    shared_limit = get_model_context_limit(
+        ctx.mm.get_model(target_node_id),
+        tokenizer,
     )
     suffix = prepare_generation_task_suffix(
         spec=spec,
-        tokenizer=ctx.tokenizer,
+        tokenizer=tokenizer,
         question=question,
         device="cpu",
     )
@@ -2441,19 +2441,21 @@ def compute_logit_task_token_budgets(
     question: str,
     eval_config,
     *,
+    tokenizer,
+    target_node_id: str,
     choices: Optional[List[str]] = None,
     choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
 ) -> Dict[str, Optional[int]]:
-    shared_limit = min(
-        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
-        for node in ctx.nodes
+    shared_limit = get_model_context_limit(
+        ctx.mm.get_model(target_node_id),
+        tokenizer,
     )
     answer_budget = get_answer_token_budget(eval_config)
 
     if spec.answer_mode == "boolq":
         suffix = prepare_boolq_question_suffix(
-            tokenizer=ctx.tokenizer,
+            tokenizer=tokenizer,
             question=question,
             device="cpu",
         )
@@ -2472,7 +2474,7 @@ def compute_logit_task_token_budgets(
 
     if spec.answer_mode == "pubmed_qa":
         suffix = prepare_pubmed_qa_question_suffix(
-            tokenizer=ctx.tokenizer,
+            tokenizer=tokenizer,
             question=question,
             device="cpu",
         )
@@ -2495,7 +2497,7 @@ def compute_logit_task_token_budgets(
         if not choice_texts:
             raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
         suffix = prepare_mmlu_redux_choices_suffix(
-            tokenizer=ctx.tokenizer,
+            tokenizer=tokenizer,
             choices=choices,
             choice_texts=choice_texts,
             device="cpu",
@@ -3015,10 +3017,8 @@ def evaluate_dataset(
     finalize_results_fn: Optional[Callable[..., None]] = None,
     progress_interval: int = 50,
 ) -> Dict[str, Dict[str, float]]:
-    nodes = ctx.nodes
     edges = ctx.edges
     device = ctx.config.device
-    tokenizer = ctx.tokenizer
     path_metrics = {edge.id: RunningAverage() for edge in edges}
     subject_accumulators_by_edge: Optional[Dict[str, Dict[str, SubjectAccuracyAccumulator]]]
     if spec.answer_mode == "mmlu_redux":
@@ -3038,51 +3038,56 @@ def evaluate_dataset(
             choices = example.get("choices")
             choice_texts = example.get("choice_texts")
 
-            token_budgets = compute_logit_task_token_budgets(
-                ctx=ctx,
-                spec=spec,
-                question=question,
-                eval_config=eval_config,
-                choices=choices,
-                choice_texts=choice_texts,
-                subject=example.get("subject"),
-            )
-            prepared_inputs = prepare_logit_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context_text,
-                question=question,
-                device=device,
-                choices=choices,
-                choice_texts=choice_texts,
-                subject=example.get("subject"),
-                max_context_tokens=token_budgets["max_context_tokens"],
-                max_prefix_tokens=token_budgets["max_prefix_tokens"],
-            )
-            prefix_input_ids = prepared_inputs["prefix_input_ids"]
-            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
-            seed_token = prepared_inputs["seed_token"]
+            for edge in edges:
+                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                token_budgets = compute_logit_task_token_budgets(
+                    ctx=ctx,
+                    spec=spec,
+                    question=question,
+                    eval_config=eval_config,
+                    tokenizer=tokenizer,
+                    target_node_id=edge.tgt_id,
+                    choices=choices,
+                    choice_texts=choice_texts,
+                    subject=example.get("subject"),
+                )
+                prepared_inputs = prepare_logit_task_inputs(
+                    spec=spec,
+                    tokenizer=tokenizer,
+                    context=context_text,
+                    question=question,
+                    device=device,
+                    choices=choices,
+                    choice_texts=choice_texts,
+                    subject=example.get("subject"),
+                    max_context_tokens=token_budgets["max_context_tokens"],
+                    max_prefix_tokens=token_budgets["max_prefix_tokens"],
+                )
+                prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
+                seed_token = prepared_inputs["seed_token"]
 
-            if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
-                logging.info(
-                    "[%s] truncated prefix to fit model context window (prefix_tokens=%d, suffix_cache_tokens=%d, answer_token_budget=%d)",
-                    spec.name_for_log,
-                    prefix_input_ids.shape[1],
-                    suffix_cache_tokens,
-                    get_answer_token_budget(eval_config),
+                if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                    logging.info(
+                        "[%s][%s] truncated prefix to fit model context window (prefix_tokens=%d, suffix_cache_tokens=%d, answer_token_budget=%d)",
+                        spec.name_for_log,
+                        edge.id,
+                        prefix_input_ids.shape[1],
+                        suffix_cache_tokens,
+                        get_answer_token_budget(eval_config),
+                    )
+
+                example_state = build_example_state_fn(
+                    ctx=ctx,
+                    spec=spec,
+                    edge=edge,
+                    example=example,
+                    prefix_input_ids=prefix_input_ids,
+                    prepared_inputs=prepared_inputs,
+                    translator_pool=translator_pool,
                 )
 
-            example_state = build_example_state_fn(
-                ctx=ctx,
-                spec=spec,
-                example=example,
-                prefix_input_ids=prefix_input_ids,
-                prepared_inputs=prepared_inputs,
-                translator_pool=translator_pool,
-            )
-
-            for edge in edges:
                 edge_artifacts = build_edge_artifacts_fn(
                     ctx=ctx,
                     spec=spec,

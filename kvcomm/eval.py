@@ -269,7 +269,6 @@ def evaluate_generation_dataset(
     translator_pool: KVCommSelectionPool,
 ) -> Dict[str, Dict[str, float]]:
     device = ctx.config.device
-    tokenizer = ctx.tokenizer
     path_metrics = {
         edge.id: GenerationRunningAverage()
         for edge in ctx.edges
@@ -283,26 +282,29 @@ def evaluate_generation_dataset(
             context = example["context"]
             gold_answers = example["answers"]
 
-            context_budget = None
-            if spec.answer_mode in {"squad", "newsqa"}:
-                context_budget = compute_benchmark_context_budget(
-                    ctx=ctx,
-                    spec=spec,
-                    question=question,
-                    eval_config=eval_config,
-                )
-
-            prepared_generation_inputs = prepare_generation_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context,
-                question=question,
-                device=device,
-                max_input_tokens=context_budget,
-            )
-            prefix_input_ids = prepared_generation_inputs["prefix_input_ids"]
-
             for edge in ctx.edges:
+                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                context_budget = None
+                if spec.answer_mode in {"squad", "newsqa"}:
+                    context_budget = compute_benchmark_context_budget(
+                        ctx=ctx,
+                        spec=spec,
+                        question=question,
+                        eval_config=eval_config,
+                        tokenizer=tokenizer,
+                        target_node_id=edge.tgt_id,
+                    )
+
+                prepared_generation_inputs = prepare_generation_task_inputs(
+                    spec=spec,
+                    tokenizer=tokenizer,
+                    context=context,
+                    question=question,
+                    device=device,
+                    max_input_tokens=context_budget,
+                )
+                prefix_input_ids = prepared_generation_inputs["prefix_input_ids"]
+
                 source_model = ctx.mm.get_model(edge.src_id)
                 target_model = ctx.mm.get_model(edge.tgt_id)
 
@@ -358,13 +360,7 @@ def evaluate_generation_dataset(
                 eval_config.max_examples_per_dataset,
             )
 
-    summarized = summarize_generation_path_metrics(path_metrics)
-    for edge in ctx.edges:
-        row = summarized[edge.id]
-        row["direct_context_f1"] = row["native_f1"]
-        row["kvcomm_f1"] = row["f1"]
-    return summarized
-
+    return summarize_generation_path_metrics(path_metrics)
 
 
 def run_eval(
