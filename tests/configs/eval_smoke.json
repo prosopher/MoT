@@ -10,5 +10,7 @@
   "seed": 123,
   "shuffle_eval_stream": false,
   "shuffle_buffer": 8,
-  "generation_max_new_tokens": 4
+  "generation_max_new_tokens": 4,
+  "generation_context_budgets": null,
+  "generation_truncation_log_limit": 3
 }
