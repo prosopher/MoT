@@ -355,6 +355,7 @@ def run_train(
 ) -> LayerWindowTranslatorPool:
     config = ctx.config
     nodes = ctx.nodes
+    node_map = build_node_map(nodes)
     logging.info("Starting layer-window position training with target-layer replay")
     logging.info("experiment_config=%s", asdict(config))
 
@@ -410,6 +411,7 @@ def run_train(
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 total_direction_loss = total_direction_loss + compute_prefix_correction_and_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -457,6 +459,7 @@ def evaluate_logit_dataset(
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
+    node_map = build_node_map(nodes)
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -509,6 +512,7 @@ def evaluate_logit_dataset(
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -517,6 +521,7 @@ def evaluate_logit_dataset(
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -525,6 +530,7 @@ def evaluate_logit_dataset(
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
 
                 native_scoring_past = prepare_answer_scoring_past(
@@ -642,6 +648,7 @@ def evaluate_generation_dataset(
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
+    node_map = build_node_map(nodes)
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -713,6 +720,7 @@ def evaluate_generation_dataset(
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -721,6 +729,7 @@ def evaluate_generation_dataset(
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -729,6 +738,7 @@ def evaluate_generation_dataset(
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
 
                 native_answer = predict_generation_task_answer(
@@ -861,6 +871,7 @@ def compute_openwebtext_native_and_full_mix_losses(
         injected_key_block=translated_key,
         injected_value_block=translated_value,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        target_model_id=build_node_map(ctx.nodes)[edge.tgt_id].model_id,
     )
 
     native_loss = float(
