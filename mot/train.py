@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+import inspect
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -836,6 +837,63 @@ def resolve_pythia_attention_dropout_p(attention: nn.Module, training: bool) -> 
 
 
 
+def unpack_pythia_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if isinstance(outputs, tuple):
+        if len(outputs) < 2:
+            raise ValueError("Expected Pythia block outputs to include present key/value cache.")
+        hidden_states = outputs[0]
+        present = outputs[1]
+    else:
+        hidden_states = getattr(outputs, "last_hidden_state", None)
+        if hidden_states is None:
+            hidden_states = getattr(outputs, "hidden_states", None)
+        present = getattr(outputs, "past_key_value", None)
+        if present is None:
+            present = getattr(outputs, "past_key_values", None)
+        if hidden_states is None or present is None:
+            raise ValueError("Unsupported block output type for Pythia layer replay.")
+    if not isinstance(present, tuple) or len(present) != 2:
+        raise ValueError("Expected Pythia present cache to be a (key, value) tuple.")
+    return hidden_states, present
+
+
+
+def pythia_block_uses_external_position_embeddings(block: nn.Module) -> bool:
+    return "position_embeddings" in inspect.signature(block.forward).parameters
+
+
+
+def build_pythia_block_forward_kwargs(
+    block: nn.Module,
+    *,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    use_cache: bool,
+) -> Dict[str, Any]:
+    signature = inspect.signature(block.forward)
+    params = signature.parameters
+    kwargs: Dict[str, Any] = {}
+    if "attention_mask" in params:
+        # Older GPT-NeoX blocks build causal masking internally via attention.bias,
+        # so passing a full causal additive mask here would double-apply masking.
+        kwargs["attention_mask"] = attention_mask if pythia_block_uses_external_position_embeddings(block) else None
+    if "position_ids" in params:
+        kwargs["position_ids"] = position_ids
+    if "position_embeddings" in params:
+        kwargs["position_embeddings"] = position_embeddings
+    if "layer_past" in params:
+        kwargs["layer_past"] = None
+    if "use_cache" in params:
+        kwargs["use_cache"] = use_cache
+    if "head_mask" in params:
+        kwargs["head_mask"] = None
+    if "output_attentions" in params:
+        kwargs["output_attentions"] = False
+    return kwargs
+
+
+
 def run_pythia_block_with_cache(
     block: nn.Module,
     hidden_states: torch.Tensor,
@@ -844,43 +902,17 @@ def run_pythia_block_with_cache(
     position_ids: torch.Tensor,
     position_embeddings: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    attention = block.attention
-    batch_size, seq_len, _ = hidden_states.shape
-    num_heads = resolve_pythia_attention_num_heads(attention)
-    head_dim = getattr(attention, "head_size", hidden_states.shape[-1] // num_heads)
-
-    residual = hidden_states
-    attn_input = block.input_layernorm(hidden_states)
-    qkv = attention.query_key_value(attn_input)
-    query, key, value = _reshape_pythia_qkv(qkv, num_heads=num_heads, head_dim=head_dim)
-    query, key = apply_rotary_pos_emb(query, key, *position_embeddings, position_ids=position_ids)
-
-    attn_scores = torch.matmul(query, key.transpose(-1, -2)) * resolve_pythia_attention_scaling(attention, head_dim)
-    attn_scores = attn_scores + attention_mask
-    attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    dropout_p = resolve_pythia_attention_dropout_p(attention, block.training)
-    attn_weights = torch.dropout(attn_weights, p=dropout_p, train=block.training)
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-    attn_output = attention.dense(attn_output)
-    post_attention_dropout = getattr(block, "post_attention_dropout", None)
-    if post_attention_dropout is not None:
-        attn_output = post_attention_dropout(attn_output)
-
-    if getattr(block, "use_parallel_residual", False):
-        mlp_output = block.mlp(block.post_attention_layernorm(hidden_states))
-        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
-        if post_mlp_dropout is not None:
-            mlp_output = post_mlp_dropout(mlp_output)
-        hidden_states = residual + attn_output + mlp_output
-    else:
-        attn_residual = residual + attn_output
-        mlp_output = block.mlp(block.post_attention_layernorm(attn_residual))
-        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
-        if post_mlp_dropout is not None:
-            mlp_output = post_mlp_dropout(mlp_output)
-        hidden_states = attn_residual + mlp_output
-    return hidden_states, (key, value)
+    outputs = block(
+        hidden_states,
+        **build_pythia_block_forward_kwargs(
+            block,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+            use_cache=True,
+        ),
+    )
+    return unpack_pythia_block_outputs(outputs)
 
 
 
@@ -914,8 +946,8 @@ def run_pythia_block_with_injected_layer(
     residual = hidden_states
     attn_input = block.input_layernorm(hidden_states)
     qkv = attention.query_key_value(attn_input)
-    query, key, _ = _reshape_pythia_qkv(qkv, num_heads=num_heads, head_dim=head_dim)
-    query, _ = apply_rotary_pos_emb(query, key, *position_embeddings, position_ids=position_ids)
+    query, native_key, native_value = _reshape_pythia_qkv(qkv, num_heads=num_heads, head_dim=head_dim)
+    query, native_key = apply_rotary_pos_emb(query, native_key, *position_embeddings, position_ids=position_ids)
 
     attn_scores = torch.matmul(query, injected_key.transpose(-1, -2)) * resolve_pythia_attention_scaling(attention, head_dim)
     attn_scores = attn_scores + attention_mask
@@ -942,7 +974,14 @@ def run_pythia_block_with_injected_layer(
         if post_mlp_dropout is not None:
             mlp_output = post_mlp_dropout(mlp_output)
         hidden_states = attn_residual + mlp_output
-    return hidden_states, (injected_key, injected_value)
+
+    # Important: the injected KV should drive the replayed attention computation,
+    # but the cached prefix state for this target layer must still be the layer's
+    # own projected KV under the replayed hidden-state input. Returning the raw
+    # injected tensors here makes window-region prefix-correction loss blind to
+    # the replay path, which is why edits inside the replay math can leave the
+    # logged loss completely unchanged.
+    return hidden_states, (native_key, native_value)
 
 
 def replay_target_prefill_with_injected_window(
