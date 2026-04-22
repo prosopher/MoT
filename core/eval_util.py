@@ -3353,7 +3353,7 @@ def build_edge_summary_markdown_table(
         "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {target_model_id} (baseline) | N/A | "
+            f"| {target_model_id} (upperbound) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('native_accuracy', float('nan')))} | "
