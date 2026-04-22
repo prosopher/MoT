@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.colors as mcolors
 
 DEFAULT_CATEGORY_ORDER = [
     "health",
@@ -38,6 +39,31 @@ EVAL_BAR_METRICS = [
     ("Gen F1 Avg", "gen_f1_avg", "F1"),
     ("OWT Val GPU Peak Memory", "gpu_peak_memory", "GPU Peak Memory (GiB)"),
 ]
+
+MOT_COLOR = "#D85A59"
+MOT_H_COLOR = "#E98C88"
+OTHER_BAR_COLOR = "#C7CDD6"
+UPPERBOUND_COLOR = "#4C5159"
+NON_RED_ORANGE_PURPLE_RADAR_PALETTES = (
+    "tab20",
+    "tab20b",
+    "tab20c",
+    "Set2",
+    "Dark2",
+    "Accent",
+    "Paired",
+    "Set3",
+)
+
+ALGORITHM_DISPLAY_NAMES = {
+    "c2c": "C2C-Project",
+    "interlat": "Interlat",
+    "kvcomm": "KVComm",
+    "lsc": "LSC",
+    "mot": "MoT",
+    "mot-h": "MoT-h",
+    "upperbound": "Upperbound",
+}
 
 
 @dataclass
@@ -92,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         "--exp-path",
         type=Path,
         required=True,
-        help="Experiment directory. Circle-chart JSON input is read from exp-path/*/mmlu_redux_subject_category_accuracy.json.",
+        help="Experiment directory. Radar-chart JSON input is read from exp-path/*/mmlu_redux_subject_category_accuracy.json.",
     )
     parser.add_argument(
         "--edge-id",
@@ -277,6 +303,18 @@ def load_series(exp_path: Path) -> LoadResult:
     )
 
 
+def display_name_for_algorithm(algorithm: str) -> str:
+    normalized = algorithm.strip().lower()
+    return ALGORITHM_DISPLAY_NAMES.get(normalized, algorithm.strip())
+
+
+def display_name_for_subcategory(subcategory: str) -> str:
+    value = subcategory.strip()
+    if not value:
+        return value
+    return value[0].upper() + value[1:]
+
+
 def dedupe_legend_names(series_list: List[Series]) -> List[str]:
     counts: Dict[str, int] = {}
     labels: List[str] = []
@@ -284,11 +322,97 @@ def dedupe_legend_names(series_list: List[Series]) -> List[str]:
         counts[s.algorithm] = counts.get(s.algorithm, 0) + 1
 
     for s in series_list:
+        display_name = display_name_for_algorithm(s.algorithm)
         if counts[s.algorithm] == 1:
-            labels.append(s.algorithm)
+            labels.append(display_name)
         else:
-            labels.append(f"{s.algorithm} ({s.filename})")
+            labels.append(f"{display_name} ({s.filename})")
     return labels
+
+
+def average_accuracy_for_series(series: Series, categories: Sequence[str]) -> float:
+    values = [
+        series.category_to_accuracy[category]
+        for category in categories
+        if category in series.category_to_accuracy
+    ]
+    if not values:
+        return float("inf")
+    return float(sum(values) / len(values))
+
+
+def order_series_by_average_accuracy(
+    series_list: Sequence[Series],
+    categories: Sequence[str],
+) -> List[Series]:
+    return sorted(
+        series_list,
+        key=lambda series: (
+            average_accuracy_for_series(series, categories),
+            series.algorithm.lower(),
+            series.filename.lower(),
+        ),
+    )
+
+
+def is_excluded_radar_palette_color(color: tuple[float, float, float, float]) -> bool:
+    r, g, b, _ = color
+    h, s, v = mcolors.rgb_to_hsv((r, g, b))
+
+    if v < 0.22:
+        return True
+    if s < 0.16:
+        return False
+
+    is_red = h < 0.05 or h >= 0.97
+    is_red_to_orange = 0.05 <= h <= 0.17
+    is_purple_or_magenta = 0.68 <= h <= 0.96
+    return is_red or is_red_to_orange or is_purple_or_magenta
+
+
+def non_red_orange_purple_radar_palette(sample_count: int) -> List[tuple[float, float, float, float]]:
+    if sample_count <= 0:
+        return []
+
+    colors: List[tuple[float, float, float, float]] = []
+    seen_hex: set[str] = set()
+    sample_grid = np.linspace(0.03, 0.97, max(sample_count * 8, 96))
+
+    for palette_name in NON_RED_ORANGE_PURPLE_RADAR_PALETTES:
+        cmap = plt.get_cmap(palette_name)
+        palette_colors = [mcolors.to_rgba(cmap(x)) for x in sample_grid]
+
+        for color in palette_colors:
+            if is_excluded_radar_palette_color(color):
+                continue
+            color_hex = mcolors.to_hex(color, keep_alpha=False)
+            if color_hex in seen_hex:
+                continue
+            seen_hex.add(color_hex)
+            colors.append(color)
+            if len(colors) >= sample_count:
+                return colors
+
+    raise ValueError(
+        f"Unable to sample {sample_count} radar colors while excluding red, orange, and purple hues."
+    )
+
+
+def radar_colors_for_series(series_list: Sequence[Series]) -> List[tuple[float, float, float, float] | str]:
+    other_count = sum(1 for series in series_list if series.algorithm.strip().lower() not in {"mot", "mot-h"})
+    other_colors = non_red_orange_purple_radar_palette(other_count)
+    other_color_iter = iter(other_colors)
+
+    colors: List[tuple[float, float, float, float] | str] = []
+    for series in series_list:
+        normalized = series.algorithm.strip().lower()
+        if normalized == "mot":
+            colors.append(MOT_COLOR)
+        elif normalized == "mot-h":
+            colors.append(MOT_H_COLOR)
+        else:
+            colors.append(next(other_color_iter))
+    return colors
 
 
 def compute_radius_max(
@@ -345,7 +469,9 @@ def plot_edge_radar(
     radius_max = compute_radius_max(
         series_list, categories, max_radius, native_upperbound=native_upperbound
     )
-    legend_labels = dedupe_legend_names(series_list)
+    ordered_series_list = order_series_by_average_accuracy(series_list, categories)
+    legend_labels = dedupe_legend_names(ordered_series_list)
+    series_colors = radar_colors_for_series(ordered_series_list)
 
     fig = plt.figure(figsize=(9, 9))
     ax = plt.subplot(111, polar=True)
@@ -353,7 +479,7 @@ def plot_edge_radar(
     ax.set_theta_direction(-1)
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(categories, fontsize=10)
+    ax.set_xticklabels([display_name_for_subcategory(category) for category in categories], fontsize=10)
 
     if radius_max <= 0.4:
         rticks = [0.1, 0.2, 0.3, 0.4]
@@ -377,18 +503,18 @@ def plot_edge_radar(
         ax.plot(
             angles,
             upperbound_values,
-            color="black",
+            color=UPPERBOUND_COLOR,
             linewidth=2.4,
             linestyle="-",
-            label="upperbound",
+            label=display_name_for_algorithm("upperbound"),
             zorder=10,
         )
 
-    for series, label in zip(series_list, legend_labels):
+    for series, label, color in zip(ordered_series_list, legend_labels, series_colors):
         values = [series.category_to_accuracy.get(cat, np.nan) for cat in categories]
         values += values[:1]
-        ax.plot(angles, values, linewidth=2, label=label)
-        ax.fill(angles, values, alpha=0.08)
+        ax.plot(angles, values, linewidth=2, label=label, color=color)
+        ax.fill(angles, values, alpha=0.08, color=color)
 
     ax.set_title(f"{title_prefix} ({edge_id})", pad=28, fontsize=14)
     ax.legend(loc="upper left", bbox_to_anchor=(1.08, 1.10), frameon=False)
@@ -573,7 +699,12 @@ def write_eval_summary_markdown(summary: EvalSummaryResult, output_path: Path) -
         lines.append("| " + " | ".join(headers) + " |")
         lines.append("|" + "|".join("---:" if i > 0 else "---" for i in range(len(headers))) + "|")
         for record in records:
-            row_values = [record.values.get(header, "") for header in headers]
+            row_values = []
+            for header in headers:
+                value = record.values.get(header, "")
+                if header == "Method":
+                    value = display_name_for_algorithm(value)
+                row_values.append(value)
             lines.append("| " + " | ".join(row_values) + " |")
         lines.append("")
 
@@ -591,7 +722,13 @@ def write_eval_summary_csvs(summary: EvalSummaryResult, output_dir: Path) -> Lis
             writer = csv.writer(f)
             writer.writerow(["Study ID"] + headers)
             for record in records:
-                writer.writerow([record.study_id] + [record.values.get(header, "") for header in headers])
+                row_values = []
+                for header in headers:
+                    value = record.values.get(header, "")
+                    if header == "Method":
+                        value = display_name_for_algorithm(value)
+                    row_values.append(value)
+                writer.writerow([record.study_id] + row_values)
         generated.append(output_path)
     return generated
 
@@ -602,11 +739,13 @@ def chart_title_text(title: str) -> str:
 
 def bar_color_for_method(method: str) -> str:
     normalized = method.strip().lower()
+    if normalized == "upperbound":
+        return UPPERBOUND_COLOR
     if normalized == "mot-h":
-        return "#58ADAA"
+        return MOT_H_COLOR
     if normalized == "mot":
-        return "#14B8A6"
-    return "#C7CDD6"
+        return MOT_COLOR
+    return OTHER_BAR_COLOR
 
 
 def plot_eval_metric_bars(
@@ -625,7 +764,9 @@ def plot_eval_metric_bars(
         metric_value = parse_metric_number(record.values.get(metric_name, ""))
         if metric_value is None:
             continue
-        label = record.method.strip() or record.study_id
+        if record.method.strip().lower() == "upperbound" and "peak memory" in metric_name.lower():
+            continue
+        label = display_name_for_algorithm(record.method.strip() or record.study_id)
         plot_items.append((metric_value, label, record.method))
 
     if not plot_items:
@@ -783,7 +924,7 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
                 for category in s.category_to_accuracy.keys()
             }
         )
-        output_path = output_dir / f"subcategory_circle_{edge_id}.png"
+        output_path = output_dir / f"subcategory_radar_{edge_id}.png"
         native_upperbound = None
         upperbound_source = None
         if not args.disable_upperbound:
