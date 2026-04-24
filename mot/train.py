@@ -1,5 +1,4 @@
 from dataclasses import asdict, dataclass
-import inspect
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
@@ -31,9 +30,9 @@ MOT_VARIANTS = {"single", "mot"}
 CHANNEL_ALIGNED_LAYER_ALIGNMENTS = {"terminal", "depth-ratio"}
 
 
+
 def uses_channel_alignment(layer_alignment: str) -> bool:
     return layer_alignment in CHANNEL_ALIGNED_LAYER_ALIGNMENTS
-
 
 
 def require_channel_profiler(ctx: Context) -> ChannelProfiler:
@@ -67,6 +66,8 @@ class TrainConfig(Config):
     variant: str
     mot_num_translators: int
     mot_top_k: int
+    topk_sparse_attn: int = 32
+    num_bottom_full_attn: int = 3
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -82,6 +83,10 @@ class TrainConfig(Config):
             raise ValueError("mot_top_k must be >= 1")
         if self.mot_top_k > self.mot_num_translators:
             raise ValueError("mot_top_k must be <= mot_num_translators")
+        if self.topk_sparse_attn < 1:
+            raise ValueError("topk_sparse_attn must be >= 1")
+        if self.num_bottom_full_attn < 0:
+            raise ValueError("num_bottom_full_attn must be >= 0")
         initialize_train_output_paths(self)
 
 
@@ -444,6 +449,7 @@ class LayerWindowTranslatorPool(nn.Module):
         *,
         source_past_key_values: PastKeyValues,
         prefix_input_ids: torch.Tensor,
+        source_model: Optional[PreTrainedModel] = None,
         target_model: PreTrainedModel,
         src_node_id: str,
         tgt_node_id: str,
@@ -461,6 +467,19 @@ class LayerWindowTranslatorPool(nn.Module):
             num_heads=tgt_spec.num_heads,
             head_dim=tgt_spec.head_dim,
         )
+        sparse_attention_indices = None
+        if source_model is not None:
+            src_spec = self.mm.get_model_spec(src_node_id)
+            sparse_attention_indices = build_extrapolated_sparse_attention_indices(
+                source_model,
+                prefix_input_ids,
+                source_layer_indices=self.cm.get_src_layer_indices(edge_id),
+                target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
+                num_source_layers=src_spec.num_layers,
+                num_target_layers=tgt_spec.num_layers,
+                source_model_id=self.node_model_ids.get(src_node_id),
+                top_k=self.ctx.config.topk_sparse_attn,
+            )
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             target_model_id=self.node_model_ids.get(tgt_node_id),
@@ -469,9 +488,10 @@ class LayerWindowTranslatorPool(nn.Module):
             injected_key_block=translated_key,
             injected_value_block=translated_value,
             tgt_spec=tgt_spec,
+            sparse_attention_indices=sparse_attention_indices,
+            num_bottom_full_attn=self.ctx.config.num_bottom_full_attn,
         )
         return mixed_target_past, translated_window_past
-
 
 
 def build_channel_map(
@@ -530,7 +550,6 @@ def resolve_channels(ctx: Context) -> None:
     profiler.profile_all_edges()
 
 
-
 def extract_layer_window_blocks(
     past_key_values: PastKeyValues,
     start_layer_idx: int,
@@ -548,15 +567,13 @@ def extract_layer_window_blocks(
     return past_key_values_to_blocks(past_key_values[start_layer_idx:end_layer_idx])
 
 
-
 def normalize_model_family(model_id: str) -> Optional[str]:
     normalized = str(model_id).strip().lower()
-    if "pythia" in normalized:
-        return "pythia"
+    if "facebook/opt" in normalized or "/opt-" in normalized or normalized.startswith("opt-"):
+        return "opt"
     if "gpt2" in normalized:
         return "gpt2"
     return None
-
 
 
 def resolve_target_model_family(
@@ -570,14 +587,18 @@ def resolve_target_model_family(
 
     if getattr(target_model, "transformer", None) is not None and hasattr(target_model.transformer, "h"):
         return "gpt2"
-    if getattr(target_model, "gpt_neox", None) is not None and hasattr(target_model.gpt_neox, "layers"):
-        return "pythia"
+    model_wrapper = getattr(target_model, "model", None)
+    decoder = getattr(model_wrapper, "decoder", None)
+    if decoder is not None and hasattr(decoder, "layers"):
+        return "opt"
+    decoder = getattr(target_model, "decoder", None)
+    if decoder is not None and hasattr(decoder, "layers"):
+        return "opt"
 
     raise ValueError(
-        "mot target-model replay supports GPT-2 and Pythia decoder stacks only "
+        "mot target-model replay supports GPT-2 and OPT decoder stacks only "
         f"(target_model_id={target_model_id!r})."
     )
-
 
 
 def require_gpt2_transformer(model: PreTrainedModel):
@@ -590,16 +611,17 @@ def require_gpt2_transformer(model: PreTrainedModel):
     return transformer
 
 
-
-def require_pythia_transformer(model: PreTrainedModel):
-    transformer = getattr(model, "gpt_neox", None)
-    if transformer is None or not hasattr(transformer, "layers"):
+def require_opt_decoder(model: PreTrainedModel):
+    model_wrapper = getattr(model, "model", None)
+    decoder = getattr(model_wrapper, "decoder", None)
+    if decoder is None:
+        decoder = getattr(model, "decoder", None)
+    if decoder is None or not hasattr(decoder, "layers"):
         raise ValueError(
-            "mot currently supports Pythia/GPT-NeoX style decoder stacks only "
-            "(expected model.gpt_neox.layers to exist)."
+            "mot currently supports OPT style decoder stacks only "
+            "(expected model.model.decoder.layers or model.decoder.layers to exist)."
         )
-    return transformer
-
+    return decoder
 
 
 def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
@@ -615,84 +637,205 @@ def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tens
     return hidden_states
 
 
-
-def resolve_pythia_rotary_embedding(transformer: nn.Module) -> nn.Module:
-    rotary_emb = getattr(transformer, "rotary_emb", None)
-    if rotary_emb is not None:
-        return rotary_emb
-    layers = getattr(transformer, "layers", None)
-    if layers:
-        first_layer_attention = getattr(layers[0], "attention", None)
-        rotary_emb = getattr(first_layer_attention, "rotary_emb", None)
-        if rotary_emb is not None:
-            return rotary_emb
-    raise ValueError(
-        "Pythia replay expects either model.gpt_neox.rotary_emb or "
-        "model.gpt_neox.layers[0].attention.rotary_emb to exist."
-    )
-
-
-
-def build_pythia_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    transformer = require_pythia_transformer(model)
+def build_opt_input_hidden_states(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    decoder = require_opt_decoder(model)
     if input_ids.ndim != 2:
         raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
     batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    hidden_states = transformer.embed_in(input_ids)
-    emb_dropout = getattr(transformer, "emb_dropout", None)
-    if emb_dropout is not None:
-        hidden_states = emb_dropout(hidden_states)
-    rotary_emb = resolve_pythia_rotary_embedding(transformer)
+    flat_input_ids = input_ids.view(batch_size, seq_len)
+    token_attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device, dtype=torch.long)
+
+    hidden_states = decoder.embed_tokens(flat_input_ids)
+    project_in = getattr(decoder, "project_in", None)
+    if project_in is not None:
+        hidden_states = project_in(hidden_states)
+
     try:
-        position_embeddings = rotary_emb(hidden_states, position_ids=position_ids)
+        pos_embeds = decoder.embed_positions(token_attention_mask, past_key_values_length=0)
     except TypeError:
-        position_embeddings = rotary_emb(hidden_states, seq_len=seq_len)
-    return hidden_states, position_ids, position_embeddings
+        pos_embeds = decoder.embed_positions(token_attention_mask)
+    hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
 
+    dropout_p = float(getattr(decoder, "dropout", 0.0))
+    hidden_states = F.dropout(hidden_states, p=dropout_p, training=decoder.training)
 
-
-def unpack_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if isinstance(outputs, tuple):
-        if len(outputs) < 2:
-            raise ValueError("Expected GPT-2 block outputs to include present key/value cache.")
-        hidden_states = outputs[0]
-        present = outputs[1]
+    prepare_mask = getattr(decoder, "_prepare_decoder_attention_mask", None)
+    if prepare_mask is not None:
+        attention_mask = prepare_mask(
+            token_attention_mask,
+            (batch_size, seq_len),
+            hidden_states,
+            0,
+        )
     else:
-        hidden_states = getattr(outputs, "last_hidden_state", None)
-        if hidden_states is None:
-            hidden_states = getattr(outputs, "hidden_states", None)
-        present = getattr(outputs, "past_key_value", None)
-        if hidden_states is None or present is None:
-            raise ValueError("Unsupported block output type for GPT-2 layer replay.")
-    if not isinstance(present, tuple) or len(present) != 2:
-        raise ValueError("Expected present cache to be a (key, value) tuple.")
-    return hidden_states, present
+        attention_mask = build_causal_attention_mask(hidden_states)
+    return hidden_states, token_attention_mask, attention_mask
 
 
+def extract_source_attention_topk_indices(
+    source_model: PreTrainedModel,
+    prefix_input_ids: torch.Tensor,
+    layer_indices: List[int],
+    *,
+    source_model_id: Optional[str] = None,
+    top_k: int,
+) -> List[torch.Tensor]:
+    if len(layer_indices) == 0:
+        return []
+    model_family = resolve_target_model_family(source_model, target_model_id=source_model_id)
+    model_kwargs: Dict[str, Any] = {
+        "input_ids": prefix_input_ids,
+        "use_cache": False,
+        "output_attentions": True,
+        "return_dict": True,
+    }
+    if model_family == "opt":
+        model_kwargs["attention_mask"] = torch.ones_like(prefix_input_ids)
+    with torch.no_grad():
+        outputs = source_model(**model_kwargs)
+    attentions = getattr(outputs, "attentions", None)
+    if attentions is None:
+        raise ValueError("Source model did not return attentions for sparse injected replay.")
 
-def run_gpt2_block_with_cache(block: nn.Module, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    outputs = block(
-        hidden_states,
-        layer_past=None,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        use_cache=True,
-        output_attentions=False,
+    sparse_indices: List[torch.Tensor] = []
+    for layer_idx in layer_indices:
+        layer_attn = attentions[layer_idx]
+        if layer_attn is None:
+            raise ValueError(f"Attention for source layer {layer_idx} is unavailable.")
+        shared_attn = layer_attn.detach().mean(dim=1, keepdim=True)
+        seq_len = shared_attn.shape[-1]
+        k = max(1, min(int(top_k), seq_len))
+        sparse_indices.append(torch.topk(shared_attn, k=k, dim=-1).indices)
+    return sparse_indices
+
+
+def extrapolate_source_layer_alignment(
+    *,
+    source_layer_indices: List[int],
+    target_layer_indices: List[int],
+    num_source_layers: int,
+    num_target_layers: int,
+) -> List[int]:
+    if len(source_layer_indices) != len(target_layer_indices):
+        raise ValueError(
+            "source_layer_indices and target_layer_indices must have the same length for extrapolation, "
+            f"got {len(source_layer_indices)} vs {len(target_layer_indices)}"
+        )
+    if len(source_layer_indices) == 0:
+        return []
+    if len(source_layer_indices) == 1:
+        only = max(0, min(num_source_layers - 1, int(source_layer_indices[0])))
+        return [only for _ in range(num_target_layers)]
+
+    aligned_source = [int(x) for x in source_layer_indices]
+    aligned_target = [int(x) for x in target_layer_indices]
+
+    def interpolate(target_layer_idx: int) -> int:
+        if target_layer_idx <= aligned_target[0]:
+            left = 0
+            right = 1
+        elif target_layer_idx >= aligned_target[-1]:
+            left = len(aligned_target) - 2
+            right = len(aligned_target) - 1
+        else:
+            left = 0
+            right = 1
+            for idx in range(len(aligned_target) - 1):
+                if aligned_target[idx] <= target_layer_idx <= aligned_target[idx + 1]:
+                    left = idx
+                    right = idx + 1
+                    break
+        src_left = aligned_source[left]
+        src_right = aligned_source[right]
+        tgt_left = aligned_target[left]
+        tgt_right = aligned_target[right]
+        if tgt_right == tgt_left:
+            mapped = src_left
+        else:
+            ratio = float(target_layer_idx - tgt_left) / float(tgt_right - tgt_left)
+            mapped = int(round(src_left + ratio * (src_right - src_left)))
+        return max(0, min(num_source_layers - 1, mapped))
+
+    return [interpolate(target_layer_idx) for target_layer_idx in range(num_target_layers)]
+
+
+def build_extrapolated_sparse_attention_indices(
+    source_model: PreTrainedModel,
+    prefix_input_ids: torch.Tensor,
+    *,
+    source_layer_indices: List[int],
+    target_layer_indices: List[int],
+    num_source_layers: int,
+    num_target_layers: int,
+    source_model_id: Optional[str] = None,
+    top_k: int,
+) -> List[torch.Tensor]:
+    aligned_source_by_target = extrapolate_source_layer_alignment(
+        source_layer_indices=source_layer_indices,
+        target_layer_indices=target_layer_indices,
+        num_source_layers=num_source_layers,
+        num_target_layers=num_target_layers,
     )
-    return unpack_block_outputs(outputs)
+    unique_source_layers = sorted(set(aligned_source_by_target))
+    unique_sparse_indices = extract_source_attention_topk_indices(
+        source_model,
+        prefix_input_ids,
+        unique_source_layers,
+        source_model_id=source_model_id,
+        top_k=top_k,
+    )
+    sparse_by_source_layer = {layer_idx: sparse_idx for layer_idx, sparse_idx in zip(unique_source_layers, unique_sparse_indices)}
+    return [sparse_by_source_layer[source_layer_idx] for source_layer_idx in aligned_source_by_target]
 
 
+def expand_sparse_attention_indices(sparse_attention_indices: torch.Tensor, num_heads: int) -> torch.Tensor:
+    if sparse_attention_indices.ndim != 4:
+        raise ValueError(
+            "sparse_attention_indices must have shape [batch, heads|1, seq, k], "
+            f"got {tuple(sparse_attention_indices.shape)}"
+        )
+    if sparse_attention_indices.size(1) == num_heads:
+        return sparse_attention_indices
+    if sparse_attention_indices.size(1) == 1:
+        return sparse_attention_indices.expand(-1, num_heads, -1, -1)
+    raise ValueError(
+        "Unable to broadcast sparse attention indices across heads: "
+        f"indices heads={sparse_attention_indices.size(1)} vs target heads={num_heads}"
+    )
 
-def run_gpt2_block_with_injected_layer(
+
+def gather_sparse_sequence_vectors(sequence: torch.Tensor, sparse_attention_indices: torch.Tensor) -> torch.Tensor:
+    batch_size, num_heads, seq_len, head_dim = sequence.shape
+    sparse_attention_indices = sparse_attention_indices.to(device=sequence.device, dtype=torch.long).clamp(0, seq_len - 1)
+    sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+    _, _, target_len, top_k = sparse_attention_indices.shape
+    flat_sequence = sequence.reshape(batch_size * num_heads, seq_len, head_dim)
+    flat_indices = sparse_attention_indices.reshape(batch_size * num_heads, target_len, top_k)
+    flat_batch = torch.arange(batch_size * num_heads, device=sequence.device).view(-1, 1, 1)
+    gathered = flat_sequence[flat_batch, flat_indices]
+    return gathered.view(batch_size, num_heads, target_len, top_k, head_dim)
+
+
+def build_sparse_query_mask(sparse_attention_indices: torch.Tensor, seq_len: int, num_heads: int) -> torch.Tensor:
+    sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+    query_positions = torch.arange(seq_len, device=sparse_attention_indices.device).view(1, 1, seq_len, 1)
+    return sparse_attention_indices > query_positions
+
+
+def run_gpt2_block(
     block: nn.Module,
     hidden_states: torch.Tensor,
-    injected_key: torch.Tensor,
-    injected_value: torch.Tensor,
+    *,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
+    injected_key: Optional[torch.Tensor] = None,
+    injected_value: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if injected_key.shape != injected_value.shape:
+    if (injected_key is None) != (injected_value is None):
+        raise ValueError("injected_key and injected_value must be provided together.")
+    if injected_key is not None and injected_key.shape != injected_value.shape:
         raise ValueError(
             "Injected key/value must have identical shapes, "
             f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
@@ -704,33 +847,44 @@ def run_gpt2_block_with_injected_layer(
 
     qkv = attn.c_attn(attn_input)
     split_size = getattr(attn, "split_size", qkv.shape[-1] // 3)
-    query, _, _ = qkv.split(split_size, dim=2)
+    query, native_key, native_value = qkv.split(split_size, dim=2)
 
     batch_size, seq_len, _ = query.shape
     num_heads = attn.num_heads
     head_dim = attn.head_dim
     expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
-    if tuple(injected_key.shape) != expected_cache_shape:
-        raise ValueError(
-            "Injected cache shape mismatch for GPT-2 layer replay: "
-            f"expected {expected_cache_shape}, got {tuple(injected_key.shape)}"
-        )
 
     query = query.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    native_key = native_key.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    native_value = native_value.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
 
-    if getattr(attn, "reorder_and_upcast_attn", False) and hasattr(attn, "_upcast_and_reordered_attn"):
-        attn_output, _ = attn._upcast_and_reordered_attn(
-            query,
-            injected_key,
-            injected_value,
-            attention_mask=None,
-            head_mask=None,
+    attention_key = native_key if injected_key is None else injected_key
+    attention_value = native_value if injected_value is None else injected_value
+    if tuple(attention_key.shape) != expected_cache_shape:
+        raise ValueError(
+            "Attention cache shape mismatch for GPT-2 layer replay: "
+            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
         )
+
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
+        attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
+        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_heads)
+        attn_scores = attn_scores.masked_fill(invalid_mask, torch.finfo(attn_scores.dtype).min)
+        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_dropout = getattr(attn, "attn_dropout", None)
+        if isinstance(attn_dropout, nn.Dropout):
+            attn_weights = attn_dropout(attn_weights)
+        else:
+            attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "attn_pdrop", 0.0)), training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
     else:
         attn_output, _ = attn._attn(
             query,
-            injected_key,
-            injected_value,
+            attention_key,
+            attention_value,
             attention_mask=None,
             head_mask=None,
         )
@@ -739,18 +893,101 @@ def run_gpt2_block_with_injected_layer(
     attn_output = attn.c_proj(attn_output)
     attn_output = attn.resid_dropout(attn_output)
     hidden_states = residual + attn_output
+    hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
+    return hidden_states, (native_key, native_value)
+
+
+def run_opt_block(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor,
+    token_attention_mask: torch.Tensor,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
+    injected_key: Optional[torch.Tensor] = None,
+    injected_value: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    del token_attention_mask
+
+    if (injected_key is None) != (injected_value is None):
+        raise ValueError("injected_key and injected_value must be provided together.")
+    if injected_key is not None and injected_key.shape != injected_value.shape:
+        raise ValueError(
+            "Injected key/value must have identical shapes, "
+            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
+        )
+
+    attn = block.self_attn
+    batch_size, seq_len, hidden_size = hidden_states.shape
+    num_heads = getattr(attn, "num_heads", None)
+    if num_heads is None:
+        raise ValueError("Unable to determine OPT attention head count.")
+    head_dim = getattr(attn, "head_dim", hidden_size // num_heads)
+    expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
 
     residual = hidden_states
-    hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
-    return hidden_states, (injected_key, injected_value)
+    if getattr(block, "do_layer_norm_before", False):
+        hidden_states = block.self_attn_layer_norm(hidden_states)
 
+    query_states = attn.q_proj(hidden_states) * float(getattr(attn, "scaling", head_dim ** -0.5))
+    native_key = attn.k_proj(hidden_states)
+    native_value = attn.v_proj(hidden_states)
+    query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    native_key = native_key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    native_value = native_value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+
+    attention_key = native_key if injected_key is None else injected_key
+    attention_value = native_value if injected_value is None else injected_value
+    if tuple(attention_key.shape) != expected_cache_shape:
+        raise ValueError(
+            "Attention cache shape mismatch for OPT layer replay: "
+            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
+        )
+
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
+        attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1)
+        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_heads)
+        attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    else:
+        attn_weights = torch.matmul(query_states, attention_key.transpose(-1, -2))
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
+        attn_output = torch.matmul(attn_weights, attention_value)
+    attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_heads * head_dim)
+    attn_output = attn.out_proj(attn_output)
+    attn_output = F.dropout(attn_output, p=float(getattr(block, "dropout", 0.0)), training=block.training)
+    hidden_states = residual + attn_output
+
+    if not getattr(block, "do_layer_norm_before", False):
+        hidden_states = block.self_attn_layer_norm(hidden_states)
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+    residual = hidden_states
+    if getattr(block, "do_layer_norm_before", False):
+        hidden_states = block.final_layer_norm(hidden_states)
+    hidden_states = block.fc1(hidden_states)
+    hidden_states = block.activation_fn(hidden_states)
+    hidden_states = block.fc2(hidden_states)
+    hidden_states = F.dropout(hidden_states, p=float(getattr(block, "dropout", 0.0)), training=block.training)
+    hidden_states = (residual + hidden_states).view(hidden_states_shape)
+    if not getattr(block, "do_layer_norm_before", False):
+        hidden_states = block.final_layer_norm(hidden_states)
+    return hidden_states, (native_key, native_value)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
 
 
 def apply_rotary_pos_emb(
@@ -778,7 +1015,6 @@ def apply_rotary_pos_emb(
     return query_embed, key_embed
 
 
-
 def build_causal_attention_mask(hidden_states: torch.Tensor) -> torch.Tensor:
     batch_size, seq_len, _ = hidden_states.shape
     mask = torch.full(
@@ -791,199 +1027,6 @@ def build_causal_attention_mask(hidden_states: torch.Tensor) -> torch.Tensor:
     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
 
 
-
-def _reshape_pythia_qkv(
-    qkv: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size, seq_len, _ = qkv.shape
-    qkv = qkv.view(batch_size, seq_len, num_heads, 3 * head_dim).permute(0, 2, 1, 3).contiguous()
-    query, key, value = qkv.chunk(3, dim=-1)
-    return query, key, value
-
-
-
-def resolve_pythia_attention_num_heads(attention: nn.Module) -> int:
-    num_heads = getattr(attention, "num_attention_heads", None)
-    if num_heads is not None:
-        return int(num_heads)
-    config = getattr(attention, "config", None)
-    num_heads = getattr(config, "num_attention_heads", None)
-    if num_heads is not None:
-        return int(num_heads)
-    raise ValueError("Unable to determine Pythia attention head count.")
-
-
-
-def resolve_pythia_attention_scaling(attention: nn.Module, head_dim: int) -> float:
-    scaling = getattr(attention, "scaling", None)
-    if scaling is not None:
-        return float(scaling)
-    norm_factor = getattr(attention, "norm_factor", None)
-    if norm_factor is not None:
-        return float(norm_factor)
-    return head_dim ** -0.5
-
-
-
-def resolve_pythia_attention_dropout_p(attention: nn.Module, training: bool) -> float:
-    if not training:
-        return 0.0
-    dropout = getattr(attention, "attention_dropout", 0.0)
-    if isinstance(dropout, nn.Dropout):
-        return float(dropout.p)
-    return float(dropout)
-
-
-
-def unpack_pythia_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if isinstance(outputs, tuple):
-        if len(outputs) < 2:
-            raise ValueError("Expected Pythia block outputs to include present key/value cache.")
-        hidden_states = outputs[0]
-        present = outputs[1]
-    else:
-        hidden_states = getattr(outputs, "last_hidden_state", None)
-        if hidden_states is None:
-            hidden_states = getattr(outputs, "hidden_states", None)
-        present = getattr(outputs, "past_key_value", None)
-        if present is None:
-            present = getattr(outputs, "past_key_values", None)
-        if hidden_states is None or present is None:
-            raise ValueError("Unsupported block output type for Pythia layer replay.")
-    if not isinstance(present, tuple) or len(present) != 2:
-        raise ValueError("Expected Pythia present cache to be a (key, value) tuple.")
-    return hidden_states, present
-
-
-
-def pythia_block_uses_external_position_embeddings(block: nn.Module) -> bool:
-    return "position_embeddings" in inspect.signature(block.forward).parameters
-
-
-
-def build_pythia_block_forward_kwargs(
-    block: nn.Module,
-    *,
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-    use_cache: bool,
-) -> Dict[str, Any]:
-    signature = inspect.signature(block.forward)
-    params = signature.parameters
-    kwargs: Dict[str, Any] = {}
-    if "attention_mask" in params:
-        # Older GPT-NeoX blocks build causal masking internally via attention.bias,
-        # so passing a full causal additive mask here would double-apply masking.
-        kwargs["attention_mask"] = attention_mask if pythia_block_uses_external_position_embeddings(block) else None
-    if "position_ids" in params:
-        kwargs["position_ids"] = position_ids
-    if "position_embeddings" in params:
-        kwargs["position_embeddings"] = position_embeddings
-    if "layer_past" in params:
-        kwargs["layer_past"] = None
-    if "use_cache" in params:
-        kwargs["use_cache"] = use_cache
-    if "head_mask" in params:
-        kwargs["head_mask"] = None
-    if "output_attentions" in params:
-        kwargs["output_attentions"] = False
-    return kwargs
-
-
-
-def run_pythia_block_with_cache(
-    block: nn.Module,
-    hidden_states: torch.Tensor,
-    *,
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    outputs = block(
-        hidden_states,
-        **build_pythia_block_forward_kwargs(
-            block,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            position_embeddings=position_embeddings,
-            use_cache=True,
-        ),
-    )
-    return unpack_pythia_block_outputs(outputs)
-
-
-
-def run_pythia_block_with_injected_layer(
-    block: nn.Module,
-    hidden_states: torch.Tensor,
-    injected_key: torch.Tensor,
-    injected_value: torch.Tensor,
-    *,
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if injected_key.shape != injected_value.shape:
-        raise ValueError(
-            "Injected key/value must have identical shapes, "
-            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
-        )
-
-    attention = block.attention
-    batch_size, seq_len, hidden_size = hidden_states.shape
-    num_heads = resolve_pythia_attention_num_heads(attention)
-    head_dim = getattr(attention, "head_size", hidden_size // num_heads)
-    expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
-    if tuple(injected_key.shape) != expected_cache_shape:
-        raise ValueError(
-            "Injected cache shape mismatch for Pythia layer replay: "
-            f"expected {expected_cache_shape}, got {tuple(injected_key.shape)}"
-        )
-
-    residual = hidden_states
-    attn_input = block.input_layernorm(hidden_states)
-    qkv = attention.query_key_value(attn_input)
-    query, native_key, native_value = _reshape_pythia_qkv(qkv, num_heads=num_heads, head_dim=head_dim)
-    query, native_key = apply_rotary_pos_emb(query, native_key, *position_embeddings, position_ids=position_ids)
-
-    attn_scores = torch.matmul(query, injected_key.transpose(-1, -2)) * resolve_pythia_attention_scaling(attention, head_dim)
-    attn_scores = attn_scores + attention_mask
-    attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    dropout_p = resolve_pythia_attention_dropout_p(attention, block.training)
-    attn_weights = torch.dropout(attn_weights, p=dropout_p, train=block.training)
-    attn_output = torch.matmul(attn_weights, injected_value)
-    attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-    attn_output = attention.dense(attn_output)
-    post_attention_dropout = getattr(block, "post_attention_dropout", None)
-    if post_attention_dropout is not None:
-        attn_output = post_attention_dropout(attn_output)
-
-    if getattr(block, "use_parallel_residual", False):
-        mlp_output = block.mlp(block.post_attention_layernorm(hidden_states))
-        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
-        if post_mlp_dropout is not None:
-            mlp_output = post_mlp_dropout(mlp_output)
-        hidden_states = residual + attn_output + mlp_output
-    else:
-        attn_residual = residual + attn_output
-        mlp_output = block.mlp(block.post_attention_layernorm(attn_residual))
-        post_mlp_dropout = getattr(block, "post_mlp_dropout", None)
-        if post_mlp_dropout is not None:
-            mlp_output = post_mlp_dropout(mlp_output)
-        hidden_states = attn_residual + mlp_output
-
-    # Important: the injected KV should drive the replayed attention computation,
-    # but the cached prefix state for this target layer must still be the layer's
-    # own projected KV under the replayed hidden-state input. Returning the raw
-    # injected tensors here makes window-region prefix-correction loss blind to
-    # the replay path, which is why edits inside the replay math can leave the
-    # logged loss completely unchanged.
-    return hidden_states, (native_key, native_value)
-
-
 def replay_target_prefill_with_injected_window(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
@@ -992,6 +1035,8 @@ def replay_target_prefill_with_injected_window(
     injected_value_block: torch.Tensor,
     tgt_spec: ModelSpec,
     target_model_id: Optional[str] = None,
+    sparse_attention_indices: Optional[List[torch.Tensor]] = None,
+    num_bottom_full_attn: int = 3,
 ) -> PastKeyValues:
     injected_window = blocks_to_partial_past_key_values(
         key_block=injected_key_block,
@@ -1008,6 +1053,11 @@ def replay_target_prefill_with_injected_window(
             "Number of target_layer_indices must match translated window size, "
             f"got {len(target_layer_indices)} vs {translated_num_layers}"
         )
+    if sparse_attention_indices is not None and len(sparse_attention_indices) != tgt_spec.num_layers:
+        raise ValueError(
+            "Number of sparse_attention_indices entries must match the total number of target layers, "
+            f"got {len(sparse_attention_indices)} vs {tgt_spec.num_layers}"
+        )
 
     model_family = resolve_target_model_family(target_model, target_model_id=target_model_id)
     if model_family == "gpt2":
@@ -1017,58 +1067,50 @@ def replay_target_prefill_with_injected_window(
         def build_initial_hidden_states() -> Tuple[torch.Tensor, None, None, None]:
             return build_gpt2_input_hidden_states(target_model, prefix_input_ids), None, None, None
 
-        def run_native_block(block: nn.Module, hidden_states: torch.Tensor, *_: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            return run_gpt2_block_with_cache(block, hidden_states)
-
-        def run_injected_block(
+        def run_block(
             block: nn.Module,
             hidden_states: torch.Tensor,
-            injected_key: torch.Tensor,
-            injected_value: torch.Tensor,
-            *_: Any,
+            _: Any,
+            __: Any,
+            ___: Any,
+            sparse_attention_indices: Optional[torch.Tensor],
+            injected_key: Optional[torch.Tensor] = None,
+            injected_value: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            return run_gpt2_block_with_injected_layer(block, hidden_states, injected_key, injected_value)
-
-    elif model_family == "pythia":
-        transformer = require_pythia_transformer(target_model)
-        target_blocks = transformer.layers
-
-        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            hidden_states, position_ids, position_embeddings = build_pythia_input_hidden_states(target_model, prefix_input_ids)
-            return hidden_states, position_ids, build_causal_attention_mask(hidden_states), position_embeddings
-
-        def run_native_block(
-            block: nn.Module,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            return run_pythia_block_with_cache(
+            return run_gpt2_block(
                 block,
                 hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
+                sparse_attention_indices=sparse_attention_indices,
+                injected_key=injected_key,
+                injected_value=injected_value,
             )
 
-        def run_injected_block(
+    elif model_family == "opt":
+        decoder = require_opt_decoder(target_model)
+        target_blocks = decoder.layers
+
+        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+            hidden_states, token_attention_mask, attention_mask = build_opt_input_hidden_states(target_model, prefix_input_ids)
+            return hidden_states, token_attention_mask, attention_mask, None
+
+        def run_block(
             block: nn.Module,
             hidden_states: torch.Tensor,
-            injected_key: torch.Tensor,
-            injected_value: torch.Tensor,
-            position_ids: torch.Tensor,
+            token_attention_mask: torch.Tensor,
             attention_mask: torch.Tensor,
-            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+            _: Any,
+            sparse_attention_indices: Optional[torch.Tensor],
+            injected_key: Optional[torch.Tensor] = None,
+            injected_value: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            return run_pythia_block_with_injected_layer(
+            return run_opt_block(
                 block,
                 hidden_states,
-                injected_key,
-                injected_value,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
+                token_attention_mask=token_attention_mask,
+                sparse_attention_indices=sparse_attention_indices,
+                injected_key=injected_key,
+                injected_value=injected_value,
             )
 
     else:
@@ -1076,62 +1118,72 @@ def replay_target_prefill_with_injected_window(
 
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
     target_start_layer_idx = target_layer_indices[0]
+    layer_sparse_attention_indices = sparse_attention_indices if sparse_attention_indices is not None else [None] * tgt_spec.num_layers
+
+    def native_sparse_attention_for_layer(layer_idx: int) -> Optional[torch.Tensor]:
+        # Keep the lowest num_bottom_full_attn native-only layers exact: do not sparsify their attention.
+        return None if layer_idx < num_bottom_full_attn else layer_sparse_attention_indices[layer_idx]
 
     if torch.is_grad_enabled():
         with torch.no_grad():
             hidden_states, position_ids, attention_mask, position_embeddings = build_initial_hidden_states()
             for lower_idx in range(target_start_layer_idx):
-                hidden_states, present = run_native_block(
+                hidden_states, present = run_block(
                     target_blocks[lower_idx],
                     hidden_states,
                     position_ids,
                     attention_mask,
                     position_embeddings,
+                    native_sparse_attention_for_layer(lower_idx),
                 )
                 rebuilt_past.append((present[0].detach(), present[1].detach()))
         hidden_states = hidden_states.detach()
     else:
         hidden_states, position_ids, attention_mask, position_embeddings = build_initial_hidden_states()
         for lower_idx in range(target_start_layer_idx):
-            hidden_states, present = run_native_block(
+            hidden_states, present = run_block(
                 target_blocks[lower_idx],
                 hidden_states,
                 position_ids,
                 attention_mask,
                 position_embeddings,
+                native_sparse_attention_for_layer(lower_idx),
             )
             rebuilt_past.append(present)
 
     previous_layer_idx = target_start_layer_idx - 1
     for layer_idx, injected_present in zip(target_layer_indices, injected_window):
         for native_layer_idx in range(previous_layer_idx + 1, layer_idx):
-            hidden_states, present = run_native_block(
+            hidden_states, present = run_block(
                 target_blocks[native_layer_idx],
                 hidden_states,
                 position_ids,
                 attention_mask,
                 position_embeddings,
+                native_sparse_attention_for_layer(native_layer_idx),
             )
             rebuilt_past.append(present)
-        hidden_states, present = run_injected_block(
+        hidden_states, present = run_block(
             target_blocks[layer_idx],
             hidden_states,
-            injected_present[0],
-            injected_present[1],
             position_ids,
             attention_mask,
             position_embeddings,
+            layer_sparse_attention_indices[layer_idx],
+            injected_present[0],
+            injected_present[1],
         )
         rebuilt_past.append(present)
         previous_layer_idx = layer_idx
 
     for upper_idx in range(previous_layer_idx + 1, len(target_blocks)):
-        hidden_states, present = run_native_block(
+        hidden_states, present = run_block(
             target_blocks[upper_idx],
             hidden_states,
             position_ids,
             attention_mask,
             position_embeddings,
+            native_sparse_attention_for_layer(upper_idx),
         )
         rebuilt_past.append(present)
 
@@ -1206,7 +1258,6 @@ def load_translator_pool_from_checkpoint(
     translator_pool.to(config.device)
     translator_pool.eval()
     return ctx, translator_pool
-
 
 
 def run_train(
@@ -1300,6 +1351,7 @@ def run_train(
                 mixed_target_past, _ = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
+                    source_model=ctx.mm.get_model(edge.src_id),
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
