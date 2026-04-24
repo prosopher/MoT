@@ -66,8 +66,8 @@ class TrainConfig(Config):
     variant: str
     mot_num_translators: int
     mot_top_k: int
-    topk_sparse_attn: int = 32
-    num_bottom_full_attn: int = 3
+    topk_sparse_attn: int
+    num_bottom_full_attn: int
 
     def __post_init__(self) -> None:
         super().__post_init__()
