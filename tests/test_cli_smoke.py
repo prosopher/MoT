@@ -5,6 +5,7 @@ import pytest
 
 import eval as eval_entry
 import train as train_entry
+import mot.train as mot_train_module
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,14 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
         train_argv.extend(["--max-steps", "1"])
     if alg == "mot":
         train_argv.extend(["--channel-profile-config-path", str(channel_profile_config_path)])
+
+        def fake_resolve_channels(ctx):
+            if ctx.cm.get_channels("A_to_B") or ctx.cm.get_channels("B_to_A"):
+                return
+            ctx.cm.add_channel("A_to_B", src_layer_idx=0, dst_layer_idx=0)
+            ctx.cm.add_channel("B_to_A", src_layer_idx=0, dst_layer_idx=0)
+
+        monkeypatch.setattr(mot_train_module, "resolve_channels", fake_resolve_channels)
     monkeypatch.setattr(sys, "argv", train_argv)
     train_entry.main()
     train_stdout = capsys.readouterr().out

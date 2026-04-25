@@ -227,7 +227,7 @@ class SharedKVTranslatorPool(nn.Module):
             {
                 node.id: ModelLatentAdapter(
                     local_layers=self.mm.get_model_spec(node.id).num_layers,
-                    local_hidden_size=self.mm.get_model_spec(node.id).hidden_size,
+                    local_hidden_size=self.mm.get_model_spec(node.id).kv_hidden_size,
                     shared_slots=shared_slots,
                     shared_dim=shared_dim,
                     translator_dim=translator_dim,
@@ -277,15 +277,19 @@ def blocks_to_past_key_values(
     batch_size, seq_len, num_layers, hidden_size = key_block.shape
     if num_layers != model_spec.num_layers:
         raise ValueError(f"Layer mismatch: block has {num_layers}, model expects {model_spec.num_layers}.")
-    if hidden_size != model_spec.hidden_size:
-        raise ValueError(f"Hidden mismatch: block has {hidden_size}, model expects {model_spec.hidden_size}.")
+    if hidden_size != model_spec.kv_hidden_size:
+        raise ValueError(
+            f"Hidden mismatch: block has {hidden_size}, "
+            f"model expects KV hidden {model_spec.kv_hidden_size} "
+            f"({model_spec.num_key_value_heads} kv heads * {model_spec.head_dim} head dim)."
+        )
 
     past_key_values = []
     for layer_idx in range(model_spec.num_layers):
         key_layer = key_block[:, :, layer_idx, :]
         value_layer = value_block[:, :, layer_idx, :]
-        key_layer = key_layer.view(batch_size, seq_len, model_spec.num_heads, model_spec.head_dim)
-        value_layer = value_layer.view(batch_size, seq_len, model_spec.num_heads, model_spec.head_dim)
+        key_layer = key_layer.view(batch_size, seq_len, model_spec.num_key_value_heads, model_spec.head_dim)
+        value_layer = value_layer.view(batch_size, seq_len, model_spec.num_key_value_heads, model_spec.head_dim)
         key_layer = key_layer.permute(0, 2, 1, 3).contiguous()
         value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
         past_key_values.append((key_layer, value_layer))
@@ -378,12 +382,14 @@ def run_train(
     for node in nodes:
         spec = ctx.mm.get_model_spec(node.id)
         logging.info(
-            "  %s (%s): layers=%d, hidden=%d, heads=%d",
+            "  %s (%s): layers=%d, hidden=%d, heads=%d, kv_heads=%d, kv_hidden=%d",
             node.id,
             node.model_id,
             spec.num_layers,
             spec.hidden_size,
             spec.num_heads,
+            spec.num_key_value_heads,
+            spec.kv_hidden_size,
         )
     logging.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 

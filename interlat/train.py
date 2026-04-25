@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 
 from core.channel_manager import ChannelManager
 from core.common import (
@@ -317,11 +316,7 @@ class NodeTokenizerPool:
 
     @staticmethod
     def _load(model_id: str):
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-        return tokenizer
+        return load_tokenizer(model_id)
 
     def __getitem__(self, node_id: str):
         return self.tokenizers[node_id]

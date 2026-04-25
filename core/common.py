@@ -18,7 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+    PreTrainedTokenizerFast,
+)
 
 from .topology import *
 
@@ -205,8 +211,40 @@ def get_torch_dtype(dtype_name: str) -> torch.dtype:
     return mapping[key]
 
 
+
+def _is_qwen2_tokenizer_error(error: Exception) -> bool:
+    message = str(error)
+    return "Qwen2Tokenizer" in message or "Qwen2TokenizerFast" in message
+
+
+def _ensure_qwen2_compat_for_old_transformers() -> None:
+    try:
+        import transformers
+
+        if hasattr(transformers, "Qwen2ForCausalLM"):
+            return
+    except Exception:
+        pass
+    from .qwen2_compat import register_qwen2_compat
+
+    register_qwen2_compat()
+
+
+def _looks_like_qwen2_model_id(model_id: str) -> bool:
+    normalized = model_id.lower()
+    return "qwen2" in normalized or "qwen2.5" in normalized or "qwen/qwen2" in normalized
+
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if _looks_like_qwen2_model_id(model_id):
+        _ensure_qwen2_compat_for_old_transformers()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    except ValueError as error:
+        if not _is_qwen2_tokenizer_error(error):
+            raise
+        # transformers==4.35.x does not ship Qwen2Tokenizer, but Qwen2/Qwen2.5
+        # repos include tokenizer.json, which the generic fast tokenizer can load.
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -220,8 +258,10 @@ def freeze_model(model: PreTrainedModel) -> None:
 
 
 def load_frozen_model(model_id: str, device: str, dtype: str = "float32") -> PreTrainedModel:
+    if _looks_like_qwen2_model_id(model_id):
+        _ensure_qwen2_compat_for_old_transformers()
     torch_dtype = get_torch_dtype(dtype)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype, trust_remote_code=True)
     model.to(device)
     freeze_model(model)
     return model

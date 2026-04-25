@@ -194,18 +194,9 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
         del model, input_ids
         return torch.zeros(1, 1, 8)
 
-    def fake_run_gpt2_block_with_cache(block, hidden_states):
-        del hidden_states
-        call_order.append(("cache", block.layer_idx))
-        present = (
-            torch.full((1, 2, 1, 4), float(block.layer_idx)),
-            torch.full((1, 2, 1, 4), float(block.layer_idx)),
-        )
-        return torch.zeros(1, 1, 8), present
-
-    def fake_run_gpt2_block_with_injected_layer(block, hidden_states, injected_key, injected_value):
-        del hidden_states, injected_key, injected_value
-        call_order.append(("inject", block.layer_idx))
+    def fake_run_gpt2_block(block, hidden_states, *, sparse_attention_indices=None, injected_key=None, injected_value=None):
+        del hidden_states, sparse_attention_indices
+        call_order.append(("cache" if injected_key is None else "inject", block.layer_idx))
         present = (
             torch.full((1, 2, 1, 4), float(block.layer_idx)),
             torch.full((1, 2, 1, 4), float(block.layer_idx)),
@@ -213,8 +204,7 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
         return torch.zeros(1, 1, 8), present
 
     monkeypatch.setattr(mot_train_module, "build_gpt2_input_hidden_states", fake_build_gpt2_input_hidden_states)
-    monkeypatch.setattr(mot_train_module, "run_gpt2_block_with_cache", fake_run_gpt2_block_with_cache)
-    monkeypatch.setattr(mot_train_module, "run_gpt2_block_with_injected_layer", fake_run_gpt2_block_with_injected_layer)
+    monkeypatch.setattr(mot_train_module, "run_gpt2_block", fake_run_gpt2_block)
 
     with torch.no_grad():
         replayed_past = replay_target_prefill_with_injected_window(

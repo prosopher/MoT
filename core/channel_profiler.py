@@ -550,9 +550,11 @@ class ChannelProfiler:
             self._format_channels(channels),
             self.profile_config.max_steps,
         )
+        src_spec = self.mm.get_model_spec(edge.src_id)
+        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
         proxy = LayerWindowDirectionalTranslator(
-            src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
-            tgt_hidden_size=self.mm.get_model_spec(edge.tgt_id).hidden_size,
+            src_hidden_size=src_spec.kv_hidden_size,
+            tgt_hidden_size=tgt_spec.kv_hidden_size,
             num_layers=len(channels),
             translator_dim=self.profile_config.translator_dim,
             translator_heads=self.profile_config.translator_heads,
