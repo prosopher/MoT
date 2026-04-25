@@ -2,6 +2,7 @@
 
 import sys
 import re
+import argparse
 from pathlib import Path
 from collections import OrderedDict
 
@@ -21,8 +22,7 @@ def split_markdown_row(line: str) -> list[str]:
     if not s.startswith("|"):
         return []
 
-    if s.startswith("|"):
-        s = s[1:]
+    s = s[1:]
     if s.endswith("|"):
         s = s[:-1]
 
@@ -68,7 +68,10 @@ def is_separator_row(cells: list[str]) -> bool:
 
 def parse_number(value: str) -> float:
     text = value.strip().replace(",", "")
-    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", text)
+    match = re.search(
+        r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+        text,
+    )
 
     if not match:
         raise ValueError(f"숫자를 찾을 수 없습니다: {value!r}")
@@ -89,7 +92,10 @@ def make_unique_name(name: str, used: set[str]) -> str:
     return candidate
 
 
-def extract_tables(md_text: str, y_col: str) -> tuple[str, OrderedDict[str, list[tuple[float, float]]]]:
+def extract_tables(
+    md_text: str,
+    y_col: str,
+) -> tuple[str, OrderedDict[str, list[tuple[float, float]]]]:
     lines = md_text.splitlines()
 
     current_heading = None
@@ -101,6 +107,7 @@ def extract_tables(md_text: str, y_col: str) -> tuple[str, OrderedDict[str, list
 
     i = 0
     table_count = 0
+    matched_table_count = 0
 
     while i < len(lines):
         line = lines[i]
@@ -129,6 +136,8 @@ def extract_tables(md_text: str, y_col: str) -> tuple[str, OrderedDict[str, list
         if not header or not is_separator_row(separator):
             continue
 
+        table_count += 1
+
         normalized_header = [normalize_col_name(cell) for cell in header]
 
         if y_key not in normalized_header:
@@ -140,7 +149,8 @@ def extract_tables(md_text: str, y_col: str) -> tuple[str, OrderedDict[str, list
         if x_col_name is None:
             x_col_name = header[x_idx]
 
-        table_count += 1
+        matched_table_count += 1
+
         series_name = make_unique_name(
             current_heading or f"Table {table_count}",
             used_series_names,
@@ -168,6 +178,10 @@ def extract_tables(md_text: str, y_col: str) -> tuple[str, OrderedDict[str, list
     if x_col_name is None:
         x_col_name = "First Column"
 
+    print(f"Found markdown tables: {table_count}")
+    print(f"Matched tables with '{y_col}': {matched_table_count}")
+    print(f"Plotted series: {len(series_data)}")
+
     return x_col_name, series_data
 
 
@@ -180,7 +194,10 @@ def plot_series(
     if not series_data:
         raise RuntimeError("플롯할 데이터가 없습니다.")
 
-    plt.figure(figsize=(10, 6))
+    width = 10 if len(series_data) <= 5 else 12
+    height = 6 if len(series_data) <= 8 else 7
+
+    plt.figure(figsize=(width, height))
 
     for series_name, points in series_data.items():
         points = sorted(points, key=lambda pair: pair[0])
@@ -200,37 +217,68 @@ def plot_series(
     plt.ylabel(y_label)
     plt.title(f"{y_label} by {x_label}")
     plt.grid(True, alpha=0.3)
-    plt.legend()
+
+    if len(series_data) > 5:
+        plt.legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0,
+        )
+    else:
+        plt.legend()
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=200)
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close()
 
 
-def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"Usage: {Path(sys.argv[0]).name} path_to_md/summary.md", file=sys.stderr)
-        raise SystemExit(1)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Markdown 파일 안의 여러 표에서 특정 컬럼을 추출해 하나의 그래프로 출력합니다."
+    )
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="입력 Markdown 파일 경로",
+    )
+    parser.add_argument(
+        "--y-col",
+        default=DEFAULT_Y_COL,
+        help=f"Y축으로 사용할 컬럼명. 기본값: {DEFAULT_Y_COL!r}",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="출력 PNG 경로. 생략하면 입력 파일명과 같은 이름의 .png 파일로 저장합니다.",
+    )
+    return parser.parse_args()
 
-    input_path = Path(sys.argv[1])
-    output_path = input_path.with_suffix(".png")
+
+def main() -> None:
+    args = parse_args()
+
+    input_path = args.input
+    output_path = args.output or input_path.with_suffix(".png")
 
     md_text = input_path.read_text(encoding="utf-8")
 
     x_label, series_data = extract_tables(
         md_text=md_text,
-        y_col=DEFAULT_Y_COL,
+        y_col=args.y_col,
     )
 
     if not series_data:
         raise SystemExit(
-            f"첫 번째 컬럼과 '{DEFAULT_Y_COL}' 컬럼을 가진 Markdown 표를 찾지 못했습니다."
+            f"첫 번째 컬럼과 '{args.y_col}' 컬럼을 가진 Markdown 표를 찾지 못했습니다."
         )
 
     plot_series(
         series_data=series_data,
         output_path=output_path,
         x_label=x_label,
-        y_label=DEFAULT_Y_COL,
+        y_label=args.y_col,
     )
 
     print(f"Saved: {output_path}")
