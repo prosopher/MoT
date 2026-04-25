@@ -1,14 +1,75 @@
 from contextlib import contextmanager
+from dataclasses import MISSING
 import importlib
 import time
 from typing import Any, Callable, Tuple
 
 import numpy as np
 
+import core.common as common_module
 from core.common import *
 from core.config import Config
 from core.context import Context
 from core.train_util import get_train_config_path
+
+
+def _patch_build_dataclass_kwargs_to_respect_defaults() -> None:
+    original = common_module.build_dataclass_kwargs_from_json_and_namespace
+    if getattr(original, "_eval_util_patched_for_defaults", False):
+        return
+
+    def patched_build_dataclass_kwargs_from_json_and_namespace(
+        config_cls: Type[T],
+        default_config_path: Union[str, Path],
+        args: argparse.Namespace,
+        exclude_fields: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        if not is_dataclass(config_cls):
+            raise TypeError(f"{config_cls} must be a dataclass type.")
+
+        excluded = exclude_fields or set()
+        default_kwargs = read_json(default_config_path)
+
+        valid_field_names = {field_info.name for field_info in fields(config_cls)}
+        unknown_keys = sorted(set(default_kwargs) - valid_field_names)
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown config keys in {default_config_path}: {unknown_keys}"
+            )
+
+        merged_kwargs = {
+            key: value
+            for key, value in default_kwargs.items()
+            if key not in excluded
+        }
+        merged_kwargs.update(
+            common_module.extract_dataclass_kwargs_from_namespace(
+                config_cls=config_cls,
+                args=args,
+                exclude_fields=exclude_fields,
+            )
+        )
+
+        missing_keys = []
+        for field_info in fields(config_cls):
+            if field_info.name in excluded or field_info.name in merged_kwargs:
+                continue
+            if field_info.default is not MISSING or field_info.default_factory is not MISSING:
+                continue
+            missing_keys.append(field_info.name)
+
+        if missing_keys:
+            raise ValueError(
+                f"Missing required config keys in {default_config_path}: {missing_keys}"
+            )
+
+        return merged_kwargs
+
+    patched_build_dataclass_kwargs_from_json_and_namespace._eval_util_patched_for_defaults = True
+    common_module.build_dataclass_kwargs_from_json_and_namespace = patched_build_dataclass_kwargs_from_json_and_namespace
+
+
+_patch_build_dataclass_kwargs_to_respect_defaults()
 
 
 @dataclass
@@ -28,7 +89,8 @@ class EvalConfig(Config):
 
     # generation QA
     generation_max_new_tokens: int
-
+    generation_dataset_filter: Optional[str] = None
+    generation_context_budgets: Optional[str] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -46,6 +108,104 @@ OPENWEBTEXT_TSNE_DISPLAY_NAMES = {
     "target_top": "Target Top KV",
 }
 OPENWEBTEXT_TSNE_FILE_BASENAME = "openwebtext_validation_tsne"
+
+
+_ACTIVE_EVAL_OUTPUT_PATH: Optional[str] = None
+_ACTIVE_GENERATION_DATASET_FILTER: Optional[str] = None
+_ACTIVE_GENERATION_BUDGETS: List[Optional[int]] = [None]
+_PENDING_GENERATION_PROFILE_EVENTS: List[Dict[str, Optional[float]]] = []
+
+
+def parse_generation_context_budgets(raw_value: Optional[str]) -> List[Optional[int]]:
+    if raw_value is None:
+        return [None]
+    if isinstance(raw_value, str):
+        parts = [part.strip() for part in raw_value.split(",")]
+    else:
+        raise TypeError(f"generation_context_budgets must be a comma-separated string, got {type(raw_value)!r}")
+
+    budgets: List[Optional[int]] = []
+    seen: set[Optional[int]] = set()
+    for part in parts:
+        if not part:
+            continue
+        normalized = part.lower()
+        if normalized in {"none", "full", "max", "native"}:
+            budget = None
+        else:
+            budget = int(part)
+            if budget < 1:
+                raise ValueError(f"generation_context_budget must be >= 1, got {budget}")
+        if budget not in seen:
+            budgets.append(budget)
+            seen.add(budget)
+    return budgets or [None]
+
+
+def normalize_generation_dataset_filter(raw_value: Optional[str]) -> Optional[str]:
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return None
+    alias_map = {
+        "hotpot": "hotpotqa",
+        "hotpotqa": "hotpotqa",
+        "hotpot_qa": "hotpotqa",
+        "hotpotqa/distractor": "hotpotqa",
+        "hotpotqa_distractor": "hotpotqa",
+        "squad": "squad",
+        "newsqa": "newsqa",
+        "all": None,
+        "default": None,
+    }
+    if normalized not in alias_map:
+        raise ValueError(
+            "Unsupported generation_dataset_filter="
+            f"{raw_value!r}. Expected one of: hotpotqa, squad, newsqa, all."
+        )
+    return alias_map[normalized]
+
+
+def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
+    global _ACTIVE_EVAL_OUTPUT_PATH
+    global _ACTIVE_GENERATION_DATASET_FILTER
+    global _ACTIVE_GENERATION_BUDGETS
+    global _PENDING_GENERATION_PROFILE_EVENTS
+
+    if eval_config is None:
+        _ACTIVE_EVAL_OUTPUT_PATH = None
+        _ACTIVE_GENERATION_DATASET_FILTER = None
+        _ACTIVE_GENERATION_BUDGETS = [None]
+        _PENDING_GENERATION_PROFILE_EVENTS = []
+
+        LOGIT_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES
+        GEN_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_GEN_QA_SPEC_GROUP_FACTORIES
+        return
+
+    _ACTIVE_EVAL_OUTPUT_PATH = eval_config.output_path
+    _ACTIVE_GENERATION_DATASET_FILTER = normalize_generation_dataset_filter(
+        getattr(eval_config, "generation_dataset_filter", None)
+    )
+    _ACTIVE_GENERATION_BUDGETS = parse_generation_context_budgets(
+        getattr(eval_config, "generation_context_budgets", None)
+    )
+    _PENDING_GENERATION_PROFILE_EVENTS = []
+
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+        LOGIT_QA_SPEC_GROUP_FACTORIES[:] = []
+        GEN_QA_SPEC_GROUP_FACTORIES[:] = _make_hotpotqa_generation_spec_factories(
+            _ACTIVE_GENERATION_BUDGETS
+        )
+    elif _ACTIVE_GENERATION_DATASET_FILTER == "squad":
+        LOGIT_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES
+        GEN_QA_SPEC_GROUP_FACTORIES[:] = [get_squad_v11_dataset_spec]
+    elif _ACTIVE_GENERATION_DATASET_FILTER == "newsqa":
+        LOGIT_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES
+        GEN_QA_SPEC_GROUP_FACTORIES[:] = [get_newsqa_generation_dataset_spec]
+    else:
+        LOGIT_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES
+        GEN_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_GEN_QA_SPEC_GROUP_FACTORIES
 
 
 @dataclass
@@ -200,6 +360,8 @@ class HFDatasetSpec:
     corrected_answer_field: Optional[str] = None
     dataset_names: Optional[List[str]] = None
     streaming: bool = False
+    manual_context_budget: Optional[int] = None
+    dataset_family: Optional[str] = None
 
 
 class HFQAPairStream(IterableDataset):
@@ -517,6 +679,7 @@ def get_squad_v11_dataset_spec() -> HFDatasetSpec:
         context_field="context",
         answers_field="answers",
         streaming=False,
+        dataset_family="squad",
     )
 
 
@@ -531,6 +694,26 @@ def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
         context_field="paragraph",
         answers_field="answers",
         streaming=False,
+        dataset_family="newsqa",
+    )
+
+
+def get_hotpotqa_distractor_generation_dataset_spec(
+    manual_context_budget: Optional[int] = None,
+) -> HFDatasetSpec:
+    budget_suffix = "" if manual_context_budget is None else f"@ctx={manual_context_budget}"
+    return HFDatasetSpec(
+        name_for_log=f"HotpotQA/distractor/validation{budget_suffix}",
+        dataset_path="hotpotqa/hotpot_qa",
+        dataset_name="distractor",
+        split="validation",
+        answer_mode="squad",
+        question_field="question",
+        context_field="context",
+        answers_field="answer",
+        streaming=False,
+        manual_context_budget=manual_context_budget,
+        dataset_family="hotpotqa",
     )
 
 
@@ -544,6 +727,7 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
         context_field="document",
         answers_field="summary",
         streaming=False,
+        dataset_family="multinews",
     )
 
 
@@ -565,6 +749,31 @@ EVAL_SPEC_GROUP_FACTORIES = {
 }
 
 
+def _make_hotpotqa_generation_spec_factories(
+    budgets: List[Optional[int]],
+) -> List[Callable[[], HFDatasetSpec]]:
+    return [
+        (
+            lambda budget=budget: get_hotpotqa_distractor_generation_dataset_spec(
+                manual_context_budget=budget
+            )
+        )
+        for budget in budgets
+    ]
+
+
+_ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES = list(LOGIT_QA_SPEC_GROUP_FACTORIES)
+_ORIGINAL_GEN_QA_SPEC_GROUP_FACTORIES = list(GEN_QA_SPEC_GROUP_FACTORIES)
+
+
+class EmptyOpenWebTextSequenceStream(IterableDataset):
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+
 def build_openwebtext_eval_dataloader(
     tokenizer: PreTrainedTokenizerBase,
     config,
@@ -576,6 +785,17 @@ def build_openwebtext_eval_dataloader(
     shuffle_buffer: Optional[int] = None,
     seed_offset: int = 10_000,
 ) -> DataLoader:
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+        logging.info(
+            "Skipping OpenWebText dataloader construction because generation_dataset_filter=%s",
+            _ACTIVE_GENERATION_DATASET_FILTER,
+        )
+        return DataLoader(
+            EmptyOpenWebTextSequenceStream(),
+            batch_size=batch_size,
+            num_workers=0,
+        )
+
     dataset = OpenWebTextSequenceStream(
         tokenizer=tokenizer,
         sequence_length=config.total_tokens,
@@ -927,8 +1147,6 @@ def run_openwebtext_greedy_inference(
 
     return total_generated_tokens
 
-
-
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss_metrics(
     *,
@@ -943,6 +1161,24 @@ def evaluate_openwebtext_validation_loss_metrics(
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+        logging.info(
+            "Skipping OpenWebText validation because generation_dataset_filter=%s",
+            _ACTIVE_GENERATION_DATASET_FILTER,
+        )
+        skipped_row = {
+            "count": 0,
+            "loss": float("nan"),
+            "native_loss": float("nan"),
+            "latency_ms": float("nan"),
+            "throughput_tokens_per_sec": float("nan"),
+            "peak_memory_gib": float("nan"),
+            "native_latency_ms": float("nan"),
+            "native_throughput_tokens_per_sec": float("nan"),
+            "native_peak_memory_gib": float("nan"),
+        }
+        return {edge.id: dict(skipped_row) for edge in ctx.edges}
+
     device = ctx.config.device
     max_examples = max(1, max_examples)
 
@@ -1281,7 +1517,6 @@ def evaluate_openwebtext_validation_loss_replay(
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
-
 @torch.inference_mode()
 def evaluate_openwebtext_validation_loss(
     ctx: Context,
@@ -1291,6 +1526,24 @@ def evaluate_openwebtext_validation_loss(
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+        logging.info(
+            "Skipping OpenWebText validation because generation_dataset_filter=%s",
+            _ACTIVE_GENERATION_DATASET_FILTER,
+        )
+        skipped_row = {
+            "count": 0,
+            "loss": float("nan"),
+            "native_loss": float("nan"),
+            "latency_ms": float("nan"),
+            "throughput_tokens_per_sec": float("nan"),
+            "peak_memory_gib": float("nan"),
+            "native_latency_ms": float("nan"),
+            "native_throughput_tokens_per_sec": float("nan"),
+            "native_peak_memory_gib": float("nan"),
+        }
+        return {edge.id: dict(skipped_row) for edge in ctx.edges}
+
     if eval_config.alg in {"mot", "mot-h"}:
         return evaluate_openwebtext_validation_loss_replay(
             ctx=ctx,
@@ -1308,6 +1561,8 @@ def evaluate_openwebtext_validation_loss(
     )
 
 
+
+
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
     try:
         factories = EVAL_SPEC_GROUP_FACTORIES[group_name]
@@ -1317,10 +1572,21 @@ def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
 
 
 def get_default_logit_qa_dataset_specs() -> List[HFDatasetSpec]:
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+        return []
     return get_eval_spec_group("logit_qa")
 
 
 def get_default_gen_qa_dataset_specs() -> List[HFDatasetSpec]:
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+        return [
+            get_hotpotqa_distractor_generation_dataset_spec(manual_context_budget=budget)
+            for budget in _ACTIVE_GENERATION_BUDGETS
+        ]
+    if _ACTIVE_GENERATION_DATASET_FILTER == "squad":
+        return [get_squad_v11_dataset_spec()]
+    if _ACTIVE_GENERATION_DATASET_FILTER == "newsqa":
+        return [get_newsqa_generation_dataset_spec()]
     return get_eval_spec_group("gen_qa")
 
 
@@ -1356,7 +1622,61 @@ def normalize_multinews_context_text(raw_value: Any) -> Optional[str]:
     return normalized or None
 
 
+def normalize_hotpotqa_context_text(raw_value: Any) -> Optional[str]:
+    if not isinstance(raw_value, dict):
+        return normalize_context_text(raw_value)
+
+    titles = raw_value.get("title")
+    sentences = raw_value.get("sentences")
+    if not isinstance(titles, list) or not isinstance(sentences, list):
+        return normalize_context_text(raw_value)
+
+    paragraphs: List[str] = []
+    for title, sentence_group in zip(titles, sentences):
+        title_text = title.strip() if isinstance(title, str) else ""
+        sentence_texts = [
+            sent.strip()
+            for sent in sentence_group
+            if isinstance(sentence_group, list) and isinstance(sent, str) and sent.strip()
+        ]
+        if not sentence_texts and not title_text:
+            continue
+        paragraph_lines: List[str] = []
+        if title_text:
+            paragraph_lines.append(f"Title: {title_text}")
+        if sentence_texts:
+            paragraph_lines.append(" ".join(sentence_texts))
+        paragraphs.append("\n".join(paragraph_lines).strip())
+
+    if not paragraphs:
+        return None
+    return "\n\n".join(paragraphs)
+
+
 def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if spec.dataset_family == "hotpotqa":
+        question_field = spec.question_field or "question"
+        context_field = spec.context_field or "context"
+        answers_field = spec.answers_field or "answer"
+
+        question = example.get(question_field, "")
+        if not isinstance(question, str) or not question.strip():
+            return []
+
+        context = normalize_hotpotqa_context_text(example.get(context_field, None))
+        if context is None:
+            return []
+
+        answer_texts = _normalize_answer_texts(example.get(answers_field, None))
+        if not answer_texts:
+            return []
+
+        return [{
+            "question": question.strip(),
+            "context": context,
+            "answers": answer_texts,
+        }]
+
     if spec.answer_mode == "squad":
         question = example.get(spec.question_field, "")
         if not isinstance(question, str) or not question.strip():
@@ -1615,6 +1935,42 @@ class GenerationRunningAverage:
         self.native_f1_sum = 0.0
         self.count = 0
 
+        self.latency_sec_sum = 0.0
+        self.tokens_sum = 0
+        self.peak_memory_bytes: Optional[int] = None
+
+        self.native_latency_sec_sum = 0.0
+        self.native_tokens_sum = 0
+        self.native_peak_memory_bytes: Optional[int] = None
+
+    def _update_profile(
+        self,
+        event: Optional[Dict[str, Optional[float]]],
+        *,
+        native: bool,
+    ) -> None:
+        if not event:
+            return
+
+        latency_sec = float(event.get("latency_sec", 0.0) or 0.0)
+        tokens = int(event.get("tokens", 0) or 0)
+        peak_memory_bytes = event.get("peak_memory_bytes")
+        peak_memory_int = None if peak_memory_bytes is None else int(peak_memory_bytes)
+
+        if native:
+            self.native_latency_sec_sum += latency_sec
+            self.native_tokens_sum += tokens
+            if peak_memory_int is not None and (
+                self.native_peak_memory_bytes is None or peak_memory_int > self.native_peak_memory_bytes
+            ):
+                self.native_peak_memory_bytes = peak_memory_int
+            return
+
+        self.latency_sec_sum += latency_sec
+        self.tokens_sum += tokens
+        if peak_memory_int is not None and (self.peak_memory_bytes is None or peak_memory_int > self.peak_memory_bytes):
+            self.peak_memory_bytes = peak_memory_int
+
     def update(
         self,
         cosine_value: float,
@@ -1627,6 +1983,11 @@ class GenerationRunningAverage:
         self.native_f1_sum += float(native_f1_value) * n
         self.count += n
 
+        translated_event = _PENDING_GENERATION_PROFILE_EVENTS.pop(0) if _PENDING_GENERATION_PROFILE_EVENTS else None
+        native_event = _PENDING_GENERATION_PROFILE_EVENTS.pop(0) if _PENDING_GENERATION_PROFILE_EVENTS else None
+        self._update_profile(translated_event, native=False)
+        self._update_profile(native_event, native=True)
+
     def summary(self) -> Dict[str, float]:
         if self.count == 0:
             return {
@@ -1634,12 +1995,32 @@ class GenerationRunningAverage:
                 "f1": float("nan"),
                 "native_f1": float("nan"),
                 "count": 0,
+                "latency_ms": float("nan"),
+                "throughput_tokens_per_sec": float("nan"),
+                "peak_memory_gib": float("nan"),
+                "native_latency_ms": float("nan"),
+                "native_throughput_tokens_per_sec": float("nan"),
+                "native_peak_memory_gib": float("nan"),
             }
+
+        latency_ms = (self.latency_sec_sum / self.count) * 1000.0
+        native_latency_ms = (self.native_latency_sec_sum / self.count) * 1000.0
+        throughput = self.tokens_sum / self.latency_sec_sum if self.latency_sec_sum > 0.0 and self.tokens_sum > 0 else float("nan")
+        native_throughput = self.native_tokens_sum / self.native_latency_sec_sum if self.native_latency_sec_sum > 0.0 and self.native_tokens_sum > 0 else float("nan")
+        peak_memory_gib = float("nan") if self.peak_memory_bytes is None else float(self.peak_memory_bytes) / (1024 ** 3)
+        native_peak_memory_gib = float("nan") if self.native_peak_memory_bytes is None else float(self.native_peak_memory_bytes) / (1024 ** 3)
+
         return {
             "cosine": self.cosine_sum / self.count,
             "f1": self.f1_sum / self.count,
             "native_f1": self.native_f1_sum / self.count,
             "count": self.count,
+            "latency_ms": latency_ms,
+            "throughput_tokens_per_sec": throughput,
+            "peak_memory_gib": peak_memory_gib,
+            "native_latency_ms": native_latency_ms,
+            "native_throughput_tokens_per_sec": native_throughput,
+            "native_peak_memory_gib": native_peak_memory_gib,
         }
 
 
@@ -1709,6 +2090,8 @@ def build_eval_context(
     nodes: List[Node],
     edges: List[Edge],
 ):
+    activate_eval_runtime_config(eval_config)
+
     if eval_config.checkpoint_dir_path is None:
         raise ValueError("EvalConfig.checkpoint_dir_path must be set before build_eval_context.")
     checkpoint_dir_path = eval_config.checkpoint_dir_path
@@ -2267,7 +2650,7 @@ def prepare_multinews_question_suffix(tokenizer, question: str, device: str) -> 
 
 def format_generation_task_prompt(context: str, question: str) -> str:
     return (
-        "Read the passage and answer the question briefly.\n\n"
+        "Read the provided context and answer the question briefly. Use a short phrase from the context when possible.\n\n"
         f"Context: {context.strip()}\n"
         f"Question: {question.strip()}\n"
         "Answer:"
@@ -2340,9 +2723,20 @@ def prepare_logit_task_prompt(
     )
 
 
-def prepare_generation_task_prompt(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_generation_task_prompt(
+    tokenizer,
+    context: str,
+    question: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
     prompt_text = format_generation_task_prompt(context=context, question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=prompt_text, device=device)
+    return prepare_cache_text_inputs(
+        tokenizer=tokenizer,
+        text=prompt_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def format_generation_question_suffix(question: str) -> str:
@@ -2426,13 +2820,24 @@ def compute_benchmark_context_budget(
         + suffix["seed_token"].shape[1]
         + get_answer_token_budget(eval_config)
     )
-    budget = shared_limit - reserved_tokens
-    if budget < 16:
+    available_budget = shared_limit - reserved_tokens
+    if available_budget < 16:
         raise ValueError(
             f"Insufficient context budget for {spec.name_for_log}: "
             f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
         )
-    return budget
+
+    manual_budget = spec.manual_context_budget
+    if manual_budget is None:
+        return available_budget
+    if int(manual_budget) > available_budget:
+        logging.info(
+            "[%s] requested manual context budget=%d exceeds available budget=%d; clamping to fit model context window.",
+            spec.name_for_log,
+            int(manual_budget),
+            available_budget,
+        )
+    return min(int(manual_budget), available_budget)
 
 
 def compute_logit_task_token_budgets(
@@ -2530,7 +2935,7 @@ def prepare_generation_task_suffix(
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode in {"squad", "newsqa"}:
+    if spec.answer_mode in {"squad", "newsqa", "hotpotqa"}:
         return prepare_squad_v11_question_suffix(
             tokenizer=tokenizer,
             question=question,
@@ -2662,7 +3067,7 @@ def prepare_generation_task_inputs(
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if spec.answer_mode in {"squad", "newsqa"}:
+    if spec.answer_mode in {"squad", "newsqa", "hotpotqa"}:
         context_prefix = prepare_squad_v11_context_inputs(
             tokenizer=tokenizer,
             context=context,
@@ -2709,6 +3114,7 @@ def prepare_generation_task_inputs(
         context=context,
         question=question,
         device=device,
+        max_input_tokens=max_input_tokens,
     )
     return {
         "prefix_input_ids": prompt["cache_ids"],
@@ -2734,13 +3140,21 @@ def predict_generation_task_answer(
             input_ids=suffix_cache_ids,
         )
 
-    return generate_greedy_answer(
-        model=model,
-        tokenizer=tokenizer,
-        past_key_values=generation_past,
-        seed_token=seed_token,
-        max_new_tokens=eval_config.generation_max_new_tokens,
+    profiler = InferenceProfiler(str(seed_token.device))
+    (answer_text, generated_tokens), profile_event = profiler.measure(
+        lambda: generate_greedy_answer(
+            model=model,
+            tokenizer=tokenizer,
+            past_key_values=generation_past,
+            seed_token=seed_token,
+            max_new_tokens=eval_config.generation_max_new_tokens,
+            return_num_generated_tokens=True,
+        ),
+        tokens=0,
     )
+    profile_event["tokens"] = int(generated_tokens)
+    _PENDING_GENERATION_PROFILE_EVENTS.append(profile_event)
+    return answer_text
 
 
 
@@ -2904,7 +3318,9 @@ def generate_greedy_answer(
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
     max_new_tokens: int,
-) -> str:
+    *,
+    return_num_generated_tokens: bool = False,
+) -> Union[str, Tuple[str, int]]:
     generated_token_ids: List[int] = []
     current_input_ids = seed_token
     current_past = past_key_values
@@ -2927,7 +3343,10 @@ def generate_greedy_answer(
         current_past = outputs.past_key_values
 
     decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-    return postprocess_generated_answer(decoded)
+    answer_text = postprocess_generated_answer(decoded)
+    if return_num_generated_tokens:
+        return answer_text, len(generated_token_ids)
+    return answer_text
 
 
 def postprocess_generated_answer(text: str) -> str:
@@ -3209,6 +3628,87 @@ def log_dataset_result(
         )
 
 
+def _build_generation_metrics_output_dir(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "generation_metrics"
+
+
+def _sanitize_dataset_name_for_filename(dataset_name: str) -> str:
+    allowed = []
+    for char in dataset_name:
+        if char.isalnum() or char in {"-", "_"}:
+            allowed.append(char)
+        else:
+            allowed.append("_")
+    return "".join(allowed).strip("_") or "dataset"
+
+
+def _build_generation_dataset_metrics_markdown(
+    dataset_name: str,
+    results: Dict[str, Dict[str, float]],
+    nodes: List[Node],
+    edges: List[Edge],
+) -> str:
+    lines = [
+        f"## {dataset_name}",
+        "",
+        "| Direction | Cosine Sim | F1 | Native F1 | Latency | Throughput | GPU Peak | Native Latency | Native Throughput | Native GPU Peak | Count |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for edge in edges:
+        row = results[edge.id]
+        pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
+        translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(row)
+        native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(row, prefix="native")
+        lines.append(
+            f"| {pretty_name} | "
+            f"{_format_summary_float(row.get('cosine', float('nan')))} | "
+            f"{_format_summary_float(row.get('f1', float('nan')))} | "
+            f"{_format_summary_float(row.get('native_f1', float('nan')))} | "
+            f"{translated_latency_text} | "
+            f"{translated_throughput_text} | "
+            f"{translated_peak_text} | "
+            f"{native_latency_text} | "
+            f"{native_throughput_text} | "
+            f"{native_peak_text} | "
+            f"{int(row.get('count', 0) or 0)} |"
+        )
+    return "\n".join(lines)
+
+
+def save_generation_dataset_result_artifacts(
+    dataset_name: str,
+    results: Dict[str, Dict[str, float]],
+    nodes: List[Node],
+    edges: List[Edge],
+) -> None:
+    if not _ACTIVE_EVAL_OUTPUT_PATH:
+        return
+
+    output_dir = _build_generation_metrics_output_dir(_ACTIVE_EVAL_OUTPUT_PATH)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_dataset_name = _sanitize_dataset_name_for_filename(dataset_name)
+    json_path = output_dir / f"{safe_dataset_name}.json"
+    markdown_path = output_dir / f"{safe_dataset_name}.md"
+
+    payload = {
+        "dataset_name": dataset_name,
+        "edges": {
+            edge.id: {
+                "pretty_name": build_edge_pretty_name(edge.id, nodes, edges),
+                **results.get(edge.id, {}),
+            }
+            for edge in edges
+        },
+    }
+    write_json(str(json_path), payload)
+    markdown_path.write_text(
+        _build_generation_dataset_metrics_markdown(dataset_name, results, nodes, edges),
+        encoding="utf-8",
+    )
+    logging.info("Saved generation metrics artifacts to %s and %s", json_path, markdown_path)
+
+
 def log_generation_dataset_result(
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
@@ -3220,13 +3720,16 @@ def log_generation_dataset_result(
         row = results[edge.id]
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
         logging.info(
-            "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | count=%d",
+            "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | translated_profile=%s | native_profile=%s | count=%d",
             pretty_name,
             row["cosine"],
             row["f1"],
             row["native_f1"],
+            build_openwebtext_profile_cell(row),
+            build_openwebtext_profile_cell(row, prefix="native"),
             row["count"],
         )
+    save_generation_dataset_result_artifacts(dataset_name, results, nodes, edges)
 
 
 def _is_valid_summary_value(value: Any) -> bool:
@@ -3276,6 +3779,13 @@ def build_openwebtext_profile_cell(row: Dict[str, float], *, prefix: str = "") -
     latency_text, throughput_text, peak_text = build_openwebtext_profile_fields(row, prefix=prefix)
     return f"{latency_text} · {throughput_text} · {peak_text}"
 
+def _parse_generation_budget_from_dataset_name(dataset_name: str) -> Optional[int]:
+    match = re.search(r"@ctx=(\d+)$", dataset_name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def build_edge_summary_markdown_table(
     alg: str,
     edge_id: str,
@@ -3289,6 +3799,55 @@ def build_edge_summary_markdown_table(
     edge_map = build_edge_map(edges)
     edge = edge_map.get(edge_id)
 
+    if edge is None:
+        target_model_id = "target"
+        direction_title = edge_id
+    else:
+        src_model_id = node_map[edge.src_id].model_id
+        target_model_id = node_map[edge.tgt_id].model_id
+        direction_title = f"{edge.id} 방향 ({src_model_id} -> {target_model_id})"
+
+    hotpot_dataset_keys = [
+        dataset_key
+        for dataset_key in all_generation_results
+        if dataset_key.startswith("HotpotQA/distractor/validation")
+    ]
+    if hotpot_dataset_keys:
+        sorted_dataset_keys = sorted(
+            hotpot_dataset_keys,
+            key=lambda name: (_parse_generation_budget_from_dataset_name(name) is None, _parse_generation_budget_from_dataset_name(name) or 0),
+        )
+        lines = [
+            f"### {direction_title}",
+            "",
+            "| Budget | Method | Cosine Sim | F1 | Avg Latency | Throughput | GPU Peak Memory | Count |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for dataset_key in sorted_dataset_keys:
+            row = all_generation_results.get(dataset_key, {}).get(edge_id, {})
+            budget_value = _parse_generation_budget_from_dataset_name(dataset_key)
+            budget_text = "max" if budget_value is None else str(budget_value)
+            native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(row, prefix="native")
+            translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(row)
+            lines.append(
+                f"| {budget_text} | {target_model_id} (upperbound) | N/A | "
+                f"{_format_summary_float(row.get('native_f1', float('nan')))} | "
+                f"{native_latency_text} | "
+                f"{native_throughput_text} | "
+                f"{native_peak_text} | "
+                f"{int(row.get('count', 0) or 0)} |"
+            )
+            lines.append(
+                f"| {budget_text} | {alg} | "
+                f"{_format_summary_float(row.get('cosine', float('nan')))} | "
+                f"{_format_summary_float(row.get('f1', float('nan')))} | "
+                f"{translated_latency_text} | "
+                f"{translated_throughput_text} | "
+                f"{translated_peak_text} | "
+                f"{int(row.get('count', 0) or 0)} |"
+            )
+        return "\n".join(lines)
+
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
@@ -3297,7 +3856,6 @@ def build_edge_summary_markdown_table(
     generation_dataset_keys = [
         ("SQuAD", "SQuAD-v1.1/validation"),
         ("NewsQA", "NewsQA/validation"),
-        # ("MultiNews", "MultiNews/validation"),
     ]
 
     logit_rows = {
@@ -3328,21 +3886,11 @@ def build_edge_summary_markdown_table(
     translated_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("f1", float("nan")),
         generation_rows["NewsQA"].get("f1", float("nan")),
-        # generation_rows["MultiNews"].get("f1", float("nan")),
     ])
     native_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("native_f1", float("nan")),
         generation_rows["NewsQA"].get("native_f1", float("nan")),
-        # generation_rows["MultiNews"].get("native_f1", float("nan")),
     ])
-
-    if edge is None:
-        target_model_id = "target"
-        direction_title = edge_id
-    else:
-        src_model_id = node_map[edge.src_id].model_id
-        target_model_id = node_map[edge.tgt_id].model_id
-        direction_title = f"{edge.id} 방향 ({src_model_id} -> {target_model_id})"
 
     native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(loss_row, prefix="native")
     translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(loss_row)
@@ -3408,4 +3956,11 @@ def build_final_summary_markdown(
             )
         )
 
-    return "\n\n".join(sections)
+    markdown = "\n\n".join(sections)
+    if _ACTIVE_EVAL_OUTPUT_PATH:
+        summary_path = Path(_ACTIVE_EVAL_OUTPUT_PATH) / "final_summary.md"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(markdown, encoding="utf-8")
+        logging.info("Saved final markdown summary to %s", summary_path)
+    return markdown
+
