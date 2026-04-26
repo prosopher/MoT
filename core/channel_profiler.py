@@ -147,9 +147,12 @@ class ChannelProfiler:
             self.mm.get_model_spec(edge.src_id).num_layers,
             self.mm.get_model_spec(edge.tgt_id).num_layers,
         )
-        probe_window_size = max(1, min_model_layers // 3)
-        probe_window_size = min(probe_window_size, len(candidate_channels))
-        max_probe_window_size = max(probe_window_size, min_model_layers // 2)
+        min_probe_window_size = max(1, round(min_model_layers * self.config.min_window_size_ratio))
+        probe_window_size = min(min_probe_window_size, len(candidate_channels))
+        max_probe_window_size = max(
+            probe_window_size,
+            round(min_model_layers * self.config.max_window_size_ratio),
+        )
         max_probe_window_size = min(max_probe_window_size, len(candidate_channels))
         probe_windows = [
             candidate_channels[idx : idx + probe_window_size]
