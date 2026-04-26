@@ -16,6 +16,8 @@
   "seed": 123,
   "shuffle_buffer": 8,
   "layer_alignment": "injection",
+  "min_window_size_ratio": 0.33,
+  "max_window_size_ratio": 0.5,
   "translator_dim": 8,
   "translator_heads": 1,
   "translator_depth": 1,

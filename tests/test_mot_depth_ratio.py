@@ -53,7 +53,12 @@ class ScoreMappedChannelProfiler(ChannelProfiler):
 def build_profiler(layer_alignment: str) -> tuple[DeterministicChannelProfiler, Edge]:
     edge = Edge(id="A_to_B", src_id="A", tgt_id="B")
     ctx = Context(
-        config=SimpleNamespace(alg="mot", layer_alignment=layer_alignment),
+        config=SimpleNamespace(
+            alg="mot",
+            layer_alignment=layer_alignment,
+            min_window_size_ratio=0.33,
+            max_window_size_ratio=0.5,
+        ),
         nodes=[],
         edges=[edge],
         mm=DummyModelManager({"A": 2, "B": 4}),
@@ -84,7 +89,12 @@ def build_scored_profiler(
 ) -> tuple[ScoreMappedChannelProfiler, Edge]:
     edge = Edge(id="A_to_B", src_id="A", tgt_id="B")
     ctx = Context(
-        config=SimpleNamespace(alg="mot", layer_alignment=layer_alignment),
+        config=SimpleNamespace(
+            alg="mot",
+            layer_alignment=layer_alignment,
+            min_window_size_ratio=0.33,
+            max_window_size_ratio=0.5,
+        ),
         nodes=[],
         edges=[edge],
         mm=DummyModelManager({"A": layer_counts[0], "B": layer_counts[1]}),

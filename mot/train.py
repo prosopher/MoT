@@ -58,6 +58,8 @@ class TrainConfig(Config):
     seed: int
     shuffle_buffer: int
     layer_alignment: str
+    min_window_size_ratio: float
+    max_window_size_ratio: float
     translator_dim: int
     translator_heads: int
     translator_depth: int
@@ -73,6 +75,12 @@ class TrainConfig(Config):
         super().__post_init__()
         if self.layer_alignment not in {"injection", "terminal", "depth-ratio"}:
             raise ValueError("layer_alignment must be one of {'injection', 'terminal', 'depth-ratio'}")
+        if self.min_window_size_ratio <= 0.0:
+            raise ValueError("min_window_size_ratio must be > 0")
+        if self.max_window_size_ratio <= 0.0:
+            raise ValueError("max_window_size_ratio must be > 0")
+        if self.max_window_size_ratio < self.min_window_size_ratio:
+            raise ValueError("max_window_size_ratio must be >= min_window_size_ratio")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
         if self.variant not in MOT_VARIANTS:

@@ -16,6 +16,8 @@
   "seed": 42,
   "shuffle_buffer": 50000,
   "layer_alignment": "depth-ratio",
+  "min_window_size_ratio": 0.33,
+  "max_window_size_ratio": 0.5,
   "translator_dim": 1024,
   "translator_heads": 16,
   "translator_depth": 2,
