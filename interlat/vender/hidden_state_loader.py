@@ -28,7 +28,7 @@ class HiddenStateLoader:
                     if isinstance(nested_array, np.ndarray) and nested_array.dtype == object:
                         list_data = nested_array.tolist()
                         numpy_array = np.array(list_data, dtype=np.float32)
-                        return torch.from_numpy(numpy_array).to(torch.bfloat16)
+                        return torch.from_numpy(numpy_array)
                     return torch.from_numpy(nested_array.astype(np.float32))
                 except Exception as exc:  # pragma: no cover - diagnostic vendor behavior
                     print(f"Conversion failed: {exc}")

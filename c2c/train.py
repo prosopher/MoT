@@ -615,7 +615,7 @@ def build_translator_pool(
             gate_temperature_start=config.gate_temperature_start,
             hard_gate_eval=config.hard_gate_eval,
         )
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     return translator_pool
 
 
@@ -653,7 +653,7 @@ def load_translator_pool_from_checkpoint(
     )
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
 
