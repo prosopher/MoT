@@ -116,6 +116,10 @@ _ACTIVE_GENERATION_BUDGETS: List[Optional[int]] = [None]
 _PENDING_GENERATION_PROFILE_EVENTS: List[Dict[str, Optional[float]]] = []
 
 
+def _is_hotpot_longcontext_filter(name: Optional[str]) -> bool:
+    return name in {"hotpotqa", "hotpotqa_e"}
+
+
 def parse_generation_context_budgets(raw_value: Optional[str]) -> List[Optional[int]]:
     if raw_value is None:
         return [None]
@@ -154,6 +158,9 @@ def normalize_generation_dataset_filter(raw_value: Optional[str]) -> Optional[st
         "hotpot_qa": "hotpotqa",
         "hotpotqa/distractor": "hotpotqa",
         "hotpotqa_distractor": "hotpotqa",
+        "hotpotqa-e": "hotpotqa_e",
+        "hotpotqa_e": "hotpotqa_e",
+        "hotpotqae": "hotpotqa_e",
         "squad": "squad",
         "newsqa": "newsqa",
         "all": None,
@@ -162,7 +169,7 @@ def normalize_generation_dataset_filter(raw_value: Optional[str]) -> Optional[st
     if normalized not in alias_map:
         raise ValueError(
             "Unsupported generation_dataset_filter="
-            f"{raw_value!r}. Expected one of: hotpotqa, squad, newsqa, all."
+            f"{raw_value!r}. Expected one of: hotpotqa, hotpotqa_e, squad, newsqa, all."
         )
     return alias_map[normalized]
 
@@ -192,7 +199,12 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
     )
     _PENDING_GENERATION_PROFILE_EVENTS = []
 
-    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa_e":
+        LOGIT_QA_SPEC_GROUP_FACTORIES[:] = []
+        GEN_QA_SPEC_GROUP_FACTORIES[:] = _make_hotpotqa_e_generation_spec_factories(
+            _ACTIVE_GENERATION_BUDGETS
+        )
+    elif _is_hotpot_longcontext_filter(_ACTIVE_GENERATION_DATASET_FILTER):
         LOGIT_QA_SPEC_GROUP_FACTORIES[:] = []
         GEN_QA_SPEC_GROUP_FACTORIES[:] = _make_hotpotqa_generation_spec_factories(
             _ACTIVE_GENERATION_BUDGETS
@@ -362,6 +374,8 @@ class HFDatasetSpec:
     streaming: bool = False
     manual_context_budget: Optional[int] = None
     dataset_family: Optional[str] = None
+    data_files: Optional[Any] = None
+    revision: Optional[str] = None
 
 
 class HFQAPairStream(IterableDataset):
@@ -383,17 +397,24 @@ class HFQAPairStream(IterableDataset):
 
     def _load_dataset(self, dataset_name: Optional[str] = None):
         resolved_dataset_name = self.spec.dataset_name if dataset_name is None else dataset_name
+        load_kwargs = {
+            "split": self.spec.split,
+            "streaming": self.spec.streaming,
+        }
+        if self.spec.data_files is not None:
+            load_kwargs["data_files"] = self.spec.data_files
+        if self.spec.revision is not None:
+            load_kwargs["revision"] = self.spec.revision
+
         if resolved_dataset_name is None:
             return load_dataset(
                 self.spec.dataset_path,
-                split=self.spec.split,
-                streaming=self.spec.streaming,
+                **load_kwargs,
             )
         return load_dataset(
             self.spec.dataset_path,
             resolved_dataset_name,
-            split=self.spec.split,
-            streaming=self.spec.streaming,
+            **load_kwargs,
         )
 
     def _collect_multi_config_examples(self) -> List[Dict[str, Any]]:
@@ -717,6 +738,28 @@ def get_hotpotqa_distractor_generation_dataset_spec(
     )
 
 
+def get_hotpotqa_e_generation_dataset_spec(
+    manual_context_budget: Optional[int] = None,
+) -> HFDatasetSpec:
+    budget_suffix = "" if manual_context_budget is None else f"@ctx={manual_context_budget}"
+    return HFDatasetSpec(
+        name_for_log=f"HotpotQA-E/test{budget_suffix}",
+        dataset_path="parquet",
+        dataset_name=None,
+        split="test",
+        answer_mode="squad",
+        question_field="input",
+        context_field="context",
+        answers_field="answers",
+        streaming=False,
+        manual_context_budget=manual_context_budget,
+        dataset_family="hotpotqa_e",
+        data_files={
+            "test": "https://huggingface.co/datasets/zai-org/LongBench/resolve/92b6c5fbfb0c97b91e92d9ef79802f95ce74b05e/hotpotqa_e/test-00000-of-00001.parquet",
+        },
+    )
+
+
 def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
         name_for_log="MultiNews/validation",
@@ -762,6 +805,19 @@ def _make_hotpotqa_generation_spec_factories(
     ]
 
 
+def _make_hotpotqa_e_generation_spec_factories(
+    budgets: List[Optional[int]],
+) -> List[Callable[[], HFDatasetSpec]]:
+    return [
+        (
+            lambda budget=budget: get_hotpotqa_e_generation_dataset_spec(
+                manual_context_budget=budget
+            )
+        )
+        for budget in budgets
+    ]
+
+
 _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES = list(LOGIT_QA_SPEC_GROUP_FACTORIES)
 _ORIGINAL_GEN_QA_SPEC_GROUP_FACTORIES = list(GEN_QA_SPEC_GROUP_FACTORIES)
 
@@ -785,7 +841,7 @@ def build_openwebtext_eval_dataloader(
     shuffle_buffer: Optional[int] = None,
     seed_offset: int = 10_000,
 ) -> DataLoader:
-    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+    if _is_hotpot_longcontext_filter(_ACTIVE_GENERATION_DATASET_FILTER):
         logging.info(
             "Skipping OpenWebText dataloader construction because generation_dataset_filter=%s",
             _ACTIVE_GENERATION_DATASET_FILTER,
@@ -1161,7 +1217,7 @@ def evaluate_openwebtext_validation_loss_metrics(
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+    if _is_hotpot_longcontext_filter(_ACTIVE_GENERATION_DATASET_FILTER):
         logging.info(
             "Skipping OpenWebText validation because generation_dataset_filter=%s",
             _ACTIVE_GENERATION_DATASET_FILTER,
@@ -1572,7 +1628,7 @@ def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
 
 
 def get_default_logit_qa_dataset_specs() -> List[HFDatasetSpec]:
-    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+    if _is_hotpot_longcontext_filter(_ACTIVE_GENERATION_DATASET_FILTER):
         return []
     return get_eval_spec_group("logit_qa")
 
@@ -1581,6 +1637,11 @@ def get_default_gen_qa_dataset_specs() -> List[HFDatasetSpec]:
     if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
         return [
             get_hotpotqa_distractor_generation_dataset_spec(manual_context_budget=budget)
+            for budget in _ACTIVE_GENERATION_BUDGETS
+        ]
+    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa_e":
+        return [
+            get_hotpotqa_e_generation_dataset_spec(manual_context_budget=budget)
             for budget in _ACTIVE_GENERATION_BUDGETS
         ]
     if _ACTIVE_GENERATION_DATASET_FILTER == "squad":
@@ -1777,17 +1838,24 @@ class HFGenerationExampleStream(IterableDataset):
         self._cached_multi_config_examples: Optional[List[Dict[str, Any]]] = None
 
     def _load_dataset(self):
+        load_kwargs = {
+            "split": self.spec.split,
+            "streaming": self.spec.streaming,
+        }
+        if self.spec.data_files is not None:
+            load_kwargs["data_files"] = self.spec.data_files
+        if self.spec.revision is not None:
+            load_kwargs["revision"] = self.spec.revision
+
         if self.spec.dataset_name is None:
             return load_dataset(
                 self.spec.dataset_path,
-                split=self.spec.split,
-                streaming=self.spec.streaming,
+                **load_kwargs,
             )
         return load_dataset(
             self.spec.dataset_path,
             self.spec.dataset_name,
-            split=self.spec.split,
-            streaming=self.spec.streaming,
+            **load_kwargs,
         )
 
     def __iter__(self):
@@ -3141,7 +3209,8 @@ def predict_generation_task_answer(
         )
 
     profiler = InferenceProfiler(str(seed_token.device))
-    (answer_text, generated_tokens), profile_event = profiler.measure(
+    started_at = time.perf_counter()
+    (answer_text, generated_tokens), peak_memory_bytes = profiler._measure_peak_allocated_bytes(
         lambda: generate_greedy_answer(
             model=model,
             tokenizer=tokenizer,
@@ -3149,11 +3218,14 @@ def predict_generation_task_answer(
             seed_token=seed_token,
             max_new_tokens=eval_config.generation_max_new_tokens,
             return_num_generated_tokens=True,
-        ),
-        tokens=0,
+        )
     )
-    profile_event["tokens"] = int(generated_tokens)
-    _PENDING_GENERATION_PROFILE_EVENTS.append(profile_event)
+    latency_sec = time.perf_counter() - started_at
+    _PENDING_GENERATION_PROFILE_EVENTS.append({
+        "latency_sec": float(latency_sec),
+        "tokens": int(generated_tokens),
+        "peak_memory_bytes": peak_memory_bytes,
+    })
     return answer_text
 
 
@@ -3628,87 +3700,6 @@ def log_dataset_result(
         )
 
 
-def _build_generation_metrics_output_dir(output_path: Union[str, Path]) -> Path:
-    return Path(output_path) / "generation_metrics"
-
-
-def _sanitize_dataset_name_for_filename(dataset_name: str) -> str:
-    allowed = []
-    for char in dataset_name:
-        if char.isalnum() or char in {"-", "_"}:
-            allowed.append(char)
-        else:
-            allowed.append("_")
-    return "".join(allowed).strip("_") or "dataset"
-
-
-def _build_generation_dataset_metrics_markdown(
-    dataset_name: str,
-    results: Dict[str, Dict[str, float]],
-    nodes: List[Node],
-    edges: List[Edge],
-) -> str:
-    lines = [
-        f"## {dataset_name}",
-        "",
-        "| Direction | Cosine Sim | F1 | Native F1 | Latency | Throughput | GPU Peak | Native Latency | Native Throughput | Native GPU Peak | Count |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for edge in edges:
-        row = results[edge.id]
-        pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
-        translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(row)
-        native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(row, prefix="native")
-        lines.append(
-            f"| {pretty_name} | "
-            f"{_format_summary_float(row.get('cosine', float('nan')))} | "
-            f"{_format_summary_float(row.get('f1', float('nan')))} | "
-            f"{_format_summary_float(row.get('native_f1', float('nan')))} | "
-            f"{translated_latency_text} | "
-            f"{translated_throughput_text} | "
-            f"{translated_peak_text} | "
-            f"{native_latency_text} | "
-            f"{native_throughput_text} | "
-            f"{native_peak_text} | "
-            f"{int(row.get('count', 0) or 0)} |"
-        )
-    return "\n".join(lines)
-
-
-def save_generation_dataset_result_artifacts(
-    dataset_name: str,
-    results: Dict[str, Dict[str, float]],
-    nodes: List[Node],
-    edges: List[Edge],
-) -> None:
-    if not _ACTIVE_EVAL_OUTPUT_PATH:
-        return
-
-    output_dir = _build_generation_metrics_output_dir(_ACTIVE_EVAL_OUTPUT_PATH)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_dataset_name = _sanitize_dataset_name_for_filename(dataset_name)
-    json_path = output_dir / f"{safe_dataset_name}.json"
-    markdown_path = output_dir / f"{safe_dataset_name}.md"
-
-    payload = {
-        "dataset_name": dataset_name,
-        "edges": {
-            edge.id: {
-                "pretty_name": build_edge_pretty_name(edge.id, nodes, edges),
-                **results.get(edge.id, {}),
-            }
-            for edge in edges
-        },
-    }
-    write_json(str(json_path), payload)
-    markdown_path.write_text(
-        _build_generation_dataset_metrics_markdown(dataset_name, results, nodes, edges),
-        encoding="utf-8",
-    )
-    logging.info("Saved generation metrics artifacts to %s and %s", json_path, markdown_path)
-
-
 def log_generation_dataset_result(
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
@@ -3729,7 +3720,6 @@ def log_generation_dataset_result(
             build_openwebtext_profile_cell(row, prefix="native"),
             row["count"],
         )
-    save_generation_dataset_result_artifacts(dataset_name, results, nodes, edges)
 
 
 def _is_valid_summary_value(value: Any) -> bool:
@@ -3810,7 +3800,7 @@ def build_edge_summary_markdown_table(
     hotpot_dataset_keys = [
         dataset_key
         for dataset_key in all_generation_results
-        if dataset_key.startswith("HotpotQA/distractor/validation")
+        if dataset_key.startswith("HotpotQA")
     ]
     if hotpot_dataset_keys:
         sorted_dataset_keys = sorted(
