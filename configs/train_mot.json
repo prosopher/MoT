@@ -23,8 +23,8 @@
   "device": "auto",
   "dtype": "float32",
   "variant": "mot",
-  "mot_num_translators": 4,
-  "mot_top_k": 2,
+  "mot_num_translators": 2,
+  "mot_top_k": 1,
   "topk_sparse_attn": 32,
   "num_bottom_full_attn": 2
 }
