@@ -257,7 +257,7 @@ def freeze_model(model: PreTrainedModel) -> None:
         param.requires_grad_(False)
 
 
-def load_frozen_model(model_id: str, device: str, dtype: str = "float32") -> PreTrainedModel:
+def load_frozen_model(model_id: str, device: str, dtype: str) -> PreTrainedModel:
     if _looks_like_qwen2_model_id(model_id):
         _ensure_qwen2_compat_for_old_transformers()
     torch_dtype = get_torch_dtype(dtype)
@@ -268,10 +268,35 @@ def load_frozen_model(model_id: str, device: str, dtype: str = "float32") -> Pre
 
 
 
+def get_model_parameter_dtype(model: PreTrainedModel) -> Optional[torch.dtype]:
+    try:
+        return next(model.parameters()).dtype
+    except StopIteration:
+        return None
+
+
+def cast_past_key_values_dtype(
+    past_key_values: PastKeyValues,
+    dtype: Optional[torch.dtype],
+) -> PastKeyValues:
+    if dtype is None:
+        return past_key_values
+    return tuple(
+        (
+            key.to(dtype=dtype) if torch.is_floating_point(key) else key,
+            value.to(dtype=dtype) if torch.is_floating_point(value) else value,
+        )
+        for key, value in past_key_values
+    )
+
+
 @torch.no_grad()
 def extract_past_key_values(model: PreTrainedModel, input_ids: torch.Tensor) -> PastKeyValues:
     outputs = model(input_ids=input_ids, use_cache=True)
-    return outputs.past_key_values
+    return cast_past_key_values_dtype(
+        outputs.past_key_values,
+        get_model_parameter_dtype(model),
+    )
 
 
 def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Tensor, torch.Tensor]:

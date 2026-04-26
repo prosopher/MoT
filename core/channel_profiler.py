@@ -15,7 +15,7 @@ from .common import (
 )
 from .context import Context
 from .topology import Edge, build_node_map
-from .train_util import InfiniteDataLoader
+from .train_util import InfiniteDataLoader, get_training_dtype
 
 
 @dataclass(frozen=True)
@@ -566,7 +566,7 @@ class ChannelProfiler:
             variant="single",
             mot_num_translators=1,
             mot_top_k=1,
-        ).to(self.config.device)
+        ).to(device=self.config.device, dtype=get_training_dtype(self.config))
         if self.profile_config.max_steps < 1:
             return proxy
 
