@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 
 @dataclass
@@ -9,6 +9,16 @@ class ModelSpec:
     hidden_size: int
     num_heads: int
     head_dim: int
+    num_key_value_heads: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_heads
+        self.num_key_value_heads = int(self.num_key_value_heads)
+
+    @property
+    def kv_hidden_size(self) -> int:
+        return int(self.num_key_value_heads) * self.head_dim
 
 
 _NUM_HEAD_FIELDS = ("num_attention_heads", "n_head")
@@ -29,9 +39,23 @@ def infer_model_spec_from_config(config: Any, *, default_model_id: str = "unknow
     num_heads = _read_required_config_value(config, _NUM_HEAD_FIELDS, "num_heads")
     hidden_size = _read_required_config_value(config, _HIDDEN_SIZE_FIELDS, "hidden_size")
     num_layers = _read_required_config_value(config, _NUM_LAYERS_FIELDS, "num_layers")
+    configured_num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    num_key_value_heads = num_heads if configured_num_key_value_heads is None else int(configured_num_key_value_heads)
+    configured_head_dim = getattr(config, "head_dim", None)
+    head_dim = hidden_size // num_heads if configured_head_dim is None else int(configured_head_dim)
 
-    if hidden_size % num_heads != 0:
-        raise ValueError(f"hidden_size must be divisible by num_heads, got {hidden_size} and {num_heads}")
+    if hidden_size != num_heads * head_dim:
+        raise ValueError(
+            "hidden_size must equal num_heads * head_dim, "
+            f"got hidden_size={hidden_size}, num_heads={num_heads}, head_dim={head_dim}"
+        )
+    if num_key_value_heads < 1:
+        raise ValueError(f"num_key_value_heads must be >= 1, got {num_key_value_heads}")
+    if num_heads % num_key_value_heads != 0:
+        raise ValueError(
+            "num_heads must be divisible by num_key_value_heads for GQA/MQA, "
+            f"got {num_heads} and {num_key_value_heads}"
+        )
 
     model_id = getattr(config, "_name_or_path", default_model_id)
     return ModelSpec(
@@ -39,5 +63,6 @@ def infer_model_spec_from_config(config: Any, *, default_model_id: str = "unknow
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_heads=num_heads,
-        head_dim=hidden_size // num_heads,
+        head_dim=head_dim,
+        num_key_value_heads=num_key_value_heads,
     )
