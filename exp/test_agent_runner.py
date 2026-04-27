@@ -7,12 +7,6 @@ from typing import Any, Dict, List
 
 import torch
 
-import sys
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
 from core.agent_runner import AgentRunner, AgentRunnerConfig
 from core.common import build_timestamp_string, setup_logging, write_json
 from core.eval_util import (
@@ -25,7 +19,7 @@ from core.eval_util import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a small SQuAD multi-agent KV-cache conversation experiment.")
-    parser.add_argument("alg", nargs="?", default="mot", choices=["c2c", "interlat", "lsc", "kvcomm", "mot", "mot-h"], help="Algorithm to run; defaults to mot.")
+    parser.add_argument("alg", choices=["c2c", "interlat", "lsc", "kvcomm", "mot", "mot-h"], help="Algorithm to run.")
     parser.add_argument("--checkpoint-dir-path", required=True)
     parser.add_argument("--outputs-path", default="outputs")
     parser.add_argument("--output-path", default=None)
@@ -42,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-turns", dest="log_turns", action="store_true", default=True, help="Print every AgentRunner conversation turn to stdout/log file.")
     parser.add_argument("--no-log-turns", dest="log_turns", action="store_false", help="Disable per-turn AgentRunner logs.")
     parser.add_argument("--log-max-chars", type=int, default=600, help="Maximum prompt/response characters shown per turn log line.")
-    parser.add_argument("--cache-mode", choices=["retain", "free"], default="retain", help="KV cache lifecycle mode: retain keeps all agent caches; free keeps Hub A cache and clears non-hub caches after offload.")
+    parser.add_argument("--cache-mode", choices=["retain", "free"], default="retain", help="KV cache lifecycle mode: retain keeps all agent caches; free keeps the Hub cache and clears every non-hub cache after offload.")
     return parser
 
 
@@ -113,6 +107,9 @@ def main() -> None:
                     "prediction": result.prediction,
                     "f1": result.f1,
                     "peak_memory_bytes": current_peak,
+                    "agent_ids": result.agent_ids,
+                    "hub_agent_id": result.hub_agent_id,
+                    "cache_mode": result.cache_mode,
                     "turns": [asdict(turn) for turn in result.turns],
                     "transcript": result.transcript,
                 }
@@ -131,6 +128,9 @@ def main() -> None:
     metrics = {
         "algorithm": args.alg,
         "cache_mode": args.cache_mode,
+        "agent_ids": runner.node_ids,
+        "hub_agent_id": runner.hub_agent.node_id,
+        "free_mode_peak_cache_agent_bound": runner._free_mode_peak_cache_agent_bound(),
         "checkpoint_dir_path": args.checkpoint_dir_path,
         "dataset": spec.name_for_log,
         "count": count,
