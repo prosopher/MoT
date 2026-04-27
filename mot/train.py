@@ -581,8 +581,6 @@ def normalize_model_family(model_id: str) -> Optional[str]:
     normalized = str(model_id).strip().lower()
     if "qwen2" in normalized or "qwen2.5" in normalized or "qwen/qwen2" in normalized:
         return "qwen2"
-    if "pythia" in normalized or "gpt-neox" in normalized or "gpt_neox" in normalized:
-        return "gpt_neox"
     if "facebook/opt" in normalized or "/opt-" in normalized or normalized.startswith("opt-"):
         return "opt"
     if "gpt2" in normalized:
@@ -602,14 +600,9 @@ def resolve_target_model_family(
     config_model_type = str(getattr(getattr(target_model, "config", None), "model_type", "")).lower()
     if config_model_type in {"qwen2", "qwen2_5"}:
         return "qwen2"
-    if config_model_type in {"gpt_neox", "pythia"}:
-        return "gpt_neox"
 
     if getattr(target_model, "transformer", None) is not None and hasattr(target_model.transformer, "h"):
         return "gpt2"
-    gpt_neox = getattr(target_model, "gpt_neox", None)
-    if gpt_neox is not None and hasattr(gpt_neox, "layers") and hasattr(gpt_neox, "embed_in"):
-        return "gpt_neox"
     model_wrapper = getattr(target_model, "model", None)
     if (
         model_wrapper is not None
@@ -626,8 +619,8 @@ def resolve_target_model_family(
         return "opt"
 
     raise ValueError(
-        "mot target-model replay supports GPT-2, OPT, Qwen2/Qwen2.5, and Pythia/GPT-NeoX "
-        f"decoder stacks only (target_model_id={target_model_id!r})."
+        "mot target-model replay supports GPT-2, OPT, and Qwen2/Qwen2.5 decoder stacks only "
+        f"(target_model_id={target_model_id!r})."
     )
 
 
@@ -654,16 +647,6 @@ def require_opt_decoder(model: PreTrainedModel):
     return decoder
 
 
-def require_gpt_neox_model(model: PreTrainedModel):
-    gpt_neox = getattr(model, "gpt_neox", None)
-    if gpt_neox is None and hasattr(model, "layers") and hasattr(model, "embed_in"):
-        gpt_neox = model
-    if gpt_neox is None or not hasattr(gpt_neox, "layers") or not hasattr(gpt_neox, "embed_in"):
-        raise ValueError(
-            "mot currently supports Pythia/GPT-NeoX style decoder stacks only "
-            "(expected model.gpt_neox.layers/model.gpt_neox.embed_in to exist)."
-        )
-    return gpt_neox
 
 
 def require_qwen2_model(model: PreTrainedModel):
@@ -729,41 +712,6 @@ def build_opt_input_hidden_states(
     return hidden_states, token_attention_mask, attention_mask
 
 
-def get_dropout_probability(dropout_or_probability: Any, default: float = 0.0) -> float:
-    if dropout_or_probability is None:
-        return default
-    if isinstance(dropout_or_probability, (int, float)):
-        return float(dropout_or_probability)
-    if hasattr(dropout_or_probability, "p"):
-        return float(getattr(dropout_or_probability, "p"))
-    return default
-
-
-def apply_dropout(dropout_or_probability: Any, hidden_states: torch.Tensor, *, training: bool) -> torch.Tensor:
-    if isinstance(dropout_or_probability, nn.Module):
-        return dropout_or_probability(hidden_states)
-    return F.dropout(
-        hidden_states,
-        p=get_dropout_probability(dropout_or_probability),
-        training=training,
-    )
-
-
-def build_gpt_neox_input_hidden_states(
-    model: PreTrainedModel,
-    input_ids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-    gpt_neox = require_gpt_neox_model(model)
-    if input_ids.ndim != 2:
-        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-
-    hidden_states = gpt_neox.embed_in(input_ids)
-    hidden_states = apply_dropout(getattr(gpt_neox, "emb_dropout", None), hidden_states, training=gpt_neox.training)
-    attention_mask = build_causal_attention_mask(hidden_states)
-    return hidden_states, position_ids, attention_mask, None
-
 
 def build_qwen2_input_hidden_states(
     model: PreTrainedModel,
@@ -804,7 +752,7 @@ def extract_source_attention_topk_indices(
         "output_attentions": True,
         "return_dict": True,
     }
-    if model_family in {"opt", "qwen2", "gpt_neox"}:
+    if model_family in {"opt", "qwen2"}:
         model_kwargs["attention_mask"] = torch.ones_like(prefix_input_ids)
     with torch.no_grad():
         outputs = source_model(**model_kwargs)
@@ -951,34 +899,6 @@ def repeat_key_value_heads(hidden_states: torch.Tensor, n_rep: int) -> torch.Ten
         head_dim,
     )
     return hidden_states.reshape(batch_size, num_key_value_heads * n_rep, seq_len, head_dim)
-
-
-def get_gpt_neox_attention_shape(attn: nn.Module, hidden_size: int) -> Tuple[int, int]:
-    config = getattr(attn, "config", None)
-    num_heads = getattr(attn, "num_attention_heads", None)
-    if num_heads is None:
-        num_heads = getattr(attn, "num_heads", None)
-    if num_heads is None and config is not None:
-        num_heads = getattr(config, "num_attention_heads", None)
-    if num_heads is None:
-        raise ValueError("Unable to determine GPT-NeoX/Pythia attention head count.")
-    num_heads = int(num_heads)
-
-    head_dim = getattr(attn, "head_size", None)
-    if head_dim is None:
-        head_dim = getattr(attn, "head_dim", None)
-    if head_dim is None and config is not None:
-        head_dim = getattr(config, "hidden_size", hidden_size) // num_heads
-    if head_dim is None:
-        head_dim = hidden_size // num_heads
-    head_dim = int(head_dim)
-
-    if hidden_size != num_heads * head_dim:
-        raise ValueError(
-            "GPT-NeoX/Pythia hidden_size must equal num_heads * head_dim, "
-            f"got hidden_size={hidden_size}, num_heads={num_heads}, head_dim={head_dim}"
-        )
-    return num_heads, head_dim
 
 
 def get_qwen2_attention_shape(attn: nn.Module, hidden_size: int) -> Tuple[int, int, int, int]:
@@ -1166,108 +1086,6 @@ def run_opt_block(
         hidden_states = block.final_layer_norm(hidden_states)
     return hidden_states, (native_key, native_value)
 
-
-
-def run_gpt_neox_block(
-    block: nn.Module,
-    hidden_states: torch.Tensor,
-    *,
-    position_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    sparse_attention_indices: Optional[torch.Tensor] = None,
-    injected_key: Optional[torch.Tensor] = None,
-    injected_value: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if (injected_key is None) != (injected_value is None):
-        raise ValueError("injected_key and injected_value must be provided together.")
-    if injected_key is not None and injected_key.shape != injected_value.shape:
-        raise ValueError(
-            "Injected key/value must have identical shapes, "
-            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
-        )
-
-    attn = block.attention
-    batch_size, seq_len, hidden_size = hidden_states.shape
-    num_heads, head_dim = get_gpt_neox_attention_shape(attn, hidden_size)
-    expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
-
-    residual = hidden_states
-    attn_input = block.input_layernorm(hidden_states)
-    qkv = attn.query_key_value(attn_input)
-    qkv = qkv.view(batch_size, seq_len, num_heads, 3 * head_dim)
-    query_states, native_key, native_value = torch.split(qkv, head_dim, dim=-1)
-    query_states = query_states.permute(0, 2, 1, 3).contiguous()
-    native_key = native_key.permute(0, 2, 1, 3).contiguous()
-    native_value = native_value.permute(0, 2, 1, 3).contiguous()
-
-    rotary_dim = int(getattr(attn, "rotary_ndims", getattr(attn, "rotary_dim", 0)) or 0)
-    if rotary_dim > 0:
-        rotary_emb = getattr(attn, "rotary_emb", None)
-        if rotary_emb is None:
-            raise ValueError("Pythia/GPT-NeoX replay requires layer.attention.rotary_emb to exist.")
-        try:
-            cos, sin = rotary_emb(native_value, seq_len=seq_len)
-        except TypeError:
-            cos, sin = rotary_emb(native_value, position_ids)
-        query_states, native_key = apply_rotary_pos_emb(query_states, native_key, cos, sin, position_ids)
-
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
-    if tuple(attention_key.shape) != expected_cache_shape:
-        raise ValueError(
-            "Attention cache shape mismatch for Pythia/GPT-NeoX layer replay: "
-            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
-        )
-
-    norm_factor = getattr(attn, "norm_factor", None)
-    scaling = (1.0 / float(norm_factor)) if norm_factor is not None else (head_dim ** -0.5)
-
-    if sparse_attention_indices is not None:
-        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
-        selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
-        selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
-        attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
-        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_heads)
-        attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        dropout = getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0))
-        attn_weights = F.dropout(
-            attn_weights,
-            p=get_dropout_probability(dropout),
-            training=block.training,
-        )
-        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
-    else:
-        attn_weights = torch.matmul(query_states, attention_key.transpose(-1, -2)) * scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        dropout = getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0))
-        attn_weights = F.dropout(
-            attn_weights,
-            p=get_dropout_probability(dropout),
-            training=block.training,
-        )
-        attn_output = torch.matmul(attn_weights, attention_value)
-
-    attn_output = attn_output.permute(0, 2, 1, 3).contiguous().reshape(batch_size, seq_len, num_heads * head_dim)
-    attn_output = attn.dense(attn_output)
-
-    post_attention_dropout = getattr(block, "post_attention_dropout", 0.0)
-    post_mlp_dropout = getattr(block, "post_mlp_dropout", 0.0)
-    if bool(getattr(block, "use_parallel_residual", True)):
-        mlp_output = block.mlp(block.post_attention_layernorm(residual))
-        hidden_states = (
-            residual
-            + apply_dropout(post_attention_dropout, attn_output, training=block.training)
-            + apply_dropout(post_mlp_dropout, mlp_output, training=block.training)
-        )
-    else:
-        hidden_states = residual + apply_dropout(post_attention_dropout, attn_output, training=block.training)
-        mlp_output = block.mlp(block.post_attention_layernorm(hidden_states))
-        hidden_states = hidden_states + apply_dropout(post_mlp_dropout, mlp_output, training=block.training)
-
-    return hidden_states, (native_key, native_value)
 
 
 def run_qwen2_block(
@@ -1489,33 +1307,6 @@ def replay_target_prefill_with_injected_window(
                 hidden_states,
                 attention_mask=attention_mask,
                 token_attention_mask=token_attention_mask,
-                sparse_attention_indices=sparse_attention_indices,
-                injected_key=injected_key,
-                injected_value=injected_value,
-            )
-
-    elif model_family == "gpt_neox":
-        gpt_neox = require_gpt_neox_model(target_model)
-        target_blocks = gpt_neox.layers
-
-        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-            return build_gpt_neox_input_hidden_states(target_model, prefix_input_ids)
-
-        def run_block(
-            block: nn.Module,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-            _: Any,
-            sparse_attention_indices: Optional[torch.Tensor],
-            injected_key: Optional[torch.Tensor] = None,
-            injected_value: Optional[torch.Tensor] = None,
-        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-            return run_gpt_neox_block(
-                block,
-                hidden_states,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
