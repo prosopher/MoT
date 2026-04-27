@@ -1,7 +1,9 @@
+import math
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 from core.channel_manager import ChannelManager
 from core.channel_profiler import ChannelProfileConfig, ChannelProfiler, ProxyValidationScore
@@ -247,3 +249,127 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
         ("cache", 10),
         ("inject", 11),
     ]
+
+
+
+def test_resolve_target_model_family_accepts_pythia_gpt_neox() -> None:
+    assert mot_train_module.normalize_model_family("EleutherAI/pythia-70m") == "gpt_neox"
+    assert mot_train_module.normalize_model_family("EleutherAI/gpt-neox-20b") == "gpt_neox"
+
+    target_model = SimpleNamespace(
+        config=SimpleNamespace(model_type="gpt_neox"),
+        gpt_neox=SimpleNamespace(layers=[], embed_in=object()),
+    )
+
+    assert mot_train_module.resolve_target_model_family(target_model) == "gpt_neox"
+
+
+
+def test_replay_dispatches_pythia_gpt_neox_layers(monkeypatch) -> None:
+    call_order: list[tuple[str, int]] = []
+
+    gpt_neox = SimpleNamespace(
+        layers=[SimpleNamespace(layer_idx=idx) for idx in range(4)],
+        embed_in=object(),
+        training=False,
+    )
+    target_model = SimpleNamespace(config=SimpleNamespace(model_type="gpt_neox"), gpt_neox=gpt_neox)
+
+    def fake_build_gpt_neox_input_hidden_states(model, input_ids):
+        del model
+        batch_size, seq_len = input_ids.shape
+        hidden_states = torch.zeros(batch_size, seq_len, 8)
+        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
+        attention_mask = torch.zeros(batch_size, 1, seq_len, seq_len)
+        return hidden_states, position_ids, attention_mask, None
+
+    def fake_run_gpt_neox_block(
+        block,
+        hidden_states,
+        *,
+        position_ids,
+        attention_mask,
+        sparse_attention_indices=None,
+        injected_key=None,
+        injected_value=None,
+    ):
+        del position_ids, attention_mask, sparse_attention_indices, injected_value
+        call_order.append(("cache" if injected_key is None else "inject", block.layer_idx))
+        present = (
+            torch.full((1, 2, 1, 4), float(block.layer_idx)),
+            torch.full((1, 2, 1, 4), float(block.layer_idx)),
+        )
+        return hidden_states, present
+
+    monkeypatch.setattr(mot_train_module, "build_gpt_neox_input_hidden_states", fake_build_gpt_neox_input_hidden_states)
+    monkeypatch.setattr(mot_train_module, "run_gpt_neox_block", fake_run_gpt_neox_block)
+
+    with torch.no_grad():
+        replayed_past = replay_target_prefill_with_injected_window(
+            target_model=target_model,
+            prefix_input_ids=torch.tensor([[1]]),
+            target_layer_indices=[1, 3],
+            injected_key_block=torch.zeros(1, 1, 2, 8),
+            injected_value_block=torch.zeros(1, 1, 2, 8),
+            tgt_spec=ModelSpec(
+                model_id="pythia-target",
+                num_layers=4,
+                hidden_size=8,
+                num_heads=2,
+                head_dim=4,
+            ),
+        )
+
+    assert len(replayed_past) == 4
+    assert call_order == [
+        ("cache", 0),
+        ("inject", 1),
+        ("cache", 2),
+        ("inject", 3),
+    ]
+
+
+class TinyGPTNeoXAttention(nn.Module):
+    def __init__(self, hidden_size: int = 8, num_heads: int = 2) -> None:
+        super().__init__()
+        self.num_attention_heads = num_heads
+        self.head_size = hidden_size // num_heads
+        self.rotary_ndims = 0
+        self.norm_factor = math.sqrt(self.head_size)
+        self.query_key_value = nn.Linear(hidden_size, 3 * hidden_size)
+        self.dense = nn.Linear(hidden_size, hidden_size)
+        self.attention_dropout = 0.0
+
+
+class TinyGPTNeoXBlock(nn.Module):
+    def __init__(self, hidden_size: int = 8, num_heads: int = 2, use_parallel_residual: bool = True) -> None:
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(hidden_size)
+        self.post_attention_layernorm = nn.LayerNorm(hidden_size)
+        self.attention = TinyGPTNeoXAttention(hidden_size=hidden_size, num_heads=num_heads)
+        self.mlp = nn.Sequential(nn.Linear(hidden_size, 4 * hidden_size), nn.GELU(), nn.Linear(4 * hidden_size, hidden_size))
+        self.post_attention_dropout = nn.Dropout(0.0)
+        self.post_mlp_dropout = nn.Dropout(0.0)
+        self.use_parallel_residual = use_parallel_residual
+
+
+@pytest.mark.parametrize("use_parallel_residual", [True, False])
+def test_run_gpt_neox_block_rebuilds_native_cache(use_parallel_residual: bool) -> None:
+    torch.manual_seed(123)
+    block = TinyGPTNeoXBlock(use_parallel_residual=use_parallel_residual)
+    block.eval()
+    hidden_states = torch.randn(1, 3, 8)
+    position_ids = torch.arange(3).unsqueeze(0)
+    attention_mask = mot_train_module.build_causal_attention_mask(hidden_states)
+
+    output, present = mot_train_module.run_gpt_neox_block(
+        block,
+        hidden_states,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+    )
+
+    assert output.shape == hidden_states.shape
+    assert present[0].shape == (1, 2, 3, 4)
+    assert present[1].shape == (1, 2, 3, 4)
+    assert torch.isfinite(output).all()
