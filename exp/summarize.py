@@ -43,7 +43,7 @@ EVAL_BAR_METRICS = [
 MOT_COLOR = "#D85A59"
 MOT_H_COLOR = "#E98C88"
 OTHER_BAR_COLOR = "#C7CDD6"
-UPPERBOUND_COLOR = "#4C5159"
+NATIVE_COLOR = "#4C5159"
 NON_RED_ORANGE_PURPLE_RADAR_PALETTES = (
     "tab20",
     "tab20b",
@@ -62,7 +62,7 @@ ALGORITHM_DISPLAY_NAMES = {
     "lsc": "LSC",
     "mot": "MoT",
     "mot-h": "MoT-h",
-    "upperbound": "Upperbound",
+    "native": "Native",
 }
 
 
@@ -77,8 +77,8 @@ class Series:
 @dataclass
 class LoadResult:
     series_by_edge: Dict[str, List[Series]]
-    native_upperbound_by_edge: Dict[str, Dict[str, float]]
-    upperbound_source_file_by_edge: Dict[str, str]
+    native_accuracy_by_edge: Dict[str, Dict[str, float]]
+    native_source_file_by_edge: Dict[str, str]
 
 
 @dataclass
@@ -86,7 +86,7 @@ class EvalSection:
     edge_id: str
     title: str
     headers: List[str]
-    upperbound_row: Dict[str, str]
+    native_row: Dict[str, str]
     method_row: Dict[str, str]
 
 
@@ -96,7 +96,7 @@ class EvalRecord:
     method: str
     values: Dict[str, str]
     source_log: Path
-    is_upperbound: bool = False
+    is_native: bool = False
 
 
 @dataclass
@@ -168,10 +168,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--disable-upperbound",
+        "--disable-native",
         action="store_true",
         help=(
-            "Do not draw the black 'upperbound' line derived from the first JSON file's "
+            "Do not draw the black 'native' line derived from the first JSON file's "
             "native_accuracy values."
         ),
     )
@@ -192,11 +192,11 @@ def category_order(categories: Sequence[str]) -> List[str]:
     return ordered + leftover
 
 
-def extract_native_upperbound(data: dict) -> Dict[str, Dict[str, float]]:
-    native_upperbound_by_edge: Dict[str, Dict[str, float]] = {}
+def extract_native_accuracy(data: dict) -> Dict[str, Dict[str, float]]:
+    native_accuracy_by_edge: Dict[str, Dict[str, float]] = {}
     edges = data.get("edges", {})
     if not isinstance(edges, dict):
-        return native_upperbound_by_edge
+        return native_accuracy_by_edge
 
     for edge_id, edge_payload in edges.items():
         if not isinstance(edge_payload, dict):
@@ -218,9 +218,9 @@ def extract_native_upperbound(data: dict) -> Dict[str, Dict[str, float]]:
                 continue
 
         if category_to_native:
-            native_upperbound_by_edge[str(edge_id)] = category_to_native
+            native_accuracy_by_edge[str(edge_id)] = category_to_native
 
-    return native_upperbound_by_edge
+    return native_accuracy_by_edge
 
 
 def list_subject_category_json_files(exp_path: Path) -> List[Path]:
@@ -240,18 +240,18 @@ def load_series(exp_path: Path) -> LoadResult:
             f"No mmlu_redux_subject_category_accuracy.json files found in {exp_path}/*/"
         )
 
-    native_upperbound_by_edge: Dict[str, Dict[str, float]] = {}
-    upperbound_source_file_by_edge: Dict[str, str] = {}
+    native_accuracy_by_edge: Dict[str, Dict[str, float]] = {}
+    native_source_file_by_edge: Dict[str, str] = {}
     series_by_edge: Dict[str, List[Series]] = {}
 
     for json_file in json_files:
         data = read_json(json_file)
 
-        native_candidates = extract_native_upperbound(data)
+        native_candidates = extract_native_accuracy(data)
         for edge_id, category_to_native in native_candidates.items():
-            if edge_id not in native_upperbound_by_edge:
-                native_upperbound_by_edge[edge_id] = category_to_native
-                upperbound_source_file_by_edge[edge_id] = json_file.name
+            if edge_id not in native_accuracy_by_edge:
+                native_accuracy_by_edge[edge_id] = category_to_native
+                native_source_file_by_edge[edge_id] = json_file.name
 
         algorithm = str(data["algorithm"]).strip()
         edges = data["edges"]
@@ -298,8 +298,8 @@ def load_series(exp_path: Path) -> LoadResult:
 
     return LoadResult(
         series_by_edge=series_by_edge,
-        native_upperbound_by_edge=native_upperbound_by_edge,
-        upperbound_source_file_by_edge=upperbound_source_file_by_edge,
+        native_accuracy_by_edge=native_accuracy_by_edge,
+        native_source_file_by_edge=native_source_file_by_edge,
     )
 
 
@@ -419,7 +419,7 @@ def compute_radius_max(
     series_list: List[Series],
     categories: Sequence[str],
     fixed: Optional[float],
-    native_upperbound: Optional[Dict[str, float]] = None,
+    native_accuracy: Optional[Dict[str, float]] = None,
 ) -> float:
     if fixed is not None:
         return fixed
@@ -430,10 +430,10 @@ def compute_radius_max(
             if c in s.category_to_accuracy:
                 values.append(s.category_to_accuracy[c])
 
-    if native_upperbound:
+    if native_accuracy:
         for c in categories:
-            if c in native_upperbound:
-                values.append(native_upperbound[c])
+            if c in native_accuracy:
+                values.append(native_accuracy[c])
 
     if not values:
         return 1.0
@@ -457,7 +457,7 @@ def plot_edge_radar(
     dpi: int = 220,
     max_radius: Optional[float] = None,
     show: bool = False,
-    native_upperbound: Optional[Dict[str, float]] = None,
+    native_accuracy: Optional[Dict[str, float]] = None,
 ) -> None:
     if not series_list:
         raise ValueError(f"No series to plot for edge_id={edge_id!r}")
@@ -467,7 +467,7 @@ def plot_edge_radar(
     angles += angles[:1]
 
     radius_max = compute_radius_max(
-        series_list, categories, max_radius, native_upperbound=native_upperbound
+        series_list, categories, max_radius, native_accuracy=native_accuracy
     )
     ordered_series_list = order_series_by_average_accuracy(series_list, categories)
     legend_labels = dedupe_legend_names(ordered_series_list)
@@ -497,16 +497,16 @@ def plot_edge_radar(
     ax.set_ylim(0, radius_max)
     ax.grid(True, alpha=0.35)
 
-    if native_upperbound:
-        upperbound_values = [native_upperbound.get(cat, np.nan) for cat in categories]
-        upperbound_values += upperbound_values[:1]
+    if native_accuracy:
+        native_values = [native_accuracy.get(cat, np.nan) for cat in categories]
+        native_values += native_values[:1]
         ax.plot(
             angles,
-            upperbound_values,
-            color=UPPERBOUND_COLOR,
+            native_values,
+            color=NATIVE_COLOR,
             linewidth=2.4,
             linestyle="-",
-            label=display_name_for_algorithm("upperbound"),
+            label=display_name_for_algorithm("native"),
             zorder=10,
         )
 
@@ -582,17 +582,17 @@ def parse_eval_log_sections(eval_log_path: Path) -> List[EvalSection]:
 
         if len(raw_rows) < 2:
             raise ValueError(
-                f"Expected upperbound row and method row in {eval_log_path} for section {title!r}"
+                f"Expected native row and method row in {eval_log_path} for section {title!r}"
             )
 
-        upperbound_row = dict(zip(header_cells, raw_rows[0]))
+        native_row = dict(zip(header_cells, raw_rows[0]))
         method_row = dict(zip(header_cells, raw_rows[1]))
         sections.append(
             EvalSection(
                 edge_id=edge_id,
                 title=title,
                 headers=header_cells,
-                upperbound_row=upperbound_row,
+                native_row=native_row,
                 method_row=method_row,
             )
         )
@@ -622,16 +622,16 @@ def load_eval_summaries(exp_path: Path) -> EvalSummaryResult:
                 )
 
             record_list = records_by_edge.setdefault(section.edge_id, [])
-            if not any(record.is_upperbound for record in record_list):
-                upperbound_values = dict(section.upperbound_row)
-                upperbound_values["Method"] = "upperbound"
+            if not any(record.is_native for record in record_list):
+                native_values = dict(section.native_row)
+                native_values["Method"] = "native"
                 record_list.append(
                     EvalRecord(
                         study_id="all",
-                        method="upperbound",
-                        values=upperbound_values,
+                        method="native",
+                        values=native_values,
                         source_log=eval_log_path,
-                        is_upperbound=True,
+                        is_native=True,
                     )
                 )
 
@@ -641,17 +641,17 @@ def load_eval_summaries(exp_path: Path) -> EvalSummaryResult:
                     method=section.method_row.get("Method", study_id),
                     values=section.method_row,
                     source_log=eval_log_path,
-                    is_upperbound=False,
+                    is_native=False,
                 )
             )
 
     for edge_id, records in records_by_edge.items():
-        upperbound_records = [record for record in records if record.is_upperbound]
+        native_records = [record for record in records if record.is_native]
         method_records = sorted(
-            (record for record in records if not record.is_upperbound),
+            (record for record in records if not record.is_native),
             key=lambda record: record.study_id,
         )
-        records_by_edge[edge_id] = upperbound_records + method_records
+        records_by_edge[edge_id] = native_records + method_records
 
     return EvalSummaryResult(
         title_by_edge=title_by_edge,
@@ -739,8 +739,8 @@ def chart_title_text(title: str) -> str:
 
 def bar_color_for_method(method: str) -> str:
     normalized = method.strip().lower()
-    if normalized == "upperbound":
-        return UPPERBOUND_COLOR
+    if normalized == "native":
+        return NATIVE_COLOR
     if normalized == "mot-h":
         return MOT_H_COLOR
     if normalized == "mot":
@@ -764,7 +764,7 @@ def plot_eval_metric_bars(
         metric_value = parse_metric_number(record.values.get(metric_name, ""))
         if metric_value is None:
             continue
-        if record.method.strip().lower() == "upperbound" and "peak memory" in metric_name.lower():
+        if record.method.strip().lower() == "native" and "peak memory" in metric_name.lower():
             continue
         label = display_name_for_algorithm(record.method.strip() or record.study_id)
         plot_items.append((metric_value, label, record.method))
@@ -901,9 +901,9 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
         directions=args.directions,
     )
 
-    if not args.disable_upperbound:
+    if not args.disable_native:
         print(
-            "[info] upperbound is taken per edge_id from the first study JSON file "
+            "[info] native is taken per edge_id from the first study JSON file "
             "(sorted order) under exp-path/*/ that actually contains that edge."
         )
 
@@ -925,11 +925,11 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
             }
         )
         output_path = output_dir / f"subcategory_radar_{edge_id}.png"
-        native_upperbound = None
-        upperbound_source = None
-        if not args.disable_upperbound:
-            native_upperbound = result.native_upperbound_by_edge.get(edge_id)
-            upperbound_source = result.upperbound_source_file_by_edge.get(edge_id)
+        native_accuracy = None
+        native_source = None
+        if not args.disable_native:
+            native_accuracy = result.native_accuracy_by_edge.get(edge_id)
+            native_source = result.native_source_file_by_edge.get(edge_id)
 
         plot_edge_radar(
             edge_id=edge_id,
@@ -940,11 +940,11 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
             dpi=args.dpi,
             max_radius=args.max_radius,
             show=args.show,
-            native_upperbound=native_upperbound,
+            native_accuracy=native_accuracy,
         )
         generated.append(output_path)
-        if upperbound_source:
-            print(f"[saved] {output_path} (upperbound source: {upperbound_source})")
+        if native_source:
+            print(f"[saved] {output_path} (native source: {native_source})")
         else:
             print(f"[saved] {output_path}")
 

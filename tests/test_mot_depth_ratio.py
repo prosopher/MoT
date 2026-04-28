@@ -126,14 +126,29 @@ def test_depth_ratio_selects_different_final_channels_than_terminal() -> None:
     depth_ratio_result = depth_ratio_profiler.profile_edge(edge)
 
     assert [(channel.src_layer_idx, channel.dst_layer_idx) for channel in terminal_result.selected_channels] == [
-        (0, 2),
+        (1, 3),
     ]
     assert [(channel.src_layer_idx, channel.dst_layer_idx) for channel in depth_ratio_result.selected_channels] == [
         (0, 0),
     ]
 
 
-@pytest.mark.parametrize("layer_alignment", ["terminal", "depth-ratio"])
+def test_terminal_directly_selects_top_max_window_without_scoring() -> None:
+    profiler, edge = build_scored_profiler(
+        "terminal",
+        layer_counts=(12, 12),
+        score_map={},
+    )
+
+    result = profiler.profile_edge(edge)
+
+    assert [channel.src_layer_idx for channel in result.selected_channels] == [6, 7, 8, 9, 10, 11]
+    assert [channel.dst_layer_idx for channel in result.selected_channels] == [6, 7, 8, 9, 10, 11]
+    assert profiler.scored_windows == []
+    assert [step.removed_side for step in result.history] == ["selected-terminal"]
+
+
+@pytest.mark.parametrize("layer_alignment", ["depth-ratio"])
 def test_window_growth_reaches_max_probe_window_without_contain_requirement(
     layer_alignment: str,
 ) -> None:
@@ -171,7 +186,7 @@ def test_window_growth_reaches_max_probe_window_without_contain_requirement(
     assert [step.removed_side for step in result.history[-3:]] == ["expand-win-5", "expand-win-6", "selected"]
 
 
-@pytest.mark.parametrize("layer_alignment", ["terminal", "depth-ratio"])
+@pytest.mark.parametrize("layer_alignment", ["depth-ratio"])
 def test_probe_window_uses_one_third_start_half_max_and_keeps_edge_layers(layer_alignment: str) -> None:
     score_map: dict[tuple[int, ...], float] = {}
     for win_size in (4, 5, 6):
