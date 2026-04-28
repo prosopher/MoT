@@ -112,6 +112,9 @@ class ChannelProfiler:
         return results
 
     def profile_edge(self, edge: Edge) -> ChannelProfileResult:
+        if self.config.layer_alignment == "terminal":
+            return self._profile_terminal_edge(edge)
+
         candidate_channels = self._build_candidate_channels(edge)
         logging.info(
             "[ChannelProfiler] %s initial %s candidates=%s (win=%d)",
@@ -240,10 +243,36 @@ class ChannelProfiler:
             history=history,
         )
 
+    def _profile_terminal_edge(self, edge: Edge) -> ChannelProfileResult:
+        selected_channels = self._build_terminal_channels(edge)
+        history = [
+            self._build_history_step(
+                removed_side="selected-terminal",
+                channels=selected_channels,
+                validation_loss=float("nan"),
+                improvement=0.0,
+            )
+        ]
+        logging.info(
+            "[ChannelProfiler] %s terminal direct selected pairs=%s (win=%d, max_window_size_ratio=%.4f)",
+            edge.id,
+            self._format_channels(selected_channels),
+            len(selected_channels),
+            self.config.max_window_size_ratio,
+        )
+        return ChannelProfileResult(
+            edge_id=edge.id,
+            selected_channels=selected_channels,
+            best_validation_loss=float("nan"),
+            history=history,
+        )
+
     def _build_terminal_channels(self, edge: Edge) -> List[Channel]:
         src_spec = self.mm.get_model_spec(edge.src_id)
         tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-        window_size = min(src_spec.num_layers, tgt_spec.num_layers)
+        min_model_layers = min(src_spec.num_layers, tgt_spec.num_layers)
+        window_size = max(1, round(min_model_layers * self.config.max_window_size_ratio))
+        window_size = min(window_size, min_model_layers)
         src_start = src_spec.num_layers - window_size
         tgt_start = tgt_spec.num_layers - window_size
         return [
