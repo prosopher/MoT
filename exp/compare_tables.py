@@ -12,6 +12,29 @@ import matplotlib.pyplot as plt
 DEFAULT_Y_COL = "Gen F1 Avg"
 
 
+# Colorblind-friendly palette, commonly used in academic plots
+AI_PAPER_PALETTE = [
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#009E73",  # green
+    "#CC79A7",  # reddish purple
+    "#E69F00",  # orange
+    "#56B4E9",  # sky blue
+    "#F0E442",  # yellow
+    "#000000",  # black
+]
+
+
+AI_PAPER_MARKERS = [
+    "o", "s", "^", "D", "v", "P", "X", "*", "h", "<", ">"
+]
+
+
+AI_PAPER_LINESTYLES = [
+    "-", "--", "-.", ":"
+]
+
+
 def normalize_col_name(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().strip("`")).lower()
 
@@ -185,56 +208,171 @@ def extract_tables(
     return x_col_name, series_data
 
 
+def apply_ai_paper_style() -> None:
+    """
+    AI 논문 figure에 자주 쓰이는 Matplotlib 스타일 설정.
+
+    특징:
+    - serif font
+    - PDF/SVG 저장 시 텍스트 편집 가능
+    - 적당한 linewidth와 tick size
+    - 과하지 않은 grid
+    """
+    plt.rcParams.update(
+        {
+            # Figure and save quality
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.02,
+
+            # Font
+            "font.family": "serif",
+            "font.serif": [
+                "Times New Roman",
+                "Times",
+                "DejaVu Serif",
+            ],
+            "mathtext.fontset": "stix",
+
+            # Editable text in vector outputs
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "svg.fonttype": "none",
+
+            # Axes
+            "axes.labelsize": 13,
+            "axes.titlesize": 13,
+            "axes.linewidth": 1.0,
+
+            # Ticks
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "xtick.direction": "out",
+            "ytick.direction": "out",
+
+            # Legend
+            "legend.fontsize": 10,
+            "legend.frameon": True,
+            "legend.framealpha": 0.95,
+            "legend.fancybox": False,
+            "legend.edgecolor": "0.85",
+
+            # Lines
+            "lines.linewidth": 2.2,
+            "lines.markersize": 6,
+        }
+    )
+
+
 def plot_series(
     series_data: OrderedDict[str, list[tuple[float, float]]],
     output_path: Path,
     x_label: str,
     y_label: str,
+    title: str | None = None,
 ) -> None:
     if not series_data:
         raise RuntimeError("플롯할 데이터가 없습니다.")
 
-    width = 10 if len(series_data) <= 5 else 12
-    height = 6 if len(series_data) <= 8 else 7
+    apply_ai_paper_style()
 
-    plt.figure(figsize=(width, height))
+    num_series = len(series_data)
 
-    for series_name, points in series_data.items():
+    # AI conference paper에서 1-column figure로 쓰기 좋은 비율
+    if num_series <= 5:
+        fig_width = 6.4
+        fig_height = 4.2
+    else:
+        fig_width = 7.4
+        fig_height = 4.8
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    for idx, (series_name, points) in enumerate(series_data.items()):
         points = sorted(points, key=lambda pair: pair[0])
         xs = [x for x, _ in points]
         ys = [y for _, y in points]
 
-        plt.plot(
+        color = AI_PAPER_PALETTE[idx % len(AI_PAPER_PALETTE)]
+        marker = AI_PAPER_MARKERS[idx % len(AI_PAPER_MARKERS)]
+        linestyle = AI_PAPER_LINESTYLES[
+            (idx // len(AI_PAPER_MARKERS)) % len(AI_PAPER_LINESTYLES)
+        ]
+
+        ax.plot(
             xs,
             ys,
-            marker="o",
-            markersize=5,
-            linewidth=1.8,
             label=series_name,
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            linewidth=2.2,
+            markersize=6,
+            markerfacecolor="white",
+            markeredgecolor=color,
+            markeredgewidth=1.4,
         )
 
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    plt.title(f"{y_label} by {x_label}")
-    plt.grid(True, alpha=0.3)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
 
-    if len(series_data) > 5:
-        plt.legend(
+    # 논문 figure는 보통 title 대신 caption을 사용하므로 기본값은 None
+    if title:
+        ax.set_title(title, pad=8)
+
+    # 논문형 plot: top/right spine 제거
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.spines["left"].set_linewidth(1.0)
+    ax.spines["bottom"].set_linewidth(1.0)
+
+    ax.tick_params(axis="both", which="major", length=4, width=1.0)
+    ax.tick_params(axis="both", which="minor", length=2, width=0.8)
+
+    ax.minorticks_on()
+    ax.set_axisbelow(True)
+
+    # 과하지 않은 grid
+    ax.grid(
+        True,
+        which="major",
+        axis="y",
+        linestyle="--",
+        linewidth=0.7,
+        alpha=0.35,
+    )
+
+    # 약간의 여백
+    ax.margins(x=0.03, y=0.08)
+
+    # Series가 많으면 legend를 plot 바깥으로 배치
+    if num_series > 5:
+        ax.legend(
             loc="center left",
             bbox_to_anchor=(1.02, 0.5),
-            borderaxespad=0,
+            borderaxespad=0.0,
+            handlelength=2.6,
         )
     else:
-        plt.legend()
+        ax.legend(
+            loc="best",
+            handlelength=2.6,
+        )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(output_path)
+    plt.close(fig)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Markdown 파일 안의 여러 표에서 특정 컬럼을 추출해 하나의 그래프로 출력합니다."
+        description=(
+            "Markdown 파일 안의 여러 표에서 특정 컬럼을 추출해 "
+            "AI 논문 스타일의 그래프로 출력합니다."
+        )
     )
     parser.add_argument(
         "input",
@@ -251,7 +389,19 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="출력 PNG 경로. 생략하면 입력 파일명과 같은 이름의 .png 파일로 저장합니다.",
+        help=(
+            "출력 파일 경로. "
+            "생략하면 입력 파일명과 같은 이름의 .png 파일로 저장합니다. "
+            "논문용으로는 .pdf 또는 .svg 권장."
+        ),
+    )
+    parser.add_argument(
+        "--title",
+        default=None,
+        help=(
+            "그래프 제목. "
+            "논문 figure에서는 보통 caption을 사용하므로 기본값은 제목 없음."
+        ),
     )
     return parser.parse_args()
 
@@ -279,6 +429,7 @@ def main() -> None:
         output_path=output_path,
         x_label=x_label,
         y_label=args.y_col,
+        title=args.title,
     )
 
     print(f"Saved: {output_path}")
