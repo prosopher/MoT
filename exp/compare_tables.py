@@ -14,13 +14,12 @@ DEFAULT_Y_COL = "Gen F1 Avg"
 
 # Colorblind-friendly palette, commonly used in academic plots
 AI_PAPER_PALETTE = [
-    "#0072B2",  # blue
-    "#D55E00",  # vermillion
-    "#009E73",  # green
-    "#CC79A7",  # reddish purple
-    "#E69F00",  # orange
-    "#56B4E9",  # sky blue
-    "#F0E442",  # yellow
+    "#C0504D",  # Accent Red
+    "#4BACC6",  # Accent Aqua
+    "#8064A2",  # Accent Purple
+    "#4F81BD",  # Accent Blue
+    "#9BBB59",  # Accent Green
+    "#F79646",  # Accent Orange
     "#000000",  # black
 ]
 
