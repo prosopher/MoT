@@ -66,15 +66,21 @@ class TinyTokenizer(PreTrainedTokenizerBase):
         return "".join(chars)
 
 
+class PreTrainedTokenizerFast(TinyTokenizer):
+    @classmethod
+    def from_pretrained(cls, model_id: str, **_: object) -> "PreTrainedTokenizerFast":
+        return cls(model_id)
+
+
 class AutoTokenizer:
     @staticmethod
-    def from_pretrained(model_id: str) -> TinyTokenizer:
+    def from_pretrained(model_id: str, **_: object) -> TinyTokenizer:
         return TinyTokenizer(model_id)
 
 
 class AutoConfig:
     @staticmethod
-    def from_pretrained(model_id: str) -> "TinyConfig":
+    def from_pretrained(model_id: str, **_: object) -> "TinyConfig":
         return TinyConfig(_name_or_path=model_id)
 
 
@@ -303,7 +309,7 @@ class TinyCausalLM(PreTrainedModel):
 
 class AutoModelForCausalLM:
     @staticmethod
-    def from_pretrained(model_id: str, torch_dtype: torch.dtype = torch.float32) -> TinyCausalLM:
+    def from_pretrained(model_id: str, torch_dtype: torch.dtype = torch.float32, **_: object) -> TinyCausalLM:
         return TinyCausalLM(model_id=model_id, torch_dtype=torch_dtype)
 
 
