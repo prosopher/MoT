@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
-import sys
 import re
+import math
 import argparse
+import textwrap
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Literal
 from collections import OrderedDict
 
 import matplotlib.pyplot as plt
@@ -34,8 +37,41 @@ AI_PAPER_LINESTYLES = [
 ]
 
 
+ChartMode = Literal["line", "bar"]
+
+
+@dataclass
+class ExtractedData:
+    chart_mode: ChartMode
+    x_col_name: str
+    line_series_data: OrderedDict[str, list[tuple[float, float]]]
+    bar_group_data: OrderedDict[str, OrderedDict[str, float]]
+    table_count: int
+    matched_table_count: int
+
+    @property
+    def has_data(self) -> bool:
+        if self.chart_mode == "line":
+            return bool(self.line_series_data)
+        return bool(self.bar_group_data)
+
+
 def normalize_col_name(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().strip("`")).lower()
+
+
+def normalize_group_label(text: str) -> str:
+    """
+    섹션 제목에 literal '\\n' 문자열이 들어 있으면
+    실제 줄바꿈으로 변환합니다.
+
+    예:
+    'gpt2-medium→gpt2\\nRatio=0.5'
+    ->
+    'gpt2-medium→gpt2
+    Ratio=0.5'
+    """
+    return text.replace("\\n", "\n").strip()
 
 
 def split_markdown_row(line: str) -> list[str]:
@@ -88,8 +124,24 @@ def is_separator_row(cells: list[str]) -> bool:
     return True
 
 
+def clean_cell_text(value: str) -> str:
+    text = value.strip()
+    text = text.strip("`")
+    return text
+
+
 def parse_number(value: str) -> float:
-    text = value.strip().replace(",", "")
+    """
+    Y값처럼 단위가 붙을 수 있는 값을 숫자로 파싱합니다.
+
+    예:
+    - "0.129" -> 0.129
+    - "18.9%" -> 18.9
+    - "436.811 ms" -> 436.811
+    - "586 tok/s" -> 586
+    """
+    text = clean_cell_text(value).replace(",", "")
+
     match = re.search(
         r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
         text,
@@ -101,8 +153,27 @@ def parse_number(value: str) -> float:
     return float(match.group(0))
 
 
+def parse_x_number(value: str) -> float:
+    """
+    X축이 진짜 숫자형인지 엄격하게 판정합니다.
+
+    parse_number()처럼 문자열 중간의 숫자를 뽑아내면
+    "Layer 1", "Block 3" 같은 문자열도 숫자형으로 오판할 수 있으므로,
+    첫 번째 컬럼 전체가 숫자 또는 퍼센트 형태일 때만 숫자로 인정합니다.
+    """
+    text = clean_cell_text(value).replace(",", "").strip()
+
+    if not re.fullmatch(
+        r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?\s*%?",
+        text,
+    ):
+        raise ValueError(f"X축 숫자가 아닙니다: {value!r}")
+
+    return parse_number(text)
+
+
 def make_unique_name(name: str, used: set[str]) -> str:
-    base = name or "Table"
+    base = normalize_group_label(name or "Table")
     candidate = base
     idx = 2
 
@@ -117,12 +188,14 @@ def make_unique_name(name: str, used: set[str]) -> str:
 def extract_tables(
     md_text: str,
     y_col: str,
-) -> tuple[str, OrderedDict[str, list[tuple[float, float]]]]:
+) -> ExtractedData:
     lines = md_text.splitlines()
 
     current_heading = None
-    used_series_names = set()
-    series_data = OrderedDict()
+    used_group_names = set()
+
+    line_series_data: OrderedDict[str, list[tuple[float, float]]] = OrderedDict()
+    bar_group_data: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
 
     x_col_name = None
     y_key = normalize_col_name(y_col)
@@ -131,12 +204,15 @@ def extract_tables(
     table_count = 0
     matched_table_count = 0
 
+    all_valid_x_are_numeric = True
+    found_valid_point = False
+
     while i < len(lines):
         line = lines[i]
 
         heading_match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
         if heading_match:
-            current_heading = heading_match.group(1).strip()
+            current_heading = normalize_group_label(heading_match.group(1))
             i += 1
             continue
 
@@ -173,12 +249,13 @@ def extract_tables(
 
         matched_table_count += 1
 
-        series_name = make_unique_name(
+        group_name = make_unique_name(
             current_heading or f"Table {table_count}",
-            used_series_names,
+            used_group_names,
         )
 
-        points = []
+        numeric_points: list[tuple[float, float]] = []
+        bar_values: OrderedDict[str, float] = OrderedDict()
 
         for row_line in table_lines[2:]:
             cells = split_markdown_row(row_line)
@@ -186,25 +263,60 @@ def extract_tables(
             if max(x_idx, y_idx) >= len(cells):
                 continue
 
+            x_raw = clean_cell_text(cells[x_idx])
+            if not x_raw:
+                continue
+
             try:
-                x = parse_number(cells[x_idx])
                 y = parse_number(cells[y_idx])
             except ValueError:
                 continue
 
-            points.append((x, y))
+            found_valid_point = True
 
-        if points:
-            series_data[series_name] = points
+            # 문자열 X축이어도 bar chart에서 쓸 수 있도록 항상 저장합니다.
+            bar_values[x_raw] = y
+
+            # 숫자 X축인지도 별도로 검사합니다.
+            try:
+                x = parse_x_number(x_raw)
+                numeric_points.append((x, y))
+            except ValueError:
+                all_valid_x_are_numeric = False
+
+        if numeric_points:
+            line_series_data[group_name] = numeric_points
+
+        if bar_values:
+            bar_group_data[group_name] = bar_values
 
     if x_col_name is None:
         x_col_name = "First Column"
 
+    if not found_valid_point:
+        chart_mode: ChartMode = "bar"
+    elif all_valid_x_are_numeric:
+        chart_mode = "line"
+    else:
+        chart_mode = "bar"
+
     print(f"Found markdown tables: {table_count}")
     print(f"Matched tables with '{y_col}': {matched_table_count}")
-    print(f"Plotted series: {len(series_data)}")
+    print(f"Chart mode: {chart_mode}")
 
-    return x_col_name, series_data
+    if chart_mode == "line":
+        print(f"Plotted series: {len(line_series_data)}")
+    else:
+        print(f"Plotted groups: {len(bar_group_data)}")
+
+    return ExtractedData(
+        chart_mode=chart_mode,
+        x_col_name=x_col_name,
+        line_series_data=line_series_data,
+        bar_group_data=bar_group_data,
+        table_count=table_count,
+        matched_table_count=matched_table_count,
+    )
 
 
 def apply_ai_paper_style() -> None:
@@ -245,7 +357,7 @@ def apply_ai_paper_style() -> None:
             "axes.linewidth": 1.0,
 
             # Ticks
-            "xtick.labelsize": 11,
+            "xtick.labelsize": 10,
             "ytick.labelsize": 11,
             "xtick.direction": "out",
             "ytick.direction": "out",
@@ -264,7 +376,58 @@ def apply_ai_paper_style() -> None:
     )
 
 
-def plot_series(
+def wrap_tick_label(text: str, width: int = 26) -> str:
+    """
+    x tick label을 적당한 길이로 줄바꿈합니다.
+
+    이미 들어 있는 실제 줄바꿈은 보존하고,
+    literal '\\n' 문자열도 실제 줄바꿈으로 변환합니다.
+    """
+    text = normalize_group_label(text)
+
+    wrapped_lines = []
+    for line in text.splitlines():
+        if not line.strip():
+            wrapped_lines.append("")
+            continue
+
+        wrapped_lines.extend(
+            textwrap.wrap(
+                line,
+                width=width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+        )
+
+    return "\n".join(wrapped_lines)
+
+
+def style_axes_common(ax) -> None:
+    # 논문형 plot: top/right spine 제거
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.spines["left"].set_linewidth(1.0)
+    ax.spines["bottom"].set_linewidth(1.0)
+
+    ax.tick_params(axis="both", which="major", length=4, width=1.0)
+    ax.tick_params(axis="both", which="minor", length=2, width=0.8)
+
+    ax.set_axisbelow(True)
+
+    # 과하지 않은 grid
+    ax.grid(
+        True,
+        which="major",
+        axis="y",
+        linestyle="--",
+        linewidth=0.7,
+        alpha=0.35,
+    )
+
+
+def plot_line_series(
     series_data: OrderedDict[str, list[tuple[float, float]]],
     output_path: Path,
     x_label: str,
@@ -272,13 +435,12 @@ def plot_series(
     title: str | None = None,
 ) -> None:
     if not series_data:
-        raise RuntimeError("플롯할 데이터가 없습니다.")
+        raise RuntimeError("Line chart로 플롯할 데이터가 없습니다.")
 
     apply_ai_paper_style()
 
     num_series = len(series_data)
 
-    # AI conference paper에서 1-column figure로 쓰기 좋은 비율
     if num_series <= 5:
         fig_width = 6.4
         fig_height = 4.2
@@ -316,37 +478,14 @@ def plot_series(
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
 
-    # 논문 figure는 보통 title 대신 caption을 사용하므로 기본값은 None
     if title:
         ax.set_title(title, pad=8)
 
-    # 논문형 plot: top/right spine 제거
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    ax.spines["left"].set_linewidth(1.0)
-    ax.spines["bottom"].set_linewidth(1.0)
-
-    ax.tick_params(axis="both", which="major", length=4, width=1.0)
-    ax.tick_params(axis="both", which="minor", length=2, width=0.8)
+    style_axes_common(ax)
 
     ax.minorticks_on()
-    ax.set_axisbelow(True)
-
-    # 과하지 않은 grid
-    ax.grid(
-        True,
-        which="major",
-        axis="y",
-        linestyle="--",
-        linewidth=0.7,
-        alpha=0.35,
-    )
-
-    # 약간의 여백
     ax.margins(x=0.03, y=0.08)
 
-    # Series가 많으면 legend를 plot 바깥으로 배치
     if num_series > 5:
         ax.legend(
             loc="center left",
@@ -361,16 +500,141 @@ def plot_series(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     fig.savefig(output_path)
     plt.close(fig)
+
+
+def collect_bar_categories(
+    group_data: OrderedDict[str, OrderedDict[str, float]],
+) -> list[str]:
+    categories = []
+    seen = set()
+
+    for values in group_data.values():
+        for category in values.keys():
+            if category not in seen:
+                seen.add(category)
+                categories.append(category)
+
+    return categories
+
+
+def plot_grouped_bar(
+    group_data: OrderedDict[str, OrderedDict[str, float]],
+    output_path: Path,
+    category_label: str,
+    y_label: str,
+    title: str | None = None,
+) -> None:
+    if not group_data:
+        raise RuntimeError("Bar chart로 플롯할 데이터가 없습니다.")
+
+    apply_ai_paper_style()
+
+    group_names = list(group_data.keys())
+    categories = collect_bar_categories(group_data)
+
+    num_groups = len(group_names)
+    num_categories = len(categories)
+
+    fig_width = max(6.4, min(14.0, 1.35 * num_groups + 0.65 * num_categories + 2.0))
+    fig_height = 4.8 if num_groups <= 6 else 5.4
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    x_positions = list(range(num_groups))
+    total_width = 0.82
+    bar_width = total_width / max(1, num_categories)
+
+    for cat_idx, category in enumerate(categories):
+        offset = (cat_idx - (num_categories - 1) / 2) * bar_width
+
+        xs = [x + offset for x in x_positions]
+        ys = [
+            group_data[group_name].get(category, math.nan)
+            for group_name in group_names
+        ]
+
+        color = AI_PAPER_PALETTE[cat_idx % len(AI_PAPER_PALETTE)]
+
+        ax.bar(
+            xs,
+            ys,
+            width=bar_width * 0.92,
+            label=category,
+            color=color,
+            edgecolor="black",
+            linewidth=0.6,
+        )
+
+    # 요청사항:
+    # bar chart에서는 X축 label을 출력하지 않습니다.
+    # 즉, ax.set_xlabel("Markdown Section")을 호출하지 않습니다.
+    ax.set_ylabel(y_label)
+
+    if title:
+        ax.set_title(title, pad=8)
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(
+        [wrap_tick_label(name, width=28) for name in group_names],
+        rotation=0,
+        ha="center",
+    )
+
+    style_axes_common(ax)
+
+    ax.margins(x=0.04, y=0.10)
+
+    if num_categories > 5 or num_groups > 5:
+        ax.legend(
+            title=category_label,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+            handlelength=1.8,
+        )
+    else:
+        ax.legend(
+            title=category_label,
+            loc="best",
+            handlelength=1.8,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_extracted_data(
+    extracted: ExtractedData,
+    output_path: Path,
+    y_label: str,
+    title: str | None = None,
+) -> None:
+    if extracted.chart_mode == "line":
+        plot_line_series(
+            series_data=extracted.line_series_data,
+            output_path=output_path,
+            x_label=extracted.x_col_name,
+            y_label=y_label,
+            title=title,
+        )
+    else:
+        plot_grouped_bar(
+            group_data=extracted.bar_group_data,
+            output_path=output_path,
+            category_label=extracted.x_col_name,
+            y_label=y_label,
+            title=title,
+        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Markdown 파일 안의 여러 표에서 특정 컬럼을 추출해 "
-            "AI 논문 스타일의 그래프로 출력합니다."
+            "첫 번째 컬럼이 숫자면 line chart, 문자열이면 grouped bar chart로 출력합니다."
         )
     )
     parser.add_argument(
@@ -413,20 +677,24 @@ def main() -> None:
 
     md_text = input_path.read_text(encoding="utf-8")
 
-    x_label, series_data = extract_tables(
+    extracted = extract_tables(
         md_text=md_text,
         y_col=args.y_col,
     )
 
-    if not series_data:
+    if extracted.matched_table_count == 0:
         raise SystemExit(
-            f"첫 번째 컬럼과 '{args.y_col}' 컬럼을 가진 Markdown 표를 찾지 못했습니다."
+            f"'{args.y_col}' 컬럼을 가진 Markdown 표를 찾지 못했습니다."
         )
 
-    plot_series(
-        series_data=series_data,
+    if not extracted.has_data:
+        raise SystemExit(
+            f"'{args.y_col}' 컬럼에서 플롯할 수 있는 숫자 데이터를 찾지 못했습니다."
+        )
+
+    plot_extracted_data(
+        extracted=extracted,
         output_path=output_path,
-        x_label=x_label,
         y_label=args.y_col,
         title=args.title,
     )
