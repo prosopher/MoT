@@ -272,9 +272,11 @@ def build_prepared_inputs(
     ctx: Context,
     spec: HFDatasetSpec,
     example: Dict[str, Any],
+    *,
+    tokenizer,
+    target_node_id: str,
 ) -> Dict[str, Any]:
     config = ctx.config
-    tokenizer = ctx.tokenizer
     if config.benchmark_mode == "logit_qa":
         return prepare_logit_task_inputs(
             spec=spec,
@@ -282,6 +284,9 @@ def build_prepared_inputs(
             context=example.get("context", None),
             question=example["question"],
             device=config.device,
+            choices=example.get("choices"),
+            choice_texts=example.get("choice_texts"),
+            subject=example.get("subject"),
         )
     if config.benchmark_mode == "gen_qa":
         context_budget = compute_benchmark_context_budget(
@@ -289,6 +294,8 @@ def build_prepared_inputs(
             spec=spec,
             question=example["question"],
             eval_config=SimpleNamespace(generation_max_new_tokens=config.generation_max_new_tokens),
+            tokenizer=tokenizer,
+            target_node_id=target_node_id,
         )
         return prepare_generation_task_inputs(
             spec=spec,
@@ -465,11 +472,10 @@ def evaluate_correction(
 ) -> Dict[str, Any]:
     config = ctx.config
     nodes = ctx.nodes
+    node_map = build_node_map(nodes)
     edges = ctx.edges
-    tokenizer = ctx.tokenizer
-    logger = setup_logger(f"correction_eval_{run_dir.name}", build_eval_log_path(run_dir))
-    logger.info("Starting correction analysis")
-    logger.info("experiment_config=%s", asdict(config))
+    logging.info("Starting correction analysis")
+    logging.info("experiment_config=%s", asdict(config))
 
     translator_pool.eval()
     for node in nodes:
@@ -500,25 +506,31 @@ def evaluate_correction(
         dataloader = dataloader_builder(spec=spec, eval_config=eval_config)
         for batch in dataloader:
             for example in batch:
-                try:
-                    prepared_inputs = build_prepared_inputs(ctx=ctx, spec=spec, example=example)
-                except Exception as exc:
-                    logger.warning("Skipping example due to input preparation error: %s", exc)
-                    continue
-                answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, tokenizer=tokenizer)
-                if answer_token_ids is None or answer_token_ids.shape[0] < 1:
-                    continue
-                answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
-                cache_input_ids = prepared_inputs["cache_input_ids"]
-                question_cache_ids = prepared_inputs.get("question_cache_ids", None)
-                seed_token = prepared_inputs["seed_token"]
-                try:
-                    past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids) for node in nodes}
-                except Exception as exc:
-                    logger.warning("Skipping example due to cache extraction error: %s", exc)
-                    continue
-
                 for edge in edges:
+                    tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                    try:
+                        prepared_inputs = build_prepared_inputs(
+                            ctx=ctx,
+                            spec=spec,
+                            example=example,
+                            tokenizer=tokenizer,
+                            target_node_id=edge.tgt_id,
+                        )
+                    except Exception as exc:
+                        logging.warning("Skipping example due to input preparation error: %s", exc)
+                        continue
+                    answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, tokenizer=tokenizer)
+                    if answer_token_ids is None or answer_token_ids.shape[0] < 1:
+                        continue
+                    answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
+                    prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                    suffix_cache_ids = prepared_inputs.get("suffix_cache_ids", None)
+                    seed_token = prepared_inputs["seed_token"]
+                    try:
+                        past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids) for node in nodes}
+                    except Exception as exc:
+                        logging.warning("Skipping example due to cache extraction error: %s", exc)
+                        continue
                     translated_key, translated_value = translator_pool.translate_layer_window(
                         past_key_values=past_by_node_id[edge.src_id],
                         src_node_id=edge.src_id,
@@ -532,11 +544,12 @@ def evaluate_correction(
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
-                        prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                        prefix_input_ids=prefix_input_ids,
+                        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                        target_model_id=node_map[edge.tgt_id].model_id,
                     )
                     random_key_block, random_value_block = build_random_matched_window(
                         native_key_block=native_key_block,
@@ -546,17 +559,18 @@ def evaluate_correction(
                     )
                     random_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.mm.get_model(edge.tgt_id),
-                        prefix_input_ids=cache_input_ids,
-                        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                        prefix_input_ids=prefix_input_ids,
+                        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
                         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                        target_model_id=node_map[edge.tgt_id].model_id,
                     )
 
                     target_model = ctx.mm.get_model(edge.tgt_id)
-                    native_past = maybe_append_input_ids(target_model, native_target_past, question_cache_ids)
-                    fullmix_past = maybe_append_input_ids(target_model, full_mix_past, question_cache_ids)
-                    random_past = maybe_append_input_ids(target_model, random_past, question_cache_ids)
+                    native_past = maybe_append_input_ids(target_model, native_target_past, suffix_cache_ids)
+                    fullmix_past = maybe_append_input_ids(target_model, full_mix_past, suffix_cache_ids)
+                    random_past = maybe_append_input_ids(target_model, random_past, suffix_cache_ids)
                     native_past = maybe_append_input_ids(target_model, native_past, seed_token)
                     fullmix_past = maybe_append_input_ids(target_model, fullmix_past, seed_token)
                     random_past = maybe_append_input_ids(target_model, random_past, seed_token)
@@ -624,7 +638,7 @@ def evaluate_correction(
 
                 processed_examples += 1
                 if processed_examples % 10 == 0:
-                    logger.info(
+                    logging.info(
                         "processed_examples=%d | fullmix_tokens=%d | avg_final_shrink_ratio=%.4f",
                         processed_examples,
                         len(fullmix_collector.final_shrink_ratios),
@@ -646,7 +660,7 @@ def evaluate_correction(
         "num_layers": num_layers,
     }
 
-    logger.info(
+    logging.info(
         "[CorrectionSummary] final_shrink_ratio=%.6f | shrink_fraction=%.6f | alpha_over_initial=%.6f | beta_over_initial=%.6f | random_final_shrink_ratio=%.6f",
         fullmix_summary["average_final_shrink_ratio"],
         fullmix_summary["shrink_fraction"],
@@ -1018,22 +1032,23 @@ def main() -> None:
 
     set_seed(config.seed)
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    models, tokenizer = lp.build_models_for_experiment(config, nodes)
+    models, tokenizers = lp.build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    setup_logging(build_train_log_path(run_dir))
     translator_pool = lp.run_train(
         ctx=ctx,
         run_dir=run_dir,
     )
+    setup_logging(build_eval_log_path(run_dir))
     metrics = evaluate_correction(
         ctx=ctx,
         run_dir=run_dir,

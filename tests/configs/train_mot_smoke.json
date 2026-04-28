@@ -15,7 +15,9 @@
   "log_every": 1,
   "seed": 123,
   "shuffle_buffer": 8,
-  "layer_alignment": "terminal",
+  "layer_alignment": "injection",
+  "min_window_size_ratio": 0.33,
+  "max_window_size_ratio": 0.5,
   "translator_dim": 8,
   "translator_heads": 1,
   "translator_depth": 1,
@@ -24,5 +26,7 @@
   "dtype": "float32",
   "variant": "single",
   "mot_num_translators": 4,
-  "mot_top_k": 2
+  "mot_top_k": 2,
+  "topk_sparse_attn": 32,
+  "num_bottom_full_attn": 0
 }

@@ -1,6 +1,7 @@
+from contextlib import contextmanager
 import importlib
 import time
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 import numpy as np
 
@@ -92,32 +93,89 @@ class InferenceProfileAccumulator:
         }
 
 
+
+
+@contextmanager
+def temporarily_offload_module(module: Optional[torch.nn.Module], device: str):
+    if module is None or not isinstance(module, torch.nn.Module):
+        yield
+        return
+    if not (torch.cuda.is_available() and str(device).startswith("cuda")):
+        yield
+        return
+
+    device_obj = torch.device(device)
+    device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+
+    try:
+        module.to("cpu")
+        torch.cuda.synchronize(device_index)
+        yield
+    finally:
+        module.to(device)
+        torch.cuda.synchronize(device_index)
+
+
 class InferenceProfiler:
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, *, sample_interval_sec: float = 0.005) -> None:
         self.device = device
-        self.enabled = torch.cuda.is_available() and self.device.startswith("cuda")
+        self.reader = CurrentProcessGPUMemoryReader(device)
+        self.enabled = self.reader.enabled
+        self.sample_interval_sec = max(float(sample_interval_sec), 0.001)
         if self.enabled:
             device_index = torch.device(self.device).index
             self.device_index = torch.cuda.current_device() if device_index is None else device_index
         else:
             self.device_index = None
 
-    def measure(self, fn: Callable[[], float], *, tokens: int) -> Tuple[float, Dict[str, Optional[float]]]:
+    def _measure_peak_allocated_bytes(self, fn: Callable[[], T]) -> Tuple[T, Optional[int]]:
+        if not self.enabled:
+            return fn(), None
+
+        peak_memory_bytes = 0
+        stop_event = threading.Event()
+        peak_lock = threading.Lock()
+
+        def sample_memory() -> None:
+            nonlocal peak_memory_bytes
+            while not stop_event.is_set():
+                allocated = self.reader.read_allocated_bytes()
+                if allocated is not None:
+                    with peak_lock:
+                        peak_memory_bytes = max(peak_memory_bytes, int(allocated))
+                stop_event.wait(self.sample_interval_sec)
+
+        sampler = threading.Thread(
+            target=sample_memory,
+            name="inference-memory-profiler",
+            daemon=True,
+        )
+
+        initial_allocated = self.reader.read_allocated_bytes()
+        if initial_allocated is not None:
+            peak_memory_bytes = max(peak_memory_bytes, int(initial_allocated))
+
+        sampler.start()
+        try:
+            result = fn()
+            torch.cuda.synchronize(self.device_index)
+        finally:
+            stop_event.set()
+            sampler.join(timeout=max(1.0, self.sample_interval_sec * 4.0))
+
+        final_allocated = self.reader.read_allocated_bytes()
+        if final_allocated is not None:
+            peak_memory_bytes = max(peak_memory_bytes, int(final_allocated))
+
+        return result, peak_memory_bytes
+
+    def measure(self, fn: Callable[[], T], *, tokens: int) -> Tuple[T, Dict[str, Optional[float]]]:
         if self.enabled:
             torch.cuda.synchronize(self.device_index)
-            torch.cuda.reset_peak_memory_stats(self.device_index)
 
         started_at = time.perf_counter()
-        result = fn()
-        if self.enabled:
-            torch.cuda.synchronize(self.device_index)
+        result, peak_memory_bytes = self._measure_peak_allocated_bytes(fn)
         latency_sec = time.perf_counter() - started_at
-
-        peak_memory_bytes: Optional[int]
-        if self.enabled:
-            peak_memory_bytes = torch.cuda.max_memory_allocated(self.device_index)
-        else:
-            peak_memory_bytes = None
 
         return result, {
             "latency_sec": float(latency_sec),
@@ -137,6 +195,10 @@ class HFDatasetSpec:
     context_field: Optional[str] = None
     answers_field: Optional[str] = None
     subject_field: Optional[str] = None
+    choices_field: Optional[str] = None
+    error_type_field: Optional[str] = None
+    corrected_answer_field: Optional[str] = None
+    dataset_names: Optional[List[str]] = None
     streaming: bool = False
 
 
@@ -151,13 +213,15 @@ class HFQAPairStream(IterableDataset):
     ) -> None:
         super().__init__()
         self.spec = spec
-        self.max_examples = max_examples
+        self.max_examples = resolve_max_examples_for_spec(spec, max_examples)
         self.shuffle = shuffle
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
+        self._cached_multi_config_examples: Optional[List[Dict[str, Any]]] = None
 
-    def _load_dataset(self):
-        if self.spec.dataset_name is None:
+    def _load_dataset(self, dataset_name: Optional[str] = None):
+        resolved_dataset_name = self.spec.dataset_name if dataset_name is None else dataset_name
+        if resolved_dataset_name is None:
             return load_dataset(
                 self.spec.dataset_path,
                 split=self.spec.split,
@@ -165,12 +229,59 @@ class HFQAPairStream(IterableDataset):
             )
         return load_dataset(
             self.spec.dataset_path,
-            self.spec.dataset_name,
+            resolved_dataset_name,
             split=self.spec.split,
             streaming=self.spec.streaming,
         )
 
+    def _collect_multi_config_examples(self) -> List[Dict[str, Any]]:
+        if self._cached_multi_config_examples is not None:
+            return self._cached_multi_config_examples
+        if not self.spec.dataset_names:
+            return []
+        if self.spec.streaming:
+            raise ValueError("dataset_names multi-config loading does not support streaming datasets.")
+
+        extracted_examples: List[Dict[str, Any]] = []
+        for dataset_index, dataset_name in enumerate(self.spec.dataset_names):
+            dataset = self._load_dataset(dataset_name)
+            if self.shuffle:
+                dataset = dataset.shuffle(seed=self.seed + dataset_index)
+
+            subject_examples: List[Dict[str, Any]] = []
+            for raw_example in dataset:
+                example = dict(raw_example)
+                subject_field = self.spec.subject_field or "subject"
+                example.setdefault(subject_field, dataset_name)
+                qa_pair = extract_question_and_answer(self.spec, example)
+                if qa_pair is None:
+                    continue
+                subject_examples.append(qa_pair)
+                if len(subject_examples) >= self.max_examples:
+                    break
+
+            extracted_examples.extend(subject_examples)
+
+        if self.shuffle:
+            random.Random(self.seed).shuffle(extracted_examples)
+
+        self._cached_multi_config_examples = extracted_examples
+        return self._cached_multi_config_examples
+
+    def _iter_multi_config_examples(self):
+        for qa_pair in self._collect_multi_config_examples():
+            yield qa_pair
+
+    def __len__(self) -> int:
+        if self.spec.dataset_names:
+            return len(self._collect_multi_config_examples())
+        return self.max_examples
+
     def __iter__(self):
+        if self.spec.dataset_names:
+            yield from self._iter_multi_config_examples()
+            return
+
         dataset = self._load_dataset()
         if self.shuffle:
             if self.spec.streaming:
@@ -192,6 +303,164 @@ class HFQAPairStream(IterableDataset):
 
 
 DEFAULT_MULTINEWS_SUMMARY_TASK = "Summarize the news articles above."
+MMLU_REDUX_MAX_SUBJECT_EXAMPLES = 25
+MMLU_REDUX_SUBJECTS = [
+    "abstract_algebra",
+    "anatomy",
+    "astronomy",
+    "business_ethics",
+    "clinical_knowledge",
+    "college_biology",
+    "college_chemistry",
+    "college_computer_science",
+    "college_mathematics",
+    "college_medicine",
+    "college_physics",
+    "computer_security",
+    "conceptual_physics",
+    "econometrics",
+    "electrical_engineering",
+    "elementary_mathematics",
+    "formal_logic",
+    "global_facts",
+    "high_school_biology",
+    "high_school_chemistry",
+    "high_school_computer_science",
+    "high_school_european_history",
+    "high_school_geography",
+    "high_school_government_and_politics",
+    "high_school_macroeconomics",
+    "high_school_mathematics",
+    "high_school_microeconomics",
+    "high_school_physics",
+    "high_school_psychology",
+    "high_school_statistics",
+    "high_school_us_history",
+    "high_school_world_history",
+    "human_aging",
+    "human_sexuality",
+    "international_law",
+    "jurisprudence",
+    "logical_fallacies",
+    "machine_learning",
+    "management",
+    "marketing",
+    "medical_genetics",
+    "miscellaneous",
+    "moral_disputes",
+    "moral_scenarios",
+    "nutrition",
+    "philosophy",
+    "prehistory",
+    "professional_accounting",
+    "professional_law",
+    "professional_medicine",
+    "professional_psychology",
+    "public_relations",
+    "security_studies",
+    "sociology",
+    "us_foreign_policy",
+    "virology",
+    "world_religions",
+]
+MMLU_REDUX_CHOICE_MARKERS = ("①", "②", "③", "④")
+MMLU_REDUX_LABELS = MMLU_REDUX_CHOICE_MARKERS
+MMLU_REDUX_SUBJECT_CATEGORIES = (
+    "math",
+    "physics",
+    "computer science",
+    "biology",
+    "chemistry",
+    "engineering",
+    "culture",
+    "psychology",
+    "politics",
+    "economics",
+    "geography",
+    "philosophy",
+    "history",
+    "law",
+    "health",
+    "other",
+    "business",
+)
+MMLU_REDUX_SUBJECT_TO_CATEGORY = {
+    "abstract_algebra": "math",
+    "anatomy": "health",
+    "astronomy": "physics",
+    "business_ethics": "business",
+    "clinical_knowledge": "health",
+    "college_biology": "biology",
+    "college_chemistry": "chemistry",
+    "college_computer_science": "computer science",
+    "college_mathematics": "math",
+    "college_medicine": "health",
+    "college_physics": "physics",
+    "computer_security": "computer science",
+    "conceptual_physics": "physics",
+    "econometrics": "economics",
+    "electrical_engineering": "engineering",
+    "elementary_mathematics": "math",
+    "formal_logic": "philosophy",
+    "global_facts": "other",
+    "high_school_biology": "biology",
+    "high_school_chemistry": "chemistry",
+    "high_school_computer_science": "computer science",
+    "high_school_european_history": "history",
+    "high_school_geography": "geography",
+    "high_school_government_and_politics": "politics",
+    "high_school_macroeconomics": "economics",
+    "high_school_mathematics": "math",
+    "high_school_microeconomics": "economics",
+    "high_school_physics": "physics",
+    "high_school_psychology": "psychology",
+    "high_school_statistics": "math",
+    "high_school_us_history": "history",
+    "high_school_world_history": "history",
+    "human_aging": "health",
+    "human_sexuality": "culture",
+    "international_law": "law",
+    "jurisprudence": "law",
+    "logical_fallacies": "philosophy",
+    "machine_learning": "computer science",
+    "management": "business",
+    "marketing": "business",
+    "medical_genetics": "health",
+    "miscellaneous": "other",
+    "moral_disputes": "philosophy",
+    "moral_scenarios": "philosophy",
+    "nutrition": "health",
+    "philosophy": "philosophy",
+    "prehistory": "history",
+    "professional_accounting": "other",
+    "professional_law": "law",
+    "professional_medicine": "health",
+    "professional_psychology": "psychology",
+    "public_relations": "politics",
+    "security_studies": "politics",
+    "sociology": "culture",
+    "us_foreign_policy": "politics",
+    "virology": "health",
+    "world_religions": "philosophy",
+}
+
+
+def resolve_max_examples_for_spec(spec: HFDatasetSpec, requested_max_examples: int) -> int:
+    resolved = int(requested_max_examples)
+    if resolved <= 0:
+        raise ValueError(f"requested_max_examples must be positive, got {requested_max_examples!r}")
+    if spec.answer_mode == "mmlu_redux":
+        return min(resolved, MMLU_REDUX_MAX_SUBJECT_EXAMPLES)
+    return resolved
+
+
+def resolve_progress_total_examples(spec: HFDatasetSpec, dataset: IterableDataset, requested_max_examples: int) -> int:
+    if spec.answer_mode == "mmlu_redux":
+        try:
+            return len(dataset)
+        except TypeError:
+            return len(MMLU_REDUX_SUBJECTS) * resolve_max_examples_for_spec(spec, requested_max_examples)
+    return resolve_max_examples_for_spec(spec, requested_max_examples)
 
 
 def get_boolq_dataset_spec() -> HFDatasetSpec:
@@ -216,6 +485,23 @@ def get_pubmedqa_dataset_spec() -> HFDatasetSpec:
         answer_mode="pubmed_qa",
         question_field="question",
         context_field="context",
+        streaming=False,
+    )
+
+
+def get_mmlu_redux_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="MMLU-Redux/test",
+        dataset_path="edinburgh-dawg/mmlu-redux-2.0",
+        dataset_name=None,
+        dataset_names=MMLU_REDUX_SUBJECTS,
+        split="test",
+        answer_mode="mmlu_redux",
+        question_field="question",
+        choices_field="choices",
+        subject_field="subject",
+        error_type_field="error_type",
+        corrected_answer_field="correct_answer",
         streaming=False,
     )
 
@@ -264,11 +550,13 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
 LOGIT_QA_SPEC_GROUP_FACTORIES = [
     get_boolq_dataset_spec,
     get_pubmedqa_dataset_spec,
+    get_mmlu_redux_dataset_spec,
 ]
 
 GEN_QA_SPEC_GROUP_FACTORIES = [
     get_squad_v11_dataset_spec,
-    # get_newsqa_generation_dataset_spec,
+    get_newsqa_generation_dataset_spec,
+    # get_multinews_generation_dataset_spec,
 ]
 
 EVAL_SPEC_GROUP_FACTORIES = {
@@ -412,7 +700,6 @@ def _finalize_openwebtext_tsne_plots(
     *,
     output_path: Union[str, Path],
     seed: int,
-    logger: logging.Logger,
     features_by_edge_and_group: Dict[str, Dict[str, List[np.ndarray]]],
     perplexity: float = 50.0,
     max_iter: int = 1000,
@@ -420,7 +707,7 @@ def _finalize_openwebtext_tsne_plots(
     try:
         plt, TSNE = _load_openwebtext_tsne_plotting_deps()
     except ModuleNotFoundError as exc:
-        logger.warning("Skipping OpenWebText t-SNE plots: %s", exc)
+        logging.warning("Skipping OpenWebText t-SNE plots: %s", exc)
         return {}
 
     output_dir = _build_openwebtext_tsne_output_dir(output_path)
@@ -444,7 +731,7 @@ def _finalize_openwebtext_tsne_plots(
             group_counts[label] = int(group_features.shape[0])
 
         if len(ordered_features) < 2:
-            logger.warning(
+            logging.warning(
                 "Skipping OpenWebText t-SNE for %s because fewer than two visible groups were collected.",
                 edge_id,
             )
@@ -464,7 +751,7 @@ def _finalize_openwebtext_tsne_plots(
 
         feature_matrix = np.concatenate(padded_features, axis=0)
         if feature_matrix.shape[0] < 3:
-            logger.warning(
+            logging.warning(
                 "Skipping OpenWebText t-SNE for %s because only %d total samples were collected.",
                 edge_id,
                 feature_matrix.shape[0],
@@ -478,7 +765,7 @@ def _finalize_openwebtext_tsne_plots(
         effective_perplexity = float(perplexity)
         if feature_matrix.shape[0] <= effective_perplexity:
             effective_perplexity = float(max(1, feature_matrix.shape[0] - 1))
-            logger.warning(
+            logging.warning(
                 "Adjusted OpenWebText t-SNE perplexity for %s from %.1f to %.1f because only %d total samples were collected.",
                 edge_id,
                 float(perplexity),
@@ -536,7 +823,7 @@ def _finalize_openwebtext_tsne_plots(
             for label in visible_labels
             if label in group_counts
         )
-        logger.info(
+        logging.info(
             "Saved OpenWebText t-SNE plot for %s to %s (%s)",
             edge_id,
             plot_path,
@@ -613,6 +900,36 @@ def summarize_openwebtext_named_losses(
 
 
 @torch.inference_mode()
+def run_openwebtext_greedy_inference(
+    *,
+    model,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+    max_new_tokens: int,
+) -> int:
+    if max_new_tokens <= 0:
+        return 0
+
+    current_input_ids = seed_token
+    current_past = past_key_values
+    total_generated_tokens = 0
+
+    for _ in range(max_new_tokens):
+        outputs = model(
+            input_ids=current_input_ids,
+            past_key_values=current_past,
+            use_cache=True,
+        )
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        total_generated_tokens += int(next_token.numel())
+        current_input_ids = next_token
+        current_past = outputs.past_key_values
+
+    return total_generated_tokens
+
+
+
+@torch.inference_mode()
 def evaluate_openwebtext_validation_loss_metrics(
     *,
     ctx: Context,
@@ -623,19 +940,9 @@ def evaluate_openwebtext_validation_loss_metrics(
     seed: int,
     shuffle_buffer: int,
     max_examples: int,
-    logger: logging.Logger,
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    dataloader = build_openwebtext_eval_dataloader(
-        tokenizer=ctx.tokenizer,
-        config=ctx.config,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=shuffle,
-        seed=seed,
-        shuffle_buffer=shuffle_buffer,
-    )
     device = ctx.config.device
     max_examples = max(1, max_examples)
 
@@ -649,56 +956,44 @@ def evaluate_openwebtext_validation_loss_metrics(
             for edge in ctx.edges
         }
 
-    processed_examples = 0
-    for batch_idx, input_ids in enumerate(dataloader, start=1):
-        if processed_examples >= max_examples:
-            break
+    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+    edges_by_target = {
+        target_node_id: [edge for edge in ctx.edges if edge.tgt_id == target_node_id]
+        for target_node_id in target_node_ids
+    }
 
-        remaining_examples = max_examples - processed_examples
-        if input_ids.shape[0] > remaining_examples:
-            input_ids = input_ids[:remaining_examples]
-        input_ids = input_ids.to(device)
-
-        prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-            input_ids=input_ids,
-            prefix_tokens=ctx.config.prefix_tokens,
+    for target_node_id in target_node_ids:
+        dataloader = build_openwebtext_eval_dataloader(
+            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+            config=ctx.config,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=shuffle,
+            seed=seed,
+            shuffle_buffer=shuffle_buffer,
         )
-        past_by_node_id = {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
-            for node in ctx.nodes
-        }
+        processed_examples = 0
+        for batch_idx, input_ids in enumerate(dataloader, start=1):
+            if processed_examples >= max_examples:
+                break
 
-        batch_examples = input_ids.shape[0]
-        for edge in ctx.edges:
-            edge_losses, edge_profiles = evaluate_edge_losses_fn(
-                edge_id=edge.id,
-                edge=edge,
-                prefix_cache_ids=prefix_cache_ids,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-                past_by_node_id=past_by_node_id,
+            remaining_examples = max_examples - processed_examples
+            if input_ids.shape[0] > remaining_examples:
+                input_ids = input_ids[:remaining_examples]
+            input_ids = input_ids.to(device)
+
+            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                input_ids=input_ids,
+                prefix_tokens=ctx.config.prefix_tokens,
             )
-            if not edge_losses:
-                continue
-            for metric_name, loss_value in edge_losses.items():
-                loss_sums[edge.id][metric_name] = (
-                    float(loss_sums[edge.id].get(metric_name, 0.0))
-                    + float(loss_value) * batch_examples
-                )
-            for metric_name, profile_values in edge_profiles.items():
-                accumulator = profile_accumulators[edge.id].setdefault(
-                    metric_name,
-                    InferenceProfileAccumulator(),
-                )
-                accumulator.update(
-                    latency_sec=float(profile_values.get("latency_sec", 0.0)),
-                    tokens=profile_values.get("tokens", 0),
-                    peak_memory_bytes=profile_values.get("peak_memory_bytes"),
-                )
-            counts[edge.id] += batch_examples
+            past_by_node_id = {
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                for node in ctx.nodes
+            }
 
-            if tsne_features is not None:
-                named_pasts = build_visualization_pasts_fn(
+            batch_examples = input_ids.shape[0]
+            for edge in edges_by_target[target_node_id]:
+                edge_losses, edge_profiles = evaluate_edge_losses_fn(
                     edge_id=edge.id,
                     edge=edge,
                     prefix_cache_ids=prefix_cache_ids,
@@ -706,20 +1001,49 @@ def evaluate_openwebtext_validation_loss_metrics(
                     lm_labels=lm_labels,
                     past_by_node_id=past_by_node_id,
                 )
-                if named_pasts:
-                    _accumulate_openwebtext_tsne_samples(
-                        tsne_features,
-                        edge_id=edge.id,
-                        named_pasts=named_pasts,
+                if not edge_losses:
+                    continue
+                for metric_name, loss_value in edge_losses.items():
+                    loss_sums[edge.id][metric_name] = (
+                        float(loss_sums[edge.id].get(metric_name, 0.0))
+                        + float(loss_value) * batch_examples
                     )
+                for metric_name, profile_values in edge_profiles.items():
+                    accumulator = profile_accumulators[edge.id].setdefault(
+                        metric_name,
+                        InferenceProfileAccumulator(),
+                    )
+                    accumulator.update(
+                        latency_sec=float(profile_values.get("latency_sec", 0.0)),
+                        tokens=profile_values.get("tokens", 0),
+                        peak_memory_bytes=profile_values.get("peak_memory_bytes"),
+                    )
+                counts[edge.id] += batch_examples
 
-        processed_examples += batch_examples
-        if batch_idx % 25 == 0:
-            logger.info(
-                "[OpenWebText/validation] progress: %d/%d sequences",
-                processed_examples,
-                max_examples,
-            )
+                if tsne_features is not None:
+                    named_pasts = build_visualization_pasts_fn(
+                        edge_id=edge.id,
+                        edge=edge,
+                        prefix_cache_ids=prefix_cache_ids,
+                        lm_input_ids=lm_input_ids,
+                        lm_labels=lm_labels,
+                        past_by_node_id=past_by_node_id,
+                    )
+                    if named_pasts:
+                        _accumulate_openwebtext_tsne_samples(
+                            tsne_features,
+                            edge_id=edge.id,
+                            named_pasts=named_pasts,
+                        )
+
+            processed_examples += batch_examples
+            if batch_idx % 25 == 0:
+                logging.info(
+                    "[OpenWebText/validation][target=%s] progress: %d/%d sequences",
+                    target_node_id,
+                    processed_examples,
+                    max_examples,
+                )
 
     summaries = {}
     for edge in ctx.edges:
@@ -739,28 +1063,18 @@ def evaluate_openwebtext_validation_loss_metrics(
             average_losses,
             count,
             primary_name="translated",
-            loss_field_by_name={
-                "native": "native_loss",
-            },
+            loss_field_by_name={"native": "native_loss"},
+            loss_delta_reference_name="native",
             profile_summary_by_name=profile_summaries,
-            profile_field_prefix_by_name={
-                "native": "native",
-            },
+            profile_field_prefix_by_name={"native": "native"},
         )
 
     if tsne_features is not None:
-        tsne_paths = _finalize_openwebtext_tsne_plots(
+        _finalize_openwebtext_tsne_plots(
             output_path=output_path,
             seed=seed,
-            logger=logger,
             features_by_edge_and_group=tsne_features,
-            perplexity=50.0,
-            max_iter=1000,
         )
-        for edge in ctx.edges:
-            if edge.id in tsne_paths:
-                summaries[edge.id]["tsne_plot_path"] = tsne_paths[edge.id]
-
     return summaries
 
 
@@ -769,7 +1083,6 @@ def evaluate_openwebtext_validation_loss_top_layers(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
     *,
     build_translated_target_past_fn: Callable[..., PastKeyValues],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
@@ -786,40 +1099,57 @@ def evaluate_openwebtext_validation_loss_top_layers(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = lm_labels.numel()
+        del edge_id, prefix_cache_ids
+        profile_tokens = int(lm_labels.numel())
+        seed_token = lm_input_ids[:, :1]
+        generation_steps = int(lm_labels.shape[1])
 
-        def compute_translated_loss_value() -> float:
-            translated_target_past = build_translated_target_past_fn(
-                edge=edge,
-                past_by_node_id=past_by_node_id,
-            )
-            return float(
-                compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=translated_target_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
+        translated_target_past = build_translated_target_past_fn(
+            edge=edge,
+            past_by_node_id=past_by_node_id,
+        )
+        translated_loss = float(
+            compute_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=translated_target_past,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        native_loss = float(
+            compute_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+
+        def run_translated_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=translated_target_past,
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        def compute_native_loss_value() -> float:
-            return float(
-                compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                ).item()
+        def run_native_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        translated_loss, translated_profile = profiler.measure(
-            compute_translated_loss_value,
+        _, translated_profile = profiler.measure(
+            run_translated_inference,
             tokens=profile_tokens,
         )
-        native_loss, native_profile = profiler.measure(
-            compute_native_loss_value,
-            tokens=profile_tokens,
-        )
+        with temporarily_offload_module(translator_pool, train_config.device):
+            _, native_profile = profiler.measure(
+                run_native_inference,
+                tokens=profile_tokens,
+            )
         return (
             {
                 "translated": translated_loss,
@@ -840,10 +1170,10 @@ def evaluate_openwebtext_validation_loss_top_layers(
         seed=eval_config.seed,
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
-        logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
+
 
 
 @torch.inference_mode()
@@ -851,8 +1181,8 @@ def evaluate_openwebtext_validation_loss_replay(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
     *,
+    build_translated_target_past_fn: Callable[..., PastKeyValues],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
@@ -867,48 +1197,66 @@ def evaluate_openwebtext_validation_loss_replay(
         lm_labels: torch.Tensor,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = lm_labels.numel()
+        profile_tokens = int(lm_labels.numel())
+        seed_token = lm_input_ids[:, :1]
+        generation_steps = int(lm_labels.shape[1])
 
-        def compute_translated_loss_value() -> float:
-            mixed_target_past, _ = translator_pool.build_replayed_target_past(
-                source_past_key_values=past_by_node_id[edge.src_id],
-                prefix_input_ids=prefix_cache_ids,
+        mixed_target_past_for_loss = build_translated_target_past_fn(
+            edge=edge,
+            prefix_cache_ids=prefix_cache_ids,
+            past_by_node_id=past_by_node_id,
+        )
+        translated_loss = float(
+            compute_prefix_correction_and_suffix_lm_loss(
                 target_model=ctx.mm.get_model(edge.tgt_id),
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                past_key_values=mixed_target_past_for_loss,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+                native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+            ).item()
+        )
+        native_loss = float(
+            compute_prefix_correction_and_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+                native_target_past_key_values=past_by_node_id[edge.tgt_id],
+                target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+            ).item()
+        )
+
+        def run_translated_inference() -> int:
+            mixed_target_past = build_translated_target_past_fn(
+                edge=edge,
+                prefix_cache_ids=prefix_cache_ids,
+                past_by_node_id=past_by_node_id,
             )
-            return float(
-                compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=mixed_target_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                ).item()
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=mixed_target_past,
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        def compute_native_loss_value() -> float:
-            return float(
-                compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
-                    past_key_values=past_by_node_id[edge.tgt_id],
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                ).item()
+        def run_native_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
             )
 
-        translated_loss, translated_profile = profiler.measure(
-            compute_translated_loss_value,
+        _, translated_profile = profiler.measure(
+            run_translated_inference,
             tokens=profile_tokens,
         )
-        native_loss, native_profile = profiler.measure(
-            compute_native_loss_value,
-            tokens=profile_tokens,
-        )
+        with temporarily_offload_module(translator_pool, train_config.device):
+            _, native_profile = profiler.measure(
+                run_native_inference,
+                tokens=profile_tokens,
+            )
         return (
             {
                 "translated": translated_loss,
@@ -929,7 +1277,6 @@ def evaluate_openwebtext_validation_loss_replay(
         seed=eval_config.seed,
         shuffle_buffer=eval_config.shuffle_buffer,
         max_examples=eval_config.max_examples_per_dataset,
-        logger=logger,
         evaluate_edge_losses_fn=evaluate_edge_losses_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
@@ -940,27 +1287,26 @@ def evaluate_openwebtext_validation_loss(
     ctx: Context,
     eval_config: EvalConfig,
     translator_pool,
-    logger: logging.Logger,
     *,
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    if eval_config.alg == "mot":
+    if eval_config.alg in {"mot", "mot-h"}:
         return evaluate_openwebtext_validation_loss_replay(
             ctx=ctx,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
+            build_translated_target_past_fn=build_translated_target_past_fn,
             build_visualization_pasts_fn=build_visualization_pasts_fn,
         )
     return evaluate_openwebtext_validation_loss_top_layers(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
+
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
     try:
@@ -1072,18 +1418,18 @@ def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) ->
     #         question = question_value.strip()
     #     else:
     #         question = DEFAULT_MULTINEWS_SUMMARY_TASK
-    #
+
     #     context_field = spec.context_field or "document"
     #     answers_field = spec.answers_field or "summary"
-    #
+
     #     context = normalize_multinews_context_text(example.get(context_field, None))
     #     if context is None:
     #         return []
-    #
+
     #     answer_texts = _normalize_answer_texts(example.get(answers_field, None))
     #     if not answer_texts:
     #         return []
-    #
+
     #     return [{
     #         "question": question,
     #         "context": context,
@@ -1104,10 +1450,11 @@ class HFGenerationExampleStream(IterableDataset):
     ) -> None:
         super().__init__()
         self.spec = spec
-        self.max_examples = max_examples
+        self.max_examples = resolve_max_examples_for_spec(spec, max_examples)
         self.shuffle = shuffle
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
+        self._cached_multi_config_examples: Optional[List[Dict[str, Any]]] = None
 
     def _load_dataset(self):
         if self.spec.dataset_name is None:
@@ -1192,6 +1539,73 @@ class RunningAverage:
             "native_accuracy": self.native_accuracy_sum / self.count,
             "count": self.count,
         }
+
+
+class SubjectAccuracyAccumulator:
+    def __init__(self, category: str) -> None:
+        self.category = category
+        self.accuracy_sum = 0.0
+        self.native_accuracy_sum = 0.0
+        self.count = 0
+
+    def update(self, *, accuracy_value: float, native_accuracy_value: float) -> None:
+        self.accuracy_sum += float(accuracy_value)
+        self.native_accuracy_sum += float(native_accuracy_value)
+        self.count += 1
+
+    def summary(self) -> Dict[str, Any]:
+        if self.count <= 0:
+            raise ValueError("SubjectAccuracyAccumulator.summary() requires count > 0")
+        return {
+            "category": self.category,
+            "accuracy": self.accuracy_sum / self.count,
+            "native_accuracy": self.native_accuracy_sum / self.count,
+            "count": self.count,
+        }
+
+
+def build_mmlu_redux_subject_breakdown(
+    subject_accumulators_by_edge: Dict[str, Dict[str, SubjectAccuracyAccumulator]],
+    *,
+    algorithm_name: str,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "algorithm": algorithm_name,
+        "edges": {},
+    }
+    for edge_id, subject_accumulators in subject_accumulators_by_edge.items():
+        subject_accuracy: Dict[str, Dict[str, Any]] = {}
+        for subject in MMLU_REDUX_SUBJECTS:
+            accumulator = subject_accumulators.get(subject)
+            if accumulator is None or accumulator.count <= 0:
+                raise ValueError(
+                    f"MMLU-Redux subject breakdown is incomplete for edge={edge_id}: missing subject={subject}"
+                )
+            subject_accuracy[subject] = accumulator.summary()
+
+        subject_category_accuracy: Dict[str, Dict[str, Any]] = {}
+        for category in MMLU_REDUX_SUBJECT_CATEGORIES:
+            subject_rows = [
+                (subject, subject_accuracy[subject])
+                for subject in MMLU_REDUX_SUBJECTS
+                if subject_accuracy[subject]["category"] == category
+            ]
+            if not subject_rows:
+                raise ValueError(f"No MMLU-Redux subjects mapped to category={category}")
+            subject_category_accuracy[category] = {
+                "accuracy": sum(row["accuracy"] for _, row in subject_rows) / len(subject_rows),
+                "native_accuracy": sum(row["native_accuracy"] for _, row in subject_rows) / len(subject_rows),
+                "num_subjects_evaluated": len(subject_rows),
+                "total_count": sum(int(row["count"]) for _, row in subject_rows),
+                "subjects": [subject for subject, _ in subject_rows],
+            }
+
+        payload["edges"][edge_id] = {
+            "subject_accuracy": subject_accuracy,
+            "subject_category_accuracy": subject_category_accuracy,
+        }
+
+    return payload
 
 
 class GenerationRunningAverage:
@@ -1390,6 +1804,85 @@ def normalize_context_text(raw_value: Any) -> Optional[str]:
     return "\n".join(parts)
 
 
+def _normalize_logit_qa_choice_text(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+
+def _match_logit_qa_choice(choices: List[str], candidate: str) -> Optional[str]:
+    normalized_candidate = _normalize_logit_qa_choice_text(candidate)
+    if not normalized_candidate:
+        return None
+
+    normalized_choices: List[Tuple[str, str]] = []
+    for choice in choices:
+        if not isinstance(choice, str):
+            continue
+        normalized_choice = _normalize_logit_qa_choice_text(choice)
+        if normalized_choice:
+            normalized_choices.append((choice.strip(), normalized_choice))
+
+    for canonical_choice, normalized_choice in normalized_choices:
+        if normalized_candidate == normalized_choice:
+            return canonical_choice
+
+    for canonical_choice, normalized_choice in normalized_choices:
+        if re.fullmatch(r"[a-z0-9]+(?:\s+[a-z0-9]+)*", normalized_choice):
+            pattern = rf"(?<!\w){re.escape(normalized_choice)}(?!\w)"
+        else:
+            pattern = re.escape(normalized_choice)
+        if re.search(pattern, normalized_candidate, flags=re.IGNORECASE):
+            return canonical_choice
+
+    return None
+
+
+
+def _parse_logit_qa_correct_answers(
+    choices: List[str],
+    raw_correct_answer: Any,
+    *,
+    include_original_choice: Optional[str] = None,
+) -> List[str]:
+    answers: List[str] = []
+    if isinstance(include_original_choice, str) and include_original_choice.strip():
+        matched_original_choice = _match_logit_qa_choice(choices, include_original_choice)
+        if matched_original_choice is not None:
+            answers.append(matched_original_choice)
+
+    if isinstance(raw_correct_answer, str) and raw_correct_answer.strip():
+        raw_text = raw_correct_answer.strip()
+        direct_answer = _match_logit_qa_choice(choices, raw_text)
+        if direct_answer is not None:
+            answers.append(direct_answer)
+        else:
+            parts = [
+                part.strip()
+                for part in re.split(r"(?:,|/|;|\bor\b|\band\b)", raw_text, flags=re.IGNORECASE)
+                if part.strip()
+            ]
+            for part in parts:
+                matched_answer = _match_logit_qa_choice(choices, part)
+                if matched_answer is not None:
+                    answers.append(matched_answer)
+
+    deduped: List[str] = []
+    for answer in answers:
+        if answer not in deduped:
+            deduped.append(answer)
+    return deduped
+
+
+
+def is_logit_answer_correct(predicted_label: str, gold_answer: Any) -> bool:
+    if isinstance(gold_answer, str):
+        return predicted_label == gold_answer
+    if isinstance(gold_answer, (list, tuple, set)):
+        return predicted_label in set(gold_answer)
+    return False
+
+
+
 def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
@@ -1408,6 +1901,7 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         return {
             "question": question.strip(),
             "context": context,
+            "choices": ["yes", "no"],
             "answer": "yes" if answer_value else "no",
         }
 
@@ -1428,7 +1922,74 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         return {
             "question": question.strip(),
             "context": context,
+            "choices": ["yes", "no", "maybe"],
             "answer": normalized_answer,
+        }
+
+    if spec.answer_mode == "mmlu_redux":
+        choices_field = spec.choices_field or "choices"
+        error_type_field = spec.error_type_field or "error_type"
+        corrected_answer_field = spec.corrected_answer_field or "correct_answer"
+        subject_field = spec.subject_field or "subject"
+
+        raw_choice_texts = example.get(choices_field, None)
+        if not isinstance(raw_choice_texts, list):
+            return None
+        choice_texts = [choice.strip() for choice in raw_choice_texts if isinstance(choice, str) and choice.strip()]
+        if len(choice_texts) != 4:
+            return None
+
+        choices = list(MMLU_REDUX_CHOICE_MARKERS)
+        raw_answer_idx = example.get("answer", None)
+        if not isinstance(raw_answer_idx, int) or not (0 <= raw_answer_idx < len(choices)):
+            return None
+        original_choice = choices[raw_answer_idx]
+
+        error_type = str(example.get(error_type_field, "ok") or "ok").strip().lower()
+        corrected_answer = example.get(corrected_answer_field, None)
+        if error_type == "expert":
+            return None
+
+        if error_type == "wrong_groundtruth":
+            acceptable_answers = _parse_logit_qa_correct_answers(
+                choices,
+                corrected_answer,
+                include_original_choice=None,
+            )
+        elif error_type == "multiple_correct_answers":
+            acceptable_answers = _parse_logit_qa_correct_answers(
+                choices,
+                corrected_answer,
+                include_original_choice=original_choice,
+            )
+        elif error_type == "no_correct_answer":
+            acceptable_answers = _parse_logit_qa_correct_answers(
+                choices,
+                corrected_answer,
+                include_original_choice=None,
+            )
+        else:
+            acceptable_answers = [original_choice]
+
+        if not acceptable_answers:
+            return None
+
+        answer_value: Union[str, List[str]]
+        if len(acceptable_answers) == 1:
+            answer_value = acceptable_answers[0]
+        else:
+            answer_value = acceptable_answers
+
+        subject_value = example.get(subject_field, None)
+        subject = subject_value.strip() if isinstance(subject_value, str) and subject_value.strip() else None
+
+        return {
+            "question": question.strip(),
+            "choices": choices,
+            "choice_texts": choice_texts,
+            "subject": subject,
+            "answer": answer_value,
+            "error_type": error_type,
         }
 
     if spec.answer_mode == "squad":
@@ -1476,21 +2037,31 @@ def format_boolq_context_prefix(context: str) -> str:
     )
 
 
-def format_boolq_question_prefix(question: str) -> str:
+def format_boolq_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
     )
 
 
-def prepare_boolq_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def prepare_boolq_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_boolq_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
-def prepare_boolq_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_boolq_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_boolq_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix_text = format_boolq_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix_text, device=device)
 
 
 def format_pubmed_qa_context_prefix(context: str) -> str:
@@ -1500,26 +2071,89 @@ def format_pubmed_qa_context_prefix(context: str) -> str:
     )
 
 
-def format_pubmed_qa_question_prefix(question: str) -> str:
+def format_pubmed_qa_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
     )
 
 
-def prepare_pubmed_qa_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def format_mmlu_redux_question_prefix(question: str, subject: Optional[str] = None) -> str:
+    prompt_lines: List[str] = []
+    if isinstance(subject, str) and subject.strip():
+        pretty_subject = subject.strip().replace("_", " ")
+        prompt_lines.append(f"Subject: {pretty_subject}")
+    prompt_lines.append(f"Question: {question.strip()}")
+    return "\n".join(prompt_lines) + "\n"
+
+
+def format_mmlu_redux_choices_suffix(
+    choices: List[str],
+    choice_texts: List[str],
+) -> str:
+    if len(choice_texts) != len(choices):
+        raise ValueError("choices and choice_texts must have the same length.")
+
+    prompt_lines: List[str] = ["Choices:"]
+    for choice, choice_text in zip(choices, choice_texts):
+        prompt_lines.append(f"{choice.strip()} {choice_text.strip()}")
+    prompt_lines.append("Answer:")
+    return "\n".join(prompt_lines)
+
+
+def prepare_pubmed_qa_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_pubmed_qa_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
-def prepare_pubmed_qa_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_pubmed_qa_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_pubmed_qa_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_pubmed_qa_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
-def format_question_prefix(
+def prepare_mmlu_redux_question_inputs(
+    tokenizer,
+    question: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+    subject: Optional[str] = None,
+) -> Dict[str, Any]:
+    prefix_text = format_mmlu_redux_question_prefix(question=question, subject=subject)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
+
+
+def prepare_mmlu_redux_choices_suffix(
+    tokenizer,
+    choices: List[str],
+    choice_texts: List[str],
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    suffix = format_mmlu_redux_choices_suffix(
+        choices=choices,
+        choice_texts=choice_texts,
+    )
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
+
+
+def format_logit_task_prompt(
     question: str,
     choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
     context: Optional[str] = None,
     answer_mode: Optional[str] = None,
@@ -1529,20 +2163,36 @@ def format_question_prefix(
     if answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("BoolQ requires passage context.")
-        return format_boolq_context_prefix(context=context) + format_boolq_question_prefix(question=question)
+        return format_boolq_context_prefix(context=context) + format_boolq_question_suffix(question=question)
 
     if answer_mode == "pubmed_qa":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("PubMedQA requires abstract context.")
-        return format_pubmed_qa_context_prefix(context=context) + format_pubmed_qa_question_prefix(question=question)
+        return format_pubmed_qa_context_prefix(context=context) + format_pubmed_qa_question_suffix(question=question)
 
     if not choices:
         return f"Question: {question}\nAnswer:"
 
-    prompt_lines = [f"Question: {question}", "Choices:"]
-    for idx, choice in enumerate(choices):
-        label = chr(ord("A") + idx)
-        prompt_lines.append(f"{label}. {choice.strip()}")
+    if answer_mode == "mmlu_redux":
+        if choice_texts is None:
+            raise ValueError("MMLU-Redux requires choice_texts.")
+        return (
+            format_mmlu_redux_question_prefix(question=question, subject=subject)
+            + format_mmlu_redux_choices_suffix(
+                choices=choices,
+                choice_texts=choice_texts,
+            )
+        )
+
+    prompt_lines: List[str] = [f"Question: {question}", "Choices:"]
+    if choice_texts is None:
+        for choice in choices:
+            prompt_lines.append(choice.strip())
+    else:
+        if len(choice_texts) != len(choices):
+            raise ValueError("choices and choice_texts must have the same length.")
+        for choice, choice_text in zip(choices, choice_texts):
+            prompt_lines.append(f"{choice.strip()} {choice_text.strip()}")
     prompt_lines.append("Answer:")
     return "\n".join(prompt_lines)
 
@@ -1554,7 +2204,7 @@ def format_squad_v11_context_prefix(context: str) -> str:
     )
 
 
-def format_squad_v11_question_prefix(question: str) -> str:
+def format_squad_v11_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
@@ -1576,9 +2226,9 @@ def prepare_squad_v11_context_inputs(
     )
 
 
-def prepare_squad_v11_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_squad_v11_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_squad_v11_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_squad_v11_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
 def format_multinews_context_prefix(context: str) -> str:
@@ -1588,7 +2238,7 @@ def format_multinews_context_prefix(context: str) -> str:
     )
 
 
-def format_multinews_question_prefix(question: str) -> str:
+def format_multinews_question_suffix(question: str) -> str:
     return (
         f"Task: {question.strip()}\n"
         "Summary:"
@@ -1610,12 +2260,12 @@ def prepare_multinews_context_inputs(
     )
 
 
-def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_multinews_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_multinews_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_multinews_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
-def format_generation_prompt(context: str, question: str) -> str:
+def format_generation_task_prompt(context: str, question: str) -> str:
     return (
         "Read the passage and answer the question briefly.\n\n"
         f"Context: {context.strip()}\n"
@@ -1624,46 +2274,78 @@ def format_generation_prompt(context: str, question: str) -> str:
     )
 
 
-def prepare_text_prefix(tokenizer, prefix_text: str, device: str) -> Dict[str, torch.Tensor]:
-    tokenized = tokenizer(prefix_text, return_tensors="pt")
-    input_ids = tokenized.input_ids.to(device)
+def prepare_cache_text_inputs(
+    tokenizer,
+    text: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+    truncation_side: str = "left",
+) -> Dict[str, torch.Tensor]:
+    tokenized = tokenizer(text, return_tensors="pt")
+    input_ids = tokenized.input_ids
+    was_truncated = False
+
+    if max_input_tokens is not None:
+        if max_input_tokens < 2:
+            raise ValueError("max_input_tokens must be >= 2")
+        if input_ids.shape[1] > max_input_tokens:
+            was_truncated = True
+            if truncation_side == "left":
+                input_ids = input_ids[:, -max_input_tokens:]
+            elif truncation_side == "right":
+                input_ids = input_ids[:, :max_input_tokens]
+            else:
+                raise ValueError(f"Unsupported truncation_side: {truncation_side}")
+
+    input_ids = input_ids.to(device)
     if input_ids.shape[1] < 2:
-        raise ValueError("Prefix must tokenize to at least 2 tokens.")
+        raise ValueError("Cache text must tokenize to at least 2 tokens.")
     cache_ids = input_ids[:, :-1]
     seed_token = input_ids[:, -1:]
     return {
-        "prefix_text": prefix_text,
-        "full_prefix_ids": input_ids,
+        "text": text,
+        "input_ids": input_ids,
         "cache_ids": cache_ids,
         "seed_token": seed_token,
+        "was_truncated": was_truncated,
     }
 
 
-def prepare_question_prefix(
+def prepare_logit_task_prompt(
     tokenizer,
     question: str,
     device: str,
     choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
     context: Optional[str] = None,
     answer_mode: Optional[str] = None,
+    max_input_tokens: Optional[int] = None,
+    truncation_side: str = "left",
 ) -> Dict[str, torch.Tensor]:
-    prefix_text = format_question_prefix(
+    prompt_text = format_logit_task_prompt(
         question,
         choices=choices,
+        choice_texts=choice_texts,
         subject=subject,
         context=context,
         answer_mode=answer_mode,
     )
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+    return prepare_cache_text_inputs(
+        tokenizer=tokenizer,
+        text=prompt_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+        truncation_side=truncation_side,
+    )
 
 
-def prepare_generation_prefix(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_generation_prompt(context=context, question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_generation_task_prompt(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prompt_text = format_generation_task_prompt(context=context, question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=prompt_text, device=device)
 
 
-def format_generation_question_prefix(question: str) -> str:
+def format_generation_question_suffix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
         "Answer:"
@@ -1693,9 +2375,9 @@ def prepare_full_text_inputs(
     }
 
 
-def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_generation_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+def prepare_generation_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    suffix = format_generation_question_suffix(question=question)
+    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
 
 
 def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> int:
@@ -1725,20 +2407,23 @@ def compute_benchmark_context_budget(
     spec: HFDatasetSpec,
     question: str,
     eval_config,
+    *,
+    tokenizer,
+    target_node_id: str,
 ) -> int:
-    shared_limit = min(
-        get_model_context_limit(ctx.mm.get_model(node.id), ctx.tokenizer)
-        for node in ctx.nodes
+    shared_limit = get_model_context_limit(
+        ctx.mm.get_model(target_node_id),
+        tokenizer,
     )
-    question_prefix = prepare_generation_task_question_prefix(
+    suffix = prepare_generation_task_suffix(
         spec=spec,
-        tokenizer=ctx.tokenizer,
+        tokenizer=tokenizer,
         question=question,
         device="cpu",
     )
     reserved_tokens = (
-        question_prefix["cache_ids"].shape[1]
-        + question_prefix["seed_token"].shape[1]
+        suffix["cache_ids"].shape[1]
+        + suffix["seed_token"].shape[1]
         + get_answer_token_budget(eval_config)
     )
     budget = shared_limit - reserved_tokens
@@ -1750,25 +2435,114 @@ def compute_benchmark_context_budget(
     return budget
 
 
-def prepare_generation_task_question_prefix(
+def compute_logit_task_token_budgets(
+    ctx: Context,
+    spec: HFDatasetSpec,
+    question: str,
+    eval_config,
+    *,
+    tokenizer,
+    target_node_id: str,
+    choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+) -> Dict[str, Optional[int]]:
+    shared_limit = get_model_context_limit(
+        ctx.mm.get_model(target_node_id),
+        tokenizer,
+    )
+    answer_budget = get_answer_token_budget(eval_config)
+
+    if spec.answer_mode == "boolq":
+        suffix = prepare_boolq_question_suffix(
+            tokenizer=tokenizer,
+            question=question,
+            device="cpu",
+        )
+        reserved_tokens = (
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    if spec.answer_mode == "pubmed_qa":
+        suffix = prepare_pubmed_qa_question_suffix(
+            tokenizer=tokenizer,
+            question=question,
+            device="cpu",
+        )
+        reserved_tokens = (
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    if spec.answer_mode == "mmlu_redux":
+        if not choices:
+            raise ValueError("MMLU-Redux requires choices for prompt budgeting.")
+        if not choice_texts:
+            raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
+        suffix = prepare_mmlu_redux_choices_suffix(
+            tokenizer=tokenizer,
+            choices=choices,
+            choice_texts=choice_texts,
+            device="cpu",
+        )
+        reserved_tokens = (
+            suffix["cache_ids"].shape[1]
+            + suffix["seed_token"].shape[1]
+            + answer_budget
+        )
+        budget = shared_limit - reserved_tokens
+        if budget < 16:
+            raise ValueError(
+                f"Insufficient context budget for {spec.name_for_log}: "
+                f"shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+            )
+        return {"max_context_tokens": budget, "max_prefix_tokens": None}
+
+    prompt_budget = shared_limit - answer_budget
+    if prompt_budget < 16:
+        raise ValueError(
+            f"Insufficient prompt budget for {spec.name_for_log}: "
+            f"shared_limit={shared_limit}, answer_budget={answer_budget}"
+        )
+    return {"max_context_tokens": None, "max_prefix_tokens": prompt_budget}
+
+
+def prepare_generation_task_suffix(
     spec: HFDatasetSpec,
     tokenizer,
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
     if spec.answer_mode in {"squad", "newsqa"}:
-        return prepare_squad_v11_question_prefix(
+        return prepare_squad_v11_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
     # if spec.answer_mode == "multinews":
-    #     return prepare_multinews_question_prefix(
+    #     return prepare_multinews_question_suffix(
     #         tokenizer=tokenizer,
     #         question=question,
     #         device=device,
     #     )
-    return prepare_generation_question_prefix(
+    return prepare_generation_question_suffix(
         tokenizer=tokenizer,
         question=question,
         device=device,
@@ -1781,6 +2555,11 @@ def prepare_logit_task_inputs(
     context: Optional[str],
     question: str,
     device: str,
+    choices: Optional[List[str]] = None,
+    choice_texts: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+    max_context_tokens: Optional[int] = None,
+    max_prefix_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     if spec.answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
@@ -1789,19 +2568,20 @@ def prepare_logit_task_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
+            max_input_tokens=max_context_tokens,
         )
-        question_prefix = prepare_boolq_question_prefix(
+        suffix = prepare_boolq_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
         return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
-            "was_truncated": False,
+            "prefix": context_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": context_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
+            "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
     if spec.answer_mode == "pubmed_qa":
@@ -1811,33 +2591,66 @@ def prepare_logit_task_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
+            max_input_tokens=max_context_tokens,
         )
-        question_prefix = prepare_pubmed_qa_question_prefix(
+        suffix = prepare_pubmed_qa_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
         return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
-            "was_truncated": False,
+            "prefix": context_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": context_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
+            "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
-    prefix = prepare_question_prefix(
+    if spec.answer_mode == "mmlu_redux":
+        if not choices:
+            raise ValueError("MMLU-Redux requires choices.")
+        if not choice_texts:
+            raise ValueError("MMLU-Redux requires choice_texts.")
+        question_prefix = prepare_mmlu_redux_question_inputs(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+            max_input_tokens=max_context_tokens,
+            subject=subject,
+        )
+        suffix = prepare_mmlu_redux_choices_suffix(
+            tokenizer=tokenizer,
+            choices=choices,
+            choice_texts=choice_texts,
+            device=device,
+        )
+        return {
+            "prefix": question_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": question_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
+            "was_truncated": bool(question_prefix.get("was_truncated", False)),
+        }
+
+    prompt = prepare_logit_task_prompt(
         tokenizer=tokenizer,
         question=question,
         device=device,
+        choices=choices,
+        choice_texts=choice_texts,
+        subject=subject,
         context=context,
         answer_mode=spec.answer_mode,
+        max_input_tokens=max_prefix_tokens,
+        truncation_side="left",
     )
     return {
-        "cache_input_ids": prefix["cache_ids"],
-        "question_cache_ids": None,
-        "seed_token": prefix["seed_token"],
-        "was_truncated": False,
+        "prefix_input_ids": prompt["cache_ids"],
+        "suffix_cache_ids": None,
+        "seed_token": prompt["seed_token"],
+        "was_truncated": bool(prompt.get("was_truncated", False)),
     }
 
 
@@ -1856,17 +2669,17 @@ def prepare_generation_task_inputs(
             device=device,
             max_input_tokens=max_input_tokens,
         )
-        question_prefix = prepare_squad_v11_question_prefix(
+        suffix = prepare_squad_v11_question_suffix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
         return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
+            "prefix": context_prefix,
+            "suffix": suffix,
+            "prefix_input_ids": context_prefix["input_ids"],
+            "suffix_cache_ids": suffix["cache_ids"],
+            "seed_token": suffix["seed_token"],
             "was_truncated": context_prefix.get("was_truncated", False),
         }
 
@@ -1877,30 +2690,30 @@ def prepare_generation_task_inputs(
     #         device=device,
     #         max_input_tokens=max_input_tokens,
     #     )
-    #     question_prefix = prepare_multinews_question_prefix(
+    #     suffix = prepare_multinews_question_suffix(
     #         tokenizer=tokenizer,
     #         question=question,
     #         device=device,
     #     )
     #     return {
-    #         "context_prefix": context_prefix,
-    #         "question_prefix": question_prefix,
-    #         "cache_input_ids": context_prefix["input_ids"],
-    #         "question_cache_ids": question_prefix["cache_ids"],
-    #         "seed_token": question_prefix["seed_token"],
+    #         "prefix": context_prefix,
+    #         "suffix": suffix,
+    #         "prefix_input_ids": context_prefix["input_ids"],
+    #         "suffix_cache_ids": suffix["cache_ids"],
+    #         "seed_token": suffix["seed_token"],
     #         "was_truncated": bool(context_prefix.get("was_truncated", False)),
     #     }
 
-    prefix = prepare_generation_prefix(
+    prompt = prepare_generation_task_prompt(
         tokenizer=tokenizer,
         context=context,
         question=question,
         device=device,
     )
     return {
-        "cache_input_ids": prefix["cache_ids"],
-        "question_cache_ids": None,
-        "seed_token": prefix["seed_token"],
+        "prefix_input_ids": prompt["cache_ids"],
+        "suffix_cache_ids": None,
+        "seed_token": prompt["seed_token"],
         "was_truncated": False,
     }
 
@@ -1911,14 +2724,14 @@ def predict_generation_task_answer(
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
     eval_config,
-    question_cache_ids: Optional[torch.Tensor] = None,
+    suffix_cache_ids: Optional[torch.Tensor] = None,
 ) -> str:
     generation_past = past_key_values
-    if question_cache_ids is not None:
+    if suffix_cache_ids is not None:
         generation_past = append_input_ids_to_past(
             model=model,
             past_key_values=past_key_values,
-            input_ids=question_cache_ids,
+            input_ids=suffix_cache_ids,
         )
 
     return generate_greedy_answer(
@@ -1983,6 +2796,12 @@ def build_logit_answer_candidates(
             {"yes": "yes", "no": "no", "maybe": "maybe"},
         )
 
+    if spec.answer_mode == "mmlu_redux":
+        return build_text_candidate_token_ids(
+            tokenizer,
+            {label: label for label in MMLU_REDUX_LABELS},
+        )
+
     raise ValueError(f"Unsupported answer_mode for logit scoring: {spec.answer_mode}")
 
 
@@ -2037,19 +2856,45 @@ def score_answer_choices(
 def prepare_answer_scoring_past(
     model,
     past_key_values: PastKeyValues,
-    question_cache_ids: Optional[torch.Tensor] = None,
+    suffix_cache_ids: Optional[torch.Tensor] = None,
 ) -> PastKeyValues:
-    if question_cache_ids is None:
+    if suffix_cache_ids is None:
         return past_key_values
     return append_input_ids_to_past(
         model=model,
         past_key_values=past_key_values,
-        input_ids=question_cache_ids,
+        input_ids=suffix_cache_ids,
     )
 
 
 def predict_answer_label(choice_scores: Dict[str, float]) -> str:
     return max(choice_scores.items(), key=lambda item: item[1])[0]
+
+
+def parse_generated_logit_answer(
+    spec: HFDatasetSpec,
+    prediction: str,
+    *,
+    choices: Optional[List[str]] = None,
+) -> Optional[str]:
+    if not choices:
+        raise ValueError(f"{spec.answer_mode} generative parsing requires choices.")
+
+    cleaned = postprocess_generated_answer(prediction)
+    if not cleaned:
+        return None
+
+    direct_answer = _match_logit_qa_choice(choices, cleaned)
+    if direct_answer is not None:
+        return direct_answer
+
+    parts = [part.strip() for part in re.split(r"[\n\r]|(?:\.\s+)|;|:", cleaned) if part.strip()]
+    for part in parts:
+        matched_answer = _match_logit_qa_choice(choices, part)
+        if matched_answer is not None:
+            return matched_answer
+
+    return None
 
 
 @torch.inference_mode()
@@ -2151,6 +2996,188 @@ def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningA
     return results
 
 
+@dataclass
+class LogitEvalEdgeArtifacts:
+    translated_past_key_values: PastKeyValues
+    native_past_key_values: PastKeyValues
+    cosine_value: float
+
+
+@torch.inference_mode()
+def evaluate_dataset(
+    *,
+    ctx: Context,
+    spec: HFDatasetSpec,
+    dataloader: DataLoader,
+    eval_config: EvalConfig,
+    translator_pool,
+    build_example_state_fn: Callable[..., Any],
+    build_edge_artifacts_fn: Callable[..., LogitEvalEdgeArtifacts],
+    prepare_scoring_past_fn: Callable[..., PastKeyValues] = prepare_answer_scoring_past,
+    finalize_results_fn: Optional[Callable[..., None]] = None,
+    progress_interval: int = 50,
+) -> Dict[str, Dict[str, float]]:
+    edges = ctx.edges
+    device = ctx.config.device
+    path_metrics = {edge.id: RunningAverage() for edge in edges}
+    subject_accumulators_by_edge: Optional[Dict[str, Dict[str, SubjectAccuracyAccumulator]]]
+    if spec.answer_mode == "mmlu_redux":
+        subject_accumulators_by_edge = {edge.id: {} for edge in edges}
+    else:
+        subject_accumulators_by_edge = None
+
+    processed_examples = 0
+    progress_total_examples = resolve_progress_total_examples(spec, dataloader.dataset, eval_config.max_examples_per_dataset)
+    next_progress_examples = progress_interval if progress_interval > 0 else None
+
+    for batch in dataloader:
+        for example in batch:
+            question = example["question"]
+            gold_answer = example["answer"]
+            context_text = example.get("context")
+            choices = example.get("choices")
+            choice_texts = example.get("choice_texts")
+
+            for edge in edges:
+                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                token_budgets = compute_logit_task_token_budgets(
+                    ctx=ctx,
+                    spec=spec,
+                    question=question,
+                    eval_config=eval_config,
+                    tokenizer=tokenizer,
+                    target_node_id=edge.tgt_id,
+                    choices=choices,
+                    choice_texts=choice_texts,
+                    subject=example.get("subject"),
+                )
+                prepared_inputs = prepare_logit_task_inputs(
+                    spec=spec,
+                    tokenizer=tokenizer,
+                    context=context_text,
+                    question=question,
+                    device=device,
+                    choices=choices,
+                    choice_texts=choice_texts,
+                    subject=example.get("subject"),
+                    max_context_tokens=token_budgets["max_context_tokens"],
+                    max_prefix_tokens=token_budgets["max_prefix_tokens"],
+                )
+                prefix_input_ids = prepared_inputs["prefix_input_ids"]
+                suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
+                seed_token = prepared_inputs["seed_token"]
+
+                if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                    logging.info(
+                        "[%s][%s] truncated prefix to fit model context window (prefix_tokens=%d, suffix_cache_tokens=%d, answer_token_budget=%d)",
+                        spec.name_for_log,
+                        edge.id,
+                        prefix_input_ids.shape[1],
+                        suffix_cache_tokens,
+                        get_answer_token_budget(eval_config),
+                    )
+
+                example_state = build_example_state_fn(
+                    ctx=ctx,
+                    spec=spec,
+                    edge=edge,
+                    example=example,
+                    prefix_input_ids=prefix_input_ids,
+                    prepared_inputs=prepared_inputs,
+                    translator_pool=translator_pool,
+                )
+
+                edge_artifacts = build_edge_artifacts_fn(
+                    ctx=ctx,
+                    spec=spec,
+                    edge=edge,
+                    example=example,
+                    prefix_input_ids=prefix_input_ids,
+                    prepared_inputs=prepared_inputs,
+                    example_state=example_state,
+                    translator_pool=translator_pool,
+                )
+
+                target_model = ctx.mm.get_model(edge.tgt_id)
+                translated_generation_past = prepare_scoring_past_fn(
+                    model=target_model,
+                    past_key_values=edge_artifacts.translated_past_key_values,
+                    suffix_cache_ids=suffix_cache_ids,
+                )
+                native_generation_past = prepare_scoring_past_fn(
+                    model=target_model,
+                    past_key_values=edge_artifacts.native_past_key_values,
+                    suffix_cache_ids=suffix_cache_ids,
+                )
+
+                translated_answer = generate_greedy_answer(
+                    model=target_model,
+                    tokenizer=tokenizer,
+                    past_key_values=translated_generation_past,
+                    seed_token=seed_token,
+                    max_new_tokens=eval_config.generation_max_new_tokens,
+                )
+                native_answer = generate_greedy_answer(
+                    model=target_model,
+                    tokenizer=tokenizer,
+                    past_key_values=native_generation_past,
+                    seed_token=seed_token,
+                    max_new_tokens=eval_config.generation_max_new_tokens,
+                )
+
+                translated_pred = parse_generated_logit_answer(
+                    spec,
+                    translated_answer,
+                    choices=choices,
+                )
+                native_pred = parse_generated_logit_answer(
+                    spec,
+                    native_answer,
+                    choices=choices,
+                )
+
+                acc = 1.0 if translated_pred is not None and is_logit_answer_correct(translated_pred, gold_answer) else 0.0
+                native_acc = 1.0 if native_pred is not None and is_logit_answer_correct(native_pred, gold_answer) else 0.0
+                path_metrics[edge.id].update(edge_artifacts.cosine_value, acc, native_acc, 1)
+
+                if subject_accumulators_by_edge is not None:
+                    subject = example.get("subject")
+                    if not isinstance(subject, str) or not subject.strip():
+                        raise ValueError("MMLU-Redux examples must include a non-empty subject.")
+                    subject = subject.strip()
+                    if subject not in MMLU_REDUX_SUBJECT_TO_CATEGORY:
+                        raise ValueError(f"Unsupported MMLU-Redux subject: {subject}")
+                    subject_accumulator = subject_accumulators_by_edge[edge.id].setdefault(
+                        subject,
+                        SubjectAccuracyAccumulator(MMLU_REDUX_SUBJECT_TO_CATEGORY[subject]),
+                    )
+                    subject_accumulator.update(
+                        accuracy_value=acc,
+                        native_accuracy_value=native_acc,
+                    )
+
+            processed_examples += 1
+            while next_progress_examples is not None and processed_examples >= next_progress_examples:
+                logging.info(
+                    "[%s] progress: %d/%d examples",
+                    spec.name_for_log,
+                    next_progress_examples,
+                    progress_total_examples,
+                )
+                next_progress_examples += progress_interval
+
+    summarized = summarize_path_metrics(path_metrics)
+    if subject_accumulators_by_edge is not None:
+        breakdown_payload = build_mmlu_redux_subject_breakdown(subject_accumulators_by_edge, algorithm_name=ctx.config.alg)
+        breakdown_path = Path(eval_config.output_path) / "mmlu_redux_subject_category_accuracy.json"
+        write_json(str(breakdown_path), breakdown_payload)
+        logging.info("Saved MMLU-Redux subject/category breakdown to %s", breakdown_path)
+    if finalize_results_fn is not None:
+        finalize_results_fn(ctx=ctx, spec=spec, results=summarized)
+    return summarized
+
+
 def build_edge_pretty_name(edge_id: str, nodes: List[Node], edges: List[Edge]) -> str:
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
@@ -2163,17 +3190,16 @@ def build_edge_pretty_name(edge_id: str, nodes: List[Node], edges: List[Edge]) -
 
 
 def log_dataset_result(
-    logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
     nodes: List[Node],
     edges: List[Edge],
 ) -> None:
-    logger.info("===== %s =====", dataset_name)
+    logging.info("===== %s =====", dataset_name)
     for edge in edges:
         row = results[edge.id]
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
-        logger.info(
+        logging.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_name,
             row["cosine"],
@@ -2184,17 +3210,16 @@ def log_dataset_result(
 
 
 def log_generation_dataset_result(
-    logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
     nodes: List[Node],
     edges: List[Edge],
 ) -> None:
-    logger.info("===== %s =====", dataset_name)
+    logging.info("===== %s =====", dataset_name)
     for edge in edges:
         row = results[edge.id]
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
-        logger.info(
+        logging.info(
             "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
             row["cosine"],
@@ -2267,10 +3292,12 @@ def build_edge_summary_markdown_table(
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
+        ("MMLU-Redux", "MMLU-Redux/test"),
     ]
     generation_dataset_keys = [
         ("SQuAD", "SQuAD-v1.1/validation"),
         ("NewsQA", "NewsQA/validation"),
+        # ("MultiNews", "MultiNews/validation"),
     ]
 
     logit_rows = {
@@ -2286,22 +3313,27 @@ def build_edge_summary_markdown_table(
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
         logit_rows["PubMedQA"].get("cosine", float("nan")),
+        logit_rows["MMLU-Redux"].get("cosine", float("nan")),
     ])
     translated_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("accuracy", float("nan")),
         logit_rows["PubMedQA"].get("accuracy", float("nan")),
+        logit_rows["MMLU-Redux"].get("accuracy", float("nan")),
     ])
     native_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("native_accuracy", float("nan")),
         logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
+        logit_rows["MMLU-Redux"].get("native_accuracy", float("nan")),
     ])
     translated_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("f1", float("nan")),
         generation_rows["NewsQA"].get("f1", float("nan")),
+        # generation_rows["MultiNews"].get("f1", float("nan")),
     ])
     native_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("native_f1", float("nan")),
         generation_rows["NewsQA"].get("native_f1", float("nan")),
+        # generation_rows["MultiNews"].get("native_f1", float("nan")),
     ])
 
     if edge is None:
@@ -2318,12 +3350,13 @@ def build_edge_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {target_model_id} (baseline) | N/A | "
+            f"| {target_model_id} (upperbound) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(native_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
@@ -2338,6 +3371,7 @@ def build_edge_summary_markdown_table(
             f"{_format_summary_float(translated_cosine_avg)} | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(translated_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "

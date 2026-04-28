@@ -1,78 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
 
-try:
-    from transformers.cache_utils import DynamicCache
-except Exception:  # pragma: no cover
-    DynamicCache = None
-
 from core.common import (
-    compute_suffix_lm_loss,
+    PastKeyValues,
     cosine_similarity_between_past,
     extract_past_key_values,
     set_seed,
-    setup_logger,
     write_json,
 )
 from core.context import Context
 from core.eval_util import *
+from core.topology import Edge
 from kvcomm.train import KVCommSelectionPool
 
 
 
 def _build_calibration_eval_name(config) -> str:
     return f"{str(config.calibration_dataset).strip()}/validation"
-
-
-def _build_kvcomm_selected_layer_views(
-    *,
-    translator_pool: KVCommSelectionPool,
-    edge_id: str,
-    source_past_key_values,
-    target_past_key_values,
-    replayed_target_past_key_values,
-):
-    selected_source_layers = translator_pool.get_selected_source_layers(edge_id)
-    selected_target_layers = translator_pool.get_selected_target_layers(edge_id)
-    return (
-        select_past_layers_by_indices(source_past_key_values, selected_source_layers),
-        select_past_layers_by_indices(replayed_target_past_key_values, selected_target_layers),
-        select_past_layers_by_indices(target_past_key_values, selected_target_layers),
-    )
-
-
-def _compute_selected_layer_cosine(
-    *,
-    translator_pool: KVCommSelectionPool,
-    edge_id: str,
-    source_past_key_values,
-    target_past_key_values,
-    replayed_target_past_key_values,
-) -> float:
-    _, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
-        translator_pool=translator_pool,
-        edge_id=edge_id,
-        source_past_key_values=source_past_key_values,
-        target_past_key_values=target_past_key_values,
-        replayed_target_past_key_values=replayed_target_past_key_values,
-    )
-    return cosine_similarity_between_past(translated_selected_past, target_selected_past)
-
-
-def _ensure_model_cache(past_key_values):
-    if past_key_values is None:
-        return None
-    if hasattr(past_key_values, "get_seq_length"):
-        return past_key_values
-    if isinstance(past_key_values, tuple) and DynamicCache is not None:
-        return DynamicCache.from_legacy_cache(past_key_values)
-    return past_key_values
 
 
 def _openwebtext_total_tokens(config) -> int:
@@ -84,22 +35,24 @@ def _openwebtext_prefix_tokens(config) -> int:
 
 
 @torch.inference_mode()
-def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str):
+def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str, *, choices=None, choice_texts=None, subject=None):
     prepared = prepare_logit_task_inputs(
         spec=spec,
         tokenizer=tokenizer,
         context=context,
         question=question,
         device=device,
+        choices=choices,
+        choice_texts=choice_texts,
+        subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
-    context_past = _ensure_model_cache(extract_past_key_values(model, prepared["cache_input_ids"]))
+    context_past = extract_past_key_values(model, prepared["prefix_input_ids"])
     scoring_past = prepare_answer_scoring_past(
         model=model,
         past_key_values=context_past,
-        question_cache_ids=prepared["question_cache_ids"],
+        suffix_cache_ids=prepared["suffix_cache_ids"],
     )
-    scoring_past = _ensure_model_cache(scoring_past)
     scores = score_answer_choices(
         model=model,
         past_key_values=scoring_past,
@@ -129,15 +82,14 @@ def _predict_direct_context_generation(
         device=device,
         max_input_tokens=context_budget,
     )
-    context_past = _ensure_model_cache(extract_past_key_values(model, prepared["cache_input_ids"]))
-    context_past = _ensure_model_cache(context_past)
+    context_past = extract_past_key_values(model, prepared["prefix_input_ids"])
     return predict_generation_task_answer(
         model=model,
         tokenizer=tokenizer,
         past_key_values=context_past,
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
-        question_cache_ids=prepared["question_cache_ids"],
+        suffix_cache_ids=prepared["suffix_cache_ids"],
     )
 
 
@@ -153,6 +105,9 @@ def _predict_kvcomm_logit(
     context: str,
     question: str,
     device: str,
+    choices=None,
+    choice_texts=None,
+    subject=None,
 ):
     prepared = prepare_logit_task_inputs(
         spec=spec,
@@ -160,21 +115,21 @@ def _predict_kvcomm_logit(
         context=context,
         question=question,
         device=device,
+        choices=choices,
+        choice_texts=choice_texts,
+        subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
-    source_past = extract_past_key_values(source_model, prepared["cache_input_ids"])
-    kvcomm_past = _ensure_model_cache(
-        pool.build_replayed_target_past(
-            edge_id=edge_id,
-            source_past_key_values=source_past,
-        )
+    source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
+    kvcomm_past = pool.build_replayed_target_past(
+        edge_id=edge_id,
+        source_past_key_values=source_past,
     )
     scoring_past = prepare_answer_scoring_past(
         model=target_model,
         past_key_values=kvcomm_past,
-        question_cache_ids=prepared["question_cache_ids"],
+        suffix_cache_ids=prepared["suffix_cache_ids"],
     )
-    scoring_past = _ensure_model_cache(scoring_past)
     scores = score_answer_choices(
         model=target_model,
         past_key_values=scoring_past,
@@ -208,145 +163,101 @@ def _predict_kvcomm_generation(
         device=device,
         max_input_tokens=context_budget,
     )
-    source_past = extract_past_key_values(source_model, prepared["cache_input_ids"])
-    kvcomm_past = _ensure_model_cache(
-        pool.build_replayed_target_past(
-            edge_id=edge_id,
-            source_past_key_values=source_past,
-        )
+    source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
+    kvcomm_past = pool.build_replayed_target_past(
+        edge_id=edge_id,
+        source_past_key_values=source_past,
     )
-    kvcomm_past = _ensure_model_cache(kvcomm_past)
     return predict_generation_task_answer(
         model=target_model,
         tokenizer=tokenizer,
         past_key_values=kvcomm_past,
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
-        question_cache_ids=prepared["question_cache_ids"],
+        suffix_cache_ids=prepared["suffix_cache_ids"],
     )
 
 
-def evaluate_dataset(
+def _build_logit_example_state(
     *,
     ctx: Context,
-    spec,
-    dataloader: DataLoader,
-    eval_config: EvalConfig,
-    translator_pool: KVCommSelectionPool,
-    logger,
-) -> Dict[str, Dict[str, float]]:
-    device = ctx.config.device
-    tokenizer = ctx.tokenizer
-    edge_map = {edge.id: edge for edge in ctx.edges}
-
-    path_metrics = {
-        edge.id: RunningAverage()
-        for edge in ctx.edges
+    prefix_input_ids: torch.Tensor,
+    **_,
+):
+    return {
+        "past_by_node_id": {
+            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            for node in ctx.nodes
+        }
     }
 
-    processed_examples = 0
 
-    for batch_idx, batch in enumerate(dataloader, start=1):
-        for example in batch:
-            question = example["question"]
-            gold_answer = example["answer"]
-            context_text = example.get("context")
+def _build_logit_edge_artifacts(
+    *,
+    edge: Edge,
+    example_state,
+    translator_pool: KVCommSelectionPool,
+    **_,
+) -> LogitEvalEdgeArtifacts:
+    past_by_node_id = example_state["past_by_node_id"]
+    kvcomm_past = translator_pool.build_replayed_target_past(
+        edge_id=edge.id,
+        source_past_key_values=past_by_node_id[edge.src_id],
+    )
+    native_past = past_by_node_id[edge.tgt_id]
+    kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
+        edge=edge,
+        translator_pool=translator_pool,
+        replayed_past=kvcomm_past,
+        native_target_past=native_past,
+    )
+    return LogitEvalEdgeArtifacts(
+        translated_past_key_values=kvcomm_past,
+        native_past_key_values=native_past,
+        cosine_value=cosine_similarity_between_past(kvcomm_past_for_cosine, native_past),
+    )
 
-            prepared_inputs = prepare_logit_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context_text,
-                question=question,
-                device=device,
+
+def _prepare_kvcomm_scoring_past(*, model, past_key_values, suffix_cache_ids):
+    return prepare_answer_scoring_past(
+        model=model,
+        past_key_values=past_key_values,
+        suffix_cache_ids=suffix_cache_ids,
+    )
+
+
+def _build_full_length_kvcomm_past_for_cosine(
+    *,
+    edge: Edge,
+    translator_pool: KVCommSelectionPool,
+    replayed_past: PastKeyValues,
+    native_target_past: PastKeyValues,
+) -> PastKeyValues:
+    selected_target_layers = set(translator_pool.get_selected_target_layers(edge.id))
+    selected_target_layers.add(0)
+    full_length_past = []
+    for layer_idx, (replayed_layer, native_layer) in enumerate(zip(replayed_past, native_target_past)):
+        if layer_idx in selected_target_layers:
+            full_length_past.append(replayed_layer)
+            continue
+
+        replayed_key, replayed_value = replayed_layer
+        native_key, native_value = native_layer
+        target_seq_len = native_key.shape[2]
+        full_length_past.append(
+            (
+                replayed_key.expand(-1, -1, target_seq_len, -1).contiguous(),
+                replayed_value.expand(-1, -1, target_seq_len, -1).contiguous(),
             )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
-            seed_token = prepared_inputs["seed_token"]
+        )
+    return tuple(full_length_past)
 
-            candidate_token_ids = build_logit_answer_candidates(
-                tokenizer=tokenizer,
-                spec=spec,
-            )
 
-            past_by_node_id = {
-                node.id: _ensure_model_cache(
-                    extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
-                )
-                for node in ctx.nodes
-            }
-
-            for edge_id, edge in edge_map.items():
-                target_model = ctx.mm.get_model(edge.tgt_id)
-
-                kvcomm_past = _ensure_model_cache(
-                    translator_pool.build_replayed_target_past(
-                        edge_id=edge_id,
-                        source_past_key_values=past_by_node_id[edge.src_id],
-                    )
-                )
-
-                cosine_value = _compute_selected_layer_cosine(
-                    translator_pool=translator_pool,
-                    edge_id=edge_id,
-                    source_past_key_values=past_by_node_id[edge.src_id],
-                    target_past_key_values=past_by_node_id[edge.tgt_id],
-                    replayed_target_past_key_values=kvcomm_past,
-                )
-
-                kvcomm_scoring_past = _ensure_model_cache(
-                    prepare_answer_scoring_past(
-                        model=target_model,
-                        past_key_values=kvcomm_past,
-                        question_cache_ids=question_cache_ids,
-                    )
-                )
-                native_scoring_past = _ensure_model_cache(
-                    prepare_answer_scoring_past(
-                        model=target_model,
-                        past_key_values=past_by_node_id[edge.tgt_id],
-                        question_cache_ids=question_cache_ids,
-                    )
-                )
-
-                kvcomm_scores = score_answer_choices(
-                    model=target_model,
-                    past_key_values=kvcomm_scoring_past,
-                    seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
-                )
-                native_scores = score_answer_choices(
-                    model=target_model,
-                    past_key_values=native_scoring_past,
-                    seed_token=seed_token,
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
-                )
-
-                pred_kvcomm = predict_answer_label(kvcomm_scores)
-                pred_native = predict_answer_label(native_scores)
-
-                acc = 1.0 if pred_kvcomm == gold_answer else 0.0
-                native_acc = 1.0 if pred_native == gold_answer else 0.0
-                path_metrics[edge_id].update(cosine_value, acc, native_acc, 1)
-
-            processed_examples += 1
-
-        if batch_idx % 50 == 0:
-            logger.info(
-                "[%s] progress: %d/%d examples",
-                spec.name_for_log,
-                processed_examples,
-                eval_config.max_examples_per_dataset,
-            )
-
-    summarized = summarize_path_metrics(path_metrics)
+def _finalize_logit_results(*, ctx: Context, results, **_) -> None:
     for edge in ctx.edges:
-        row = summarized[edge.id]
+        row = results[edge.id]
         row["direct_context_accuracy"] = row["native_accuracy"]
         row["kvcomm_accuracy"] = row["accuracy"]
-    return summarized
-
 
 
 def evaluate_generation_dataset(
@@ -356,10 +267,8 @@ def evaluate_generation_dataset(
     dataloader: DataLoader,
     eval_config: EvalConfig,
     translator_pool: KVCommSelectionPool,
-    logger,
 ) -> Dict[str, Dict[str, float]]:
     device = ctx.config.device
-    tokenizer = ctx.tokenizer
     path_metrics = {
         edge.id: GenerationRunningAverage()
         for edge in ctx.edges
@@ -373,26 +282,29 @@ def evaluate_generation_dataset(
             context = example["context"]
             gold_answers = example["answers"]
 
-            context_budget = None
-            if spec.answer_mode in {"squad", "newsqa"}:
-                context_budget = compute_benchmark_context_budget(
-                    ctx=ctx,
-                    spec=spec,
-                    question=question,
-                    eval_config=eval_config,
-                )
-
-            prepared_generation_inputs = prepare_generation_task_inputs(
-                spec=spec,
-                tokenizer=tokenizer,
-                context=context,
-                question=question,
-                device=device,
-                max_input_tokens=context_budget,
-            )
-            cache_input_ids = prepared_generation_inputs["cache_input_ids"]
-
             for edge in ctx.edges:
+                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                context_budget = None
+                if spec.answer_mode in {"squad", "newsqa"}:
+                    context_budget = compute_benchmark_context_budget(
+                        ctx=ctx,
+                        spec=spec,
+                        question=question,
+                        eval_config=eval_config,
+                        tokenizer=tokenizer,
+                        target_node_id=edge.tgt_id,
+                    )
+
+                prepared_generation_inputs = prepare_generation_task_inputs(
+                    spec=spec,
+                    tokenizer=tokenizer,
+                    context=context,
+                    question=question,
+                    device=device,
+                    max_input_tokens=context_budget,
+                )
+                prefix_input_ids = prepared_generation_inputs["prefix_input_ids"]
+
                 source_model = ctx.mm.get_model(edge.src_id)
                 target_model = ctx.mm.get_model(edge.tgt_id)
 
@@ -420,21 +332,19 @@ def evaluate_generation_dataset(
                     context_budget=context_budget,
                 )
 
-                kvcomm_source_past = _ensure_model_cache(extract_past_key_values(source_model, cache_input_ids))
-                kvcomm_replayed_past = _ensure_model_cache(
-                    translator_pool.build_replayed_target_past(
-                        edge_id=edge.id,
-                        source_past_key_values=kvcomm_source_past,
-                    )
-                )
-                native_target_past = _ensure_model_cache(extract_past_key_values(target_model, cache_input_ids))
-                cosine_value = _compute_selected_layer_cosine(
-                    translator_pool=translator_pool,
+                kvcomm_source_past = extract_past_key_values(source_model, prefix_input_ids)
+                kvcomm_replayed_past = translator_pool.build_replayed_target_past(
                     edge_id=edge.id,
                     source_past_key_values=kvcomm_source_past,
-                    target_past_key_values=native_target_past,
-                    replayed_target_past_key_values=kvcomm_replayed_past,
                 )
+                native_target_past = extract_past_key_values(target_model, prefix_input_ids)
+                kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
+                    edge=edge,
+                    translator_pool=translator_pool,
+                    replayed_past=kvcomm_replayed_past,
+                    native_target_past=native_target_past,
+                )
+                cosine_value = cosine_similarity_between_past(kvcomm_past_for_cosine, native_target_past)
 
                 f1_value = compute_generation_f1(pred_kvcomm, gold_answers)
                 native_f1_value = compute_generation_f1(pred_direct, gold_answers)
@@ -443,20 +353,14 @@ def evaluate_generation_dataset(
             processed_examples += 1
 
         if batch_idx % 25 == 0:
-            logger.info(
+            logging.info(
                 "[%s] generation progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
                 eval_config.max_examples_per_dataset,
             )
 
-    summarized = summarize_generation_path_metrics(path_metrics)
-    for edge in ctx.edges:
-        row = summarized[edge.id]
-        row["direct_context_f1"] = row["native_f1"]
-        row["kvcomm_f1"] = row["f1"]
-    return summarized
-
+    return summarize_generation_path_metrics(path_metrics)
 
 
 def run_eval(
@@ -475,26 +379,25 @@ def run_eval(
     write_json(str(config_path), asdict(eval_config))
 
     log_path = get_eval_log_path(eval_config.output_path)
-    logger = setup_logger(f"{eval_config.alg}_eval", log_path)
-    logger.info("Starting evaluation")
-    logger.info("checkpoint_dir_path=%s", checkpoint_dir_path)
-    logger.info("eval_config=%s", asdict(eval_config))
+    logging.info("Starting evaluation")
+    logging.info("checkpoint_dir_path=%s", checkpoint_dir_path)
+    logging.info("eval_config=%s", asdict(eval_config))
 
     translator_pool.eval()
     for node in nodes:
         ctx.mm.get_model(node.id).eval()
 
-    logger.info("restored_train_config=%s", asdict(train_config))
-    logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("edges=%s", [edge.id for edge in edges])
-    logger.info(
+    logging.info("restored_train_config=%s", asdict(train_config))
+    logging.info("nodes=%s", [asdict(node) for node in nodes])
+    logging.info("edges=%s", [edge.id for edge in edges])
+    logging.info(
         "layer_selection_source=%s/train | selection_total_tokens=%d | selection_prefix_tokens=%d",
         train_config.calibration_dataset,
         _openwebtext_total_tokens(train_config),
         _openwebtext_prefix_tokens(train_config),
     )
     for edge in edges:
-        logger.info(
+        logging.info(
             "%s | selected_target_layers=%s | selected_source_layers=%s",
             edge.id,
             translator_pool.get_selected_target_layers(edge.id),
@@ -502,48 +405,39 @@ def run_eval(
         )
 
     calibration_eval_name = _build_calibration_eval_name(train_config)
-    logger.info("Preparing validation dataloader for %s", calibration_eval_name)
+    logging.info("Preparing validation dataloader for %s", calibration_eval_name)
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        return _ensure_model_cache(
-            translator_pool.build_replayed_target_past(
-                edge_id=edge.id,
-                source_past_key_values=past_by_node_id[edge.src_id],
-            )
+        return translator_pool.build_replayed_target_past(
+            edge_id=edge.id,
+            source_past_key_values=past_by_node_id[edge.src_id],
         )
 
     def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
-        native_past = _ensure_model_cache(past_by_node_id[edge.tgt_id])
-        translated_past = _ensure_model_cache(
-            translator_pool.build_replayed_target_past(
-                edge_id=edge.id,
-                source_past_key_values=past_by_node_id[edge.src_id],
-            )
-        )
-        source_selected_past, translated_selected_past, target_selected_past = _build_kvcomm_selected_layer_views(
-            translator_pool=translator_pool,
+        native_past = past_by_node_id[edge.tgt_id]
+        translated_past = translator_pool.build_replayed_target_past(
             edge_id=edge.id,
             source_past_key_values=past_by_node_id[edge.src_id],
-            target_past_key_values=native_past,
-            replayed_target_past_key_values=translated_past,
         )
         return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=source_selected_past,
-            translated_past_key_values=translated_selected_past,
-            target_top_past_key_values=target_selected_past,
+            source_top_past_key_values=select_past_layers_by_indices(
+                past_by_node_id[edge.src_id],
+                translator_pool.get_selected_source_layers(edge.id),
+            ),
+            translated_past_key_values=translated_past,
+            target_top_past_key_values=native_past,
         )
 
     openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        logger=logger,
         build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
         row = openwebtext_loss_results[edge.id]
-        logger.info(
+        logging.info(
             "[%s] %s | native_loss=%.6f | native_profile=%s | kvcomm_loss=%.6f | kvcomm_profile=%s | count=%d",
             calibration_eval_name,
             edge.id,
@@ -554,13 +448,13 @@ def run_eval(
             row["count"],
         )
         if row.get("tsne_plot_path"):
-            logger.info("[%s] %s | tsne_plot=%s", calibration_eval_name, edge.id, row["tsne_plot_path"])
+            logging.info("[%s] %s | tsne_plot=%s", calibration_eval_name, edge.id, row["tsne_plot_path"])
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for spec in get_default_logit_qa_dataset_specs():
-        logger.info("Preparing dataloader for %s", spec.name_for_log)
+        logging.info("Preparing dataloader for %s", spec.name_for_log)
         dataloader = build_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
@@ -571,11 +465,13 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
+            build_example_state_fn=_build_logit_example_state,
+            build_edge_artifacts_fn=_build_logit_edge_artifacts,
+            prepare_scoring_past_fn=_prepare_kvcomm_scoring_past,
+            finalize_results_fn=_finalize_logit_results,
         )
         all_logit_results[spec.name_for_log] = results
         log_dataset_result(
-            logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
             nodes=nodes,
@@ -586,7 +482,7 @@ def run_eval(
 
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for spec in get_default_gen_qa_dataset_specs():
-        logger.info("Preparing generation dataloader for %s", spec.name_for_log)
+        logging.info("Preparing generation dataloader for %s", spec.name_for_log)
         dataloader = build_generation_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
@@ -597,11 +493,9 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            logger=logger,
         )
         all_generation_results[spec.name_for_log] = results
         log_generation_dataset_result(
-            logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
             nodes=nodes,
@@ -652,8 +546,8 @@ def run_eval(
     summary_path = Path(eval_config.output_path) / "summary.md"
     summary_path.write_text(summary_markdown, encoding="utf-8")
 
-    logger.info("===== FINAL MARKDOWN SUMMARY =====\n%s", summary_markdown)
-    logger.info("Saved metrics to %s", metrics_path)
-    logger.info("Saved summary to %s", summary_path)
-    logger.info("Done. Saved log to %s", log_path)
+    logging.info("===== FINAL MARKDOWN SUMMARY =====\n%s", summary_markdown)
+    logging.info("Saved metrics to %s", metrics_path)
+    logging.info("Saved summary to %s", summary_path)
+    logging.info("Done. Saved log to %s", log_path)
     return log_path

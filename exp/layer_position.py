@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import math
 import sys
 
 from pathlib import Path
@@ -13,7 +14,7 @@ from core.common import *
 from core.channel_manager import ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
-from core.model_spec import ModelSpec
+from core.model_spec import ModelSpec, infer_model_spec_from_config
 from core.eval_util import *
 from mot.train import *
 from core.train_util import *
@@ -270,26 +271,6 @@ def sanitize_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "default"
 
 
-def load_model_spec_from_pretrained_config(model_id: str) -> ModelSpec:
-    config = AutoConfig.from_pretrained(model_id)
-    try:
-        num_heads = config.n_head
-        hidden_size = config.n_embd
-        num_layers = config.n_layer
-    except AttributeError as exc:
-        raise ValueError("This experiment expects GPT-2 style configs with n_head/n_embd/n_layer.") from exc
-    if hidden_size % num_heads != 0:
-        raise ValueError("hidden_size must be divisible by num_heads.")
-    resolved_model_id = config._name_or_path if hasattr(config, "_name_or_path") else model_id
-    return ModelSpec(
-        model_id=resolved_model_id,
-        num_layers=num_layers,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        head_dim=hidden_size // num_heads,
-    )
-
-
 
 def resolve_run_position_label(config: LayerPositionConfig) -> str:
     return f"injection_layer_start_idx_{config.injection_layer_start_idx:03d}"
@@ -306,7 +287,7 @@ def resolve_target_num_layers(
     node_map = build_node_map(nodes)
     reference_edge = edges[0]
     target_model_id = node_map[reference_edge.tgt_id].model_id
-    return load_model_spec_from_pretrained_config(target_model_id).num_layers
+    return infer_model_spec_from_config(AutoConfig.from_pretrained(target_model_id)).num_layers
 
 
 def build_control_window_variants(
@@ -371,50 +352,23 @@ def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
 
 
-def build_models_for_experiment(
-    config: LayerPositionConfig,
-    nodes: List[Node],
-) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase]:
-    return build_models_and_tokenizer(
-        SimpleNamespace(
-            device=config.device,
-            dtype=config.dtype,
-        ),
-        nodes,
-    )
-
-
 def run_train(
     ctx: Context,
     run_dir: Path,
 ) -> LayerWindowTranslatorPool:
     config = ctx.config
     nodes = ctx.nodes
-    tokenizer = ctx.tokenizer
-    logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
-    logger.info("Starting layer-window position training with target-layer replay")
-    logger.info("experiment_config=%s", asdict(config))
+    node_map = build_node_map(nodes)
+    logging.info("Starting layer-window position training with target-layer replay")
+    logging.info("experiment_config=%s", asdict(config))
 
     translator_pool = build_translator_pool(
         ctx=ctx,
     )
     translator_pool.train()
-    logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
+    logging.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = InfiniteDataLoader(
-        DataLoader(
-            OpenWebTextSequenceStream(
-                tokenizer=tokenizer,
-                sequence_length=config.total_tokens,
-                split="train",
-                shuffle=True,
-                shuffle_buffer=config.shuffle_buffer,
-                seed=config.seed,
-            ),
-            batch_size=config.batch_size,
-            num_workers=0,
-        )
-    )
+    dataloaders_by_target = build_training_dataloaders_by_target(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
@@ -431,20 +385,23 @@ def run_train(
         step_loss_value = 0.0
 
         for _ in range(config.grad_accum_steps):
-            input_ids = next(dataloader).to(config.device)
-            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                input_ids=input_ids,
-                prefix_tokens=config.prefix_tokens,
-            )
-
-            with torch.no_grad():
-                past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
-                    for node in nodes
-                }
+            target_batches = {}
+            for target_node_id, dataloader in dataloaders_by_target.items():
+                input_ids = next(dataloader).to(config.device)
+                prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                    input_ids=input_ids,
+                    prefix_tokens=config.prefix_tokens,
+                )
+                with torch.no_grad():
+                    past_by_node_id = {
+                        node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                        for node in nodes
+                    }
+                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
 
             total_direction_loss = 0.0
             for edge in ctx.edges:
+                prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
                 translated_key, translated_value = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
@@ -453,10 +410,11 @@ def run_train(
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=prefix_cache_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 total_direction_loss = total_direction_loss + compute_prefix_correction_and_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
@@ -464,7 +422,7 @@ def run_train(
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                 )
 
             loss = total_direction_loss / config.grad_accum_steps
@@ -481,8 +439,8 @@ def run_train(
             avg_loss = running_loss / config.log_every
             progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.lr:.2e}")
             gpu_memory = gpu_memory_tracker.summary()
-            logger.info(
-                "[Step %04d] window_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+            logging.info(
+                "[Step %04d] loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
                 scheduler.lr,
@@ -491,7 +449,7 @@ def run_train(
             )
             running_loss = 0.0
 
-    logger.info("[Done] training complete")
+    logging.info("[Done] training complete")
     return translator_pool
 
 
@@ -501,11 +459,10 @@ def evaluate_logit_dataset(
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     translator_pool: LayerWindowTranslatorPool,
-    logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
-    tokenizer = ctx.tokenizer
+    node_map = build_node_map(nodes)
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("accuracy") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -515,15 +472,18 @@ def evaluate_logit_dataset(
         for example in batch:
             prepared_inputs = prepare_logit_task_inputs(
                 spec=spec,
-                tokenizer=tokenizer,
+                tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id),
                 context=example.get("context"),
                 question=example["question"],
                 device=config.device,
+                choices=example.get("choices"),
+                choice_texts=example.get("choice_texts"),
+                subject=example.get("subject"),
             )
-            candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
+            candidate_token_ids = build_logit_answer_candidates(tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id), spec=spec)
             gold_answer = example["answer"]
-            context_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            context_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
             past_by_node_id = {
                 node.id: extract_past_key_values(ctx.mm.get_model(node.id), context_input_ids)
@@ -551,47 +511,50 @@ def evaluate_logit_dataset(
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     prefix_input_ids=context_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
 
                 native_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=native_target_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 dir_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=dir_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 mag_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mag_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 full_mix_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=full_mix_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 native_scores = score_answer_choices(
@@ -628,10 +591,10 @@ def evaluate_logit_dataset(
                 mag_only_pred = predict_answer_label(mag_only_scores)
                 full_mix_pred = predict_answer_label(full_mix_scores)
                 path_metrics[edge.id].update(
-                    native_value=1.0 if native_pred == gold_answer else 0.0,
-                    dir_only_value=1.0 if dir_only_pred == gold_answer else 0.0,
-                    mag_only_value=1.0 if mag_only_pred == gold_answer else 0.0,
-                    full_mix_value=1.0 if full_mix_pred == gold_answer else 0.0,
+                    native_value=1.0 if is_logit_answer_correct(native_pred, gold_answer) else 0.0,
+                    dir_only_value=1.0 if is_logit_answer_correct(dir_only_pred, gold_answer) else 0.0,
+                    mag_only_value=1.0 if is_logit_answer_correct(mag_only_pred, gold_answer) else 0.0,
+                    full_mix_value=1.0 if is_logit_answer_correct(full_mix_pred, gold_answer) else 0.0,
                     n=1,
                 )
 
@@ -667,7 +630,7 @@ def evaluate_logit_dataset(
             processed_examples += 1
 
         if batch_idx % 50 == 0:
-            logger.info(
+            logging.info(
                 "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -685,11 +648,10 @@ def evaluate_generation_dataset(
     spec: HFDatasetSpec,
     dataloader: DataLoader,
     translator_pool: LayerWindowTranslatorPool,
-    logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     config = ctx.config
     nodes = ctx.nodes
-    tokenizer = ctx.tokenizer
+    node_map = build_node_map(nodes)
     edges = ctx.edges
     path_metrics = {edge.id: ControlMetricMeter("f1") for edge in edges}
     path_logit_kl = {edge.id: LogitKLMeter() for edge in edges}
@@ -706,31 +668,33 @@ def evaluate_generation_dataset(
                 spec=spec,
                 question=question,
                 eval_config=config,
+                tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id),
+                target_node_id=edges[0].tgt_id,
             )
             prepared_inputs = prepare_generation_task_inputs(
                 spec=spec,
-                tokenizer=tokenizer,
+                tokenizer=ctx.mm.get_tokenizer(edges[0].tgt_id),
                 context=context_text,
                 question=question,
                 device=config.device,
                 max_input_tokens=context_budget,
             )
-            cache_input_ids = prepared_inputs["cache_input_ids"]
-            question_cache_ids = prepared_inputs["question_cache_ids"]
+            prefix_input_ids = prepared_inputs["prefix_input_ids"]
+            suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
             seed_token = prepared_inputs["seed_token"]
 
             if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                question_cache_tokens = 0 if question_cache_ids is None else question_cache_ids.shape[1]
-                logger.info(
-                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
+                suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                logging.info(
+                    "[%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
-                    cache_input_ids.shape[1],
-                    question_cache_tokens,
+                    prefix_input_ids.shape[1],
+                    suffix_cache_tokens,
                     get_answer_token_budget(config),
                 )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), cache_input_ids)
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
                 for node in nodes
             }
 
@@ -754,60 +718,63 @@ def evaluate_generation_dataset(
                 )
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    prefix_input_ids=prefix_input_ids,
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    prefix_input_ids=prefix_input_ids,
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=ctx.mm.get_model(edge.tgt_id),
-                    prefix_input_ids=cache_input_ids,
-                    target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+                    prefix_input_ids=prefix_input_ids,
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
                 )
 
                 native_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=native_target_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 dir_only_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=dir_only_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 mag_only_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=mag_only_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 full_mix_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    tokenizer=ctx.mm.get_tokenizer(edge.tgt_id),
                     past_key_values=full_mix_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 path_metrics[edge.id].update(
@@ -821,22 +788,22 @@ def evaluate_generation_dataset(
                 native_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=native_target_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 dir_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=dir_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 mag_only_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mag_only_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
                 full_mix_scoring_past = prepare_answer_scoring_past(
                     model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=full_mix_past,
-                    question_cache_ids=question_cache_ids,
+                    suffix_cache_ids=suffix_cache_ids,
                 )
 
                 native_log_probs = compute_next_token_log_probs(
@@ -871,7 +838,7 @@ def evaluate_generation_dataset(
             processed_examples += 1
 
         if batch_idx % 25 == 0:
-            logger.info(
+            logging.info(
                 "[%s] generation progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
@@ -903,10 +870,11 @@ def compute_openwebtext_native_and_full_mix_losses(
     full_mix_past = replay_target_prefill_with_injected_window(
         target_model=ctx.mm.get_model(edge.tgt_id),
         prefix_input_ids=prefix_cache_ids,
-        target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
+        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
         injected_key_block=translated_key,
         injected_value_block=translated_value,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        target_model_id=build_node_map(ctx.nodes)[edge.tgt_id].model_id,
     )
 
     native_loss = float(
@@ -1498,7 +1466,6 @@ def evaluate_openwebtext_losses_and_kv_similarity(
     ctx: Context,
     run_dir: Path,
     translator_pool: LayerWindowTranslatorPool,
-    logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, str], Dict[str, str]]:
     config = ctx.config
     dataloader = build_openwebtext_eval_dataloader(
@@ -1621,7 +1588,7 @@ def evaluate_openwebtext_losses_and_kv_similarity(
 
         processed_examples += batch_examples
         if batch_idx % 10 == 0:
-            logger.info(
+            logging.info(
                 "[OpenWebText/validation] loss+kv-sim progress: %d/%d sequences",
                 processed_examples,
                 max_examples,
@@ -1652,7 +1619,7 @@ def evaluate_openwebtext_losses_and_kv_similarity(
         )
         heatmap_paths[edge.id] = str(heatmap_path)
         metadata_paths[edge.id] = str(metadata_path)
-        logger.info(
+        logging.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | kv_similarity_heatmap=%s",
             edge.id,
             native_loss,
@@ -1808,9 +1775,8 @@ def run_eval(
 ) -> Dict[str, Any]:
     config = ctx.config
     edges = ctx.edges
-    logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
-    logger.info("Starting layer-window position evaluation with target-layer replay")
-    logger.info("experiment_config=%s", asdict(config))
+    logging.info("Starting layer-window position evaluation with target-layer replay")
+    logging.info("experiment_config=%s", asdict(config))
 
     translator_pool.eval()
     for node in ctx.nodes:
@@ -1820,6 +1786,7 @@ def run_eval(
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         max_examples_per_dataset=config.eval_max_examples_per_dataset,
+        output_path=str(run_dir),
         seed=config.seed,
         shuffle_eval_stream=config.eval_shuffle_stream,
         shuffle_buffer=config.shuffle_buffer,
@@ -1828,16 +1795,29 @@ def run_eval(
     dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
     dataset_logit_kl_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-    logger.info("Preparing validation dataloader for OpenWebText/validation")
-    openwebtext_loss_by_edge, openwebtext_kv_similarity_heatmaps, openwebtext_kv_similarity_metadata = evaluate_openwebtext_losses_and_kv_similarity(
+    logging.info("Preparing validation dataloader for OpenWebText/validation")
+    raw_openwebtext_loss_by_edge, openwebtext_kv_similarity_heatmaps, openwebtext_kv_similarity_metadata = evaluate_openwebtext_losses_and_kv_similarity(
         ctx=ctx,
         run_dir=run_dir,
         translator_pool=translator_pool,
-        logger=logger,
     )
+
+    openwebtext_loss_by_edge: Dict[str, Dict[str, float]] = {}
+    for edge in ctx.edges:
+        row = dict(raw_openwebtext_loss_by_edge[edge.id])
+        full_mix_loss = float(row.get("loss", float("nan")))
+        native_loss = float(row.get("native_loss", float("nan")))
+        row["full_mix_loss"] = full_mix_loss
+        row["delta_full_mix_loss"] = (
+            full_mix_loss - native_loss
+            if math.isfinite(full_mix_loss) and math.isfinite(native_loss)
+            else float("nan")
+        )
+        openwebtext_loss_by_edge[edge.id] = row
+
     for edge in ctx.edges:
         row = openwebtext_loss_by_edge[edge.id]
-        logger.info(
+        logging.info(
             "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | count=%d",
             edge.id,
             row["native_loss"],
@@ -1881,14 +1861,13 @@ def run_eval(
             spec=spec,
             dataloader=dataloader,
             translator_pool=translator_pool,
-            logger=logger,
         )
         dataset_results_by_name[spec.name_for_log] = dataset_results
         dataset_logit_kl_by_name[spec.name_for_log] = dataset_logit_kl
         for edge in edges:
             metric_row = dataset_results[edge.id]
             logit_row = dataset_logit_kl[edge.id]
-            logger.info(
+            logging.info(
                 progress_log_template,
                 spec.name_for_log,
                 edge.id,
@@ -1925,7 +1904,7 @@ def run_eval(
     average_native_loss = compute_average_metric(openwebtext_loss_results, "native_loss")
     average_full_mix_loss = compute_average_metric(openwebtext_loss_results, "full_mix_loss")
 
-    logger.info(
+    logging.info(
         "[Summary] metric=%s | native=%.6f | dir_only=%.6f | mag_only=%.6f | full_mix=%.6f",
         metric_name,
         average_native_metric,
@@ -1933,13 +1912,13 @@ def run_eval(
         average_mag_only_metric,
         average_full_mix_metric,
     )
-    logger.info(
+    logging.info(
         "[Summary] delta_dir_only=%.6f | delta_mag_only=%.6f | delta_full_mix=%.6f",
         average_delta_dir_only,
         average_delta_mag_only,
         average_delta_full_mix,
     )
-    logger.info(
+    logging.info(
         "[Summary] avg_kl(native||dir)=%.6f | avg_kl(native||mag)=%.6f | avg_kl(native||full)=%.6f | avg_kl(full||dir)=%.6f | avg_kl(full||mag)=%.6f",
         average_native_to_dir_only_logit_kl,
         average_native_to_mag_only_logit_kl,
@@ -1947,7 +1926,7 @@ def run_eval(
         average_full_mix_to_dir_only_logit_kl,
         average_full_mix_to_mag_only_logit_kl,
     )
-    logger.info(
+    logging.info(
         "[Summary] OpenWebText/validation loss | native=%.6f | full_mix=%.6f",
         average_native_loss,
         average_full_mix_loss,
@@ -2026,22 +2005,23 @@ def main() -> None:
 
     set_seed(config.seed)
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    models, tokenizer = build_models_for_experiment(config, nodes)
+    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models),
-        tokenizer,
+        ModelManager(models, tokenizers),
         ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    setup_logging(build_train_log_path(run_dir))
     translator_pool = run_train(
         ctx=ctx,
         run_dir=run_dir,
     )
+    setup_logging(build_eval_log_path(run_dir))
     combined_metrics = run_eval(
         ctx=ctx,
         run_dir=run_dir,

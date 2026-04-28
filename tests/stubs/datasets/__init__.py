@@ -65,6 +65,26 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
         ]
         return FakeMapDataset(items)
 
+
+    if dataset_path == "edinburgh-dawg/mmlu-redux-2.0" and isinstance(dataset_name, str) and split == "test":
+        items = [
+            {
+                "question": f"[{dataset_name}] What is 2 + 2?",
+                "choices": ["3", "4", "5", "6"],
+                "answer": 1,
+                "error_type": "ok",
+                "correct_answer": None,
+            },
+            {
+                "question": f"[{dataset_name}] Which option is correct after relabeling?",
+                "choices": ["wrong", "still wrong", "right answer", "also wrong"],
+                "answer": 0,
+                "error_type": "wrong_groundtruth",
+                "correct_answer": "right answer",
+            },
+        ]
+        return FakeMapDataset(items)
+
     if key == ("gabrieltorresgamez/newsqa", None, "validation"):
         long_prefix = " ".join(["news"] * 90)
         items = [
@@ -80,6 +100,23 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
                 "paragraph": "The short article says the baker sold bread.",
                 "questions": ["What did the baker sell?"],
                 "answers": [{"text": ["bread"]}],
+            },
+        ]
+        return FakeMapDataset(items)
+
+    if key == ("Awesome075/multi_news_parquet", None, "validation"):
+        long_prefix = " ||||| ".join([
+            " ".join(["multinews"] * 45),
+            "A coalition of editors produced a concise validation summary.",
+        ])
+        items = [
+            {
+                "document": long_prefix,
+                "summary": "Editors produced a concise validation summary.",
+            },
+            {
+                "document": "Report one describes the launch. ||||| Report two describes the reaction.",
+                "summary": "The reports cover a launch and the reaction.",
             },
         ]
         return FakeMapDataset(items)
