@@ -47,22 +47,24 @@ AI_PAPER_DOUBLE_COLUMN_SQUARE_FIGSIZE = (AI_PAPER_DOUBLE_COLUMN_WIDTH, AI_PAPER_
 AI_PAPER_FIGURE_DPI = 300
 AI_PAPER_PREVIEW_DPI = 150
 
-# Double-column-friendly typography. Most AI conference templates render body text
-# around 9--10 pt in two-column mode, so figure text should stay in that range.
-AI_PAPER_AXIS_LABEL_SIZE = 10
-AI_PAPER_TICK_LABEL_SIZE = 9
-AI_PAPER_LEGEND_FONT_SIZE = 9
-AI_PAPER_ANNOTATION_FONT_SIZE = 8
-AI_PAPER_COLORBAR_LABEL_SIZE = 9
-AI_PAPER_COLORBAR_TICK_SIZE = 8
+# Double-column-friendly typography requested for this project.
+# Major text uses 12 pt; minor text uses 10 pt.
+AI_PAPER_MAJOR_FONT_SIZE = 12
+AI_PAPER_MINOR_FONT_SIZE = 10
+AI_PAPER_AXIS_LABEL_SIZE = AI_PAPER_MAJOR_FONT_SIZE
+AI_PAPER_LEGEND_FONT_SIZE = AI_PAPER_MAJOR_FONT_SIZE
+AI_PAPER_COLORBAR_LABEL_SIZE = AI_PAPER_MAJOR_FONT_SIZE
+AI_PAPER_TICK_LABEL_SIZE = AI_PAPER_MINOR_FONT_SIZE
+AI_PAPER_ANNOTATION_FONT_SIZE = AI_PAPER_MINOR_FONT_SIZE
+AI_PAPER_COLORBAR_TICK_SIZE = AI_PAPER_MINOR_FONT_SIZE
 
 AI_PAPER_LINE_WIDTH = 1.8
 AI_PAPER_REFERENCE_LINE_WIDTH = 1.0
 AI_PAPER_MARKER_SIZE = 8.5
 AI_PAPER_SCATTER_SIZE = 90.0
 AI_PAPER_MARKER_EDGE_WIDTH = 1.5
-AI_PAPER_BAR_VALUE_FONT_SIZE = 8
-AI_PAPER_HEATMAP_VALUE_FONT_SIZE = 7
+AI_PAPER_BAR_VALUE_FONT_SIZE = AI_PAPER_MINOR_FONT_SIZE
+AI_PAPER_HEATMAP_VALUE_FONT_SIZE = AI_PAPER_MINOR_FONT_SIZE
 AI_PAPER_ALGORITHM_LABEL_ROTATION = 35
 AI_PAPER_LAYER_TICK_ROTATION = 45
 AI_PAPER_LEGEND_HANDLE_LENGTH = 2.4
@@ -158,18 +160,13 @@ def apply_ai_paper_style() -> None:
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
 
-            # Font: STIX/Times-like serif is closer to common AI conference paper text.
-            "font.family": "serif",
-            "font.serif": [
-                "STIXGeneral",
-                "Times New Roman",
-                "Nimbus Roman",
-                "TeX Gyre Termes",
-                "Times",
-                "DejaVu Serif",
-            ],
-            "font.size": AI_PAPER_TICK_LABEL_SIZE,
-            "mathtext.fontset": "stix",
+            # Font: fixed to Times New Roman; no fallback family list.
+            "font.family": "Times New Roman",
+            "font.size": AI_PAPER_MINOR_FONT_SIZE,
+            "mathtext.fontset": "custom",
+            "mathtext.rm": "Times New Roman",
+            "mathtext.it": "Times New Roman:italic",
+            "mathtext.bf": "Times New Roman:bold",
 
             # Editable text in vector outputs
             "pdf.fonttype": 42,
