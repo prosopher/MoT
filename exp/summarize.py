@@ -20,10 +20,27 @@ if str(REPO_ROOT) not in sys.path:
 from exp.exp_util import (
     ACCENT_RED,
     AI_PAPER_PALETTE,
+    AI_PAPER_ALGORITHM_LABEL_ROTATION,
+    AI_PAPER_ANNOTATION_FONT_SIZE,
+    AI_PAPER_BAR_VALUE_FONT_SIZE,
+    AI_PAPER_DENSE_WIDTH_SCALE_MAX,
+    AI_PAPER_RADAR_FILL_ALPHA,
+    AI_PAPER_VALUE_OFFSET_FRACTION,
+    AI_PAPER_FIGURE_DPI,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_LINE_WIDTH,
+    AI_PAPER_NATIVE_LINESTYLE,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_CONTROL_LINESTYLE,
+    AI_PAPER_TICK_LABEL_SIZE,
+    double_column_figsize,
+    scaled_double_column_figsize,
     apply_ai_paper_style,
     require_matplotlib_colors,
     require_matplotlib_pyplot,
     save_paper_figure,
+    style_algorithm_tick_labels,
     style_axes_common,
 )
 
@@ -163,8 +180,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dpi",
         type=int,
-        default=220,
-        help="Saved figure DPI. Default: 220",
+        default=AI_PAPER_FIGURE_DPI,
+        help=f"Saved figure DPI. Default: {AI_PAPER_FIGURE_DPI}",
     )
     parser.add_argument(
         "--show",
@@ -492,13 +509,13 @@ def plot_edge_radar(
     legend_labels = dedupe_legend_names(ordered_series_list)
     series_colors = radar_colors_for_series(ordered_series_list)
 
-    fig = plt.figure(figsize=(9, 9))
+    fig = plt.figure(figsize=double_column_figsize(square=True))
     ax = plt.subplot(111, polar=True)
     ax.set_theta_offset(np.pi / 2)
     ax.set_theta_direction(-1)
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([display_name_for_subcategory(category) for category in categories], fontsize=10)
+    ax.set_xticklabels([display_name_for_subcategory(category) for category in categories], fontsize=AI_PAPER_TICK_LABEL_SIZE)
 
     if radius_max <= 0.4:
         rticks = [0.1, 0.2, 0.3, 0.4]
@@ -512,7 +529,7 @@ def plot_edge_radar(
     rticks = [t for t in rticks if t <= radius_max + 1e-9]
     ax.set_rlabel_position(0)
     ax.set_yticks(rticks)
-    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=9)
+    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=AI_PAPER_BAR_VALUE_FONT_SIZE)
     ax.set_ylim(0, radius_max)
     style_axes_common(ax, grid=True, grid_axis="both")
 
@@ -523,8 +540,8 @@ def plot_edge_radar(
             angles,
             native_values,
             color=NATIVE_COLOR,
-            linewidth=2.4,
-            linestyle="-",
+            linewidth=AI_PAPER_LINE_WIDTH,
+            linestyle=AI_PAPER_NATIVE_LINESTYLE,
             label=display_name_for_algorithm("native"),
             zorder=10,
         )
@@ -532,8 +549,8 @@ def plot_edge_radar(
     for series, label, color in zip(ordered_series_list, legend_labels, series_colors):
         values = [series.category_to_accuracy.get(cat, np.nan) for cat in categories]
         values += values[:1]
-        ax.plot(angles, values, linewidth=2, label=label, color=color)
-        ax.fill(angles, values, alpha=0.08, color=color)
+        ax.plot(angles, values, linewidth=AI_PAPER_LINE_WIDTH, label=label, color=color)
+        ax.fill(angles, values, alpha=AI_PAPER_RADAR_FILL_ALPHA, color=color)
     ax.legend(loc="upper left", bbox_to_anchor=(1.08, 1.10), frameon=False)
 
     save_paper_figure(fig, output_path, dpi=dpi, show=show)
@@ -772,16 +789,21 @@ def plot_eval_metric_bars(
     show: bool,
 ) -> Optional[Path]:
     plot_items = []
+    native_values = []
     for record in records:
         metric_value = parse_metric_number(record.values.get(metric_name, ""))
         if metric_value is None:
             continue
-        if record.method.strip().lower() == "native" and "peak memory" in metric_name.lower():
+        if record.method.strip().lower() == "native":
+            if "peak memory" not in metric_name.lower():
+                native_values.append(metric_value)
             continue
         label = display_name_for_algorithm(record.method.strip() or record.study_id)
         plot_items.append((metric_value, label, record.method))
 
-    if not plot_items:
+    native_value = native_values[0] if native_values else None
+
+    if not plot_items and native_value is None:
         return None
 
     plot_items.sort(key=lambda item: (item[0], item[1]))
@@ -792,16 +814,19 @@ def plot_eval_metric_bars(
     apply_ai_paper_style()
     plt = require_matplotlib_pyplot()
 
-    fig_width = max(10, 1.2 * len(labels) + 2)
-    fig, ax = plt.subplots(figsize=(fig_width, 6))
-    bars = ax.bar(range(len(labels)), values, color=colors)
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=35, ha="right")
+    width_scale = min(AI_PAPER_DENSE_WIDTH_SCALE_MAX, max(1.0, (1.2 * max(1, len(labels)) + 2.0) / 7.16))
+    fig, ax = plt.subplots(figsize=scaled_double_column_figsize(width_scale=width_scale, height=4.80))
+    x_positions = list(range(len(labels)))
+    bars = ax.bar(x_positions, values, color=colors) if values else []
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels, rotation=AI_PAPER_ALGORITHM_LABEL_ROTATION, ha="right")
     ax.set_ylabel(ylabel)
     style_axes_common(ax, grid=True, grid_axis="y")
+    style_algorithm_tick_labels(ax, axis="x")
 
     value_format = "{:.1f}" if metric_name == "Acc Avg" else "{:.3f}"
-    offset = max(values) * 0.01 if max(values) > 0 else 0.01
+    plotted_values = values + ([native_value] if native_value is not None else [])
+    offset = max(plotted_values) * AI_PAPER_VALUE_OFFSET_FRACTION if plotted_values and max(plotted_values) > 0 else AI_PAPER_VALUE_OFFSET_FRACTION
     for bar, value in zip(bars, values):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -809,8 +834,19 @@ def plot_eval_metric_bars(
             value_format.format(value),
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=AI_PAPER_BAR_VALUE_FONT_SIZE,
         )
+
+    if native_value is not None:
+        ax.axhline(
+            native_value,
+            color=NATIVE_COLOR,
+            linestyle=AI_PAPER_NATIVE_LINESTYLE,
+            linewidth=AI_PAPER_LINE_WIDTH,
+            label=f"{display_name_for_algorithm('native')} {value_format.format(native_value)}",
+            zorder=5,
+        )
+        ax.legend(loc="best", handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     output_path = output_dir / f"eval_bar_{sanitize_filename_component(edge_id)}_{metric_slug}.png"
     save_paper_figure(fig, output_path, dpi=dpi, show=show)

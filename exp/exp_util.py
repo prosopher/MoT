@@ -31,6 +31,98 @@ AI_PAPER_MARKERS = [
 AI_PAPER_LINESTYLES = [
     "-", "--", "-.", ":"
 ]
+AI_PAPER_NATIVE_LINESTYLE = ":"
+AI_PAPER_CONTROL_LINESTYLE = "--"
+
+# Common double-column figure template for AI conference papers.
+AI_PAPER_DOUBLE_COLUMN_WIDTH = 7.16
+AI_PAPER_DOUBLE_COLUMN_HEIGHT = 4.20
+AI_PAPER_DOUBLE_COLUMN_FIGSIZE = (
+    AI_PAPER_DOUBLE_COLUMN_WIDTH,
+    AI_PAPER_DOUBLE_COLUMN_HEIGHT,
+)
+AI_PAPER_DOUBLE_COLUMN_TALL_FIGSIZE = (AI_PAPER_DOUBLE_COLUMN_WIDTH, 4.80)
+AI_PAPER_DOUBLE_COLUMN_SHORT_FIGSIZE = (AI_PAPER_DOUBLE_COLUMN_WIDTH, 3.80)
+AI_PAPER_DOUBLE_COLUMN_SQUARE_FIGSIZE = (AI_PAPER_DOUBLE_COLUMN_WIDTH, AI_PAPER_DOUBLE_COLUMN_WIDTH)
+AI_PAPER_FIGURE_DPI = 300
+AI_PAPER_PREVIEW_DPI = 150
+
+# Double-column-friendly typography. Most AI conference templates render body text
+# around 9--10 pt in two-column mode, so figure text should stay in that range.
+AI_PAPER_AXIS_LABEL_SIZE = 9
+AI_PAPER_TICK_LABEL_SIZE = 8
+AI_PAPER_LEGEND_FONT_SIZE = 8
+AI_PAPER_ANNOTATION_FONT_SIZE = 7
+AI_PAPER_COLORBAR_LABEL_SIZE = 8
+AI_PAPER_COLORBAR_TICK_SIZE = 7
+
+AI_PAPER_LINE_WIDTH = 1.8
+AI_PAPER_REFERENCE_LINE_WIDTH = 1.0
+AI_PAPER_MARKER_SIZE = 8.5
+AI_PAPER_SCATTER_SIZE = 90.0
+AI_PAPER_MARKER_EDGE_WIDTH = 1.5
+AI_PAPER_BAR_VALUE_FONT_SIZE = 7
+AI_PAPER_HEATMAP_VALUE_FONT_SIZE = 6
+AI_PAPER_ALGORITHM_LABEL_ROTATION = 35
+AI_PAPER_LAYER_TICK_ROTATION = 45
+AI_PAPER_LEGEND_HANDLE_LENGTH = 2.4
+AI_PAPER_GRID_LINE_WIDTH = 0.6
+AI_PAPER_GRID_ALPHA = 0.32
+AI_PAPER_GRID_LINESTYLE = "--"
+AI_PAPER_REFERENCE_COLOR = "0.35"
+AI_PAPER_BORDER_COLOR = "0.20"
+AI_PAPER_LEGEND_EDGE_COLOR = "0.85"
+AI_PAPER_MARKER_FACE_COLOR = "white"
+AI_PAPER_DENSE_WIDTH_SCALE_MAX = 1.45
+AI_PAPER_GROUPED_BAR_TOTAL_WIDTH = 0.82
+AI_PAPER_GROUPED_BAR_WIDTH_SCALE = 0.92
+AI_PAPER_VALUE_OFFSET_FRACTION = 0.01
+AI_PAPER_RADAR_FILL_ALPHA = 0.08
+AI_PAPER_ANNOTATION_OFFSET = (5, 4)
+AI_PAPER_DEFAULT_X_MARGIN = 0.03
+AI_PAPER_DEFAULT_Y_MARGIN = 0.08
+AI_PAPER_BAR_X_MARGIN = 0.04
+AI_PAPER_BAR_Y_MARGIN = 0.10
+AI_PAPER_WRAP_TICK_WIDTH = 28
+AI_PAPER_LEGEND_OUTSIDE_ANCHOR = (1.02, 0.5)
+
+
+def double_column_figsize(*, height: float | None = None, square: bool = False) -> tuple[float, float]:
+    """Return the shared double-column figure size in inches."""
+    if square:
+        return AI_PAPER_DOUBLE_COLUMN_SQUARE_FIGSIZE
+    return (AI_PAPER_DOUBLE_COLUMN_WIDTH, height or AI_PAPER_DOUBLE_COLUMN_HEIGHT)
+
+
+def scaled_double_column_figsize(
+    *,
+    width_scale: float = 1.0,
+    height: float | None = None,
+    height_scale: float = 1.0,
+) -> tuple[float, float]:
+    """Return a double-column-derived size for unusually dense plots."""
+    width = AI_PAPER_DOUBLE_COLUMN_WIDTH * width_scale
+    fig_height = (height or AI_PAPER_DOUBLE_COLUMN_HEIGHT) * height_scale
+    return (width, fig_height)
+
+
+def apply_bold_axis_labels(ax) -> None:
+    """Ensure axis labels stay bold even when labels are assigned after rcParams."""
+    try:
+        ax.xaxis.label.set_fontweight("bold")
+        ax.yaxis.label.set_fontweight("bold")
+        ax.xaxis.label.set_fontsize(AI_PAPER_AXIS_LABEL_SIZE)
+        ax.yaxis.label.set_fontsize(AI_PAPER_AXIS_LABEL_SIZE)
+    except Exception:
+        pass
+
+
+def style_algorithm_tick_labels(ax, *, axis: str = "x") -> None:
+    """Bold algorithm/category tick labels used as method names in bar charts."""
+    labels = ax.get_xticklabels() if axis == "x" else ax.get_yticklabels()
+    for label in labels:
+        label.set_fontweight("bold")
+        label.set_fontsize(AI_PAPER_TICK_LABEL_SIZE)
 
 
 def require_matplotlib_pyplot():
@@ -59,8 +151,9 @@ def apply_ai_paper_style() -> None:
     plt.rcParams.update(
         {
             # Figure and save quality
-            "figure.dpi": 120,
-            "savefig.dpi": 300,
+            "figure.figsize": AI_PAPER_DOUBLE_COLUMN_FIGSIZE,
+            "figure.dpi": AI_PAPER_PREVIEW_DPI,
+            "savefig.dpi": AI_PAPER_FIGURE_DPI,
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
 
@@ -79,28 +172,30 @@ def apply_ai_paper_style() -> None:
             "svg.fonttype": "none",
 
             # Axes
-            "axes.labelsize": 13,
-            "axes.titlesize": 13,
+            "axes.labelsize": AI_PAPER_AXIS_LABEL_SIZE,
+            "axes.labelweight": "bold",
+            "axes.titlesize": AI_PAPER_AXIS_LABEL_SIZE,
             "axes.linewidth": 1.0,
             "axes.spines.top": True,
             "axes.spines.right": True,
 
             # Ticks
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 11,
+            "xtick.labelsize": AI_PAPER_TICK_LABEL_SIZE,
+            "ytick.labelsize": AI_PAPER_TICK_LABEL_SIZE,
             "xtick.direction": "out",
             "ytick.direction": "out",
 
             # Legend
-            "legend.fontsize": 10,
+            "legend.fontsize": AI_PAPER_LEGEND_FONT_SIZE,
             "legend.frameon": True,
             "legend.framealpha": 0.95,
             "legend.fancybox": False,
-            "legend.edgecolor": "0.85",
+            "legend.edgecolor": AI_PAPER_LEGEND_EDGE_COLOR,
 
             # Lines
-            "lines.linewidth": 2.2,
-            "lines.markersize": 6,
+            "lines.linewidth": AI_PAPER_LINE_WIDTH,
+            "lines.markersize": AI_PAPER_MARKER_SIZE,
+            "lines.markeredgewidth": AI_PAPER_MARKER_EDGE_WIDTH,
         }
     )
 
@@ -114,6 +209,25 @@ def clear_figure_titles(fig) -> None:
             ax.set_title("")
         except Exception:
             pass
+
+
+def style_figure_legends(fig) -> None:
+    """Bold legend entries; method/algorithm names are commonly rendered there."""
+    for ax in getattr(fig, "axes", []):
+        legend = None
+        try:
+            legend = ax.get_legend()
+        except Exception:
+            legend = None
+        if legend is None:
+            continue
+        for text in legend.get_texts():
+            text.set_fontweight("bold")
+            text.set_fontsize(AI_PAPER_LEGEND_FONT_SIZE)
+        title = legend.get_title()
+        if title is not None:
+            title.set_fontweight("bold")
+            title.set_fontsize(AI_PAPER_LEGEND_FONT_SIZE)
 
 
 def style_axes_common(
@@ -138,13 +252,15 @@ def style_axes_common(
     for spine in getattr(ax, "spines", {}).values():
         spine.set_visible(True)
         spine.set_linewidth(1.0)
-        spine.set_color("0.20")
+        spine.set_color(AI_PAPER_BORDER_COLOR)
 
     try:
         ax.tick_params(axis="both", which="major", length=4, width=1.0)
         ax.tick_params(axis="both", which="minor", length=2, width=0.8)
     except Exception:
         pass
+
+    apply_bold_axis_labels(ax)
 
     try:
         ax.set_axisbelow(True)
@@ -157,19 +273,19 @@ def style_axes_common(
                 True,
                 which="major",
                 axis=grid_axis,
-                linestyle="--",
-                linewidth=0.7,
-                alpha=0.35,
+                linestyle=AI_PAPER_GRID_LINESTYLE,
+                linewidth=AI_PAPER_GRID_LINE_WIDTH,
+                alpha=AI_PAPER_GRID_ALPHA,
             )
         except Exception:
-            ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+            ax.grid(True, linestyle=AI_PAPER_GRID_LINESTYLE, linewidth=AI_PAPER_GRID_LINE_WIDTH, alpha=AI_PAPER_GRID_ALPHA)
 
 
 def style_paper_axes(
     ax,
     *,
     x_values: Optional[Sequence[int | float]] = None,
-    margins: tuple[float, float] | None = (0.03, 0.08),
+    margins: tuple[float, float] | None = (AI_PAPER_DEFAULT_X_MARGIN, AI_PAPER_DEFAULT_Y_MARGIN),
     minorticks: bool = True,
     grid: bool = True,
     grid_axis: str = "y",
@@ -199,10 +315,9 @@ def save_paper_figure(
 ) -> None:
     """Save a paper-style figure using shared defaults and no in-plot title."""
     clear_figure_titles(fig)
+    style_figure_legends(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_kwargs = {}
-    if dpi is not None:
-        save_kwargs["dpi"] = dpi
+    save_kwargs = {"dpi": AI_PAPER_FIGURE_DPI if dpi is None else dpi}
     fig.savefig(output_path, **save_kwargs)
 
     plt = require_matplotlib_pyplot()

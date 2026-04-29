@@ -21,6 +21,17 @@ from core.eval_util import *
 from exp.exp_util import (
     AI_PAPER_PALETTE,
     AI_PAPER_MARKERS,
+    AI_PAPER_ANNOTATION_FONT_SIZE,
+    AI_PAPER_ANNOTATION_OFFSET,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_MARKER_FACE_COLOR,
+    AI_PAPER_NATIVE_LINESTYLE,
+    AI_PAPER_REFERENCE_COLOR,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_CONTROL_LINESTYLE,
+    AI_PAPER_SCATTER_SIZE,
+    double_column_figsize,
     apply_ai_paper_style,
     require_matplotlib_pyplot,
     save_paper_figure as _save_paper_figure,
@@ -829,15 +840,15 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
         raise ValueError("No token_00 trajectory found for plotting")
     x_values = list(range(source_idx, source_idx + len(full["rho_median"])))
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
         full["rho_median"],
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median ||s_L|| / ||s_T||",
     )
     if rand and rand.get("rho_median"):
@@ -847,29 +858,29 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
             color=ACCENT_BLACK,
             linestyle="--",
             marker=AI_PAPER_MARKERS[1],
-            markerfacecolor="white",
+            markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
             markeredgecolor=ACCENT_BLACK,
-            markeredgewidth=1.4,
+            markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
             label="Random control median ||s_L|| / ||s_T||",
         )
-    ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(1.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax.set_xlabel("Post-window layer boundary index k")
     ax.set_ylabel("Norm ratio relative to Translation Shift ||s_T||")
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     norm_ratio_path = build_norm_ratio_chart_path(run_dir)
     _save_paper_figure(fig, norm_ratio_path)
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
         full["alpha_over_initial_median"],
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median α_k / ||s_T||",
     )
     ax.plot(
@@ -877,9 +888,9 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
         full["beta_over_initial_median"],
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[2],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median β_k / ||s_T||",
     )
     ax.plot(
@@ -887,16 +898,16 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
         full["correction_cosine_median"],
         color=ACCENT_PURPLE,
         marker=AI_PAPER_MARKERS[3],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median correction cosine",
     )
-    ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax.set_xlabel("Post-window layer boundary index k")
     ax.set_ylabel("Projected correction relative to Translation Shift ||s_T||")
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     projection_path = build_projection_chart_path(run_dir)
     _save_paper_figure(fig, projection_path)
     plt.close(fig)
@@ -910,7 +921,7 @@ def _annotate_ranges(ax, rows: List[CorrectionSummaryRow], y_values: List[float]
             textcoords="offset points",
             xytext=(0, 7),
             ha="center",
-            fontsize=8,
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
         )
 
 
@@ -942,15 +953,15 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     structural_cosine_advantage = [full - rand for full, rand in zip(cosine, random_cosine)]
     beta_minus_alpha = [b - a for a, b in zip(alpha, beta)]
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
         avg_shrink,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix avg final shrink ratio",
     )
     ax.plot(
@@ -958,9 +969,9 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         median_shrink,
         color=ACCENT_PURPLE,
         marker=AI_PAPER_MARKERS[2],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median final shrink ratio",
     )
     ax.plot(
@@ -969,30 +980,30 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         color=ACCENT_BLACK,
         linestyle="--",
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_BLACK,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Random control avg final shrink ratio",
     )
-    ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(1.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     _annotate_ranges(ax, rows, avg_shrink)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Final ||s_L|| / ||s_T||")
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["shrink"] = build_summary_shrink_chart_path(study_dir)
     _save_paper_figure(fig, outputs["shrink"])
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
         alpha,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Total α_L / ||s_T||",
     )
     ax.plot(
@@ -1000,9 +1011,9 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         beta,
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[2],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Total β_L / ||s_T||",
     )
     ax.plot(
@@ -1010,9 +1021,9 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         attn_alpha,
         color=ACCENT_PURPLE,
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Attention α contribution",
     )
     ax.plot(
@@ -1020,9 +1031,9 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         mlp_alpha,
         color=ACCENT_GREEN,
         marker=AI_PAPER_MARKERS[3],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_GREEN,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="MLP α contribution",
     )
     ax.plot(
@@ -1030,25 +1041,25 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         beta_minus_alpha,
         color=ACCENT_ORANGE,
         marker=AI_PAPER_MARKERS[6],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_ORANGE,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="β - α",
     )
     _annotate_ranges(ax, rows, beta)
-    ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Translation-shift-normalized magnitude")
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["decomposition"] = build_summary_decomposition_chart_path(study_dir)
     _save_paper_figure(fig, outputs["decomposition"])
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     raw_alpha = [row.average_final_alpha for row in rows]
     raw_beta = [row.average_final_beta for row in rows]
-    phase_sizes = [max(40.0, 8.0 * max(v, 1.0)) for v in initial_shift]
+    phase_sizes = [max(AI_PAPER_SCATTER_SIZE, 10.0 * max(v, 1.0)) for v in initial_shift]
     correction_deficit_coefficients = [row.average_final_correction_deficit_coefficient for row in rows]
     ax.scatter(
         raw_beta,
@@ -1056,8 +1067,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         s=phase_sizes,
         marker=AI_PAPER_MARKERS[0],
         color=ACCENT_RED,
-        edgecolor="black",
-        linewidth=0.6,
+        edgecolor=AI_PAPER_REFERENCE_COLOR,
+        linewidth=AI_PAPER_MARKER_EDGE_WIDTH * 0.4,
         alpha=0.88,
     )
     for row, x, y, d_t in zip(rows, raw_beta, raw_alpha, correction_deficit_coefficients):
@@ -1065,8 +1076,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
             f"L{row.injection_layer_start_idx}\nd_T={d_t:.3f}",
             (x, y),
             textcoords="offset points",
-            xytext=(5, 4),
-            fontsize=8,
+            xytext=AI_PAPER_ANNOTATION_OFFSET,
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
         )
     ax.set_xlabel("Total β_L")
     ax.set_ylabel("Total α_L")
@@ -1075,51 +1086,51 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     _save_paper_figure(fig, outputs["phase"])
     plt.close(fig)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.4, 6.0), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=double_column_figsize(height=5.80), sharex=True)
     ax1.plot(
         x_values,
         structural_shrink_advantage,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Random - Full-Mix shrink ratio",
     )
-    ax1.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax1.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     _annotate_ranges(ax1, rows, structural_shrink_advantage)
     ax1.set_ylabel("Positive is better")
     _style_paper_axes(ax1)
-    ax1.legend(handlelength=2.6)
+    ax1.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     ax2.plot(
         x_values,
         structural_cosine_advantage,
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix - Random correction cosine",
     )
-    ax2.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax2.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax2.set_xlabel("Injection target layer start index")
     ax2.set_ylabel("Positive is better")
     _style_paper_axes(ax2, x_values=x_values)
-    ax2.legend(handlelength=2.6)
+    ax2.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["random"] = build_summary_random_chart_path(study_dir)
     _save_paper_figure(fig, outputs["random"])
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    fig, ax = plt.subplots(figsize=double_column_figsize())
     ax.plot(
         x_values,
         initial_shift,
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Translation Shift ||s_T||",
     )
     ax.plot(
@@ -1127,16 +1138,16 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         final_shift,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Last-State Shift ||s_L||",
     )
     _annotate_ranges(ax, rows, final_shift)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Average norm")
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["shift_norms"] = build_summary_shift_norm_chart_path(study_dir)
     _save_paper_figure(fig, outputs["shift_norms"])
     plt.close(fig)
