@@ -18,11 +18,13 @@ from core.channel_manager import ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
 from core.eval_util import *
-from exp.compare_tables import (
+from exp.exp_util import (
     AI_PAPER_PALETTE,
     AI_PAPER_MARKERS,
     apply_ai_paper_style,
-    style_axes_common,
+    require_matplotlib_pyplot,
+    save_paper_figure as _save_paper_figure,
+    style_paper_axes as _style_paper_axes,
 )
 import exp.layer_position as lp
 
@@ -808,23 +810,10 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path
 
 
 
-def _style_paper_axes(ax, *, x_values: Optional[List[int]] = None) -> None:
-    style_axes_common(ax)
-    ax.minorticks_on()
-    ax.margins(x=0.03, y=0.08)
-    if x_values is not None:
-        ax.set_xticks(x_values)
-
-
-def _save_paper_figure(fig, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
-
 
 def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path, Path]:
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     source_idx = metrics["trajectory"]["source_idx"]
     reference_edge = ctx.edges[0]
@@ -866,7 +855,6 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
     ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Post-window layer boundary index k")
     ax.set_ylabel("Norm ratio relative to Translation Shift ||s_T||")
-    ax.set_title(f"Correction trajectory after injected window {injected_window_label} (token 0)", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
     norm_ratio_path = build_norm_ratio_chart_path(run_dir)
@@ -907,7 +895,6 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
     ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Post-window layer boundary index k")
     ax.set_ylabel("Projected correction relative to Translation Shift ||s_T||")
-    ax.set_title(f"Correction projection trajectory after injected window {injected_window_label} (token 0)", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
     projection_path = build_projection_chart_path(run_dir)
@@ -928,9 +915,8 @@ def _annotate_ranges(ax, rows: List[CorrectionSummaryRow], y_values: List[float]
 
 
 def plot_summary(summary_path: Path) -> Dict[str, Path]:
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     rows = read_summary_rows(summary_path)
     if not rows:
@@ -992,7 +978,6 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     _annotate_ranges(ax, rows, avg_shrink)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Final ||s_L|| / ||s_T||")
-    ax.set_title("Final post-window shrink ratio vs injected-window start index", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
     outputs["shrink"] = build_summary_shrink_chart_path(study_dir)
@@ -1054,7 +1039,6 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Translation-shift-normalized magnitude")
-    ax.set_title("Correction decomposition vs injection target layer start index", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
     outputs["decomposition"] = build_summary_decomposition_chart_path(study_dir)
@@ -1086,7 +1070,6 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         )
     ax.set_xlabel("Total β_L")
     ax.set_ylabel("Total α_L")
-    ax.set_title("Correction phase scatter: error correction", pad=8)
     _style_paper_axes(ax)
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
     _save_paper_figure(fig, outputs["phase"])
@@ -1106,7 +1089,6 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax1.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     _annotate_ranges(ax1, rows, structural_shrink_advantage)
     ax1.set_ylabel("Positive is better")
-    ax1.set_title("Structural advantage over random control (post-window correction)", pad=8)
     _style_paper_axes(ax1)
     ax1.legend(handlelength=2.6)
 
@@ -1153,7 +1135,6 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     _annotate_ranges(ax, rows, final_shift)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Average norm")
-    ax.set_title("Translation Shift ||s_T|| and Last-State Shift ||s_L||", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
     outputs["shift_norms"] = build_summary_shift_norm_chart_path(study_dir)
