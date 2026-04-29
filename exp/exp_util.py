@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -57,6 +61,31 @@ AI_PAPER_COLORBAR_LABEL_SIZE = AI_PAPER_MAJOR_FONT_SIZE
 AI_PAPER_TICK_LABEL_SIZE = AI_PAPER_MINOR_FONT_SIZE
 AI_PAPER_ANNOTATION_FONT_SIZE = AI_PAPER_MINOR_FONT_SIZE
 AI_PAPER_COLORBAR_TICK_SIZE = AI_PAPER_MINOR_FONT_SIZE
+
+TIMES_NEW_ROMAN_FONT_FAMILY = "Times New Roman"
+TIMES_NEW_ROMAN_FONT_ENV_PATHS = (
+    "MOT_TIMES_NEW_ROMAN_FONT_PATH",
+    "TIMES_NEW_ROMAN_FONT_PATH",
+)
+TIMES_NEW_ROMAN_FONT_URLS_ENV = "MOT_TIMES_NEW_ROMAN_FONT_URLS"
+TIMES_NEW_ROMAN_ARCHIVE_URL_ENV = "MOT_TIMES_NEW_ROMAN_ARCHIVE_URL"
+TIMES_NEW_ROMAN_CACHE_SUBDIR = "mot_times_new_roman"
+TIMES_NEW_ROMAN_FONT_SUFFIXES = (".ttf", ".otf", ".ttc")
+# The direct URLs are used only when the font is absent from the system and no
+# local font path is provided. Override them with MOT_TIMES_NEW_ROMAN_FONT_URLS
+# in environments that mirror fonts internally. Font files are cached locally
+# and are not bundled in this repository.
+DEFAULT_TIMES_NEW_ROMAN_FONT_URLS = (
+    "https://raw.githubusercontent.com/justrajdeep/fonts/master/Times%20New%20Roman.ttf",
+    "https://raw.githubusercontent.com/justrajdeep/fonts/master/Times%20New%20Roman%20Bold.ttf",
+    "https://raw.githubusercontent.com/justrajdeep/fonts/master/Times%20New%20Roman%20Italic.ttf",
+    "https://raw.githubusercontent.com/justrajdeep/fonts/master/Times%20New%20Roman%20Bold%20Italic.ttf",
+)
+DEFAULT_TIMES_NEW_ROMAN_ARCHIVE_URL = (
+    "https://downloads.sourceforge.net/project/corefonts/the%20fonts/final/times32.exe"
+)
+TIMES_NEW_ROMAN_ARCHIVE_EXTRACTORS = ("cabextract", "7z", "bsdtar")
+AI_PAPER_MATH_FONTSET = "stix"
 
 AI_PAPER_LINE_WIDTH = 1.8
 AI_PAPER_REFERENCE_LINE_WIDTH = 1.0
@@ -128,6 +157,180 @@ def style_algorithm_tick_labels(ax, *, axis: str = "x") -> None:
         label.set_fontsize(AI_PAPER_TICK_LABEL_SIZE)
 
 
+
+def _font_cache_dir() -> Path:
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / TIMES_NEW_ROMAN_CACHE_SUBDIR
+
+
+def _iter_font_files(path: Path):
+    if path.is_file() and path.suffix.lower() in TIMES_NEW_ROMAN_FONT_SUFFIXES:
+        yield path
+        return
+    if path.is_dir():
+        for suffix in TIMES_NEW_ROMAN_FONT_SUFFIXES:
+            yield from path.rglob(f"*{suffix}")
+
+
+def _register_font_files(path: Path) -> int:
+    try:
+        from matplotlib import font_manager
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required only for plotting. Install matplotlib to generate figures."
+        ) from exc
+
+    registered = 0
+    for font_path in _iter_font_files(path):
+        try:
+            font_manager.fontManager.addfont(str(font_path))
+            registered += 1
+        except Exception:
+            continue
+    return registered
+
+
+def _find_times_new_roman_font() -> str | None:
+    try:
+        from matplotlib import font_manager
+        return font_manager.findfont(
+            TIMES_NEW_ROMAN_FONT_FAMILY,
+            fallback_to_default=False,
+            rebuild_if_missing=True,
+        )
+    except Exception:
+        return None
+
+
+def _font_available() -> bool:
+    return _find_times_new_roman_font() is not None
+
+
+def _split_font_url_env(value: str) -> list[str]:
+    pieces: list[str] = []
+    for chunk in value.replace("\n", ",").replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if chunk:
+            pieces.append(chunk)
+    return pieces
+
+
+def _download_file(url: str, dst: Path) -> bool:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=45) as response, dst.open("wb") as fh:
+            shutil.copyfileobj(response, fh)
+        return dst.exists() and dst.stat().st_size > 0
+    except Exception:
+        try:
+            dst.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _download_times_new_roman_ttf_files(cache_dir: Path) -> int:
+    url_env = os.environ.get(TIMES_NEW_ROMAN_FONT_URLS_ENV, "")
+    urls = _split_font_url_env(url_env) if url_env else list(DEFAULT_TIMES_NEW_ROMAN_FONT_URLS)
+    downloaded = 0
+    for idx, url in enumerate(urls):
+        guessed_name = url.rsplit("/", 1)[-1].split("?", 1)[0].replace("%20", "_")
+        suffix = Path(guessed_name).suffix.lower()
+        if suffix not in TIMES_NEW_ROMAN_FONT_SUFFIXES:
+            guessed_name = f"times_new_roman_{idx}.ttf"
+        dst = cache_dir / guessed_name
+        if dst.exists() and dst.stat().st_size > 0:
+            downloaded += 1
+            continue
+        if _download_file(url, dst):
+            downloaded += 1
+    if downloaded:
+        _register_font_files(cache_dir)
+    return downloaded
+
+
+def _extract_corefonts_archive(archive_path: Path, output_dir: Path) -> bool:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    extractor = next((name for name in TIMES_NEW_ROMAN_ARCHIVE_EXTRACTORS if shutil.which(name)), None)
+    if extractor is None:
+        return False
+    try:
+        if extractor == "cabextract":
+            cmd = [extractor, "-q", "-d", str(output_dir), str(archive_path)]
+        elif extractor == "7z":
+            cmd = [extractor, "x", "-y", f"-o{output_dir}", str(archive_path)]
+        else:
+            cmd = [extractor, "-xf", str(archive_path), "-C", str(output_dir)]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return any(_iter_font_files(output_dir))
+    except Exception:
+        return False
+
+
+def _download_and_extract_corefonts_times(cache_dir: Path) -> bool:
+    archive_url = os.environ.get(TIMES_NEW_ROMAN_ARCHIVE_URL_ENV, DEFAULT_TIMES_NEW_ROMAN_ARCHIVE_URL)
+    archive_path = cache_dir / "times32.exe"
+    if not archive_path.exists() or archive_path.stat().st_size == 0:
+        if not _download_file(archive_url, archive_path):
+            return False
+    extracted_dir = cache_dir / "corefonts"
+    if not _extract_corefonts_archive(archive_path, extracted_dir):
+        return False
+    _register_font_files(extracted_dir)
+    return True
+
+
+def ensure_times_new_roman_font() -> str:
+    """Ensure Times New Roman is registered with matplotlib before plotting.
+
+    Lookup order:
+    1. system matplotlib/fontconfig fonts,
+    2. local paths from MOT_TIMES_NEW_ROMAN_FONT_PATH or TIMES_NEW_ROMAN_FONT_PATH,
+    3. previously cached fonts under XDG_CACHE_HOME or ~/.cache,
+    4. download direct TTF URLs, overridable with MOT_TIMES_NEW_ROMAN_FONT_URLS,
+    5. download the Microsoft core-fonts Times archive and extract it when an
+       extractor such as cabextract, 7z, or bsdtar is available.
+    """
+    existing = _find_times_new_roman_font()
+    if existing:
+        return existing
+
+    for env_name in TIMES_NEW_ROMAN_FONT_ENV_PATHS:
+        raw_path = os.environ.get(env_name)
+        if not raw_path:
+            continue
+        for part in raw_path.split(os.pathsep):
+            part = part.strip()
+            if part:
+                _register_font_files(Path(part).expanduser())
+        existing = _find_times_new_roman_font()
+        if existing:
+            return existing
+
+    cache_dir = _font_cache_dir()
+    if cache_dir.exists():
+        _register_font_files(cache_dir)
+        existing = _find_times_new_roman_font()
+        if existing:
+            return existing
+
+    _download_times_new_roman_ttf_files(cache_dir)
+    existing = _find_times_new_roman_font()
+    if existing:
+        return existing
+
+    _download_and_extract_corefonts_times(cache_dir)
+    existing = _find_times_new_roman_font()
+    if existing:
+        return existing
+
+    raise RuntimeError(
+        "Times New Roman could not be found or downloaded. "
+        "Provide a local .ttf/.ttc path via MOT_TIMES_NEW_ROMAN_FONT_PATH, "
+        "or provide a reachable URL via MOT_TIMES_NEW_ROMAN_FONT_URLS."
+    )
+
 def require_matplotlib_pyplot():
     try:
         import matplotlib.pyplot as plt
@@ -150,6 +353,7 @@ def require_matplotlib_colors():
 
 def apply_ai_paper_style() -> None:
     """Apply the shared paper-figure Matplotlib template."""
+    ensure_times_new_roman_font()
     plt = require_matplotlib_pyplot()
     plt.rcParams.update(
         {
@@ -161,12 +365,10 @@ def apply_ai_paper_style() -> None:
             "savefig.pad_inches": 0.02,
 
             # Font: fixed to Times New Roman; no fallback family list.
-            "font.family": "Times New Roman",
+            "font.family": TIMES_NEW_ROMAN_FONT_FAMILY,
             "font.size": AI_PAPER_MINOR_FONT_SIZE,
-            "mathtext.fontset": "custom",
-            "mathtext.rm": "Times New Roman",
-            "mathtext.it": "Times New Roman:italic",
-            "mathtext.bf": "Times New Roman:bold",
+            # Math text is intentionally separated from Times New Roman.
+            "mathtext.fontset": AI_PAPER_MATH_FONTSET,
 
             # Editable text in vector outputs
             "pdf.fonttype": 42,
