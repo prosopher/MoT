@@ -843,7 +843,7 @@ def plot_eval_metric_bars(
             color=NATIVE_COLOR,
             linestyle=AI_PAPER_NATIVE_LINESTYLE,
             linewidth=AI_PAPER_LINE_WIDTH,
-            label=f"{display_name_for_algorithm('native')} {value_format.format(native_value)}",
+            label=f"{display_name_for_algorithm('native')}={value_format.format(native_value)}",
             zorder=5,
         )
         ax.legend(loc="best", handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
