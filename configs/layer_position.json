@@ -37,6 +37,6 @@
   "mot_num_translators": 2,
   "mot_top_k": 1,
   "topk_sparse_attn": 32,
-  "num_bottom_full_attn": 2,
+  "num_bottom_full_attn": 12,
   "kv_similarity_token_group_size": 8
 }
