@@ -1116,24 +1116,24 @@ def run_qwen2_block(
     attn_input = block.input_layernorm(hidden_states)
 
     query_states = attn.q_proj(attn_input).view(batch_size, seq_len, num_query_heads, head_dim).transpose(1, 2).contiguous()
-    native_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
-    native_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
 
     if position_embeddings is not None:
         cos, sin = position_embeddings
-        query_states, native_key = apply_rotary_pos_emb(query_states, native_key, cos, sin)
+        query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin)
     else:
         rotary_emb = getattr(attn, "rotary_emb", None)
         if rotary_emb is None:
             raise ValueError("Qwen2 replay requires rotary embeddings from model.model.rotary_emb or layer.self_attn.rotary_emb.")
         try:
-            cos, sin = rotary_emb(native_value, seq_len=seq_len)
+            cos, sin = rotary_emb(native_like_value, seq_len=seq_len)
         except TypeError:
-            cos, sin = rotary_emb(native_value, position_ids)
-        query_states, native_key = apply_rotary_pos_emb(query_states, native_key, cos, sin, position_ids)
+            cos, sin = rotary_emb(native_like_value, position_ids)
+        query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin, position_ids)
 
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for Qwen2/Qwen2.5 layer replay: "
@@ -1180,7 +1180,7 @@ def run_qwen2_block(
     hidden_states = block.post_attention_layernorm(hidden_states)
     hidden_states = block.mlp(hidden_states)
     hidden_states = residual + hidden_states
-    return hidden_states, (native_key, native_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
