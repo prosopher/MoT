@@ -434,6 +434,45 @@ def style_figure_legends(fig) -> None:
             title.set_fontsize(AI_PAPER_LEGEND_FONT_SIZE)
 
 
+def apply_times_new_roman_to_figure(fig) -> None:
+    """Force all regular Matplotlib text objects to Times New Roman before save.
+
+    Some artists are created after rcParams are set, or by colorbar/legend helper
+    code that may retain a backend default font. Applying this at save time makes
+    every ordinary text object in the figure use the registered Times New Roman
+    family while leaving math rendering controlled by mathtext.fontset.
+    """
+    ensure_times_new_roman_font()
+    try:
+        from matplotlib.text import Text
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required only for plotting. Install matplotlib to generate figures."
+        ) from exc
+
+    try:
+        text_objects = fig.findobj(match=Text)
+    except Exception:
+        text_objects = []
+    for text in text_objects:
+        try:
+            text.set_fontfamily(TIMES_NEW_ROMAN_FONT_FAMILY)
+        except Exception:
+            pass
+
+    for ax in getattr(fig, "axes", []):
+        for label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+            try:
+                label.set_fontfamily(TIMES_NEW_ROMAN_FONT_FAMILY)
+            except Exception:
+                pass
+        try:
+            ax.xaxis.label.set_fontfamily(TIMES_NEW_ROMAN_FONT_FAMILY)
+            ax.yaxis.label.set_fontfamily(TIMES_NEW_ROMAN_FONT_FAMILY)
+        except Exception:
+            pass
+
+
 def style_axes_common(
     ax,
     *,
@@ -518,8 +557,10 @@ def save_paper_figure(
     close: bool = False,
 ) -> None:
     """Save a paper-style figure using shared defaults and no in-plot title."""
+    ensure_times_new_roman_font()
     clear_figure_titles(fig)
     style_figure_legends(fig)
+    apply_times_new_roman_to_figure(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs = {"dpi": AI_PAPER_FIGURE_DPI if dpi is None else dpi}
     fig.savefig(output_path, **save_kwargs)
