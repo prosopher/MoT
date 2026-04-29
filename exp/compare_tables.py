@@ -4,46 +4,29 @@ import re
 import math
 import argparse
 import textwrap
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 from collections import OrderedDict
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-def _require_matplotlib_pyplot():
-    try:
-        import matplotlib.pyplot as plt
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "matplotlib is required only for plotting. Install matplotlib to generate figures."
-        ) from exc
-    return plt
+from exp.exp_util import (
+    AI_PAPER_PALETTE,
+    AI_PAPER_MARKERS,
+    AI_PAPER_LINESTYLES,
+    apply_ai_paper_style,
+    require_matplotlib_pyplot,
+    save_paper_figure,
+    style_axes_common,
+)
 
 
 DEFAULT_Y_COL = "Gen F1 Avg"
-
-
-# Colorblind-friendly palette, commonly used in academic plots
-AI_PAPER_PALETTE = [
-    "#C0504D",  # Accent Red
-    "#4BACC6",  # Accent Aqua
-    "#8064A2",  # Accent Purple
-    "#4F81BD",  # Accent Blue
-    "#9BBB59",  # Accent Green
-    "#F79646",  # Accent Orange
-    "#000000",  # black
-]
-
-
-AI_PAPER_MARKERS = [
-    "o", "s", "^", "D", "v", "P", "X", "*", "h", "<", ">"
-]
-
-
-AI_PAPER_LINESTYLES = [
-    "-", "--", "-.", ":"
-]
 
 
 ChartMode = Literal["line", "bar"]
@@ -328,63 +311,6 @@ def extract_tables(
     )
 
 
-def apply_ai_paper_style() -> None:
-    """
-    AI 논문 figure에 자주 쓰이는 Matplotlib 스타일 설정.
-
-    특징:
-    - serif font
-    - PDF/SVG 저장 시 텍스트 편집 가능
-    - 적당한 linewidth와 tick size
-    - 과하지 않은 grid
-    """
-    plt = _require_matplotlib_pyplot()
-    plt.rcParams.update(
-        {
-            # Figure and save quality
-            "figure.dpi": 120,
-            "savefig.dpi": 300,
-            "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.02,
-
-            # Font
-            "font.family": "serif",
-            "font.serif": [
-                "Times New Roman",
-                "Times",
-                "DejaVu Serif",
-            ],
-            "mathtext.fontset": "stix",
-
-            # Editable text in vector outputs
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-
-            # Axes
-            "axes.labelsize": 13,
-            "axes.titlesize": 13,
-            "axes.linewidth": 1.0,
-
-            # Ticks
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 11,
-            "xtick.direction": "out",
-            "ytick.direction": "out",
-
-            # Legend
-            "legend.fontsize": 10,
-            "legend.frameon": True,
-            "legend.framealpha": 0.95,
-            "legend.fancybox": False,
-            "legend.edgecolor": "0.85",
-
-            # Lines
-            "lines.linewidth": 2.2,
-            "lines.markersize": 6,
-        }
-    )
-
 
 def wrap_tick_label(text: str, width: int = 26) -> str:
     """
@@ -413,29 +339,6 @@ def wrap_tick_label(text: str, width: int = 26) -> str:
     return "\n".join(wrapped_lines)
 
 
-def style_axes_common(ax) -> None:
-    # 논문형 plot: top/right spine 제거
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    ax.spines["left"].set_linewidth(1.0)
-    ax.spines["bottom"].set_linewidth(1.0)
-
-    ax.tick_params(axis="both", which="major", length=4, width=1.0)
-    ax.tick_params(axis="both", which="minor", length=2, width=0.8)
-
-    ax.set_axisbelow(True)
-
-    # 과하지 않은 grid
-    ax.grid(
-        True,
-        which="major",
-        axis="y",
-        linestyle="--",
-        linewidth=0.7,
-        alpha=0.35,
-    )
-
 
 def plot_line_series(
     series_data: OrderedDict[str, list[tuple[float, float]]],
@@ -458,7 +361,7 @@ def plot_line_series(
         fig_width = 7.4
         fig_height = 4.8
 
-    plt = _require_matplotlib_pyplot()
+    plt = require_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
@@ -490,9 +393,6 @@ def plot_line_series(
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
 
-    if title:
-        ax.set_title(title, pad=8)
-
     style_axes_common(ax)
 
     ax.minorticks_on()
@@ -511,8 +411,7 @@ def plot_line_series(
             handlelength=2.6,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    save_paper_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -552,7 +451,7 @@ def plot_grouped_bar(
     fig_width = max(6.4, min(14.0, 1.35 * num_groups + 0.65 * num_categories + 2.0))
     fig_height = 4.8 if num_groups <= 6 else 5.4
 
-    plt = _require_matplotlib_pyplot()
+    plt = require_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
@@ -586,9 +485,6 @@ def plot_grouped_bar(
     # 즉, ax.set_xlabel("Markdown Section")을 호출하지 않습니다.
     ax.set_ylabel(y_label)
 
-    if title:
-        ax.set_title(title, pad=8)
-
     ax.set_xticks(x_positions)
     ax.set_xticklabels(
         [wrap_tick_label(name, width=28) for name in group_names],
@@ -615,8 +511,7 @@ def plot_grouped_bar(
             handlelength=1.8,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    save_paper_figure(fig, output_path)
     plt.close(fig)
 
 

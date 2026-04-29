@@ -6,13 +6,26 @@ import csv
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-import matplotlib.pyplot as plt
 import numpy as np
-import matplotlib.colors as mcolors
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from exp.exp_util import (
+    ACCENT_RED,
+    AI_PAPER_PALETTE,
+    apply_ai_paper_style,
+    require_matplotlib_colors,
+    require_matplotlib_pyplot,
+    save_paper_figure,
+    style_axes_common,
+)
 
 DEFAULT_CATEGORY_ORDER = [
     "health",
@@ -40,10 +53,10 @@ EVAL_BAR_METRICS = [
     ("OWT Val GPU Peak Memory", "gpu_peak_memory", "GPU Peak Memory (GiB)"),
 ]
 
-MOT_COLOR = "#D85A59"
-MOT_H_COLOR = "#E98C88"
+MOT_COLOR = ACCENT_RED
+MOT_H_COLOR = AI_PAPER_PALETTE[2]
 OTHER_BAR_COLOR = "#C7CDD6"
-NATIVE_COLOR = "#4C5159"
+NATIVE_COLOR = AI_PAPER_PALETTE[6]
 NON_RED_ORANGE_PURPLE_RADAR_PALETTES = (
     "tab20",
     "tab20b",
@@ -356,6 +369,7 @@ def order_series_by_average_accuracy(
 
 
 def is_excluded_radar_palette_color(color: tuple[float, float, float, float]) -> bool:
+    mcolors = require_matplotlib_colors()
     r, g, b, _ = color
     h, s, v = mcolors.rgb_to_hsv((r, g, b))
 
@@ -371,6 +385,8 @@ def is_excluded_radar_palette_color(color: tuple[float, float, float, float]) ->
 
 
 def non_red_orange_purple_radar_palette(sample_count: int) -> List[tuple[float, float, float, float]]:
+    plt = require_matplotlib_pyplot()
+    mcolors = require_matplotlib_colors()
     if sample_count <= 0:
         return []
 
@@ -462,6 +478,9 @@ def plot_edge_radar(
     if not series_list:
         raise ValueError(f"No series to plot for edge_id={edge_id!r}")
 
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
+
     n = len(categories)
     angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
     angles += angles[:1]
@@ -495,7 +514,7 @@ def plot_edge_radar(
     ax.set_yticks(rticks)
     ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=9)
     ax.set_ylim(0, radius_max)
-    ax.grid(True, alpha=0.35)
+    style_axes_common(ax, grid=True, grid_axis="both")
 
     if native_accuracy:
         native_values = [native_accuracy.get(cat, np.nan) for cat in categories]
@@ -515,16 +534,9 @@ def plot_edge_radar(
         values += values[:1]
         ax.plot(angles, values, linewidth=2, label=label, color=color)
         ax.fill(angles, values, alpha=0.08, color=color)
-
-    ax.set_title(f"{title_prefix} ({edge_id})", pad=28, fontsize=14)
     ax.legend(loc="upper left", bbox_to_anchor=(1.08, 1.10), frameon=False)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
-
-    if show:
-        plt.show()
+    save_paper_figure(fig, output_path, dpi=dpi, show=show)
     plt.close(fig)
 
 
@@ -777,14 +789,16 @@ def plot_eval_metric_bars(
     labels = [item[1] for item in plot_items]
     colors = [bar_color_for_method(item[2]) for item in plot_items]
 
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
+
     fig_width = max(10, 1.2 * len(labels) + 2)
     fig, ax = plt.subplots(figsize=(fig_width, 6))
     bars = ax.bar(range(len(labels)), values, color=colors)
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=35, ha="right")
     ax.set_ylabel(ylabel)
-    ax.set_title(f"{metric_name} ({chart_title_text(title)})")
-    ax.grid(axis="y", alpha=0.3)
+    style_axes_common(ax, grid=True, grid_axis="y")
 
     value_format = "{:.1f}" if metric_name == "Acc Avg" else "{:.3f}"
     offset = max(values) * 0.01 if max(values) > 0 else 0.01
@@ -799,11 +813,7 @@ def plot_eval_metric_bars(
         )
 
     output_path = output_dir / f"eval_bar_{sanitize_filename_component(edge_id)}_{metric_slug}.png"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
-    if show:
-        plt.show()
+    save_paper_figure(fig, output_path, dpi=dpi, show=show)
     plt.close(fig)
     return output_path
 

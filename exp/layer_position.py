@@ -19,11 +19,13 @@ from core.eval_util import *
 from mot.train import *
 from core.train_util import *
 from transformers import AutoConfig
-from exp.compare_tables import (
+from exp.exp_util import (
     AI_PAPER_PALETTE,
     AI_PAPER_MARKERS,
     apply_ai_paper_style,
-    style_axes_common,
+    require_matplotlib_pyplot,
+    save_paper_figure as _save_paper_figure,
+    style_paper_axes as _style_paper_axes,
 )
 
 
@@ -1106,18 +1108,6 @@ def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
 
 
 
-def _style_paper_axes(ax, *, x_values: Optional[List[int]] = None) -> None:
-    style_axes_common(ax)
-    ax.minorticks_on()
-    ax.margins(x=0.03, y=0.08)
-    if x_values is not None:
-        ax.set_xticks(x_values)
-
-
-def _save_paper_figure(fig, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
-
 
 def build_analysis_metrics_path(run_dir: Path) -> Path:
     return run_dir / "control_analysis_metrics.json"
@@ -1147,9 +1137,8 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(7.4, 4.8))
     ax.plot(
@@ -1195,7 +1184,6 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} decomposition vs injection target layer start index ({window_title})", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
 
@@ -1215,9 +1203,8 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(7.4, 4.8))
     ax.plot(
@@ -1272,7 +1259,6 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     )
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("KL divergence")
-    ax.set_title(f"Logit KL comparison vs layer index ({window_title})", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
 
@@ -1292,9 +1278,8 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(7.4, 4.8))
     ax.plot(
@@ -1320,7 +1305,6 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("OpenWebText validation Loss")
-    ax.set_title(f"OpenWebText validation Loss vs layer index ({window_title})", pad=8)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=2.6)
 
