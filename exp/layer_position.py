@@ -1576,6 +1576,7 @@ def evaluate_openwebtext_losses_and_kv_similarity(
                     injected_value_block=translated_value,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                     target_model_id=node_map[edge.tgt_id].model_id,
+                    cache_injected_window=True,
                 )
                 native_prefix_past = past_by_node_id[edge.tgt_id]
                 target_model = ctx.mm.get_model(edge.tgt_id)
