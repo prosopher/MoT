@@ -1503,17 +1503,13 @@ def evaluate_openwebtext_losses_and_kv_similarity(
     translator_pool: LayerWindowTranslatorPool,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, str], Dict[str, str]]:
     config = ctx.config
-    dataloader = build_openwebtext_eval_dataloader(
-        tokenizer=ctx.tokenizer,
-        config=config,
-        batch_size=config.eval_batch_size,
-        num_workers=config.eval_num_workers,
-        shuffle=config.eval_shuffle_stream,
-        seed=config.seed,
-        shuffle_buffer=config.shuffle_buffer,
-    )
     max_examples = max(1, config.eval_max_examples_per_dataset)
-    processed_examples = 0
+    node_map = build_node_map(ctx.nodes)
+    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+    edges_by_target = {
+        target_node_id: [edge for edge in ctx.edges if edge.tgt_id == target_node_id]
+        for target_node_id in target_node_ids
+    }
 
     loss_sums = {edge.id: {"native": 0.0, "full_mix": 0.0} for edge in ctx.edges}
     counts = {edge.id: 0 for edge in ctx.edges}
@@ -1522,112 +1518,127 @@ def evaluate_openwebtext_losses_and_kv_similarity(
         for edge in ctx.edges
     }
 
-    for batch_idx, input_ids in enumerate(dataloader, start=1):
-        if processed_examples >= max_examples:
-            break
-
-        remaining_examples = max_examples - processed_examples
-        if input_ids.shape[0] > remaining_examples:
-            input_ids = input_ids[:remaining_examples]
-        input_ids = input_ids.to(config.device)
-
-        prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-            input_ids=input_ids,
-            prefix_tokens=config.prefix_tokens,
+    for target_node_id in target_node_ids:
+        dataloader = build_openwebtext_eval_dataloader(
+            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+            config=config,
+            batch_size=config.eval_batch_size,
+            num_workers=config.eval_num_workers,
+            shuffle=config.eval_shuffle_stream,
+            seed=config.seed,
+            shuffle_buffer=config.shuffle_buffer,
         )
-        past_by_node_id = {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
-            for node in ctx.nodes
-        }
+        processed_examples = 0
 
-        batch_examples = input_ids.shape[0]
-        for edge in ctx.edges:
-            edge_losses = compute_openwebtext_native_and_full_mix_losses(
-                ctx=ctx,
-                edge=edge,
-                prefix_cache_ids=prefix_cache_ids,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-                past_by_node_id=past_by_node_id,
-                translator_pool=translator_pool,
+        for batch_idx, input_ids in enumerate(dataloader, start=1):
+            if processed_examples >= max_examples:
+                break
+
+            remaining_examples = max_examples - processed_examples
+            if input_ids.shape[0] > remaining_examples:
+                input_ids = input_ids[:remaining_examples]
+            input_ids = input_ids.to(config.device)
+
+            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                input_ids=input_ids,
+                prefix_tokens=config.prefix_tokens,
             )
-            for metric_name in ["native", "full_mix"]:
-                loss_sums[edge.id][metric_name] += float(edge_losses[metric_name]) * batch_examples
-            counts[edge.id] += batch_examples
+            past_by_node_id = {
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                for node in ctx.nodes
+            }
 
-            translated_key, translated_value = translator_pool.translate_layer_window(
-                past_key_values=past_by_node_id[edge.src_id],
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-            )
-            full_mix_prefix_past = replay_target_prefill_with_injected_window(
-                target_model=ctx.mm.get_model(edge.tgt_id),
-                prefix_input_ids=prefix_cache_ids,
-                target_start_layer_idx=ctx.cm.get_tgt_layer_start_idx(edge.id),
-                injected_key_block=translated_key,
-                injected_value_block=translated_value,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            )
-            native_prefix_past = past_by_node_id[edge.tgt_id]
-            target_model = ctx.mm.get_model(edge.tgt_id)
+            batch_examples = input_ids.shape[0]
+            for edge in edges_by_target[target_node_id]:
+                edge_losses = compute_openwebtext_native_and_full_mix_losses(
+                    ctx=ctx,
+                    edge=edge,
+                    prefix_cache_ids=prefix_cache_ids,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                    past_by_node_id=past_by_node_id,
+                    translator_pool=translator_pool,
+                )
+                for metric_name in ["native", "full_mix"]:
+                    loss_sums[edge.id][metric_name] += float(edge_losses[metric_name]) * batch_examples
+                counts[edge.id] += batch_examples
 
-            for example_idx in range(batch_examples):
-                native_prefix_example = slice_past_key_values_batch(native_prefix_past, example_idx)
-                full_mix_prefix_example = slice_past_key_values_batch(full_mix_prefix_past, example_idx)
-                example_lm_input_ids = lm_input_ids[example_idx : example_idx + 1]
-                example_seed_token = lm_labels[example_idx : example_idx + 1, -1:]
+                translated_key, translated_value = translator_pool.translate_layer_window(
+                    past_key_values=past_by_node_id[edge.src_id],
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
+                )
+                full_mix_prefix_past = replay_target_prefill_with_injected_window(
+                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    prefix_input_ids=prefix_cache_ids,
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+                    injected_key_block=translated_key,
+                    injected_value_block=translated_value,
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
+                )
+                native_prefix_past = past_by_node_id[edge.tgt_id]
+                target_model = ctx.mm.get_model(edge.tgt_id)
+                target_tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
 
-                native_past_before_seed = append_input_ids_to_past(
-                    model=target_model,
-                    past_key_values=native_prefix_example,
-                    input_ids=example_lm_input_ids,
-                )
-                full_mix_past_before_seed = append_input_ids_to_past(
-                    model=target_model,
-                    past_key_values=full_mix_prefix_example,
-                    input_ids=example_lm_input_ids,
-                )
+                for example_idx in range(batch_examples):
+                    native_prefix_example = slice_past_key_values_batch(native_prefix_past, example_idx)
+                    full_mix_prefix_example = slice_past_key_values_batch(full_mix_prefix_past, example_idx)
+                    example_lm_input_ids = lm_input_ids[example_idx : example_idx + 1]
+                    example_seed_token = lm_labels[example_idx : example_idx + 1, -1:]
 
-                native_generation = generate_greedy_with_final_past(
-                    model=target_model,
-                    tokenizer=ctx.tokenizer,
-                    past_key_values=native_past_before_seed,
-                    seed_token=example_seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
-                )
-                full_mix_generation = generate_greedy_with_final_past(
-                    model=target_model,
-                    tokenizer=ctx.tokenizer,
-                    past_key_values=full_mix_past_before_seed,
-                    seed_token=example_seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
-                )
+                    native_past_before_seed = append_input_ids_to_past(
+                        model=target_model,
+                        past_key_values=native_prefix_example,
+                        input_ids=example_lm_input_ids,
+                    )
+                    full_mix_past_before_seed = append_input_ids_to_past(
+                        model=target_model,
+                        past_key_values=full_mix_prefix_example,
+                        input_ids=example_lm_input_ids,
+                    )
 
-                comparable_generated_tokens = min(
-                    len(native_generation["generated_token_ids"]),
-                    len(full_mix_generation["generated_token_ids"]),
-                )
-                similarity_matrix, group_labels, segment_group_counts = compute_full_mix_vs_native_kv_similarity_matrix(
-                    native_past_key_values=native_generation["final_past"],
-                    full_mix_past_key_values=full_mix_generation["final_past"],
-                    prefix_tokens=prefix_cache_ids.shape[1],
-                    suffix_tokens=example_lm_input_ids.shape[1] + 1,
-                    generated_tokens=comparable_generated_tokens,
-                    token_group_size=config.kv_similarity_token_group_size,
-                )
-                similarity_accumulators[edge.id].update(
-                    similarity_matrix=similarity_matrix,
-                    group_labels=group_labels,
-                    segment_group_counts=segment_group_counts,
-                )
+                    native_generation = generate_greedy_with_final_past(
+                        model=target_model,
+                        tokenizer=target_tokenizer,
+                        past_key_values=native_past_before_seed,
+                        seed_token=example_seed_token,
+                        max_new_tokens=config.generation_max_new_tokens,
+                    )
+                    full_mix_generation = generate_greedy_with_final_past(
+                        model=target_model,
+                        tokenizer=target_tokenizer,
+                        past_key_values=full_mix_past_before_seed,
+                        seed_token=example_seed_token,
+                        max_new_tokens=config.generation_max_new_tokens,
+                    )
 
-        processed_examples += batch_examples
-        if batch_idx % 10 == 0:
-            logging.info(
-                "[OpenWebText/validation] loss+kv-sim progress: %d/%d sequences",
-                processed_examples,
-                max_examples,
-            )
+                    comparable_generated_tokens = min(
+                        len(native_generation["generated_token_ids"]),
+                        len(full_mix_generation["generated_token_ids"]),
+                    )
+                    similarity_matrix, group_labels, segment_group_counts = compute_full_mix_vs_native_kv_similarity_matrix(
+                        native_past_key_values=native_generation["final_past"],
+                        full_mix_past_key_values=full_mix_generation["final_past"],
+                        prefix_tokens=prefix_cache_ids.shape[1],
+                        suffix_tokens=example_lm_input_ids.shape[1] + 1,
+                        generated_tokens=comparable_generated_tokens,
+                        token_group_size=config.kv_similarity_token_group_size,
+                    )
+                    similarity_accumulators[edge.id].update(
+                        similarity_matrix=similarity_matrix,
+                        group_labels=group_labels,
+                        segment_group_counts=segment_group_counts,
+                    )
+
+            processed_examples += batch_examples
+            if batch_idx % 10 == 0:
+                logging.info(
+                    "[OpenWebText/validation][target=%s] loss+kv-sim progress: %d/%d sequences",
+                    target_node_id,
+                    processed_examples,
+                    max_examples,
+                )
 
     loss_summary_by_edge: Dict[str, Dict[str, float]] = {}
     heatmap_paths: Dict[str, str] = {}
@@ -1663,7 +1674,6 @@ def evaluate_openwebtext_losses_and_kv_similarity(
         )
 
     return loss_summary_by_edge, heatmap_paths, metadata_paths
-
 
 def plot_metric_controls_summary(summary_path: Path) -> Path:
     rows = read_summary_rows(summary_path)
