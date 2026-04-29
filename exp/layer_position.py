@@ -1144,7 +1144,6 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     x_values = [row.injection_layer_start_idx for row in rows]
     metric_name = rows[0].metric_name or "metric"
     metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
-    is_f1 = metric_name == "f1"
     study_dir = summary_path.parent
 
     apply_ai_paper_style()
@@ -1159,7 +1158,7 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label="MoT" if is_f1 else f"Full-mix {metric_label}",
+        label="MoT",
     )
     ax.plot(
         x_values,
@@ -1170,27 +1169,7 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_BLACK,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label="Native" if is_f1 else f"Native {metric_label}",
-    )
-    ax.plot(
-        x_values,
-        [row.average_dir_only_metric for row in rows],
-        color=ACCENT_AQUA,
-        marker=AI_PAPER_MARKERS[1],
-        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
-        markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label="_nolegend_" if is_f1 else f"Dir-only {metric_label}",
-    )
-    ax.plot(
-        x_values,
-        [row.average_mag_only_metric for row in rows],
-        color=ACCENT_PURPLE,
-        marker=AI_PAPER_MARKERS[2],
-        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
-        markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label="_nolegend_" if is_f1 else f"Mag-only {metric_label}",
+        label="Native",
     )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
     ax.set_xlabel("Injection target layer start index")
@@ -1301,17 +1280,18 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label="Full-mix Loss",
+        label="MoT",
     )
     ax.plot(
         x_values,
         [row.average_native_loss for row in rows],
         color=ACCENT_BLACK,
+        linestyle=AI_PAPER_NATIVE_LINESTYLE,
         marker=AI_PAPER_MARKERS[0],
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_BLACK,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label="Native Loss",
+        label="Native",
     )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
     ax.set_xlabel("Injection target layer start index")
