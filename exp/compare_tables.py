@@ -9,7 +9,16 @@ from dataclasses import dataclass
 from typing import Literal
 from collections import OrderedDict
 
-import matplotlib.pyplot as plt
+
+
+def _require_matplotlib_pyplot():
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required only for plotting. Install matplotlib to generate figures."
+        ) from exc
+    return plt
 
 
 DEFAULT_Y_COL = "Gen F1 Avg"
@@ -329,6 +338,7 @@ def apply_ai_paper_style() -> None:
     - 적당한 linewidth와 tick size
     - 과하지 않은 grid
     """
+    plt = _require_matplotlib_pyplot()
     plt.rcParams.update(
         {
             # Figure and save quality
@@ -448,6 +458,8 @@ def plot_line_series(
         fig_width = 7.4
         fig_height = 4.8
 
+    plt = _require_matplotlib_pyplot()
+
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     for idx, (series_name, points) in enumerate(series_data.items()):
@@ -539,6 +551,8 @@ def plot_grouped_bar(
 
     fig_width = max(6.4, min(14.0, 1.35 * num_groups + 0.65 * num_categories + 2.0))
     fig_height = 4.8 if num_groups <= 6 else 5.4
+
+    plt = _require_matplotlib_pyplot()
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 

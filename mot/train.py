@@ -950,7 +950,7 @@ def run_gpt2_block(
 
     qkv = attn.c_attn(attn_input)
     split_size = getattr(attn, "split_size", qkv.shape[-1] // 3)
-    query, native_key, native_value = qkv.split(split_size, dim=2)
+    query, native_like_key, native_like_value = qkv.split(split_size, dim=2)
 
     batch_size, seq_len, _ = query.shape
     num_heads = attn.num_heads
@@ -958,11 +958,11 @@ def run_gpt2_block(
     expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
 
     query = query.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    native_key = native_key.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    native_value = native_value.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    native_like_key = native_like_key.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    native_like_value = native_like_value.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
 
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for GPT-2 layer replay: "
@@ -997,7 +997,7 @@ def run_gpt2_block(
     attn_output = attn.resid_dropout(attn_output)
     hidden_states = residual + attn_output
     hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
-    return hidden_states, (native_key, native_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 def run_opt_block(
@@ -1033,14 +1033,14 @@ def run_opt_block(
         hidden_states = block.self_attn_layer_norm(hidden_states)
 
     query_states = attn.q_proj(hidden_states) * float(getattr(attn, "scaling", head_dim ** -0.5))
-    native_key = attn.k_proj(hidden_states)
-    native_value = attn.v_proj(hidden_states)
+    native_like_key = attn.k_proj(hidden_states)
+    native_like_value = attn.v_proj(hidden_states)
     query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    native_key = native_key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    native_value = native_value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_key = native_like_key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_value = native_like_value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
 
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for OPT layer replay: "
@@ -1084,7 +1084,7 @@ def run_opt_block(
     hidden_states = (residual + hidden_states).view(hidden_states_shape)
     if not getattr(block, "do_layer_norm_before", False):
         hidden_states = block.final_layer_norm(hidden_states)
-    return hidden_states, (native_key, native_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 
