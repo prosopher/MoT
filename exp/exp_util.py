@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 
 # Colorblind-friendly palette for paper figures.
@@ -49,20 +49,20 @@ AI_PAPER_PREVIEW_DPI = 150
 
 # Double-column-friendly typography. Most AI conference templates render body text
 # around 9--10 pt in two-column mode, so figure text should stay in that range.
-AI_PAPER_AXIS_LABEL_SIZE = 9
-AI_PAPER_TICK_LABEL_SIZE = 8
-AI_PAPER_LEGEND_FONT_SIZE = 8
-AI_PAPER_ANNOTATION_FONT_SIZE = 7
-AI_PAPER_COLORBAR_LABEL_SIZE = 8
-AI_PAPER_COLORBAR_TICK_SIZE = 7
+AI_PAPER_AXIS_LABEL_SIZE = 10
+AI_PAPER_TICK_LABEL_SIZE = 9
+AI_PAPER_LEGEND_FONT_SIZE = 9
+AI_PAPER_ANNOTATION_FONT_SIZE = 8
+AI_PAPER_COLORBAR_LABEL_SIZE = 9
+AI_PAPER_COLORBAR_TICK_SIZE = 8
 
 AI_PAPER_LINE_WIDTH = 1.8
 AI_PAPER_REFERENCE_LINE_WIDTH = 1.0
 AI_PAPER_MARKER_SIZE = 8.5
 AI_PAPER_SCATTER_SIZE = 90.0
 AI_PAPER_MARKER_EDGE_WIDTH = 1.5
-AI_PAPER_BAR_VALUE_FONT_SIZE = 7
-AI_PAPER_HEATMAP_VALUE_FONT_SIZE = 6
+AI_PAPER_BAR_VALUE_FONT_SIZE = 8
+AI_PAPER_HEATMAP_VALUE_FONT_SIZE = 7
 AI_PAPER_ALGORITHM_LABEL_ROTATION = 35
 AI_PAPER_LAYER_TICK_ROTATION = 45
 AI_PAPER_LEGEND_HANDLE_LENGTH = 2.4
@@ -73,7 +73,7 @@ AI_PAPER_REFERENCE_COLOR = "0.35"
 AI_PAPER_BORDER_COLOR = "0.20"
 AI_PAPER_LEGEND_EDGE_COLOR = "0.85"
 AI_PAPER_MARKER_FACE_COLOR = "white"
-AI_PAPER_DENSE_WIDTH_SCALE_MAX = 1.45
+AI_PAPER_DENSE_WIDTH_SCALE_MAX = 1.0
 AI_PAPER_GROUPED_BAR_TOTAL_WIDTH = 0.82
 AI_PAPER_GROUPED_BAR_WIDTH_SCALE = 0.92
 AI_PAPER_VALUE_OFFSET_FRACTION = 0.01
@@ -83,7 +83,7 @@ AI_PAPER_DEFAULT_X_MARGIN = 0.03
 AI_PAPER_DEFAULT_Y_MARGIN = 0.08
 AI_PAPER_BAR_X_MARGIN = 0.04
 AI_PAPER_BAR_Y_MARGIN = 0.10
-AI_PAPER_WRAP_TICK_WIDTH = 28
+AI_PAPER_WRAP_TICK_WIDTH = 24
 AI_PAPER_LEGEND_OUTSIDE_ANCHOR = (1.02, 0.5)
 
 
@@ -100,8 +100,9 @@ def scaled_double_column_figsize(
     height: float | None = None,
     height_scale: float = 1.0,
 ) -> tuple[float, float]:
-    """Return a double-column-derived size for unusually dense plots."""
-    width = AI_PAPER_DOUBLE_COLUMN_WIDTH * width_scale
+    """Return a double-column-derived size, capped at the shared double-column width."""
+    bounded_width_scale = min(max(width_scale, 1.0), AI_PAPER_DENSE_WIDTH_SCALE_MAX)
+    width = AI_PAPER_DOUBLE_COLUMN_WIDTH * bounded_width_scale
     fig_height = (height or AI_PAPER_DOUBLE_COLUMN_HEIGHT) * height_scale
     return (width, fig_height)
 
@@ -157,13 +158,17 @@ def apply_ai_paper_style() -> None:
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
 
-            # Font
+            # Font: STIX/Times-like serif is closer to common AI conference paper text.
             "font.family": "serif",
             "font.serif": [
+                "STIXGeneral",
                 "Times New Roman",
+                "Nimbus Roman",
+                "TeX Gyre Termes",
                 "Times",
                 "DejaVu Serif",
             ],
+            "font.size": AI_PAPER_TICK_LABEL_SIZE,
             "mathtext.fontset": "stix",
 
             # Editable text in vector outputs

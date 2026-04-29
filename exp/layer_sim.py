@@ -26,6 +26,8 @@ from core.common import (  # noqa: E402
 )
 from core.config import resolve_device
 from exp.exp_util import (
+    AI_PAPER_COLORBAR_LABEL_SIZE,
+    AI_PAPER_COLORBAR_TICK_SIZE,
     AI_PAPER_HEATMAP_VALUE_FONT_SIZE,
     AI_PAPER_LAYER_TICK_ROTATION,
     apply_ai_paper_style,
@@ -615,7 +617,8 @@ def plot_heatmap(
     ax.set_yticklabels([str(idx) for idx in range(matrix.shape[0])])
 
     cbar = fig.colorbar(image, ax=ax)
-    cbar.set_label("Similarity", fontweight="bold")
+    cbar.set_label("Similarity", fontweight="bold", fontsize=AI_PAPER_COLORBAR_LABEL_SIZE)
+    cbar.ax.tick_params(labelsize=AI_PAPER_COLORBAR_TICK_SIZE)
 
     if annotate and matrix.numel() <= 900:
         values = matrix.cpu().numpy()
