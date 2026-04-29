@@ -51,6 +51,7 @@ class CorrectionSummaryRow:
     shrink_fraction: float
     average_final_alpha: float
     average_final_alpha_over_initial: float
+    average_final_correction_deficit_coefficient: float
     average_final_beta: float
     average_final_beta_over_initial: float
     average_final_correction_cosine: float
@@ -341,6 +342,7 @@ class MetricCollector:
         self.final_shrink_ratios: List[float] = []
         self.final_alphas: List[float] = []
         self.final_alpha_over_initial: List[float] = []
+        self.final_correction_deficit_coefficients: List[float] = []
         self.final_betas: List[float] = []
         self.final_beta_over_initial: List[float] = []
         self.final_correction_cosines: List[float] = []
@@ -348,13 +350,14 @@ class MetricCollector:
         self.final_mlp_alpha_over_initial: List[float] = []
         self.final_shrink_flags: List[bool] = []
 
-    def update(self, *, initial_shift_norm: float, window_input_norm: float, final_shift_norm: float, final_shrink_ratio: float, final_alpha: float, final_alpha_over_initial: float, final_beta: float, final_beta_over_initial: float, final_correction_cosine: float, final_attn_alpha_over_initial: float, final_mlp_alpha_over_initial: float) -> None:
+    def update(self, *, initial_shift_norm: float, window_input_norm: float, final_shift_norm: float, final_shrink_ratio: float, final_alpha: float, final_alpha_over_initial: float, final_correction_deficit_coefficient: float, final_beta: float, final_beta_over_initial: float, final_correction_cosine: float, final_attn_alpha_over_initial: float, final_mlp_alpha_over_initial: float) -> None:
         self.initial_shift_norms.append(float(initial_shift_norm))
         self.window_input_norms.append(float(window_input_norm))
         self.final_shift_norms.append(float(final_shift_norm))
         self.final_shrink_ratios.append(float(final_shrink_ratio))
         self.final_alphas.append(float(final_alpha))
         self.final_alpha_over_initial.append(float(final_alpha_over_initial))
+        self.final_correction_deficit_coefficients.append(float(final_correction_deficit_coefficient))
         self.final_betas.append(float(final_beta))
         self.final_beta_over_initial.append(float(final_beta_over_initial))
         self.final_correction_cosines.append(float(final_correction_cosine))
@@ -373,6 +376,7 @@ class MetricCollector:
             "shrink_fraction": _fraction(self.final_shrink_flags),
             "average_final_alpha": _nanmean(self.final_alphas),
             "average_final_alpha_over_initial": _nanmean(self.final_alpha_over_initial),
+            "average_final_correction_deficit_coefficient": _nanmean(self.final_correction_deficit_coefficients),
             "average_final_beta": _nanmean(self.final_betas),
             "average_final_beta_over_initial": _nanmean(self.final_beta_over_initial),
             "average_final_correction_cosine": _nanmean(self.final_correction_cosines),
@@ -443,6 +447,7 @@ def compute_correction_metrics_from_traces(
         "final_shrink_ratio": rho_values[-1],
         "final_alpha": alpha_values[-1],
         "final_alpha_over_initial": alpha_over_initial_values[-1],
+        "final_correction_deficit_coefficient": float(torch.dot(hidden_delta[-1], u).item() / initial_shift_norm),
         "final_beta": beta_values[-1],
         "final_beta_over_initial": beta_over_initial_values[-1],
         "final_correction_cosine": correction_cosine_values[-1],
@@ -593,6 +598,7 @@ def evaluate_correction(
                                 final_shrink_ratio=correction_metrics["final_shrink_ratio"],
                                 final_alpha=correction_metrics["final_alpha"],
                                 final_alpha_over_initial=correction_metrics["final_alpha_over_initial"],
+                                final_correction_deficit_coefficient=correction_metrics["final_correction_deficit_coefficient"],
                                 final_beta=correction_metrics["final_beta"],
                                 final_beta_over_initial=correction_metrics["final_beta_over_initial"],
                                 final_correction_cosine=correction_metrics["final_correction_cosine"],
@@ -620,6 +626,7 @@ def evaluate_correction(
                                 final_shrink_ratio=random_metrics["final_shrink_ratio"],
                                 final_alpha=random_metrics["final_alpha"],
                                 final_alpha_over_initial=random_metrics["final_alpha_over_initial"],
+                                final_correction_deficit_coefficient=random_metrics["final_correction_deficit_coefficient"],
                                 final_beta=random_metrics["final_beta"],
                                 final_beta_over_initial=random_metrics["final_beta_over_initial"],
                                 final_correction_cosine=random_metrics["final_correction_cosine"],
@@ -661,9 +668,10 @@ def evaluate_correction(
     }
 
     logging.info(
-        "[CorrectionSummary] final_shrink_ratio=%.6f | shrink_fraction=%.6f | alpha_over_initial=%.6f | beta_over_initial=%.6f | random_final_shrink_ratio=%.6f",
+        "[CorrectionSummary] final_shrink_ratio=%.6f | shrink_fraction=%.6f | d_T=%.6f | alpha_over_initial=%.6f | beta_over_initial=%.6f | random_final_shrink_ratio=%.6f",
         fullmix_summary["average_final_shrink_ratio"],
         fullmix_summary["shrink_fraction"],
+        fullmix_summary["average_final_correction_deficit_coefficient"],
         fullmix_summary["average_final_alpha_over_initial"],
         fullmix_summary["average_final_beta_over_initial"],
         random_summary["average_final_shrink_ratio"],
@@ -674,6 +682,7 @@ def evaluate_correction(
         "metric_semantics": {
             "initial_shift": "first hidden-state difference immediately after the entire injected window",
             "final_shrink_ratio": "||final hidden-state difference|| divided by ||initial post-window hidden-state difference||",
+            "final_correction_deficit_coefficient": "<final hidden-state difference, normalized initial post-window shift> divided by ||initial post-window shift||",
             "source_idx": "post-window boundary index used as the first correction analysis point",
         },
         "full_mix": fullmix_summary,
@@ -709,6 +718,7 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
                 shrink_fraction=float(raw_row["shrink_fraction"]),
                 average_final_alpha=float(raw_row["average_final_alpha"]),
                 average_final_alpha_over_initial=float(raw_row["average_final_alpha_over_initial"]),
+                average_final_correction_deficit_coefficient=float(raw_row["average_final_correction_deficit_coefficient"]),
                 average_final_beta=float(raw_row["average_final_beta"]),
                 average_final_beta_over_initial=float(raw_row["average_final_beta_over_initial"]),
                 average_final_correction_cosine=float(raw_row["average_final_correction_cosine"]),
@@ -756,6 +766,7 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path
         shrink_fraction=float(full_mix["shrink_fraction"]),
         average_final_alpha=float(full_mix["average_final_alpha"]),
         average_final_alpha_over_initial=float(full_mix["average_final_alpha_over_initial"]),
+        average_final_correction_deficit_coefficient=float(full_mix["average_final_correction_deficit_coefficient"]),
         average_final_beta=float(full_mix["average_final_beta"]),
         average_final_beta_over_initial=float(full_mix["average_final_beta_over_initial"]),
         average_final_correction_cosine=float(full_mix["average_final_correction_cosine"]),
@@ -912,16 +923,11 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     raw_alpha = [row.average_final_alpha for row in rows]
     raw_beta = [row.average_final_beta for row in rows]
     phase_sizes = [max(40.0, 8.0 * max(v, 1.0)) for v in initial_shift]
-    window_input_norms = [row.average_window_input_norm for row in rows]
+    correction_deficit_coefficients = [row.average_final_correction_deficit_coefficient for row in rows]
     ax.scatter(raw_beta, raw_alpha, s=phase_sizes, marker="o")
-    for row, x, y, s_norm, x_in_norm in zip(rows, raw_beta, raw_alpha, initial_shift, window_input_norms):
-        if row.target_layer_start_idx == row.target_layer_end_idx:
-            shift_symbol = f"s_{row.target_layer_start_idx}"
-        else:
-            shift_symbol = f"s_{row.target_layer_end_idx+1}"
-        input_symbol = f"X_{row.target_layer_start_idx}"
+    for row, x, y, d_t in zip(rows, raw_beta, raw_alpha, correction_deficit_coefficients):
         ax.annotate(
-            f"L{row.injection_layer_start_idx}\n||{shift_symbol}||={s_norm:.2f}\n||{input_symbol}||={x_in_norm:.2f}",
+            f"L{row.injection_layer_start_idx}\nd_T={d_t:.3f}",
             (x, y),
             textcoords="offset points",
             xytext=(5, 4),
