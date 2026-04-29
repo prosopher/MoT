@@ -350,8 +350,8 @@ class C2CFuserPool(nn.Module):
                 )
 
             adapters[edge.id] = DirectionalCacheFuser(
-                src_hidden_size=src_spec.hidden_size,
-                tgt_hidden_size=tgt_spec.hidden_size,
+                src_hidden_size=src_spec.kv_hidden_size,
+                tgt_hidden_size=tgt_spec.kv_hidden_size,
                 top_layers_to_translate=top_layers_to_translate,
                 fuser_dim=fuser_dim,
                 fuser_heads=fuser_heads,
@@ -424,7 +424,7 @@ class C2CFuserPool(nn.Module):
         return blocks_to_partial_past_key_values(
             key_block=fused_key,
             value_block=fused_value,
-            num_heads=tgt_spec.num_heads,
+            num_heads=tgt_spec.num_key_value_heads,
             head_dim=tgt_spec.head_dim,
         )
 
@@ -549,8 +549,8 @@ class C2CProjectorPool(nn.Module):
                     f"for edge {edge.id}."
                 )
             adapters[edge.id] = DirectionalCacheProjector(
-                src_hidden_size=src_spec.hidden_size,
-                tgt_hidden_size=tgt_spec.hidden_size,
+                src_hidden_size=src_spec.kv_hidden_size,
+                tgt_hidden_size=tgt_spec.kv_hidden_size,
                 top_layers_to_translate=top_layers_to_translate,
                 hidden_dim=projector_dim,
                 depth=projector_depth,
@@ -586,7 +586,7 @@ class C2CProjectorPool(nn.Module):
         return blocks_to_partial_past_key_values(
             key_block=projected_key,
             value_block=projected_value,
-            num_heads=tgt_spec.num_heads,
+            num_heads=tgt_spec.num_key_value_heads,
             head_dim=tgt_spec.head_dim,
         )
 
@@ -615,7 +615,7 @@ def build_translator_pool(
             gate_temperature_start=config.gate_temperature_start,
             hard_gate_eval=config.hard_gate_eval,
         )
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     return translator_pool
 
 
@@ -653,7 +653,7 @@ def load_translator_pool_from_checkpoint(
     )
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
 

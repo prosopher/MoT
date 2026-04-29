@@ -108,6 +108,16 @@ class WarmupCosineScheduler:
         return self.optimizer.param_groups[0]["lr"]
 
 
+def get_training_dtype(config) -> torch.dtype:
+    if not hasattr(config, "dtype"):
+        raise AttributeError("Training config must define a dtype field.")
+    return get_torch_dtype(config.dtype)
+
+
+def move_trainable_module_to_config_dtype(module: nn.Module, config) -> nn.Module:
+    return module.to(device=config.device, dtype=get_training_dtype(config))
+
+
 def build_models_and_tokenizers(
     config,
     nodes: List[Node],

@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 
 from core.channel_manager import ChannelManager
 from core.common import (
@@ -35,7 +34,8 @@ from core.train_util import (
     get_train_checkpoint_path,
     get_train_config_path,
     get_train_log_path,
-    initialize_train_output_paths
+    initialize_train_output_paths,
+    move_trainable_module_to_config_dtype
 )
 from core.topology import Edge, Node
 from interlat.vender import ModelArguments as VendorModelArguments
@@ -317,11 +317,7 @@ class NodeTokenizerPool:
 
     @staticmethod
     def _load(model_id: str):
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-        return tokenizer
+        return load_tokenizer(model_id)
 
     def __getitem__(self, node_id: str):
         return self.tokenizers[node_id]
@@ -356,7 +352,7 @@ def tokenize_valid_texts(
 
 def build_translator_pool(ctx: Context) -> InterLatTranslatorPool:
     pool = InterLatTranslatorPool(ctx)
-    pool.to(ctx.config.device)
+    move_trainable_module_to_config_dtype(pool, ctx.config)
     return pool
 
 
@@ -387,7 +383,7 @@ def load_translator_pool_from_checkpoint(
     )
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(torch.load(str(checkpoint_path_obj), map_location="cpu"))
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     node_tokenizers = NodeTokenizerPool(nodes)
     return ctx, translator_pool, node_tokenizers
