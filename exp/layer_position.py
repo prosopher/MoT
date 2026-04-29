@@ -430,13 +430,11 @@ def run_train(
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                     target_model_id=node_map[edge.tgt_id].model_id,
                 )
-                total_direction_loss = total_direction_loss + compute_prefix_correction_and_suffix_lm_loss(
+                total_direction_loss = total_direction_loss + compute_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
-                    native_target_past_key_values=past_by_node_id[edge.tgt_id],
-                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                 )
 
             loss = total_direction_loss / config.grad_accum_steps
@@ -895,23 +893,19 @@ def compute_openwebtext_native_and_full_mix_losses(
     target_layer_indices = ctx.cm.get_tgt_layer_indices(edge.id)
 
     native_loss = float(
-        compute_prefix_correction_and_suffix_lm_loss(
+        compute_suffix_lm_loss(
             target_model=target_model,
             past_key_values=native_target_past,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
-            native_target_past_key_values=native_target_past,
-            target_layer_indices=target_layer_indices,
         ).item()
     )
     full_mix_loss = float(
-        compute_prefix_correction_and_suffix_lm_loss(
+        compute_suffix_lm_loss(
             target_model=target_model,
             past_key_values=full_mix_past,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
-            native_target_past_key_values=native_target_past,
-            target_layer_indices=target_layer_indices,
         ).item()
     )
     return {
