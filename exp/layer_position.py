@@ -1107,6 +1107,7 @@ def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
             xytext=(0, 7),
             ha="center",
             fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
         )
 
 
