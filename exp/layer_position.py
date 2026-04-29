@@ -888,20 +888,27 @@ def compute_openwebtext_native_and_full_mix_losses(
         target_model_id=build_node_map(ctx.nodes)[edge.tgt_id].model_id,
     )
 
+    target_model = ctx.mm.get_model(edge.tgt_id)
+    target_layer_indices = ctx.cm.get_tgt_layer_indices(edge.id)
+
     native_loss = float(
-        compute_suffix_lm_loss(
-            target_model=ctx.mm.get_model(edge.tgt_id),
+        compute_prefix_correction_and_suffix_lm_loss(
+            target_model=target_model,
             past_key_values=native_target_past,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
+            native_target_past_key_values=native_target_past,
+            target_layer_indices=target_layer_indices,
         ).item()
     )
     full_mix_loss = float(
-        compute_suffix_lm_loss(
-            target_model=ctx.mm.get_model(edge.tgt_id),
+        compute_prefix_correction_and_suffix_lm_loss(
+            target_model=target_model,
             past_key_values=full_mix_past,
             lm_input_ids=lm_input_ids,
             lm_labels=lm_labels,
+            native_target_past_key_values=native_target_past,
+            target_layer_indices=target_layer_indices,
         ).item()
     )
     return {
