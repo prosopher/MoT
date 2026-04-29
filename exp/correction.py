@@ -18,7 +18,22 @@ from core.channel_manager import ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
 from core.eval_util import *
+from exp.compare_tables import (
+    AI_PAPER_PALETTE,
+    AI_PAPER_MARKERS,
+    apply_ai_paper_style,
+    style_axes_common,
+)
 import exp.layer_position as lp
+
+
+ACCENT_RED = AI_PAPER_PALETTE[0]
+ACCENT_AQUA = AI_PAPER_PALETTE[1]
+ACCENT_PURPLE = AI_PAPER_PALETTE[2]
+ACCENT_BLUE = AI_PAPER_PALETTE[3]
+ACCENT_GREEN = AI_PAPER_PALETTE[4]
+ACCENT_ORANGE = AI_PAPER_PALETTE[5]
+ACCENT_BLACK = AI_PAPER_PALETTE[6]
 
 
 @dataclass
@@ -792,8 +807,24 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path
     return summary_path
 
 
+
+def _style_paper_axes(ax, *, x_values: Optional[List[int]] = None) -> None:
+    style_axes_common(ax)
+    ax.minorticks_on()
+    ax.margins(x=0.03, y=0.08)
+    if x_values is not None:
+        ax.set_xticks(x_values)
+
+
+def _save_paper_figure(fig, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+
+
 def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path, Path]:
     import matplotlib.pyplot as plt
+
+    apply_ai_paper_style()
 
     source_idx = metrics["trajectory"]["source_idx"]
     reference_edge = ctx.edges[0]
@@ -809,39 +840,80 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
         raise ValueError("No token_00 trajectory found for plotting")
     x_values = list(range(source_idx, source_idx + len(full["rho_median"])))
 
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, full["rho_median"], marker="o", label="Full-Mix median ||Δh_k|| / ||s_t||")
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.plot(
+        x_values,
+        full["rho_median"],
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=1.4,
+        label="Full-Mix median ||s_L|| / ||s_T||",
+    )
     if rand and rand.get("rho_median"):
-        ax.plot(x_values, rand["rho_median"], marker="s", label="Random control median ||Δh_k|| / ||s_t||")
-    ax.axhline(1.0, linestyle="--", linewidth=1)
+        ax.plot(
+            x_values,
+            rand["rho_median"],
+            color=ACCENT_BLACK,
+            linestyle="--",
+            marker=AI_PAPER_MARKERS[1],
+            markerfacecolor="white",
+            markeredgecolor=ACCENT_BLACK,
+            markeredgewidth=1.4,
+            label="Random control median ||s_L|| / ||s_T||",
+        )
+    ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Post-window layer boundary index k")
-    ax.set_ylabel("Norm ratio relative to first post-window shift")
-    ax.set_title(f"Correction trajectory after injected window {injected_window_label} (token 0)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_ylabel("Norm ratio relative to Translation Shift ||s_T||")
+    ax.set_title(f"Correction trajectory after injected window {injected_window_label} (token 0)", pad=8)
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=2.6)
     norm_ratio_path = build_norm_ratio_chart_path(run_dir)
-    fig.savefig(norm_ratio_path, dpi=200)
+    _save_paper_figure(fig, norm_ratio_path)
     plt.close(fig)
 
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, full["alpha_over_initial_median"], marker="o", label="Full-Mix median α_k / ||s_t||")
-    ax.plot(x_values, full["beta_over_initial_median"], marker="^", label="Full-Mix median β_k / ||s_t||")
-    ax.plot(x_values, full["correction_cosine_median"], marker="d", label="Full-Mix median correction cosine")
-    ax.axhline(0.0, linestyle="--", linewidth=1)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.plot(
+        x_values,
+        full["alpha_over_initial_median"],
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=1.4,
+        label="Full-Mix median α_k / ||s_T||",
+    )
+    ax.plot(
+        x_values,
+        full["beta_over_initial_median"],
+        color=ACCENT_AQUA,
+        marker=AI_PAPER_MARKERS[2],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_AQUA,
+        markeredgewidth=1.4,
+        label="Full-Mix median β_k / ||s_T||",
+    )
+    ax.plot(
+        x_values,
+        full["correction_cosine_median"],
+        color=ACCENT_PURPLE,
+        marker=AI_PAPER_MARKERS[3],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_PURPLE,
+        markeredgewidth=1.4,
+        label="Full-Mix median correction cosine",
+    )
+    ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Post-window layer boundary index k")
-    ax.set_ylabel("Projected correction relative to first post-window shift")
-    ax.set_title(f"Correction projection trajectory after injected window {injected_window_label} (token 0)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_ylabel("Projected correction relative to Translation Shift ||s_T||")
+    ax.set_title(f"Correction projection trajectory after injected window {injected_window_label} (token 0)", pad=8)
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=2.6)
     projection_path = build_projection_chart_path(run_dir)
-    fig.savefig(projection_path, dpi=200)
+    _save_paper_figure(fig, projection_path)
     plt.close(fig)
     return norm_ratio_path, projection_path
-
 
 def _annotate_ranges(ax, rows: List[CorrectionSummaryRow], y_values: List[float]) -> None:
     for row, y in zip(rows, y_values):
@@ -857,6 +929,9 @@ def _annotate_ranges(ax, rows: List[CorrectionSummaryRow], y_values: List[float]
 
 def plot_summary(summary_path: Path) -> Dict[str, Path]:
     import matplotlib.pyplot as plt
+
+    apply_ai_paper_style()
+
     rows = read_summary_rows(summary_path)
     if not rows:
         raise ValueError(f"No rows found in {summary_path}")
@@ -880,51 +955,127 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     structural_shrink_advantage = [rand - full for rand, full in zip(random_shrink, avg_shrink)]
     structural_cosine_advantage = [full - rand for full, rand in zip(cosine, random_cosine)]
     beta_minus_alpha = [b - a for a, b in zip(alpha, beta)]
-    beta_over_alpha = [float("nan") if abs(a) < 1e-8 else b / a for a, b in zip(alpha, beta)]
 
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, avg_shrink, marker="o", label="Full-Mix avg final shrink ratio")
-    ax.plot(x_values, median_shrink, marker="^", label="Full-Mix median final shrink ratio")
-    ax.plot(x_values, random_shrink, marker="s", label="Random control avg final shrink ratio")
-    ax.axhline(1.0, linestyle="--", linewidth=1)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.plot(
+        x_values,
+        avg_shrink,
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=1.4,
+        label="Full-Mix avg final shrink ratio",
+    )
+    ax.plot(
+        x_values,
+        median_shrink,
+        color=ACCENT_PURPLE,
+        marker=AI_PAPER_MARKERS[2],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_PURPLE,
+        markeredgewidth=1.4,
+        label="Full-Mix median final shrink ratio",
+    )
+    ax.plot(
+        x_values,
+        random_shrink,
+        color=ACCENT_BLACK,
+        linestyle="--",
+        marker=AI_PAPER_MARKERS[1],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_BLACK,
+        markeredgewidth=1.4,
+        label="Random control avg final shrink ratio",
+    )
+    ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
     _annotate_ranges(ax, rows, avg_shrink)
     ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("Final ||Δh_L|| / ||s_{t+w-1}||")
-    ax.set_title("Final post-window shrink ratio vs injected-window start index")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_ylabel("Final ||s_L|| / ||s_T||")
+    ax.set_title("Final post-window shrink ratio vs injected-window start index", pad=8)
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=2.6)
     outputs["shrink"] = build_summary_shrink_chart_path(study_dir)
-    fig.savefig(outputs["shrink"], dpi=200)
+    _save_paper_figure(fig, outputs["shrink"])
     plt.close(fig)
 
-    fig = plt.figure(figsize=(9.5, 5.6))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, alpha, marker="o", label="Total α_L / ||s_{t+w-1}||")
-    ax.plot(x_values, beta, marker="^", label="Total β_L / ||s_{t+w-1}||")
-    ax.plot(x_values, attn_alpha, marker="s", label="Attention α contribution")
-    ax.plot(x_values, mlp_alpha, marker="d", label="MLP α contribution")
-    ax.plot(x_values, beta_minus_alpha, marker="x", label="β - α")
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.plot(
+        x_values,
+        alpha,
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=1.4,
+        label="Total α_L / ||s_T||",
+    )
+    ax.plot(
+        x_values,
+        beta,
+        color=ACCENT_AQUA,
+        marker=AI_PAPER_MARKERS[2],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_AQUA,
+        markeredgewidth=1.4,
+        label="Total β_L / ||s_T||",
+    )
+    ax.plot(
+        x_values,
+        attn_alpha,
+        color=ACCENT_PURPLE,
+        marker=AI_PAPER_MARKERS[1],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_PURPLE,
+        markeredgewidth=1.4,
+        label="Attention α contribution",
+    )
+    ax.plot(
+        x_values,
+        mlp_alpha,
+        color=ACCENT_GREEN,
+        marker=AI_PAPER_MARKERS[3],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_GREEN,
+        markeredgewidth=1.4,
+        label="MLP α contribution",
+    )
+    ax.plot(
+        x_values,
+        beta_minus_alpha,
+        color=ACCENT_ORANGE,
+        marker=AI_PAPER_MARKERS[6],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_ORANGE,
+        markeredgewidth=1.4,
+        label="β - α",
+    )
     _annotate_ranges(ax, rows, beta)
-    ax.axhline(0.0, linestyle="--", linewidth=1)
+    ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("Initial-shift-normalized magnitude")
-    ax.set_title("Correction decomposition vs injection target layer start index")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_ylabel("Translation-shift-normalized magnitude")
+    ax.set_title("Correction decomposition vs injection target layer start index", pad=8)
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=2.6)
     outputs["decomposition"] = build_summary_decomposition_chart_path(study_dir)
-    fig.savefig(outputs["decomposition"], dpi=200)
+    _save_paper_figure(fig, outputs["decomposition"])
     plt.close(fig)
 
-    fig = plt.figure(figsize=(10, 6.2))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
     raw_alpha = [row.average_final_alpha for row in rows]
     raw_beta = [row.average_final_beta for row in rows]
     phase_sizes = [max(40.0, 8.0 * max(v, 1.0)) for v in initial_shift]
     correction_deficit_coefficients = [row.average_final_correction_deficit_coefficient for row in rows]
-    ax.scatter(raw_beta, raw_alpha, s=phase_sizes, marker="o")
+    ax.scatter(
+        raw_beta,
+        raw_alpha,
+        s=phase_sizes,
+        marker=AI_PAPER_MARKERS[0],
+        color=ACCENT_RED,
+        edgecolor="black",
+        linewidth=0.6,
+        alpha=0.88,
+    )
     for row, x, y, d_t in zip(rows, raw_beta, raw_alpha, correction_deficit_coefficients):
         ax.annotate(
             f"L{row.injection_layer_start_idx}\nd_T={d_t:.3f}",
@@ -935,48 +1086,78 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         )
     ax.set_xlabel("Total β_L")
     ax.set_ylabel("Total α_L")
-    ax.set_title("Correction phase scatter: error correction")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    ax.set_title("Correction phase scatter: error correction", pad=8)
+    _style_paper_axes(ax)
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
-    fig.savefig(outputs["phase"], dpi=200)
+    _save_paper_figure(fig, outputs["phase"])
     plt.close(fig)
 
-    fig = plt.figure(figsize=(10, 6.0))
-    ax1 = fig.add_subplot(211)
-    ax1.plot(x_values, structural_shrink_advantage, marker="o", label="Random - Full-Mix shrink ratio")
-    ax1.axhline(0.0, linestyle="--", linewidth=1)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.4, 6.0), sharex=True)
+    ax1.plot(
+        x_values,
+        structural_shrink_advantage,
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=1.4,
+        label="Random - Full-Mix shrink ratio",
+    )
+    ax1.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     _annotate_ranges(ax1, rows, structural_shrink_advantage)
     ax1.set_ylabel("Positive is better")
-    ax1.set_title("Structural advantage over random control (post-window correction)")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    ax1.set_title("Structural advantage over random control (post-window correction)", pad=8)
+    _style_paper_axes(ax1)
+    ax1.legend(handlelength=2.6)
 
-    ax2 = fig.add_subplot(212)
-    ax2.plot(x_values, structural_cosine_advantage, marker="s", label="Full-Mix - Random correction cosine")
-    ax2.axhline(0.0, linestyle="--", linewidth=1)
+    ax2.plot(
+        x_values,
+        structural_cosine_advantage,
+        color=ACCENT_AQUA,
+        marker=AI_PAPER_MARKERS[1],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_AQUA,
+        markeredgewidth=1.4,
+        label="Full-Mix - Random correction cosine",
+    )
+    ax2.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
     ax2.set_xlabel("Injection target layer start index")
     ax2.set_ylabel("Positive is better")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    fig.tight_layout()
+    _style_paper_axes(ax2, x_values=x_values)
+    ax2.legend(handlelength=2.6)
     outputs["random"] = build_summary_random_chart_path(study_dir)
-    fig.savefig(outputs["random"], dpi=200)
+    _save_paper_figure(fig, outputs["random"])
     plt.close(fig)
 
-    fig = plt.figure(figsize=(10, 4.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, initial_shift, marker="o", label="Translation Shift ||s_T||")
-    ax.plot(x_values, final_shift, marker="s", label="Last-State Shift ||s_L||")
+    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    ax.plot(
+        x_values,
+        initial_shift,
+        color=ACCENT_AQUA,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_AQUA,
+        markeredgewidth=1.4,
+        label="Translation Shift ||s_T||",
+    )
+    ax.plot(
+        x_values,
+        final_shift,
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[1],
+        markerfacecolor="white",
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=1.4,
+        label="Last-State Shift ||s_L||",
+    )
     _annotate_ranges(ax, rows, final_shift)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Average norm")
-    ax.set_title("Translation Shift ||s_T|| and Last-State Shift ||s_L||")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_title("Translation Shift ||s_T|| and Last-State Shift ||s_L||", pad=8)
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=2.6)
     outputs["shift_norms"] = build_summary_shift_norm_chart_path(study_dir)
-    fig.savefig(outputs["shift_norms"], dpi=200)
+    _save_paper_figure(fig, outputs["shift_norms"])
     plt.close(fig)
 
     return outputs
