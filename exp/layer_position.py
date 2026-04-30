@@ -19,10 +19,13 @@ from core.eval_util import *
 from mot.train import *
 from core.train_util import *
 from transformers import AutoConfig
-from exp.compare_tables import (
+from exp.exp_util import (
+    AI_PAPER_DOUBLE_COLUMN_TALL_FIGSIZE,
     AI_PAPER_PALETTE,
     AI_PAPER_MARKERS,
     apply_ai_paper_style,
+    require_matplotlib_pyplot,
+    save_paper_figure,
     style_axes_common,
 )
 
@@ -1383,16 +1386,15 @@ def plot_full_mix_vs_native_kv_similarity_heatmap(
     if similarity_matrix.ndim != 2:
         raise ValueError(f"similarity_matrix must be 2D, got {tuple(similarity_matrix.shape)}")
 
-    import matplotlib.pyplot as plt
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
     import numpy as np
 
     matrix_np = similarity_matrix.detach().cpu().numpy()
     masked_matrix = np.ma.masked_invalid(matrix_np)
     num_layers, num_groups = masked_matrix.shape
-    fig_width = max(10.0, 0.42 * max(1, num_groups))
-    fig_height = max(5.0, 0.35 * max(1, num_layers))
 
-    fig = plt.figure(figsize=(fig_width, fig_height))
+    fig = plt.figure(figsize=AI_PAPER_DOUBLE_COLUMN_TALL_FIGSIZE)
     ax = fig.add_subplot(111)
     image = ax.imshow(
         masked_matrix,
@@ -1403,20 +1405,12 @@ def plot_full_mix_vs_native_kv_similarity_heatmap(
         vmax=1.0,
     )
 
-    prefix_group_count = int(segment_group_counts.get("prefix", 0))
-    suffix_group_count = int(segment_group_counts.get("suffix", 0))
-    generated_group_count = int(segment_group_counts.get("generated", 0))
-
-    for boundary in [prefix_group_count, prefix_group_count + suffix_group_count]:
-        if 0 < boundary < num_groups:
-            ax.axvline(boundary - 0.5, linestyle="--", linewidth=1.0, alpha=0.8)
-
     x_tick_step = max(1, num_groups // 24) if num_groups > 0 else 1
     x_tick_positions = list(range(0, num_groups, x_tick_step))
     if num_groups > 0 and (num_groups - 1) not in x_tick_positions:
         x_tick_positions.append(num_groups - 1)
     ax.set_xticks(x_tick_positions)
-    ax.set_xticklabels([group_labels[idx] for idx in x_tick_positions], rotation=90)
+    ax.set_xticklabels([str(idx) for idx in x_tick_positions], rotation=90)
 
     y_tick_step = max(1, num_layers // 16) if num_layers > 0 else 1
     y_tick_positions = list(range(0, num_layers, y_tick_step))
@@ -1425,27 +1419,14 @@ def plot_full_mix_vs_native_kv_similarity_heatmap(
     ax.set_yticks(y_tick_positions)
     ax.set_yticklabels([str(idx) for idx in y_tick_positions])
 
-    ax.set_xlabel(f"Token groups (group_size={token_group_size})")
-    ax.set_ylabel("Layer index")
-    ax.set_title(title)
-
-    segment_specs = [
-        ("Prefix", 0, prefix_group_count),
-        ("Observed suffix", prefix_group_count, suffix_group_count),
-        ("Generated suffix", prefix_group_count + suffix_group_count, generated_group_count),
-    ]
-    text_y = num_layers - 0.35 if num_layers > 0 else 0.0
-    for segment_name, start_idx, width in segment_specs:
-        if width < 1:
-            continue
-        center = start_idx + (width - 1) / 2.0
-        ax.text(center, text_y, segment_name, ha="center", va="bottom", fontsize=9)
+    ax.set_xlabel(f"Token Groups (Group Size={token_group_size})")
+    ax.set_ylabel("Layer Index")
+    style_axes_common(ax, grid=False)
 
     cbar = fig.colorbar(image, ax=ax)
-    cbar.set_label("Cosine similarity (Native vs Full-Mix)")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
+    cbar.set_label("Cosine Similarity(Native vs Translation)")
+
+    save_paper_figure(fig, output_path, close=True)
     return output_path
 
 
