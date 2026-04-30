@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from dataclasses import MISSING
 import importlib
 import inspect
+import sys
 import time
 from typing import Any, Callable, Tuple
 
@@ -116,11 +117,13 @@ _ACTIVE_GENERATION_DATASET_FILTER: Optional[str] = None
 _ACTIVE_GENERATION_BUDGETS: List[Optional[int]] = [None]
 _PENDING_GENERATION_PROFILE_EVENTS: List[Dict[str, Optional[float]]] = []
 _PENDING_GENERATION_UPPERBOUND_PROMPTS: List[Dict[str, Any]] = []
+_PENDING_GENERATION_METHOD_PROFILES: List[Dict[str, Any]] = []
+_PROFILE_WARNING_KEYS: set[str] = set()
 
 # Temporary profiling switch for fast long-context TTFT experiments.
-# When True, generation stops immediately after the first token is produced.
-# F1 from such a run is profile-only and must not be compared with normal full-generation F1.
-PROFILE_STOP_AFTER_TTFT_ONLY = False
+# This profile run intentionally stops after the first token. F1 from such a run
+# is profile-only and must not be compared with normal full-generation F1.
+PROFILE_STOP_AFTER_TTFT_ONLY = True
 PROFILE_KV_DTYPE_BYTES = 2
 
 
@@ -186,7 +189,78 @@ def register_generation_upperbound_prompt(
 def _pop_generation_upperbound_prompt() -> Optional[Dict[str, Any]]:
     if not _PENDING_GENERATION_UPPERBOUND_PROMPTS:
         return None
-    return _PENDING_GENERATION_UPPERBOUND_PROMPTS.pop(0)
+    # Some algorithms prepare both target- and source-side prompts in one
+    # example. The first registered prompt is the target-side ordinary
+    # upperbound prompt; clear duplicates to avoid leaking stale prompts into
+    # subsequent examples.
+    prompt = _PENDING_GENERATION_UPPERBOUND_PROMPTS.pop(0)
+    _PENDING_GENERATION_UPPERBOUND_PROMPTS.clear()
+    return prompt
+
+
+def register_generation_method_profile_start(
+    *,
+    profile_started_at: Optional[float] = None,
+    translator_input_past_key_values: Optional[Any] = None,
+    kv_or_prefix_size_bytes: Optional[int] = None,
+) -> None:
+    """Register translated-path profiling metadata.
+
+    This marker is created immediately before translation/replay. The next
+    translated predict_generation_task_answer() call consumes it, so method TTFT
+    includes translation + target replay/suffix append + first-token forward,
+    while excluding source prefill.
+    """
+    if not _should_capture_generation_method_profile():
+        return
+
+    payload = {
+        "profile_started_at": time.perf_counter() if profile_started_at is None else float(profile_started_at),
+        "translator_input_past_key_values": translator_input_past_key_values,
+        "kv_or_prefix_size_bytes": kv_or_prefix_size_bytes,
+    }
+
+    # Nested or overlapping wrappers can fire more than once for one translated
+    # answer. Coalesce consecutive pending markers so exactly one marker is
+    # consumed by the translated generation call.
+    if _PENDING_GENERATION_METHOD_PROFILES:
+        latest = _PENDING_GENERATION_METHOD_PROFILES[-1]
+        latest["profile_started_at"] = min(
+            float(latest.get("profile_started_at", payload["profile_started_at"])),
+            float(payload["profile_started_at"]),
+        )
+        if translator_input_past_key_values is not None:
+            latest["translator_input_past_key_values"] = translator_input_past_key_values
+        if kv_or_prefix_size_bytes is not None:
+            latest["kv_or_prefix_size_bytes"] = kv_or_prefix_size_bytes
+        return
+
+    _PENDING_GENERATION_METHOD_PROFILES.append(payload)
+
+
+def register_generation_source_prefill_done(
+    *,
+    translator_input_past_key_values: Optional[Any] = None,
+    kv_or_prefix_size_bytes: Optional[int] = None,
+) -> None:
+    """Compatibility alias for the intended translated TTFT start marker."""
+    register_generation_method_profile_start(
+        translator_input_past_key_values=translator_input_past_key_values,
+        kv_or_prefix_size_bytes=kv_or_prefix_size_bytes,
+    )
+
+
+def _pop_generation_method_profile_start() -> Optional[Dict[str, Any]]:
+    if not _PENDING_GENERATION_METHOD_PROFILES:
+        return None
+    return _PENDING_GENERATION_METHOD_PROFILES.pop(0)
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key in _PROFILE_WARNING_KEYS:
+        return
+    _PROFILE_WARNING_KEYS.add(key)
+    logging.warning(message)
 
 
 def synchronize_if_needed(device: Union[str, torch.device]) -> None:
@@ -204,64 +278,123 @@ def _should_capture_generation_method_profile() -> bool:
     return _is_hotpot_longcontext_filter(_ACTIVE_GENERATION_DATASET_FILTER)
 
 
-def _extract_source_past_key_values_from_replay_call(
+def _extract_argument_from_call(
     fn: Callable[..., Any],
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
+    *candidate_names: str,
 ) -> Optional[Any]:
-    if "source_past_key_values" in kwargs:
-        return kwargs.get("source_past_key_values")
+    for name in candidate_names:
+        if name in kwargs:
+            return kwargs.get(name)
     try:
         bound = inspect.signature(fn).bind_partial(*args, **kwargs)
     except (TypeError, ValueError):
         return None
-    return bound.arguments.get("source_past_key_values")
+    for name in candidate_names:
+        if name in bound.arguments:
+            return bound.arguments.get(name)
+    return None
+
+
+def _register_method_profile_before_translation(translator_input: Optional[Any]) -> None:
+    if _should_capture_generation_method_profile() and translator_input is not None:
+        register_generation_method_profile_start(
+            profile_started_at=time.perf_counter(),
+            translator_input_past_key_values=translator_input,
+        )
+
+
+def _wrap_callable_once(
+    owner: Any,
+    attr_name: str,
+    wrapper_factory: Callable[[Callable[..., Any]], Callable[..., Any]],
+) -> bool:
+    original = getattr(owner, attr_name, None)
+    if original is None or getattr(original, "_generation_profile_wrapped", False):
+        return False
+    wrapped = wrapper_factory(original)
+    wrapped._generation_profile_wrapped = True
+    wrapped._generation_profile_original = original
+    try:
+        setattr(owner, attr_name, wrapped)
+    except Exception as exc:
+        _warn_once(
+            f"generation_profile_wrap_failed:{type(owner)!r}:{attr_name}",
+            f"Failed to install generation profile wrapper on {type(owner)!r}.{attr_name}: {exc}",
+        )
+        return False
+    return True
 
 
 def install_generation_profile_wrapper_on_translator_pool(translator_pool: Any) -> Any:
-    """Wrap translator replay so eval_util alone can capture exact method profiling.
-
-    c2c/interlat/mot evaluation code builds translated KV caches by calling
-    translator_pool.build_replayed_target_past(...).  The timer for the method
-    row must start immediately after source prefill and before that translation
-    call.  Installing this wrapper lets the existing call sites remain unchanged:
-    the wrapper records the translator-input source KV and starts the TTFT timer
-    immediately before translator execution.  The next translated
-    predict_generation_task_answer() call consumes this metadata.
-    """
+    """Wrap translator methods so eval_util alone can capture method TTFT/KV size."""
     if translator_pool is None:
         return translator_pool
 
-    original = getattr(translator_pool, "build_replayed_target_past", None)
-    if original is None or getattr(original, "_generation_profile_wrapped", False):
-        return translator_pool
-
-    def wrapped_build_replayed_target_past(*args: Any, **kwargs: Any) -> Any:
-        source_past_key_values = _extract_source_past_key_values_from_replay_call(
-            original,
-            args,
-            kwargs,
-        )
-        if _should_capture_generation_method_profile() and source_past_key_values is not None:
-            register_generation_source_prefill_done(
-                translator_input_past_key_values=source_past_key_values,
+    def build_replayed_wrapper_factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped_build_replayed_target_past(*args: Any, **kwargs: Any) -> Any:
+            source_past_key_values = _extract_argument_from_call(
+                original,
+                args,
+                kwargs,
+                "source_past_key_values",
+                "sharer_past_key_values",
             )
-        return original(*args, **kwargs)
+            _register_method_profile_before_translation(source_past_key_values)
+            return original(*args, **kwargs)
+        return wrapped_build_replayed_target_past
 
-    wrapped_build_replayed_target_past._generation_profile_wrapped = True
-    wrapped_build_replayed_target_past._generation_profile_original = original
-    try:
-        setattr(translator_pool, "build_replayed_target_past", wrapped_build_replayed_target_past)
-    except Exception as exc:
-        _warn_once(
-            "translator_pool_profile_wrap_failed",
-            f"Failed to install generation profile wrapper on translator_pool={type(translator_pool)!r}: {exc}",
-        )
+    def translate_hidden_states_wrapper_factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped_translate_hidden_states(*args: Any, **kwargs: Any) -> Any:
+            source_hidden_states = _extract_argument_from_call(
+                original,
+                args,
+                kwargs,
+                "source_hidden_states",
+                "hidden_states",
+            )
+            _register_method_profile_before_translation(source_hidden_states)
+            return original(*args, **kwargs)
+        return wrapped_translate_hidden_states
+
+    _wrap_callable_once(translator_pool, "build_replayed_target_past", build_replayed_wrapper_factory)
+    _wrap_callable_once(translator_pool, "translate_hidden_states", translate_hidden_states_wrapper_factory)
     return translator_pool
 
 
-def install_generation_profile_wrappers(value: Any) -> Any:
+def install_generation_profile_wrapper_on_eval_module(alg: str) -> None:
+    """Patch algorithm eval-module globals imported from train modules.
+
+    c2c/eval.py imports translate_top_layers directly from c2c.train, so wrapping
+    translator_pool alone is insufficient. eval.py imports the algorithm eval
+    module before build_eval_context(), making the module object available here.
+    """
+    eval_module = sys.modules.get(f"{alg}.eval")
+    if eval_module is None:
+        return
+
+    def translate_top_layers_wrapper_factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped_translate_top_layers(*args: Any, **kwargs: Any) -> Any:
+            sharer_past_key_values = _extract_argument_from_call(
+                original,
+                args,
+                kwargs,
+                "sharer_past_key_values",
+                "source_past_key_values",
+            )
+            _register_method_profile_before_translation(sharer_past_key_values)
+            return original(*args, **kwargs)
+        return wrapped_translate_top_layers
+
+    _wrap_callable_once(eval_module, "translate_top_layers", translate_top_layers_wrapper_factory)
+
+
+def install_generation_profile_wrappers(value: Any, *, alg: Optional[str] = None) -> Any:
     """Best-effort recursive wrapper installer for build_eval_context outputs."""
+    if alg is not None:
+        install_generation_profile_wrapper_on_eval_module(alg)
+
     visited: set[int] = set()
 
     def visit(obj: Any) -> None:
@@ -272,7 +405,7 @@ def install_generation_profile_wrappers(value: Any) -> Any:
             return
         visited.add(obj_id)
 
-        if hasattr(obj, "build_replayed_target_past"):
+        if hasattr(obj, "build_replayed_target_past") or hasattr(obj, "translate_hidden_states"):
             install_generation_profile_wrapper_on_translator_pool(obj)
 
         if isinstance(obj, dict):
@@ -293,6 +426,7 @@ def install_generation_profile_wrappers(value: Any) -> Any:
 
     visit(value)
     return value
+
 
 def parse_generation_context_budgets(raw_value: Optional[str]) -> List[Optional[int]]:
     if raw_value is None:
@@ -354,6 +488,8 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
     global _ACTIVE_GENERATION_BUDGETS
     global _PENDING_GENERATION_PROFILE_EVENTS
     global _PENDING_GENERATION_UPPERBOUND_PROMPTS
+    global _PENDING_GENERATION_METHOD_PROFILES
+    global _PROFILE_WARNING_KEYS
 
     if eval_config is None:
         _ACTIVE_EVAL_OUTPUT_PATH = None
@@ -361,6 +497,8 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
         _ACTIVE_GENERATION_BUDGETS = [None]
         _PENDING_GENERATION_PROFILE_EVENTS = []
         _PENDING_GENERATION_UPPERBOUND_PROMPTS = []
+        _PENDING_GENERATION_METHOD_PROFILES = []
+        _PROFILE_WARNING_KEYS = set()
 
         LOGIT_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES
         GEN_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_GEN_QA_SPEC_GROUP_FACTORIES
@@ -375,6 +513,8 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
     )
     _PENDING_GENERATION_PROFILE_EVENTS = []
     _PENDING_GENERATION_UPPERBOUND_PROMPTS = []
+    _PENDING_GENERATION_METHOD_PROFILES = []
+    _PROFILE_WARNING_KEYS = set()
 
     if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa_e":
         LOGIT_QA_SPEC_GROUP_FACTORIES[:] = []
@@ -2409,7 +2549,7 @@ def build_eval_context(
         edges=edges,
         device_override=eval_config.device,
     )
-    install_generation_profile_wrappers(eval_context)
+    install_generation_profile_wrappers(eval_context, alg=alg)
     return eval_context
 
 def resolve_latest_checkpoint_dir_for_alg(
@@ -3448,6 +3588,7 @@ def predict_generation_task_answer(
     source prefill. Then TTFT excludes source prefill and includes translation,
     target replay/suffix append, and the first target token forward.
     """
+    profile_mode = str(profile_mode or "auto").lower()
     auto_native_upperbound = profile_mode == "auto" and len(_PENDING_GENERATION_PROFILE_EVENTS) % 2 == 1
     requested_native_upperbound = profile_mode in {"native", "upperbound"}
     if auto_native_upperbound or requested_native_upperbound:
@@ -3462,9 +3603,17 @@ def predict_generation_task_answer(
                 eval_config=eval_config,
                 prefix_text=upperbound_prompt.get("prefix_text"),
             )
-        logging.warning(
-            "Upperbound prompt was not registered; falling back to KV-cache-based native generation profile."
+        _warn_once(
+            "upperbound_prompt_missing",
+            "Upperbound prompt was not registered; falling back to KV-cache-based native generation profile.",
         )
+
+    if profile_started_at is None and translator_input_past_key_values is None and kv_or_prefix_size_bytes is None:
+        method_profile = _pop_generation_method_profile_start()
+        if method_profile is not None:
+            profile_started_at = method_profile.get("profile_started_at")
+            translator_input_past_key_values = method_profile.get("translator_input_past_key_values")
+            kv_or_prefix_size_bytes = method_profile.get("kv_or_prefix_size_bytes")
 
     profiler = InferenceProfiler(str(seed_token.device))
     if profiler.enabled:
@@ -3472,10 +3621,11 @@ def predict_generation_task_answer(
 
     started_at = float(profile_started_at) if profile_started_at is not None else time.perf_counter()
     if profile_started_at is None and profile_mode in {"auto", "translated", "method"}:
-        logging.warning(
+        _warn_once(
+            "translated_ttft_missing_method_marker",
             "Translated TTFT profile_started_at was not provided. The measured method TTFT excludes source prefill as intended, "
             "but also excludes translator execution that occurred before predict_generation_task_answer(). "
-            "The eval_util translator-pool wrapper should normally provide this automatically for long-context runs."
+            "The eval_util translation wrapper should normally provide this automatically for long-context runs.",
         )
 
     def run_generation() -> Tuple[str, int, float]:
@@ -3505,6 +3655,12 @@ def predict_generation_task_answer(
         kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(translator_input_past_key_values)
     if kv_or_prefix_size_bytes is None:
         kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(past_key_values)
+        if profile_mode in {"auto", "translated", "method"}:
+            _warn_once(
+                "translated_kv_size_fallback",
+                "translator_input_past_key_values was not provided. Avg KV/Prefix Size for the method row falls back to "
+                "the past_key_values passed to predict_generation_task_answer(), which may be translated target KV rather than translator-input source KV.",
+            )
 
     _PENDING_GENERATION_PROFILE_EVENTS.append({
         "latency_sec": float(latency_sec),
@@ -3514,8 +3670,9 @@ def predict_generation_task_answer(
         "kv_or_prefix_size_bytes": int(kv_or_prefix_size_bytes),
     })
     if PROFILE_STOP_AFTER_TTFT_ONLY:
-        logging.warning(
-            "PROFILE_STOP_AFTER_TTFT_ONLY=True: generation stopped after first token; F1 is profile-only and not comparable."
+        _warn_once(
+            "ttft_only_generation_stopped",
+            "PROFILE_STOP_AFTER_TTFT_ONLY=True: generation stops after the first token; F1 is profile-only and not comparable.",
         )
     return answer_text
 
@@ -3596,8 +3753,9 @@ def predict_generation_task_answer_upperbound(
         "kv_or_prefix_size_bytes": compute_text_utf8_bytes(prefix_text),
     })
     if PROFILE_STOP_AFTER_TTFT_ONLY:
-        logging.warning(
-            "PROFILE_STOP_AFTER_TTFT_ONLY=True: upperbound generation stopped after first token; F1 is profile-only and not comparable."
+        _warn_once(
+            "ttft_only_upperbound_generation_stopped",
+            "PROFILE_STOP_AFTER_TTFT_ONLY=True: upperbound generation stops after the first token; F1 is profile-only and not comparable.",
         )
     return answer_text
 
@@ -4374,3 +4532,4 @@ def build_final_summary_markdown(
         summary_path.write_text(markdown, encoding="utf-8")
         logging.info("Saved final markdown summary to %s", summary_path)
     return markdown
+
