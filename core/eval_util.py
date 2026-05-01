@@ -116,14 +116,10 @@ _ACTIVE_EVAL_OUTPUT_PATH: Optional[str] = None
 _ACTIVE_GENERATION_DATASET_FILTER: Optional[str] = None
 _ACTIVE_GENERATION_BUDGETS: List[Optional[int]] = [None]
 _PENDING_GENERATION_PROFILE_EVENTS: List[Dict[str, Optional[float]]] = []
-_PENDING_GENERATION_UPPERBOUND_PROMPTS: List[Dict[str, Any]] = []
 _PENDING_GENERATION_METHOD_PROFILES: List[Dict[str, Any]] = []
+_PENDING_GENERATION_SOURCE_PREFILL_STARTS: List[float] = []
 _PROFILE_WARNING_KEYS: set[str] = set()
 
-# Temporary profiling switch for fast long-context TTFT experiments.
-# This profile run intentionally stops after the first token. F1 from such a run
-# is profile-only and must not be compared with normal full-generation F1.
-PROFILE_STOP_AFTER_TTFT_ONLY = True
 PROFILE_KV_DTYPE_BYTES = 2
 
 
@@ -171,52 +167,102 @@ def compute_text_utf8_bytes(text: Optional[str]) -> int:
     return len(text.encode("utf-8"))
 
 
-def register_generation_upperbound_prompt(
+def compute_generation_prefix_text_bytes(prepared_inputs: Dict[str, Any]) -> int:
+    """Return the byte size of the native prompt prefix text, without retaining tensors."""
+    prefix_text = prepared_inputs.get("prefix_text")
+    if prefix_text is None:
+        prefix_info = prepared_inputs.get("prefix")
+        if isinstance(prefix_info, dict):
+            prefix_text = prefix_info.get("text")
+    return compute_text_utf8_bytes(prefix_text)
+
+
+def start_native_generation_profile(
     *,
     prefix_input_ids: torch.Tensor,
-    seed_token: torch.Tensor,
-    suffix_cache_ids: Optional[torch.Tensor] = None,
+    prefix_size_bytes: Optional[int] = None,
     prefix_text: Optional[str] = None,
-) -> None:
-    _PENDING_GENERATION_UPPERBOUND_PROMPTS.append({
-        "prefix_input_ids": prefix_input_ids,
-        "suffix_cache_ids": suffix_cache_ids,
-        "seed_token": seed_token,
-        "prefix_text": prefix_text,
-    })
+) -> Dict[str, Any]:
+    """Start Native TTFT at the actual Target Prefix Prefill call site."""
+    synchronize_if_needed(prefix_input_ids.device)
+    started_at = time.perf_counter()
+    if prefix_size_bytes is None:
+        prefix_size_bytes = compute_text_utf8_bytes(prefix_text)
+    return {
+        "started_at": started_at,
+        "kv_or_prefix_size_bytes": int(prefix_size_bytes or 0),
+    }
 
 
-def _pop_generation_upperbound_prompt() -> Optional[Dict[str, Any]]:
-    if not _PENDING_GENERATION_UPPERBOUND_PROMPTS:
+def finish_native_generation_profile(
+    profile_state: Dict[str, Any],
+    *,
+    device: Optional[Union[str, torch.device]] = None,
+) -> Dict[str, Any]:
+    """Finish Native Prefix Prefill profiling without retaining the KV cache.
+
+    The returned kwargs make Native TTFT equal to:
+    Target Prefix Prefill + optional Suffix Prefill + Completion first-token time.
+    This avoids any separate full-prompt forward for metric collection.
+    """
+    if device is not None:
+        synchronize_if_needed(device)
+    prefill_elapsed = time.perf_counter() - float(profile_state["started_at"])
+    return {
+        "profile_elapsed_before_generation_sec": max(0.0, prefill_elapsed),
+        "kv_or_prefix_size_bytes": int(profile_state.get("kv_or_prefix_size_bytes") or 0),
+        "profile_mode": "native",
+    }
+
+
+def register_generation_source_prefill_start(*, device: Optional[Union[str, torch.device]] = None) -> Optional[float]:
+    """Register the Source Prefill start time for Source-included TTFT."""
+    if not _should_capture_generation_method_profile():
         return None
-    # Some algorithms prepare both target- and source-side prompts in one
-    # example. The first registered prompt is the target-side ordinary
-    # upperbound prompt; clear duplicates to avoid leaking stale prompts into
-    # subsequent examples.
-    prompt = _PENDING_GENERATION_UPPERBOUND_PROMPTS.pop(0)
-    _PENDING_GENERATION_UPPERBOUND_PROMPTS.clear()
-    return prompt
+    if device is not None:
+        synchronize_if_needed(device)
+    started_at = time.perf_counter()
+    _PENDING_GENERATION_SOURCE_PREFILL_STARTS.append(started_at)
+    return started_at
+
+
+def _pop_generation_source_prefill_start() -> Optional[float]:
+    if not _PENDING_GENERATION_SOURCE_PREFILL_STARTS:
+        return None
+    return _PENDING_GENERATION_SOURCE_PREFILL_STARTS.pop(0)
 
 
 def register_generation_method_profile_start(
     *,
     profile_started_at: Optional[float] = None,
+    source_included_started_at: Optional[float] = None,
     translator_input_past_key_values: Optional[Any] = None,
     kv_or_prefix_size_bytes: Optional[int] = None,
 ) -> None:
     """Register translated-path profiling metadata.
 
-    This marker is created immediately before translation/replay. The next
-    translated predict_generation_task_answer() call consumes it, so method TTFT
-    includes translation + target replay/suffix append + first-token forward,
-    while excluding source prefill.
+    ``profile_started_at`` is the Source-excluded TTFT start: immediately before
+    translation/replay after Source Prefill has been synchronized.
+    ``source_included_started_at`` is the Source-included TTFT start: immediately
+    before Source Prefill.
+
+    Pending profile entries must not retain GPU tensors. If a caller provides
+    ``translator_input_past_key_values`` for size accounting, convert it to a
+    plain byte count immediately and only store that integer.
     """
     if not _should_capture_generation_method_profile():
         return
 
+    source_start = source_included_started_at
+    if source_start is None:
+        source_start = _pop_generation_source_prefill_start()
+
+    if kv_or_prefix_size_bytes is None and translator_input_past_key_values is not None:
+        kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(translator_input_past_key_values)
+
     payload = {
         "profile_started_at": time.perf_counter() if profile_started_at is None else float(profile_started_at),
-        "translator_input_past_key_values": translator_input_past_key_values,
+        "source_included_started_at": None if source_start is None else float(source_start),
         "kv_or_prefix_size_bytes": kv_or_prefix_size_bytes,
     }
 
@@ -229,21 +275,24 @@ def register_generation_method_profile_start(
             float(latest.get("profile_started_at", payload["profile_started_at"])),
             float(payload["profile_started_at"]),
         )
-        if translator_input_past_key_values is not None:
-            latest["translator_input_past_key_values"] = translator_input_past_key_values
+        if payload["source_included_started_at"] is not None:
+            existing_source_start = latest.get("source_included_started_at")
+            latest["source_included_started_at"] = (
+                payload["source_included_started_at"]
+                if existing_source_start is None
+                else min(float(existing_source_start), float(payload["source_included_started_at"]))
+            )
         if kv_or_prefix_size_bytes is not None:
             latest["kv_or_prefix_size_bytes"] = kv_or_prefix_size_bytes
         return
 
     _PENDING_GENERATION_METHOD_PROFILES.append(payload)
 
-
 def register_generation_source_prefill_done(
     *,
     translator_input_past_key_values: Optional[Any] = None,
     kv_or_prefix_size_bytes: Optional[int] = None,
 ) -> None:
-    """Compatibility alias for the intended translated TTFT start marker."""
     register_generation_method_profile_start(
         translator_input_past_key_values=translator_input_past_key_values,
         kv_or_prefix_size_bytes=kv_or_prefix_size_bytes,
@@ -297,12 +346,28 @@ def _extract_argument_from_call(
     return None
 
 
+def _first_tensor_device(value: Any) -> Optional[torch.device]:
+    for tensor in _iter_tensors_recursive(value):
+        return tensor.device
+    return None
+
+
 def _register_method_profile_before_translation(translator_input: Optional[Any]) -> None:
-    if _should_capture_generation_method_profile() and translator_input is not None:
-        register_generation_method_profile_start(
-            profile_started_at=time.perf_counter(),
-            translator_input_past_key_values=translator_input,
-        )
+    if not _should_capture_generation_method_profile() or translator_input is None:
+        return
+
+    # Source prefill is enqueued immediately before translation in the long-context
+    # generation paths. CUDA execution is asynchronous, so the start marker must be
+    # placed only after all pre-translation work on the same GPU has completed.
+    input_device = _first_tensor_device(translator_input)
+    if input_device is not None:
+        synchronize_if_needed(input_device)
+
+    kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(translator_input)
+    register_generation_method_profile_start(
+        profile_started_at=time.perf_counter(),
+        kv_or_prefix_size_bytes=kv_or_prefix_size_bytes,
+    )
 
 
 def _wrap_callable_once(
@@ -358,8 +423,23 @@ def install_generation_profile_wrapper_on_translator_pool(translator_pool: Any) 
             return original(*args, **kwargs)
         return wrapped_translate_hidden_states
 
+    def translate_layers_wrapper_factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped_translate_layers(*args: Any, **kwargs: Any) -> Any:
+            past_key_values = _extract_argument_from_call(
+                original,
+                args,
+                kwargs,
+                "past_key_values",
+                "source_past_key_values",
+                "sharer_past_key_values",
+            )
+            _register_method_profile_before_translation(past_key_values)
+            return original(*args, **kwargs)
+        return wrapped_translate_layers
+
     _wrap_callable_once(translator_pool, "build_replayed_target_past", build_replayed_wrapper_factory)
     _wrap_callable_once(translator_pool, "translate_hidden_states", translate_hidden_states_wrapper_factory)
+    _wrap_callable_once(translator_pool, "translate_layers", translate_layers_wrapper_factory)
     return translator_pool
 
 
@@ -405,7 +485,11 @@ def install_generation_profile_wrappers(value: Any, *, alg: Optional[str] = None
             return
         visited.add(obj_id)
 
-        if hasattr(obj, "build_replayed_target_past") or hasattr(obj, "translate_hidden_states"):
+        if (
+            hasattr(obj, "build_replayed_target_past")
+            or hasattr(obj, "translate_hidden_states")
+            or hasattr(obj, "translate_layers")
+        ):
             install_generation_profile_wrapper_on_translator_pool(obj)
 
         if isinstance(obj, dict):
@@ -487,8 +571,8 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
     global _ACTIVE_GENERATION_DATASET_FILTER
     global _ACTIVE_GENERATION_BUDGETS
     global _PENDING_GENERATION_PROFILE_EVENTS
-    global _PENDING_GENERATION_UPPERBOUND_PROMPTS
     global _PENDING_GENERATION_METHOD_PROFILES
+    global _PENDING_GENERATION_SOURCE_PREFILL_STARTS
     global _PROFILE_WARNING_KEYS
 
     if eval_config is None:
@@ -496,8 +580,8 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
         _ACTIVE_GENERATION_DATASET_FILTER = None
         _ACTIVE_GENERATION_BUDGETS = [None]
         _PENDING_GENERATION_PROFILE_EVENTS = []
-        _PENDING_GENERATION_UPPERBOUND_PROMPTS = []
         _PENDING_GENERATION_METHOD_PROFILES = []
+        _PENDING_GENERATION_SOURCE_PREFILL_STARTS = []
         _PROFILE_WARNING_KEYS = set()
 
         LOGIT_QA_SPEC_GROUP_FACTORIES[:] = _ORIGINAL_LOGIT_QA_SPEC_GROUP_FACTORIES
@@ -512,8 +596,8 @@ def activate_eval_runtime_config(eval_config: Optional[EvalConfig]) -> None:
         getattr(eval_config, "generation_context_budgets", None)
     )
     _PENDING_GENERATION_PROFILE_EVENTS = []
-    _PENDING_GENERATION_UPPERBOUND_PROMPTS = []
     _PENDING_GENERATION_METHOD_PROFILES = []
+    _PENDING_GENERATION_SOURCE_PREFILL_STARTS = []
     _PROFILE_WARNING_KEYS = set()
 
     if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa_e":
@@ -1899,7 +1983,7 @@ def evaluate_openwebtext_validation_loss(
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    if _ACTIVE_GENERATION_DATASET_FILTER == "hotpotqa":
+    if _is_hotpot_longcontext_filter(_ACTIVE_GENERATION_DATASET_FILTER):
         logging.info(
             "Skipping OpenWebText validation because generation_dataset_filter=%s",
             _ACTIVE_GENERATION_DATASET_FILTER,
@@ -2320,13 +2404,13 @@ class GenerationRunningAverage:
         self.native_f1_sum = 0.0
         self.count = 0
 
-        self.latency_sec_sum = 0.0
+        self.ttft_source_included_sec_sum = 0.0
         self.ttft_sec_sum = 0.0
         self.tokens_sum = 0
         self.kv_or_prefix_size_bytes_sum = 0.0
         self.peak_memory_bytes: Optional[int] = None
 
-        self.native_latency_sec_sum = 0.0
+        self.native_ttft_source_included_sec_sum = 0.0
         self.native_ttft_sec_sum = 0.0
         self.native_tokens_sum = 0
         self.native_kv_or_prefix_size_bytes_sum = 0.0
@@ -2341,15 +2425,15 @@ class GenerationRunningAverage:
         if not event:
             return
 
-        latency_sec = float(event.get("latency_sec", 0.0) or 0.0)
         ttft_sec = float(event.get("ttft_sec", 0.0) or 0.0)
+        ttft_source_included_sec = float(event.get("ttft_source_included_sec", ttft_sec) or ttft_sec)
         tokens = int(event.get("tokens", 0) or 0)
         kv_or_prefix_size_bytes = float(event.get("kv_or_prefix_size_bytes", 0.0) or 0.0)
         peak_memory_bytes = event.get("peak_memory_bytes")
         peak_memory_int = None if peak_memory_bytes is None else int(peak_memory_bytes)
 
         if native:
-            self.native_latency_sec_sum += latency_sec
+            self.native_ttft_source_included_sec_sum += ttft_source_included_sec
             self.native_ttft_sec_sum += ttft_sec
             self.native_tokens_sum += tokens
             self.native_kv_or_prefix_size_bytes_sum += kv_or_prefix_size_bytes
@@ -2359,7 +2443,7 @@ class GenerationRunningAverage:
                 self.native_peak_memory_bytes = peak_memory_int
             return
 
-        self.latency_sec_sum += latency_sec
+        self.ttft_source_included_sec_sum += ttft_source_included_sec
         self.ttft_sec_sum += ttft_sec
         self.tokens_sum += tokens
         self.kv_or_prefix_size_bytes_sum += kv_or_prefix_size_bytes
@@ -2390,26 +2474,26 @@ class GenerationRunningAverage:
                 "f1": float("nan"),
                 "native_f1": float("nan"),
                 "count": 0,
-                "latency_ms": float("nan"),
+                "ttft_source_included_ms": float("nan"),
                 "ttft_ms": float("nan"),
                 "kv_or_prefix_size_bytes": float("nan"),
                 "throughput_tokens_per_sec": float("nan"),
                 "peak_memory_gib": float("nan"),
-                "native_latency_ms": float("nan"),
+                "native_ttft_source_included_ms": float("nan"),
                 "native_ttft_ms": float("nan"),
                 "native_kv_or_prefix_size_bytes": float("nan"),
                 "native_throughput_tokens_per_sec": float("nan"),
                 "native_peak_memory_gib": float("nan"),
             }
 
-        latency_ms = (self.latency_sec_sum / self.count) * 1000.0
+        ttft_source_included_ms = (self.ttft_source_included_sec_sum / self.count) * 1000.0
         ttft_ms = (self.ttft_sec_sum / self.count) * 1000.0
         kv_or_prefix_size_bytes = self.kv_or_prefix_size_bytes_sum / self.count
-        native_latency_ms = (self.native_latency_sec_sum / self.count) * 1000.0
+        native_ttft_source_included_ms = (self.native_ttft_source_included_sec_sum / self.count) * 1000.0
         native_ttft_ms = (self.native_ttft_sec_sum / self.count) * 1000.0
         native_kv_or_prefix_size_bytes = self.native_kv_or_prefix_size_bytes_sum / self.count
-        throughput = self.tokens_sum / self.latency_sec_sum if self.latency_sec_sum > 0.0 and self.tokens_sum > 0 else float("nan")
-        native_throughput = self.native_tokens_sum / self.native_latency_sec_sum if self.native_latency_sec_sum > 0.0 and self.native_tokens_sum > 0 else float("nan")
+        throughput = self.tokens_sum / self.ttft_sec_sum if self.ttft_sec_sum > 0.0 and self.tokens_sum > 0 else float("nan")
+        native_throughput = self.native_tokens_sum / self.native_ttft_sec_sum if self.native_ttft_sec_sum > 0.0 and self.native_tokens_sum > 0 else float("nan")
         peak_memory_gib = float("nan") if self.peak_memory_bytes is None else float(self.peak_memory_bytes) / (1024 ** 3)
         native_peak_memory_gib = float("nan") if self.native_peak_memory_bytes is None else float(self.native_peak_memory_bytes) / (1024 ** 3)
 
@@ -2418,12 +2502,12 @@ class GenerationRunningAverage:
             "f1": self.f1_sum / self.count,
             "native_f1": self.native_f1_sum / self.count,
             "count": self.count,
-            "latency_ms": latency_ms,
+            "ttft_source_included_ms": ttft_source_included_ms,
             "ttft_ms": ttft_ms,
             "kv_or_prefix_size_bytes": kv_or_prefix_size_bytes,
             "throughput_tokens_per_sec": throughput,
             "peak_memory_gib": peak_memory_gib,
-            "native_latency_ms": native_latency_ms,
+            "native_ttft_source_included_ms": native_ttft_source_included_ms,
             "native_ttft_ms": native_ttft_ms,
             "native_kv_or_prefix_size_bytes": native_kv_or_prefix_size_bytes,
             "native_throughput_tokens_per_sec": native_throughput,
@@ -3512,18 +3596,13 @@ def prepare_generation_task_inputs(
             question=question,
             device=device,
         )
-        register_generation_upperbound_prompt(
-            prefix_input_ids=context_prefix["input_ids"],
-            suffix_cache_ids=suffix["cache_ids"],
-            seed_token=suffix["seed_token"],
-            prefix_text=context_prefix.get("text"),
-        )
         return {
             "prefix": context_prefix,
             "suffix": suffix,
             "prefix_input_ids": context_prefix["input_ids"],
             "suffix_cache_ids": suffix["cache_ids"],
             "seed_token": suffix["seed_token"],
+            "prefix_text": context_prefix.get("text"),
             "was_truncated": context_prefix.get("was_truncated", False),
         }
 
@@ -3555,16 +3634,11 @@ def prepare_generation_task_inputs(
         device=device,
         max_input_tokens=max_input_tokens,
     )
-    register_generation_upperbound_prompt(
-        prefix_input_ids=prompt["cache_ids"],
-        suffix_cache_ids=None,
-        seed_token=prompt["seed_token"],
-        prefix_text=prompt.get("text"),
-    )
     return {
         "prefix_input_ids": prompt["cache_ids"],
         "suffix_cache_ids": None,
         "seed_token": prompt["seed_token"],
+        "prefix_text": prompt.get("text"),
         "was_truncated": False,
     }
 
@@ -3578,48 +3652,51 @@ def predict_generation_task_answer(
     suffix_cache_ids: Optional[torch.Tensor] = None,
     *,
     profile_started_at: Optional[float] = None,
+    source_included_started_at: Optional[float] = None,
     kv_or_prefix_size_bytes: Optional[int] = None,
     translator_input_past_key_values: Optional[Any] = None,
+    profile_elapsed_before_generation_sec: Optional[float] = None,
     profile_mode: str = "auto",
 ) -> str:
-    """Generate an answer while recording full latency and TTFT.
+    """Generate an answer while recording Source-included/excluded TTFT.
 
-    For translated paths, callers can pass profile_started_at immediately after
-    source prefill. Then TTFT excludes source prefill and includes translation,
-    target replay/suffix append, and the first target token forward.
+    For translated paths, profile_started_at is the Source-excluded start
+    immediately before translation/replay. source_included_started_at is the
+    Source-included start immediately before Source Prefill.
     """
     profile_mode = str(profile_mode or "auto").lower()
-    auto_native_upperbound = profile_mode == "auto" and len(_PENDING_GENERATION_PROFILE_EVENTS) % 2 == 1
-    requested_native_upperbound = profile_mode in {"native", "upperbound"}
-    if auto_native_upperbound or requested_native_upperbound:
-        upperbound_prompt = _pop_generation_upperbound_prompt()
-        if upperbound_prompt is not None:
-            return predict_generation_task_answer_upperbound(
-                model=model,
-                tokenizer=tokenizer,
-                prefix_input_ids=upperbound_prompt["prefix_input_ids"],
-                suffix_cache_ids=upperbound_prompt.get("suffix_cache_ids"),
-                seed_token=upperbound_prompt.get("seed_token", seed_token),
-                eval_config=eval_config,
-                prefix_text=upperbound_prompt.get("prefix_text"),
-            )
-        _warn_once(
-            "upperbound_prompt_missing",
-            "Upperbound prompt was not registered; falling back to KV-cache-based native generation profile.",
-        )
 
-    if profile_started_at is None and translator_input_past_key_values is None and kv_or_prefix_size_bytes is None:
+    if (
+        profile_started_at is None
+        and source_included_started_at is None
+        and translator_input_past_key_values is None
+        and kv_or_prefix_size_bytes is None
+        and profile_elapsed_before_generation_sec is None
+    ):
         method_profile = _pop_generation_method_profile_start()
         if method_profile is not None:
             profile_started_at = method_profile.get("profile_started_at")
-            translator_input_past_key_values = method_profile.get("translator_input_past_key_values")
+            source_included_started_at = method_profile.get("source_included_started_at")
             kv_or_prefix_size_bytes = method_profile.get("kv_or_prefix_size_bytes")
+
+    if kv_or_prefix_size_bytes is None and translator_input_past_key_values is not None:
+        kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(translator_input_past_key_values)
+    translator_input_past_key_values = None
 
     profiler = InferenceProfiler(str(seed_token.device))
     if profiler.enabled:
         torch.cuda.synchronize(profiler.device_index)
 
     started_at = float(profile_started_at) if profile_started_at is not None else time.perf_counter()
+    source_included_started_at = (
+        float(source_included_started_at)
+        if source_included_started_at is not None
+        else started_at
+    )
+    elapsed_before_generation_sec = max(
+        0.0,
+        float(profile_elapsed_before_generation_sec or 0.0),
+    )
     if profile_started_at is None and profile_mode in {"auto", "translated", "method"}:
         _warn_once(
             "translated_ttft_missing_method_marker",
@@ -3646,13 +3723,11 @@ def predict_generation_task_answer(
             return_num_generated_tokens=True,
             return_ttft_sec=True,
             ttft_started_at=started_at,
-            stop_after_first_token=PROFILE_STOP_AFTER_TTFT_ONLY,
         )
 
-    (answer_text, generated_tokens, ttft_sec), peak_memory_bytes = profiler._measure_peak_allocated_bytes(run_generation)
-    latency_sec = time.perf_counter() - started_at
-    if kv_or_prefix_size_bytes is None and translator_input_past_key_values is not None:
-        kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(translator_input_past_key_values)
+    (answer_text, generated_tokens, raw_ttft_sec), peak_memory_bytes = profiler._measure_peak_allocated_bytes(run_generation)
+    ttft_sec = float(raw_ttft_sec) + elapsed_before_generation_sec
+    ttft_source_included_sec = ttft_sec + max(0.0, started_at - source_included_started_at)
     if kv_or_prefix_size_bytes is None:
         kv_or_prefix_size_bytes = compute_past_key_values_bfloat16_bytes(past_key_values)
         if profile_mode in {"auto", "translated", "method"}:
@@ -3663,100 +3738,12 @@ def predict_generation_task_answer(
             )
 
     _PENDING_GENERATION_PROFILE_EVENTS.append({
-        "latency_sec": float(latency_sec),
         "ttft_sec": float(ttft_sec),
+        "ttft_source_included_sec": float(ttft_source_included_sec),
         "tokens": int(generated_tokens),
         "peak_memory_bytes": peak_memory_bytes,
         "kv_or_prefix_size_bytes": int(kv_or_prefix_size_bytes),
     })
-    if PROFILE_STOP_AFTER_TTFT_ONLY:
-        _warn_once(
-            "ttft_only_generation_stopped",
-            "PROFILE_STOP_AFTER_TTFT_ONLY=True: generation stops after the first token; F1 is profile-only and not comparable.",
-        )
-    return answer_text
-
-
-@torch.inference_mode()
-def predict_generation_task_answer_upperbound(
-    *,
-    model,
-    tokenizer,
-    prefix_input_ids: torch.Tensor,
-    seed_token: torch.Tensor,
-    eval_config,
-    suffix_cache_ids: Optional[torch.Tensor] = None,
-    prefix_text: Optional[str] = None,
-) -> str:
-    """Upperbound generation with ordinary target-model TTFT.
-
-    This path intentionally performs target-model prefill over the full prompt,
-    rather than reusing an already-built native KV cache. Its TTFT therefore
-    matches the standard no-translation baseline: target prefill + first token.
-    """
-    prompt_parts = [prefix_input_ids]
-    if suffix_cache_ids is not None:
-        prompt_parts.append(suffix_cache_ids)
-    prompt_parts.append(seed_token)
-    full_prompt_input_ids = torch.cat(prompt_parts, dim=1)
-
-    profiler = InferenceProfiler(str(seed_token.device))
-    if profiler.enabled:
-        torch.cuda.synchronize(profiler.device_index)
-    started_at = time.perf_counter()
-
-    def run_upperbound_generation() -> Tuple[str, int, float]:
-        outputs = model(input_ids=full_prompt_input_ids, use_cache=True)
-        synchronize_if_needed(seed_token.device)
-        ttft_sec = time.perf_counter() - started_at
-
-        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        next_token_id = int(next_token.item())
-        eos_token_id = tokenizer.eos_token_id
-        generated_token_ids: List[int] = []
-        if eos_token_id is None or next_token_id != eos_token_id:
-            generated_token_ids.append(next_token_id)
-
-        if PROFILE_STOP_AFTER_TTFT_ONLY:
-            decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-            return postprocess_generated_answer(decoded), len(generated_token_ids), ttft_sec
-
-        current_input_ids = next_token
-        current_past = outputs.past_key_values
-        remaining_steps = max(int(eval_config.generation_max_new_tokens) - 1, 0)
-        for _ in range(remaining_steps):
-            outputs = model(
-                input_ids=current_input_ids,
-                past_key_values=current_past,
-                use_cache=True,
-            )
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            next_token_id = int(next_token.item())
-            if eos_token_id is not None and next_token_id == eos_token_id:
-                break
-            generated_token_ids.append(next_token_id)
-            current_input_ids = next_token
-            current_past = outputs.past_key_values
-
-        decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-        return postprocess_generated_answer(decoded), len(generated_token_ids), ttft_sec
-
-    (answer_text, generated_tokens, ttft_sec), peak_memory_bytes = profiler._measure_peak_allocated_bytes(
-        run_upperbound_generation
-    )
-    latency_sec = time.perf_counter() - started_at
-    _PENDING_GENERATION_PROFILE_EVENTS.append({
-        "latency_sec": float(latency_sec),
-        "ttft_sec": float(ttft_sec),
-        "tokens": int(generated_tokens),
-        "peak_memory_bytes": peak_memory_bytes,
-        "kv_or_prefix_size_bytes": compute_text_utf8_bytes(prefix_text),
-    })
-    if PROFILE_STOP_AFTER_TTFT_ONLY:
-        _warn_once(
-            "ttft_only_upperbound_generation_stopped",
-            "PROFILE_STOP_AFTER_TTFT_ONLY=True: upperbound generation stops after the first token; F1 is profile-only and not comparable.",
-        )
     return answer_text
 
 
@@ -3925,7 +3912,6 @@ def generate_greedy_answer(
     return_num_generated_tokens: bool = False,
     return_ttft_sec: bool = False,
     ttft_started_at: Optional[float] = None,
-    stop_after_first_token: bool = False,
 ) -> Union[str, Tuple[str, int], Tuple[str, int, float]]:
     generated_token_ids: List[int] = []
     current_input_ids = seed_token
@@ -3954,8 +3940,6 @@ def generate_greedy_answer(
         current_input_ids = next_token
         current_past = outputs.past_key_values
 
-        if stop_after_first_token:
-            break
 
     if ttft_sec is None:
         ttft_sec = time.perf_counter() - started_at
@@ -4033,6 +4017,54 @@ def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningA
         results[path_name] = meter.summary()
 
     return results
+
+
+def _weighted_generation_progress_ms(
+    path_metrics: Dict[str, GenerationRunningAverage],
+    *,
+    source_included: bool,
+    native: bool,
+) -> float:
+    total_sec = 0.0
+    total_count = 0
+    for meter in path_metrics.values():
+        if meter.count <= 0:
+            continue
+        if native:
+            total_sec += (
+                meter.native_ttft_source_included_sec_sum
+                if source_included
+                else meter.native_ttft_sec_sum
+            )
+        else:
+            total_sec += (
+                meter.ttft_source_included_sec_sum
+                if source_included
+                else meter.ttft_sec_sum
+            )
+        total_count += meter.count
+    if total_count <= 0:
+        return float("nan")
+    return (total_sec / total_count) * 1000.0
+
+
+def format_generation_progress_ttft(path_metrics: Dict[str, GenerationRunningAverage], *, method_name: str) -> str:
+    native_source_o = _format_summary_ms(
+        _weighted_generation_progress_ms(path_metrics, source_included=True, native=True)
+    )
+    native_source_x = _format_summary_ms(
+        _weighted_generation_progress_ms(path_metrics, source_included=False, native=True)
+    )
+    method_source_o = _format_summary_ms(
+        _weighted_generation_progress_ms(path_metrics, source_included=True, native=False)
+    )
+    method_source_x = _format_summary_ms(
+        _weighted_generation_progress_ms(path_metrics, source_included=False, native=False)
+    )
+    return (
+        f"Native TTFT (Source O/X): {native_source_o} / {native_source_x} | "
+        f"{method_name} TTFT (Source O/X): {method_source_o} / {method_source_x}"
+    )
 
 
 @dataclass
@@ -4381,25 +4413,33 @@ def build_edge_summary_markdown_table(
         lines = [
             f"### {direction_title}",
             "",
-            "| Budget | Method | Cosine Sim | F1 | Avg KV/Prefix Size | Avg TTFT | Avg Latency | Throughput | GPU Peak Memory | Count |",
+            "| Budget | Method | Cosine Sim | F1 | Avg KV/Prefix Size | Avg TTFT (Source O) | Avg TTFT (Source X) | Throughput | GPU Peak Memory | Count |",
             "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for dataset_key in sorted_dataset_keys:
             row = all_generation_results.get(dataset_key, {}).get(edge_id, {})
             budget_value = _parse_generation_budget_from_dataset_name(dataset_key)
             budget_text = "max" if budget_value is None else str(budget_value)
-            native_latency_text, native_throughput_text, native_peak_text = build_openwebtext_profile_fields(row, prefix="native")
-            translated_latency_text, translated_throughput_text, translated_peak_text = build_openwebtext_profile_fields(row)
+            native_throughput_text = _format_summary_throughput(row.get("native_throughput_tokens_per_sec", float("nan")))
+            translated_throughput_text = _format_summary_throughput(row.get("throughput_tokens_per_sec", float("nan")))
+            native_peak_text = _format_summary_float(row.get("native_peak_memory_gib", float("nan")))
+            if native_peak_text != "N/A":
+                native_peak_text = f"{native_peak_text} GiB"
+            translated_peak_text = _format_summary_float(row.get("peak_memory_gib", float("nan")))
+            if translated_peak_text != "N/A":
+                translated_peak_text = f"{translated_peak_text} GiB"
             native_size_text = _format_summary_bytes(row.get("native_kv_or_prefix_size_bytes", float("nan")))
             translated_size_text = _format_summary_bytes(row.get("kv_or_prefix_size_bytes", float("nan")))
-            native_ttft_text = _format_summary_ms(row.get("native_ttft_ms", float("nan")))
-            translated_ttft_text = _format_summary_ms(row.get("ttft_ms", float("nan")))
+            native_ttft_source_o_text = _format_summary_ms(row.get("native_ttft_source_included_ms", float("nan")))
+            native_ttft_source_x_text = _format_summary_ms(row.get("native_ttft_ms", float("nan")))
+            translated_ttft_source_o_text = _format_summary_ms(row.get("ttft_source_included_ms", float("nan")))
+            translated_ttft_source_x_text = _format_summary_ms(row.get("ttft_ms", float("nan")))
             lines.append(
-                f"| {budget_text} | {target_model_id} (upperbound) | N/A | "
+                f"| {budget_text} | {target_model_id} (Native) | N/A | "
                 f"{_format_summary_float(row.get('native_f1', float('nan')))} | "
                 f"{native_size_text} | "
-                f"{native_ttft_text} | "
-                f"{native_latency_text} | "
+                f"{native_ttft_source_o_text} | "
+                f"{native_ttft_source_x_text} | "
                 f"{native_throughput_text} | "
                 f"{native_peak_text} | "
                 f"{int(row.get('count', 0) or 0)} |"
@@ -4409,8 +4449,8 @@ def build_edge_summary_markdown_table(
                 f"{_format_summary_float(row.get('cosine', float('nan')))} | "
                 f"{_format_summary_float(row.get('f1', float('nan')))} | "
                 f"{translated_size_text} | "
-                f"{translated_ttft_text} | "
-                f"{translated_latency_text} | "
+                f"{translated_ttft_source_o_text} | "
+                f"{translated_ttft_source_x_text} | "
                 f"{translated_throughput_text} | "
                 f"{translated_peak_text} | "
                 f"{int(row.get('count', 0) or 0)} |"
@@ -4470,7 +4510,7 @@ def build_edge_summary_markdown_table(
         "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {target_model_id} (upperbound) | N/A | "
+            f"| {target_model_id} (Native) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['MMLU-Redux'].get('native_accuracy', float('nan')))} | "

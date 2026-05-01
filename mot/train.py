@@ -454,18 +454,45 @@ class LayerWindowTranslatorPool(nn.Module):
         translated_key, translated_value = self.adapters[edge_id](key_block, value_block)
         return translated_key, translated_value
 
+    def build_sparse_attention_indices(
+        self,
+        *,
+        source_model: PreTrainedModel,
+        prefix_input_ids: torch.Tensor,
+        src_node_id: str,
+        tgt_node_id: str,
+        tgt_spec: ModelSpec,
+    ) -> List[torch.Tensor]:
+        edge_id = f"{src_node_id}_to_{tgt_node_id}"
+        src_spec = self.mm.get_model_spec(src_node_id)
+        return build_extrapolated_sparse_attention_indices(
+            source_model,
+            prefix_input_ids,
+            source_layer_indices=self.cm.get_src_layer_indices(edge_id),
+            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
+            num_source_layers=src_spec.num_layers,
+            num_target_layers=tgt_spec.num_layers,
+            source_model_id=self.node_model_ids.get(src_node_id),
+            top_k=self.ctx.config.topk_sparse_attn,
+        )
+
     def build_replayed_target_past(
         self,
         *,
         source_past_key_values: PastKeyValues,
         prefix_input_ids: torch.Tensor,
-        source_model: Optional[PreTrainedModel] = None,
+        sparse_attention_indices: List[torch.Tensor],
         target_model: PreTrainedModel,
         src_node_id: str,
         tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> Tuple[PastKeyValues, PastKeyValues]:
         edge_id = f"{src_node_id}_to_{tgt_node_id}"
+        if len(sparse_attention_indices) != tgt_spec.num_layers:
+            raise ValueError(
+                "sparse_attention_indices must contain one entry per target layer, "
+                f"got {len(sparse_attention_indices)} vs target layers={tgt_spec.num_layers}"
+            )
         translated_key, translated_value = self.translate_layer_window(
             past_key_values=source_past_key_values,
             src_node_id=src_node_id,
@@ -477,19 +504,6 @@ class LayerWindowTranslatorPool(nn.Module):
             num_heads=tgt_spec.num_key_value_heads,
             head_dim=tgt_spec.head_dim,
         )
-        sparse_attention_indices = None
-        if source_model is not None:
-            src_spec = self.mm.get_model_spec(src_node_id)
-            sparse_attention_indices = build_extrapolated_sparse_attention_indices(
-                source_model,
-                prefix_input_ids,
-                source_layer_indices=self.cm.get_src_layer_indices(edge_id),
-                target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
-                num_source_layers=src_spec.num_layers,
-                num_target_layers=tgt_spec.num_layers,
-                source_model_id=self.node_model_ids.get(src_node_id),
-                top_k=self.ctx.config.topk_sparse_attn,
-            )
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             target_model_id=self.node_model_ids.get(tgt_node_id),
@@ -745,32 +759,86 @@ def extract_source_attention_topk_indices(
 ) -> List[torch.Tensor]:
     if len(layer_indices) == 0:
         return []
+
+    requested_layers = [int(layer_idx) for layer_idx in layer_indices]
+    requested_layer_set = set(requested_layers)
+    max_requested_layer = max(requested_layer_set)
+    sparse_by_layer: Dict[int, torch.Tensor] = {}
     model_family = resolve_target_model_family(source_model, target_model_id=source_model_id)
-    model_kwargs: Dict[str, Any] = {
-        "input_ids": prefix_input_ids,
-        "use_cache": False,
-        "output_attentions": True,
-        "return_dict": True,
-    }
-    if model_family in {"opt", "qwen2"}:
-        model_kwargs["attention_mask"] = torch.ones_like(prefix_input_ids)
+
     with torch.no_grad():
-        outputs = source_model(**model_kwargs)
-    attentions = getattr(outputs, "attentions", None)
-    if attentions is None:
-        raise ValueError("Source model did not return attentions for sparse injected replay.")
+        if model_family == "gpt2":
+            transformer = require_gpt2_transformer(source_model)
+            source_blocks = transformer.h
+            hidden_states = build_gpt2_input_hidden_states(source_model, prefix_input_ids)
+            for layer_idx, block in enumerate(source_blocks):
+                if layer_idx > max_requested_layer:
+                    break
+                collected: Optional[List[torch.Tensor]] = [] if layer_idx in requested_layer_set else None
+                hidden_states, present = run_gpt2_block(
+                    block,
+                    hidden_states,
+                    collect_top_k=top_k if collected is not None else None,
+                    collected_sparse_indices=collected,
+                )
+                del present
+                if collected is not None:
+                    if len(collected) != 1:
+                        raise ValueError(f"Expected one sparse attention index for source layer {layer_idx}, got {len(collected)}.")
+                    sparse_by_layer[layer_idx] = collected[0]
 
-    sparse_indices: List[torch.Tensor] = []
-    for layer_idx in layer_indices:
-        layer_attn = attentions[layer_idx]
-        if layer_attn is None:
-            raise ValueError(f"Attention for source layer {layer_idx} is unavailable.")
-        shared_attn = layer_attn.detach().mean(dim=1, keepdim=True)
-        seq_len = shared_attn.shape[-1]
-        k = max(1, min(int(top_k), seq_len))
-        sparse_indices.append(torch.topk(shared_attn, k=k, dim=-1).indices)
-    return sparse_indices
+        elif model_family == "opt":
+            decoder = require_opt_decoder(source_model)
+            source_blocks = decoder.layers
+            hidden_states, token_attention_mask, attention_mask = build_opt_input_hidden_states(source_model, prefix_input_ids)
+            for layer_idx, block in enumerate(source_blocks):
+                if layer_idx > max_requested_layer:
+                    break
+                collected = [] if layer_idx in requested_layer_set else None
+                hidden_states, present = run_opt_block(
+                    block,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    token_attention_mask=token_attention_mask,
+                    collect_top_k=top_k if collected is not None else None,
+                    collected_sparse_indices=collected,
+                )
+                del present
+                if collected is not None:
+                    if len(collected) != 1:
+                        raise ValueError(f"Expected one sparse attention index for source layer {layer_idx}, got {len(collected)}.")
+                    sparse_by_layer[layer_idx] = collected[0]
 
+        elif model_family == "qwen2":
+            qwen_model = require_qwen2_model(source_model)
+            source_blocks = qwen_model.layers
+            hidden_states, position_ids, attention_mask, position_embeddings = build_qwen2_input_hidden_states(source_model, prefix_input_ids)
+            for layer_idx, block in enumerate(source_blocks):
+                if layer_idx > max_requested_layer:
+                    break
+                collected = [] if layer_idx in requested_layer_set else None
+                hidden_states, present = run_qwen2_block(
+                    block,
+                    hidden_states,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                    collect_top_k=top_k if collected is not None else None,
+                    collected_sparse_indices=collected,
+                )
+                del present
+                if collected is not None:
+                    if len(collected) != 1:
+                        raise ValueError(f"Expected one sparse attention index for source layer {layer_idx}, got {len(collected)}.")
+                    sparse_by_layer[layer_idx] = collected[0]
+
+        else:
+            raise ValueError(f"Unsupported source model family for sparse attention extraction: {model_family}")
+
+    missing_layers = [layer_idx for layer_idx in requested_layers if layer_idx not in sparse_by_layer]
+    if missing_layers:
+        raise ValueError(f"Failed to collect source sparse attention indices for layers: {missing_layers}")
+    return [sparse_by_layer[layer_idx] for layer_idx in requested_layers]
 
 def extrapolate_source_layer_alignment(
     *,
@@ -928,6 +996,32 @@ def get_qwen2_attention_shape(attn: nn.Module, hidden_size: int) -> Tuple[int, i
     return num_query_heads, num_key_value_heads, num_query_heads // num_key_value_heads, head_dim
 
 
+
+
+def attention_weights_to_sparse_indices(attn_weights: torch.Tensor, top_k: int) -> torch.Tensor:
+    if attn_weights.ndim != 4:
+        raise ValueError(
+            "Attention weights must have shape [batch, heads, query, key], "
+            f"got {tuple(attn_weights.shape)}"
+        )
+    shared_attn = attn_weights.detach().mean(dim=1, keepdim=True)
+    seq_len = shared_attn.shape[-1]
+    k = max(1, min(int(top_k), int(seq_len)))
+    return torch.topk(shared_attn, k=k, dim=-1).indices.detach()
+
+
+def maybe_collect_sparse_attention_indices(
+    attn_weights: torch.Tensor,
+    *,
+    collect_top_k: Optional[int],
+    collected_sparse_indices: Optional[List[torch.Tensor]],
+) -> None:
+    if collect_top_k is None:
+        return
+    if collected_sparse_indices is None:
+        raise ValueError("collected_sparse_indices must be provided when collect_top_k is set.")
+    collected_sparse_indices.append(attention_weights_to_sparse_indices(attn_weights, collect_top_k))
+
 def run_gpt2_block(
     block: nn.Module,
     hidden_states: torch.Tensor,
@@ -935,6 +1029,8 @@ def run_gpt2_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    collect_top_k: Optional[int] = None,
+    collected_sparse_indices: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if (injected_key is None) != (injected_value is None):
         raise ValueError("injected_key and injected_value must be provided together.")
@@ -984,14 +1080,20 @@ def run_gpt2_block(
             attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "attn_pdrop", 0.0)), training=block.training)
         attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
     else:
-        attn_output, _ = attn._attn(
+        attn_output, attn_weights = attn._attn(
             query,
             attention_key,
             attention_value,
             attention_mask=None,
             head_mask=None,
         )
+        maybe_collect_sparse_attention_indices(
+            attn_weights,
+            collect_top_k=collect_top_k,
+            collected_sparse_indices=collected_sparse_indices,
+        )
 
+    del attn_weights
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
     attn_output = attn.c_proj(attn_output)
     attn_output = attn.resid_dropout(attn_output)
@@ -1009,6 +1111,8 @@ def run_opt_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    collect_top_k: Optional[int] = None,
+    collected_sparse_indices: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     del token_attention_mask
 
@@ -1062,8 +1166,14 @@ def run_opt_block(
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        maybe_collect_sparse_attention_indices(
+            attn_weights,
+            collect_top_k=collect_top_k,
+            collected_sparse_indices=collected_sparse_indices,
+        )
         attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
         attn_output = torch.matmul(attn_weights, attention_value)
+    del attn_weights
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_heads * head_dim)
     attn_output = attn.out_proj(attn_output)
     attn_output = F.dropout(attn_output, p=float(getattr(block, "dropout", 0.0)), training=block.training)
@@ -1098,6 +1208,8 @@ def run_qwen2_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    collect_top_k: Optional[int] = None,
+    collected_sparse_indices: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if (injected_key is None) != (injected_value is None):
         raise ValueError("injected_key and injected_value must be provided together.")
@@ -1168,10 +1280,16 @@ def run_qwen2_block(
         if effective_attention_mask is not None:
             attn_weights = attn_weights + effective_attention_mask
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        maybe_collect_sparse_attention_indices(
+            attn_weights,
+            collect_top_k=collect_top_k,
+            collected_sparse_indices=collected_sparse_indices,
+        )
         dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
         attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
         attn_output = torch.matmul(attn_weights, expanded_attention_value)
 
+    del attn_weights
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_query_heads * head_dim)
     attn_output = attn.o_proj(attn_output)
     hidden_states = residual + attn_output
@@ -1578,7 +1696,13 @@ def run_train(
                 mixed_target_past, _ = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
-                    source_model=ctx.mm.get_model(edge.src_id),
+                    sparse_attention_indices=translator_pool.build_sparse_attention_indices(
+                        source_model=ctx.mm.get_model(edge.src_id),
+                        prefix_input_ids=prefix_cache_ids,
+                        src_node_id=edge.src_id,
+                        tgt_node_id=edge.tgt_id,
+                        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    ),
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,

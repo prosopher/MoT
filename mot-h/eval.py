@@ -143,6 +143,7 @@ def evaluate_generation_dataset(
                 prefix_input_ids = prepared_inputs["prefix_input_ids"]
                 suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
                 seed_token = prepared_inputs["seed_token"]
+                native_prefix_size_bytes = compute_generation_prefix_text_bytes(prepared_inputs)
 
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
                     suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
@@ -155,21 +156,14 @@ def evaluate_generation_dataset(
                         get_answer_token_budget(eval_config),
                     )
 
-                prefill_by_node_id = {
-                    node.id: extract_model_prefill_artifacts(ctx.mm.get_model(node.id), prefix_input_ids)
-                    for node in nodes
-                }
-                past_by_node_id = {
-                    node.id: prefill_by_node_id[node.id][0]
-                    for node in nodes
-                }
-                hidden_states_by_node_id = {
-                    node.id: prefill_by_node_id[node.id][1]
-                    for node in nodes
-                }
+                register_generation_source_prefill_start(device=prefix_input_ids.device)
+                source_past, source_hidden_states = extract_model_prefill_artifacts(
+                    ctx.mm.get_model(edge.src_id),
+                    prefix_input_ids,
+                )
 
                 mixed_target_past, _ = translator_pool.build_replayed_target_past(
-                    source_past_key_values=past_by_node_id[edge.src_id],
+                    source_past_key_values=source_past,
                     prefix_input_ids=prefix_input_ids,
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
@@ -177,13 +171,10 @@ def evaluate_generation_dataset(
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                     source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
                         ctx.mm.get_model(edge.src_id),
-                        hidden_states_by_node_id[edge.src_id],
+                        source_hidden_states,
                         ctx.cm.get_src_layer_indices(edge.id),
                     ),
                 )
-
-                native_past = past_by_node_id[edge.tgt_id]
-                cosine_value = cosine_similarity_between_past(mixed_target_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
@@ -193,13 +184,25 @@ def evaluate_generation_dataset(
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
                 )
+
+                native_profile_state = start_native_generation_profile(
+                    prefix_input_ids=prefix_input_ids,
+                    prefix_size_bytes=native_prefix_size_bytes,
+                )
+                native_past = extract_past_key_values(ctx.mm.get_model(edge.tgt_id), prefix_input_ids)
+                native_profile = finish_native_generation_profile(
+                    native_profile_state,
+                    device=prefix_input_ids.device,
+                )
+                cosine_value = cosine_similarity_between_past(mixed_target_past, native_past)
                 native_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
-                    past_key_values=past_by_node_id[edge.tgt_id],
+                    past_key_values=native_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
+                    **native_profile,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -216,10 +219,18 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logging.info(
-                "[%s] generation progress: %d/%d examples",
+                "[%s] generation progress: %d/%d examples | %s",
                 spec.name_for_log,
                 processed_examples,
                 eval_config.max_examples_per_dataset,
+                format_generation_progress_ttft(
+                    path_metrics,
+                    method_name=(
+                        getattr(eval_config, "alg", None)
+                        or getattr(ctx.config, "alg", None)
+                        or "Method"
+                    ),
+                ),
             )
 
     return summarize_generation_path_metrics(path_metrics)

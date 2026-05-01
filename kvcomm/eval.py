@@ -82,7 +82,16 @@ def _predict_direct_context_generation(
         device=device,
         max_input_tokens=context_budget,
     )
+    native_prefix_size_bytes = compute_generation_prefix_text_bytes(prepared)
+    native_profile_state = start_native_generation_profile(
+        prefix_input_ids=prepared["prefix_input_ids"],
+        prefix_size_bytes=native_prefix_size_bytes,
+    )
     context_past = extract_past_key_values(model, prepared["prefix_input_ids"])
+    native_profile = finish_native_generation_profile(
+        native_profile_state,
+        device=prepared["prefix_input_ids"].device,
+    )
     return predict_generation_task_answer(
         model=model,
         tokenizer=tokenizer,
@@ -90,6 +99,7 @@ def _predict_direct_context_generation(
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
         suffix_cache_ids=prepared["suffix_cache_ids"],
+        **native_profile,
     )
 
 
@@ -120,6 +130,7 @@ def _predict_kvcomm_logit(
         subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
+    register_generation_source_prefill_start(device=prepared["prefix_input_ids"].device)
     source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
     kvcomm_past = pool.build_replayed_target_past(
         edge_id=edge_id,
@@ -163,6 +174,7 @@ def _predict_kvcomm_generation(
         device=device,
         max_input_tokens=context_budget,
     )
+    register_generation_source_prefill_start(device=prepared["prefix_input_ids"].device)
     source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
     kvcomm_past = pool.build_replayed_target_past(
         edge_id=edge_id,
@@ -304,40 +316,37 @@ def evaluate_generation_dataset(
                     max_input_tokens=context_budget,
                 )
                 prefix_input_ids = prepared_generation_inputs["prefix_input_ids"]
+                suffix_cache_ids = prepared_generation_inputs["suffix_cache_ids"]
+                seed_token = prepared_generation_inputs["seed_token"]
+                native_prefix_size_bytes = compute_generation_prefix_text_bytes(prepared_generation_inputs)
 
                 source_model = ctx.mm.get_model(edge.src_id)
                 target_model = ctx.mm.get_model(edge.tgt_id)
 
-                pred_direct = _predict_direct_context_generation(
-                    model=target_model,
-                    spec=spec,
-                    tokenizer=tokenizer,
-                    context=context,
-                    question=question,
-                    eval_config=eval_config,
-                    device=device,
-                    context_budget=context_budget,
-                )
-                pred_kvcomm = _predict_kvcomm_generation(
-                    pool=translator_pool,
-                    edge_id=edge.id,
-                    source_model=source_model,
-                    target_model=target_model,
-                    spec=spec,
-                    tokenizer=tokenizer,
-                    context=context,
-                    question=question,
-                    eval_config=eval_config,
-                    device=device,
-                    context_budget=context_budget,
-                )
-
+                register_generation_source_prefill_start(device=prefix_input_ids.device)
                 kvcomm_source_past = extract_past_key_values(source_model, prefix_input_ids)
                 kvcomm_replayed_past = translator_pool.build_replayed_target_past(
                     edge_id=edge.id,
                     source_past_key_values=kvcomm_source_past,
                 )
+                pred_kvcomm = predict_generation_task_answer(
+                    model=target_model,
+                    tokenizer=tokenizer,
+                    past_key_values=kvcomm_replayed_past,
+                    seed_token=seed_token,
+                    eval_config=eval_config,
+                    suffix_cache_ids=suffix_cache_ids,
+                )
+
+                native_profile_state = start_native_generation_profile(
+                    prefix_input_ids=prefix_input_ids,
+                    prefix_size_bytes=native_prefix_size_bytes,
+                )
                 native_target_past = extract_past_key_values(target_model, prefix_input_ids)
+                native_profile = finish_native_generation_profile(
+                    native_profile_state,
+                    device=prefix_input_ids.device,
+                )
                 kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
                     edge=edge,
                     translator_pool=translator_pool,
@@ -345,6 +354,15 @@ def evaluate_generation_dataset(
                     native_target_past=native_target_past,
                 )
                 cosine_value = cosine_similarity_between_past(kvcomm_past_for_cosine, native_target_past)
+                pred_direct = predict_generation_task_answer(
+                    model=target_model,
+                    tokenizer=tokenizer,
+                    past_key_values=native_target_past,
+                    seed_token=seed_token,
+                    eval_config=eval_config,
+                    suffix_cache_ids=suffix_cache_ids,
+                    **native_profile,
+                )
 
                 f1_value = compute_generation_f1(pred_kvcomm, gold_answers)
                 native_f1_value = compute_generation_f1(pred_direct, gold_answers)
@@ -354,10 +372,18 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logging.info(
-                "[%s] generation progress: %d/%d examples",
+                "[%s] generation progress: %d/%d examples | %s",
                 spec.name_for_log,
                 processed_examples,
                 eval_config.max_examples_per_dataset,
+                format_generation_progress_ttft(
+                    path_metrics,
+                    method_name=(
+                        getattr(eval_config, "alg", None)
+                        or getattr(ctx.config, "alg", None)
+                        or "Method"
+                    ),
+                ),
             )
 
     return summarize_generation_path_metrics(path_metrics)

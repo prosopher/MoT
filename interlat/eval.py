@@ -474,6 +474,7 @@ def _evaluate_generation_dataset(
                 prefix_input_ids = prepared_inputs["prefix_input_ids"]
                 suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
                 seed_token = prepared_inputs["seed_token"]
+                native_prefix_size_bytes = compute_generation_prefix_text_bytes(prepared_inputs)
 
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
                     suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
@@ -494,6 +495,7 @@ def _evaluate_generation_dataset(
                     device=ctx.config.device,
                     max_input_tokens=context_budget,
                 )
+                register_generation_source_prefill_start(device=source_prepared["prefix_input_ids"].device)
                 source_hidden = extract_last_hidden_states(
                     ctx.mm.get_model(edge.src_id),
                     source_prepared["prefix_input_ids"],
@@ -520,7 +522,6 @@ def _evaluate_generation_dataset(
                     prefix_input_ids=translated_prefix_input_ids,
                     latent_prefix=translated_latents,
                 )
-                native_past = extract_past_key_values(target_model, prefix_input_ids)
 
                 translated_answer = predict_generation_task_answer(
                     model=target_model,
@@ -530,6 +531,16 @@ def _evaluate_generation_dataset(
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
                 )
+
+                native_profile_state = start_native_generation_profile(
+                    prefix_input_ids=prefix_input_ids,
+                    prefix_size_bytes=native_prefix_size_bytes,
+                )
+                native_past = extract_past_key_values(target_model, prefix_input_ids)
+                native_profile = finish_native_generation_profile(
+                    native_profile_state,
+                    device=prefix_input_ids.device,
+                )
                 native_answer = predict_generation_task_answer(
                     model=target_model,
                     tokenizer=target_tokenizer,
@@ -537,6 +548,7 @@ def _evaluate_generation_dataset(
                     seed_token=seed_token,
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
+                    **native_profile,
                 )
 
                 path_metrics[edge.id].update(
@@ -550,10 +562,18 @@ def _evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logging.info(
-                "[%s] generation progress: %d/%d examples",
+                "[%s] generation progress: %d/%d examples | %s",
                 spec.name_for_log,
                 processed_examples,
                 eval_config.max_examples_per_dataset,
+                format_generation_progress_ttft(
+                    path_metrics,
+                    method_name=(
+                        getattr(eval_config, "alg", None)
+                        or getattr(ctx.config, "alg", None)
+                        or "Method"
+                    ),
+                ),
             )
 
     return summarize_generation_path_metrics(path_metrics)
