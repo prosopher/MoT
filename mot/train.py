@@ -457,7 +457,7 @@ class LayerWindowTranslatorPool(nn.Module):
         *,
         source_past_key_values: PastKeyValues,
         prefix_input_ids: torch.Tensor,
-        source_model: Optional[PreTrainedModel] = None,
+        source_model: PreTrainedModel,
         target_model: PreTrainedModel,
         src_node_id: str,
         tgt_node_id: str,
@@ -475,19 +475,17 @@ class LayerWindowTranslatorPool(nn.Module):
             num_heads=tgt_spec.num_heads,
             head_dim=tgt_spec.head_dim,
         )
-        sparse_attention_indices = None
-        if source_model is not None:
-            src_spec = self.mm.get_model_spec(src_node_id)
-            sparse_attention_indices = build_extrapolated_sparse_attention_indices(
-                source_model,
-                prefix_input_ids,
-                source_layer_indices=self.cm.get_src_layer_indices(edge_id),
-                target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
-                num_source_layers=src_spec.num_layers,
-                num_target_layers=tgt_spec.num_layers,
-                source_model_id=self.node_model_ids.get(src_node_id),
-                top_k=self.ctx.config.topk_sparse_attn,
-            )
+        src_spec = self.mm.get_model_spec(src_node_id)
+        sparse_attention_indices = build_extrapolated_sparse_attention_indices(
+            source_model,
+            prefix_input_ids,
+            source_layer_indices=self.cm.get_src_layer_indices(edge_id),
+            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
+            num_source_layers=src_spec.num_layers,
+            num_target_layers=tgt_spec.num_layers,
+            source_model_id=self.node_model_ids.get(src_node_id),
+            top_k=self.ctx.config.topk_sparse_attn,
+        )
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             target_model_id=self.node_model_ids.get(tgt_node_id),

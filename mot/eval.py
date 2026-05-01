@@ -65,6 +65,7 @@ def _build_logit_edge_artifacts(
     mixed_target_past, _ = translator_pool.build_replayed_target_past(
         source_past_key_values=past_by_node_id[edge.src_id],
         prefix_input_ids=prefix_input_ids,
+        source_model=ctx.mm.get_model(edge.src_id),
         target_model=ctx.mm.get_model(edge.tgt_id),
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
@@ -144,6 +145,7 @@ def evaluate_generation_dataset(
                 mixed_target_past, _ = translator_pool.build_replayed_target_past(
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_input_ids,
+                    source_model=ctx.mm.get_model(edge.src_id),
                     target_model=ctx.mm.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
@@ -265,6 +267,7 @@ def run_eval(
         mixed_target_past, _ = translator_pool.build_replayed_target_past(
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
+            source_model=ctx.mm.get_model(edge.src_id),
             target_model=ctx.mm.get_model(edge.tgt_id),
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
@@ -282,6 +285,7 @@ def run_eval(
         _, translated_window_past = translator_pool.build_replayed_target_past(
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
+            source_model=ctx.mm.get_model(edge.src_id),
             target_model=ctx.mm.get_model(edge.tgt_id),
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
