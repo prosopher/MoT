@@ -25,6 +25,17 @@ from core.common import (  # noqa: E402
     write_json,
 )
 from core.config import resolve_device
+from exp.exp_util import (
+    AI_PAPER_COLORBAR_LABEL_SIZE,
+    AI_PAPER_COLORBAR_TICK_SIZE,
+    AI_PAPER_HEATMAP_VALUE_FONT_SIZE,
+    AI_PAPER_LAYER_TICK_ROTATION,
+    apply_ai_paper_style,
+    double_column_figsize,
+    save_paper_figure,
+    style_axes_common,
+    require_matplotlib_pyplot,
+)
 
 PoolMode = Literal["mean", "last"]
 MetricName = Literal["linear_cka"]
@@ -592,22 +603,22 @@ def plot_heatmap(
     annotate: bool,
     dpi: int,
 ) -> None:
-    import matplotlib.pyplot as plt
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
-    height = max(5.5, 0.42 * matrix.shape[0] + 2.0)
-    width = max(7.0, 0.34 * matrix.shape[1] + 2.5)
-    fig, ax = plt.subplots(figsize=(width, height))
+    height = max(4.80, min(7.16, 0.42 * matrix.shape[0] + 2.0))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=height))
     image = ax.imshow(matrix.cpu().numpy(), aspect="auto", vmin=0.0, vmax=1.0)
-    ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_xticks(range(matrix.shape[1]))
     ax.set_yticks(range(matrix.shape[0]))
-    ax.set_xticklabels([str(idx) for idx in range(matrix.shape[1])], rotation=45, ha="right")
+    ax.set_xticklabels([str(idx) for idx in range(matrix.shape[1])], rotation=AI_PAPER_LAYER_TICK_ROTATION, ha="right")
     ax.set_yticklabels([str(idx) for idx in range(matrix.shape[0])])
 
     cbar = fig.colorbar(image, ax=ax)
-    cbar.set_label("Similarity")
+    cbar.set_label("Similarity", fontweight="bold", fontsize=AI_PAPER_COLORBAR_LABEL_SIZE)
+    cbar.ax.tick_params(labelsize=AI_PAPER_COLORBAR_TICK_SIZE)
 
     if annotate and matrix.numel() <= 900:
         values = matrix.cpu().numpy()
@@ -615,11 +626,10 @@ def plot_heatmap(
             for col_idx in range(values.shape[1]):
                 value = values[row_idx, col_idx]
                 text_color = "white" if value < 0.5 else "black"
-                ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", color=text_color, fontsize=7)
+                ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", color=text_color, fontsize=AI_PAPER_HEATMAP_VALUE_FONT_SIZE)
 
-    fig.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    style_axes_common(ax, grid=False)
+    save_paper_figure(fig, output_path, dpi=dpi)
     plt.close(fig)
 
 

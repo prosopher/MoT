@@ -4,46 +4,50 @@ import re
 import math
 import argparse
 import textwrap
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 from collections import OrderedDict
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-def _require_matplotlib_pyplot():
-    try:
-        import matplotlib.pyplot as plt
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "matplotlib is required only for plotting. Install matplotlib to generate figures."
-        ) from exc
-    return plt
+from exp.exp_util import (
+    AI_PAPER_PALETTE,
+    AI_PAPER_MARKERS,
+    AI_PAPER_LINESTYLES,
+    AI_PAPER_ALGORITHM_LABEL_ROTATION,
+    AI_PAPER_BAR_X_MARGIN,
+    AI_PAPER_BAR_Y_MARGIN,
+    AI_PAPER_BAR_VALUE_FONT_SIZE,
+    AI_PAPER_DEFAULT_X_MARGIN,
+    AI_PAPER_DEFAULT_Y_MARGIN,
+    AI_PAPER_DENSE_WIDTH_SCALE_MAX,
+    AI_PAPER_GROUPED_BAR_TOTAL_WIDTH,
+    AI_PAPER_GROUPED_BAR_WIDTH_SCALE,
+    AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_LINE_WIDTH,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_MARKER_FACE_COLOR,
+    AI_PAPER_MARKER_SIZE,
+    AI_PAPER_REFERENCE_COLOR,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_WRAP_TICK_WIDTH,
+    double_column_figsize,
+    scaled_double_column_figsize,
+    apply_ai_paper_style,
+    require_matplotlib_pyplot,
+    save_paper_figure,
+    style_algorithm_tick_labels,
+    style_axes_common,
+)
 
 
 DEFAULT_Y_COL = "Gen F1 Avg"
-
-
-# Colorblind-friendly palette, commonly used in academic plots
-AI_PAPER_PALETTE = [
-    "#C0504D",  # Accent Red
-    "#4BACC6",  # Accent Aqua
-    "#8064A2",  # Accent Purple
-    "#4F81BD",  # Accent Blue
-    "#9BBB59",  # Accent Green
-    "#F79646",  # Accent Orange
-    "#000000",  # black
-]
-
-
-AI_PAPER_MARKERS = [
-    "o", "s", "^", "D", "v", "P", "X", "*", "h", "<", ">"
-]
-
-
-AI_PAPER_LINESTYLES = [
-    "-", "--", "-.", ":"
-]
 
 
 ChartMode = Literal["line", "bar"]
@@ -328,63 +332,6 @@ def extract_tables(
     )
 
 
-def apply_ai_paper_style() -> None:
-    """
-    AI 논문 figure에 자주 쓰이는 Matplotlib 스타일 설정.
-
-    특징:
-    - serif font
-    - PDF/SVG 저장 시 텍스트 편집 가능
-    - 적당한 linewidth와 tick size
-    - 과하지 않은 grid
-    """
-    plt = _require_matplotlib_pyplot()
-    plt.rcParams.update(
-        {
-            # Figure and save quality
-            "figure.dpi": 120,
-            "savefig.dpi": 300,
-            "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.02,
-
-            # Font
-            "font.family": "serif",
-            "font.serif": [
-                "Times New Roman",
-                "Times",
-                "DejaVu Serif",
-            ],
-            "mathtext.fontset": "stix",
-
-            # Editable text in vector outputs
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-
-            # Axes
-            "axes.labelsize": 13,
-            "axes.titlesize": 13,
-            "axes.linewidth": 1.0,
-
-            # Ticks
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 11,
-            "xtick.direction": "out",
-            "ytick.direction": "out",
-
-            # Legend
-            "legend.fontsize": 10,
-            "legend.frameon": True,
-            "legend.framealpha": 0.95,
-            "legend.fancybox": False,
-            "legend.edgecolor": "0.85",
-
-            # Lines
-            "lines.linewidth": 2.2,
-            "lines.markersize": 6,
-        }
-    )
-
 
 def wrap_tick_label(text: str, width: int = 26) -> str:
     """
@@ -413,29 +360,6 @@ def wrap_tick_label(text: str, width: int = 26) -> str:
     return "\n".join(wrapped_lines)
 
 
-def style_axes_common(ax) -> None:
-    # 논문형 plot: top/right spine 제거
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    ax.spines["left"].set_linewidth(1.0)
-    ax.spines["bottom"].set_linewidth(1.0)
-
-    ax.tick_params(axis="both", which="major", length=4, width=1.0)
-    ax.tick_params(axis="both", which="minor", length=2, width=0.8)
-
-    ax.set_axisbelow(True)
-
-    # 과하지 않은 grid
-    ax.grid(
-        True,
-        which="major",
-        axis="y",
-        linestyle="--",
-        linewidth=0.7,
-        alpha=0.35,
-    )
-
 
 def plot_line_series(
     series_data: OrderedDict[str, list[tuple[float, float]]],
@@ -452,15 +376,13 @@ def plot_line_series(
     num_series = len(series_data)
 
     if num_series <= 5:
-        fig_width = 6.4
-        fig_height = 4.2
+        fig_size = double_column_figsize()
     else:
-        fig_width = 7.4
-        fig_height = 4.8
+        fig_size = double_column_figsize(height=4.80)
 
-    plt = _require_matplotlib_pyplot()
+    plt = require_matplotlib_pyplot()
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = plt.subplots(figsize=fig_size)
 
     for idx, (series_name, points) in enumerate(series_data.items()):
         points = sorted(points, key=lambda pair: pair[0])
@@ -480,39 +402,35 @@ def plot_line_series(
             color=color,
             linestyle=linestyle,
             marker=marker,
-            linewidth=2.2,
-            markersize=6,
-            markerfacecolor="white",
+            linewidth=AI_PAPER_LINE_WIDTH,
+            markersize=AI_PAPER_MARKER_SIZE,
+            markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
             markeredgecolor=color,
-            markeredgewidth=1.4,
+            markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         )
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
 
-    if title:
-        ax.set_title(title, pad=8)
-
     style_axes_common(ax)
 
     ax.minorticks_on()
-    ax.margins(x=0.03, y=0.08)
+    ax.margins(x=AI_PAPER_DEFAULT_X_MARGIN, y=AI_PAPER_DEFAULT_Y_MARGIN)
 
     if num_series > 5:
         ax.legend(
             loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
+            bbox_to_anchor=AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
             borderaxespad=0.0,
-            handlelength=2.6,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
     else:
         ax.legend(
             loc="best",
-            handlelength=2.6,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    save_paper_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -549,15 +467,18 @@ def plot_grouped_bar(
     num_groups = len(group_names)
     num_categories = len(categories)
 
-    fig_width = max(6.4, min(14.0, 1.35 * num_groups + 0.65 * num_categories + 2.0))
-    fig_height = 4.8 if num_groups <= 6 else 5.4
+    width_scale = min(AI_PAPER_DENSE_WIDTH_SCALE_MAX, max(1.0, (1.35 * num_groups + 0.65 * num_categories + 2.0) / 7.16))
+    fig_size = scaled_double_column_figsize(
+        width_scale=width_scale,
+        height=4.80 if num_groups <= 6 else 5.40,
+    )
 
-    plt = _require_matplotlib_pyplot()
+    plt = require_matplotlib_pyplot()
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = plt.subplots(figsize=fig_size)
 
     x_positions = list(range(num_groups))
-    total_width = 0.82
+    total_width = AI_PAPER_GROUPED_BAR_TOTAL_WIDTH
     bar_width = total_width / max(1, num_categories)
 
     for cat_idx, category in enumerate(categories):
@@ -574,11 +495,11 @@ def plot_grouped_bar(
         ax.bar(
             xs,
             ys,
-            width=bar_width * 0.92,
+            width=bar_width * AI_PAPER_GROUPED_BAR_WIDTH_SCALE,
             label=category,
             color=color,
-            edgecolor="black",
-            linewidth=0.6,
+            edgecolor=AI_PAPER_REFERENCE_COLOR,
+            linewidth=AI_PAPER_REFERENCE_LINE_WIDTH * 0.6,
         )
 
     # 요청사항:
@@ -586,37 +507,34 @@ def plot_grouped_bar(
     # 즉, ax.set_xlabel("Markdown Section")을 호출하지 않습니다.
     ax.set_ylabel(y_label)
 
-    if title:
-        ax.set_title(title, pad=8)
-
     ax.set_xticks(x_positions)
     ax.set_xticklabels(
-        [wrap_tick_label(name, width=28) for name in group_names],
+        [wrap_tick_label(name, width=AI_PAPER_WRAP_TICK_WIDTH) for name in group_names],
         rotation=0,
         ha="center",
     )
 
     style_axes_common(ax)
+    style_algorithm_tick_labels(ax, axis="x")
 
-    ax.margins(x=0.04, y=0.10)
+    ax.margins(x=AI_PAPER_BAR_X_MARGIN, y=AI_PAPER_BAR_Y_MARGIN)
 
     if num_categories > 5 or num_groups > 5:
         ax.legend(
             title=category_label,
             loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
+            bbox_to_anchor=AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
             borderaxespad=0.0,
-            handlelength=1.8,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
     else:
         ax.legend(
             title=category_label,
             loc="best",
-            handlelength=1.8,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    save_paper_figure(fig, output_path)
     plt.close(fig)
 
 

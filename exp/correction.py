@@ -18,11 +18,24 @@ from core.channel_manager import ChannelManager
 from core.context import Context
 from core.model_manager import ModelManager
 from core.eval_util import *
-from exp.compare_tables import (
+from exp.exp_util import (
     AI_PAPER_PALETTE,
     AI_PAPER_MARKERS,
+    AI_PAPER_ANNOTATION_FONT_SIZE,
+    AI_PAPER_ANNOTATION_OFFSET,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_MARKER_FACE_COLOR,
+    AI_PAPER_NATIVE_LINESTYLE,
+    AI_PAPER_REFERENCE_COLOR,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_CONTROL_LINESTYLE,
+    AI_PAPER_SCATTER_SIZE,
+    double_column_figsize,
     apply_ai_paper_style,
-    style_axes_common,
+    require_matplotlib_pyplot,
+    save_paper_figure as _save_paper_figure,
+    style_paper_axes as _style_paper_axes,
 )
 import exp.layer_position as lp
 
@@ -64,11 +77,11 @@ class CorrectionSummaryRow:
     average_final_shrink_ratio: float
     median_final_shrink_ratio: float
     shrink_fraction: float
-    average_final_alpha: float
-    average_final_alpha_over_initial: float
-    average_final_correction_deficit_coefficient: float
-    average_final_beta: float
-    average_final_beta_over_initial: float
+    average_final_alpha_L_T: float
+    average_final_alpha_L_T_over_initial: float
+    average_final_d_L_T: float
+    average_final_beta_L_T: float
+    average_final_beta_L_T_over_initial: float
     average_final_correction_cosine: float
     average_final_attn_alpha_over_initial: float
     average_final_mlp_alpha_over_initial: float
@@ -328,23 +341,23 @@ class TrajectoryAccumulator:
     def __init__(self, num_points: int) -> None:
         self.num_points = num_points
         self.rho_values = [[] for _ in range(num_points)]
-        self.alpha_over_initial_values = [[] for _ in range(num_points)]
-        self.beta_over_initial_values = [[] for _ in range(num_points)]
+        self.alpha_L_T_over_initial_values = [[] for _ in range(num_points)]
+        self.beta_L_T_over_initial_values = [[] for _ in range(num_points)]
         self.correction_cosine_values = [[] for _ in range(num_points)]
 
-    def update(self, rho: List[float], alpha_over_initial: List[float], beta_over_initial: List[float], correction_cosine: List[float]) -> None:
+    def update(self, rho: List[float], alpha_L_T_over_initial: List[float], beta_L_T_over_initial: List[float], correction_cosine: List[float]) -> None:
         for idx in range(self.num_points):
             self.rho_values[idx].append(float(rho[idx]))
-            self.alpha_over_initial_values[idx].append(float(alpha_over_initial[idx]))
-            self.beta_over_initial_values[idx].append(float(beta_over_initial[idx]))
+            self.alpha_L_T_over_initial_values[idx].append(float(alpha_L_T_over_initial[idx]))
+            self.beta_L_T_over_initial_values[idx].append(float(beta_L_T_over_initial[idx]))
             self.correction_cosine_values[idx].append(float(correction_cosine[idx]))
 
     def summarize(self) -> Dict[str, List[float]]:
         return {
             "rho_median": [_nanmedian(values) for values in self.rho_values],
             "rho_mean": [_nanmean(values) for values in self.rho_values],
-            "alpha_over_initial_median": [_nanmedian(values) for values in self.alpha_over_initial_values],
-            "beta_over_initial_median": [_nanmedian(values) for values in self.beta_over_initial_values],
+            "alpha_L_T_over_initial_median": [_nanmedian(values) for values in self.alpha_L_T_over_initial_values],
+            "beta_L_T_over_initial_median": [_nanmedian(values) for values in self.beta_L_T_over_initial_values],
             "correction_cosine_median": [_nanmedian(values) for values in self.correction_cosine_values],
         }
 
@@ -355,26 +368,26 @@ class MetricCollector:
         self.window_input_norms: List[float] = []
         self.final_shift_norms: List[float] = []
         self.final_shrink_ratios: List[float] = []
-        self.final_alphas: List[float] = []
-        self.final_alpha_over_initial: List[float] = []
-        self.final_correction_deficit_coefficients: List[float] = []
-        self.final_betas: List[float] = []
-        self.final_beta_over_initial: List[float] = []
+        self.final_alpha_L_T_values: List[float] = []
+        self.final_alpha_L_T_over_initial: List[float] = []
+        self.final_d_L_T_values: List[float] = []
+        self.final_beta_L_T_values: List[float] = []
+        self.final_beta_L_T_over_initial: List[float] = []
         self.final_correction_cosines: List[float] = []
         self.final_attn_alpha_over_initial: List[float] = []
         self.final_mlp_alpha_over_initial: List[float] = []
         self.final_shrink_flags: List[bool] = []
 
-    def update(self, *, initial_shift_norm: float, window_input_norm: float, final_shift_norm: float, final_shrink_ratio: float, final_alpha: float, final_alpha_over_initial: float, final_correction_deficit_coefficient: float, final_beta: float, final_beta_over_initial: float, final_correction_cosine: float, final_attn_alpha_over_initial: float, final_mlp_alpha_over_initial: float) -> None:
+    def update(self, *, initial_shift_norm: float, window_input_norm: float, final_shift_norm: float, final_shrink_ratio: float, final_alpha_L_T: float, final_alpha_L_T_over_initial: float, final_d_L_T: float, final_beta_L_T: float, final_beta_L_T_over_initial: float, final_correction_cosine: float, final_attn_alpha_over_initial: float, final_mlp_alpha_over_initial: float) -> None:
         self.initial_shift_norms.append(float(initial_shift_norm))
         self.window_input_norms.append(float(window_input_norm))
         self.final_shift_norms.append(float(final_shift_norm))
         self.final_shrink_ratios.append(float(final_shrink_ratio))
-        self.final_alphas.append(float(final_alpha))
-        self.final_alpha_over_initial.append(float(final_alpha_over_initial))
-        self.final_correction_deficit_coefficients.append(float(final_correction_deficit_coefficient))
-        self.final_betas.append(float(final_beta))
-        self.final_beta_over_initial.append(float(final_beta_over_initial))
+        self.final_alpha_L_T_values.append(float(final_alpha_L_T))
+        self.final_alpha_L_T_over_initial.append(float(final_alpha_L_T_over_initial))
+        self.final_d_L_T_values.append(float(final_d_L_T))
+        self.final_beta_L_T_values.append(float(final_beta_L_T))
+        self.final_beta_L_T_over_initial.append(float(final_beta_L_T_over_initial))
         self.final_correction_cosines.append(float(final_correction_cosine))
         self.final_attn_alpha_over_initial.append(float(final_attn_alpha_over_initial))
         self.final_mlp_alpha_over_initial.append(float(final_mlp_alpha_over_initial))
@@ -389,11 +402,11 @@ class MetricCollector:
             "average_final_shrink_ratio": _nanmean(self.final_shrink_ratios),
             "median_final_shrink_ratio": _nanmedian(self.final_shrink_ratios),
             "shrink_fraction": _fraction(self.final_shrink_flags),
-            "average_final_alpha": _nanmean(self.final_alphas),
-            "average_final_alpha_over_initial": _nanmean(self.final_alpha_over_initial),
-            "average_final_correction_deficit_coefficient": _nanmean(self.final_correction_deficit_coefficients),
-            "average_final_beta": _nanmean(self.final_betas),
-            "average_final_beta_over_initial": _nanmean(self.final_beta_over_initial),
+            "average_final_alpha_L_T": _nanmean(self.final_alpha_L_T_values),
+            "average_final_alpha_L_T_over_initial": _nanmean(self.final_alpha_L_T_over_initial),
+            "average_final_d_L_T": _nanmean(self.final_d_L_T_values),
+            "average_final_beta_L_T": _nanmean(self.final_beta_L_T_values),
+            "average_final_beta_L_T_over_initial": _nanmean(self.final_beta_L_T_over_initial),
             "average_final_correction_cosine": _nanmean(self.final_correction_cosines),
             "average_final_attn_alpha_over_initial": _nanmean(self.final_attn_alpha_over_initial),
             "average_final_mlp_alpha_over_initial": _nanmean(self.final_mlp_alpha_over_initial),
@@ -425,26 +438,26 @@ def compute_correction_metrics_from_traces(
     u = initial_shift / initial_shift_norm
 
     rho_values: List[float] = []
-    alpha_values: List[float] = []
-    alpha_over_initial_values: List[float] = []
-    beta_values: List[float] = []
-    beta_over_initial_values: List[float] = []
+    alpha_L_T_values: List[float] = []
+    alpha_L_T_over_initial_values: List[float] = []
+    beta_L_T_values: List[float] = []
+    beta_L_T_over_initial_values: List[float] = []
     correction_cosine_values: List[float] = []
 
     for hidden_idx in range(source_idx, hidden_delta.shape[0]):
         delta_h = hidden_delta[hidden_idx]
         delta_h_norm = float(delta_h.norm().item())
         rho_values.append(delta_h_norm / initial_shift_norm)
-        correction = delta_h - initial_shift
-        alpha = float((-torch.dot(correction, u)).item())
-        orth = correction + alpha * u
-        beta = float(orth.norm().item())
-        correction_norm = float(correction.norm().item())
-        correction_cosine = float(alpha / correction_norm) if correction_norm > 1e-12 else 0.0
-        alpha_values.append(alpha)
-        alpha_over_initial_values.append(alpha / initial_shift_norm)
-        beta_values.append(beta)
-        beta_over_initial_values.append(beta / initial_shift_norm)
+        delta_s_L_T = delta_h - initial_shift
+        alpha_L_T = float((-torch.dot(delta_s_L_T, u)).item())
+        orth = delta_s_L_T + alpha_L_T * u
+        beta_L_T = float(orth.norm().item())
+        delta_s_L_T_norm = float(delta_s_L_T.norm().item())
+        correction_cosine = float(alpha_L_T / delta_s_L_T_norm) if delta_s_L_T_norm > 1e-12 else 0.0
+        alpha_L_T_values.append(alpha_L_T)
+        alpha_L_T_over_initial_values.append(alpha_L_T / initial_shift_norm)
+        beta_L_T_values.append(beta_L_T)
+        beta_L_T_over_initial_values.append(beta_L_T / initial_shift_norm)
         correction_cosine_values.append(correction_cosine)
 
     cumulative_upper_attn = attn_delta[source_idx:, :].sum(dim=0) if source_idx < attn_delta.shape[0] else torch.zeros_like(initial_shift)
@@ -460,18 +473,18 @@ def compute_correction_metrics_from_traces(
         "window_input_norm": window_input_norm,
         "final_shift_norm": float(hidden_delta[-1].norm().item()),
         "final_shrink_ratio": rho_values[-1],
-        "final_alpha": alpha_values[-1],
-        "final_alpha_over_initial": alpha_over_initial_values[-1],
-        "final_correction_deficit_coefficient": float(torch.dot(hidden_delta[-1], u).item() / initial_shift_norm),
-        "final_beta": beta_values[-1],
-        "final_beta_over_initial": beta_over_initial_values[-1],
+        "final_alpha_L_T": alpha_L_T_values[-1],
+        "final_alpha_L_T_over_initial": alpha_L_T_over_initial_values[-1],
+        "final_d_L_T": float(torch.dot(hidden_delta[-1], u).item() / initial_shift_norm),
+        "final_beta_L_T": beta_L_T_values[-1],
+        "final_beta_L_T_over_initial": beta_L_T_over_initial_values[-1],
         "final_correction_cosine": correction_cosine_values[-1],
         "final_attn_alpha_over_initial": final_attn_alpha_over_initial,
         "final_mlp_alpha_over_initial": final_mlp_alpha_over_initial,
         "trajectory": {
             "rho": rho_values,
-            "alpha_over_initial": alpha_over_initial_values,
-            "beta_over_initial": beta_over_initial_values,
+            "alpha_L_T_over_initial": alpha_L_T_over_initial_values,
+            "beta_L_T_over_initial": beta_L_T_over_initial_values,
             "correction_cosine": correction_cosine_values,
         },
     }
@@ -611,19 +624,19 @@ def evaluate_correction(
                                 window_input_norm=correction_metrics["window_input_norm"],
                                 final_shift_norm=correction_metrics["final_shift_norm"],
                                 final_shrink_ratio=correction_metrics["final_shrink_ratio"],
-                                final_alpha=correction_metrics["final_alpha"],
-                                final_alpha_over_initial=correction_metrics["final_alpha_over_initial"],
-                                final_correction_deficit_coefficient=correction_metrics["final_correction_deficit_coefficient"],
-                                final_beta=correction_metrics["final_beta"],
-                                final_beta_over_initial=correction_metrics["final_beta_over_initial"],
+                                final_alpha_L_T=correction_metrics["final_alpha_L_T"],
+                                final_alpha_L_T_over_initial=correction_metrics["final_alpha_L_T_over_initial"],
+                                final_d_L_T=correction_metrics["final_d_L_T"],
+                                final_beta_L_T=correction_metrics["final_beta_L_T"],
+                                final_beta_L_T_over_initial=correction_metrics["final_beta_L_T_over_initial"],
                                 final_correction_cosine=correction_metrics["final_correction_cosine"],
                                 final_attn_alpha_over_initial=correction_metrics["final_attn_alpha_over_initial"],
                                 final_mlp_alpha_over_initial=correction_metrics["final_mlp_alpha_over_initial"],
                             )
                             fullmix_trajectory_by_token[token_idx].update(
                                 rho=correction_metrics["trajectory"]["rho"],
-                                alpha_over_initial=correction_metrics["trajectory"]["alpha_over_initial"],
-                                beta_over_initial=correction_metrics["trajectory"]["beta_over_initial"],
+                                alpha_L_T_over_initial=correction_metrics["trajectory"]["alpha_L_T_over_initial"],
+                                beta_L_T_over_initial=correction_metrics["trajectory"]["beta_L_T_over_initial"],
                                 correction_cosine=correction_metrics["trajectory"]["correction_cosine"],
                             )
                         random_trace = trace_single_token_with_past(target_model, random_past, current_input_ids)
@@ -639,19 +652,19 @@ def evaluate_correction(
                                 window_input_norm=random_metrics["window_input_norm"],
                                 final_shift_norm=random_metrics["final_shift_norm"],
                                 final_shrink_ratio=random_metrics["final_shrink_ratio"],
-                                final_alpha=random_metrics["final_alpha"],
-                                final_alpha_over_initial=random_metrics["final_alpha_over_initial"],
-                                final_correction_deficit_coefficient=random_metrics["final_correction_deficit_coefficient"],
-                                final_beta=random_metrics["final_beta"],
-                                final_beta_over_initial=random_metrics["final_beta_over_initial"],
+                                final_alpha_L_T=random_metrics["final_alpha_L_T"],
+                                final_alpha_L_T_over_initial=random_metrics["final_alpha_L_T_over_initial"],
+                                final_d_L_T=random_metrics["final_d_L_T"],
+                                final_beta_L_T=random_metrics["final_beta_L_T"],
+                                final_beta_L_T_over_initial=random_metrics["final_beta_L_T_over_initial"],
                                 final_correction_cosine=random_metrics["final_correction_cosine"],
                                 final_attn_alpha_over_initial=random_metrics["final_attn_alpha_over_initial"],
                                 final_mlp_alpha_over_initial=random_metrics["final_mlp_alpha_over_initial"],
                             )
                             random_trajectory_by_token[token_idx].update(
                                 rho=random_metrics["trajectory"]["rho"],
-                                alpha_over_initial=random_metrics["trajectory"]["alpha_over_initial"],
-                                beta_over_initial=random_metrics["trajectory"]["beta_over_initial"],
+                                alpha_L_T_over_initial=random_metrics["trajectory"]["alpha_L_T_over_initial"],
+                                beta_L_T_over_initial=random_metrics["trajectory"]["beta_L_T_over_initial"],
                                 correction_cosine=random_metrics["trajectory"]["correction_cosine"],
                             )
                         native_past = native_trace["past_key_values"]
@@ -683,12 +696,12 @@ def evaluate_correction(
     }
 
     logging.info(
-        "[CorrectionSummary] final_shrink_ratio=%.6f | shrink_fraction=%.6f | d_T=%.6f | alpha_over_initial=%.6f | beta_over_initial=%.6f | random_final_shrink_ratio=%.6f",
+        "[CorrectionSummary] final_shrink_ratio=%.6f | shrink_fraction=%.6f | d_T:L=%.6f | alpha_L_T_over_initial=%.6f | beta_L_T_over_initial=%.6f | random_final_shrink_ratio=%.6f",
         fullmix_summary["average_final_shrink_ratio"],
         fullmix_summary["shrink_fraction"],
-        fullmix_summary["average_final_correction_deficit_coefficient"],
-        fullmix_summary["average_final_alpha_over_initial"],
-        fullmix_summary["average_final_beta_over_initial"],
+        fullmix_summary["average_final_d_L_T"],
+        fullmix_summary["average_final_alpha_L_T_over_initial"],
+        fullmix_summary["average_final_beta_L_T_over_initial"],
         random_summary["average_final_shrink_ratio"],
     )
 
@@ -697,7 +710,7 @@ def evaluate_correction(
         "metric_semantics": {
             "initial_shift": "first hidden-state difference immediately after the entire injected window",
             "final_shrink_ratio": "||final hidden-state difference|| divided by ||initial post-window hidden-state difference||",
-            "final_correction_deficit_coefficient": "<final hidden-state difference, normalized initial post-window shift> divided by ||initial post-window shift||",
+            "final_d_L_T": "d_{T:L}: <s_L, normalized s_T> divided by ||s_T||",
             "source_idx": "post-window boundary index used as the first correction analysis point",
         },
         "full_mix": fullmix_summary,
@@ -731,11 +744,11 @@ def read_summary_rows(summary_path: Path) -> List[CorrectionSummaryRow]:
                 average_final_shrink_ratio=float(raw_row["average_final_shrink_ratio"]),
                 median_final_shrink_ratio=float(raw_row["median_final_shrink_ratio"]),
                 shrink_fraction=float(raw_row["shrink_fraction"]),
-                average_final_alpha=float(raw_row["average_final_alpha"]),
-                average_final_alpha_over_initial=float(raw_row["average_final_alpha_over_initial"]),
-                average_final_correction_deficit_coefficient=float(raw_row["average_final_correction_deficit_coefficient"]),
-                average_final_beta=float(raw_row["average_final_beta"]),
-                average_final_beta_over_initial=float(raw_row["average_final_beta_over_initial"]),
+                average_final_alpha_L_T=float(raw_row["average_final_alpha_L_T"]),
+                average_final_alpha_L_T_over_initial=float(raw_row["average_final_alpha_L_T_over_initial"]),
+                average_final_d_L_T=float(raw_row["average_final_d_L_T"]),
+                average_final_beta_L_T=float(raw_row["average_final_beta_L_T"]),
+                average_final_beta_L_T_over_initial=float(raw_row["average_final_beta_L_T_over_initial"]),
                 average_final_correction_cosine=float(raw_row["average_final_correction_cosine"]),
                 average_final_attn_alpha_over_initial=float(raw_row["average_final_attn_alpha_over_initial"]),
                 average_final_mlp_alpha_over_initial=float(raw_row["average_final_mlp_alpha_over_initial"]),
@@ -779,11 +792,11 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path
         average_final_shrink_ratio=float(full_mix["average_final_shrink_ratio"]),
         median_final_shrink_ratio=float(full_mix["median_final_shrink_ratio"]),
         shrink_fraction=float(full_mix["shrink_fraction"]),
-        average_final_alpha=float(full_mix["average_final_alpha"]),
-        average_final_alpha_over_initial=float(full_mix["average_final_alpha_over_initial"]),
-        average_final_correction_deficit_coefficient=float(full_mix["average_final_correction_deficit_coefficient"]),
-        average_final_beta=float(full_mix["average_final_beta"]),
-        average_final_beta_over_initial=float(full_mix["average_final_beta_over_initial"]),
+        average_final_alpha_L_T=float(full_mix["average_final_alpha_L_T"]),
+        average_final_alpha_L_T_over_initial=float(full_mix["average_final_alpha_L_T_over_initial"]),
+        average_final_d_L_T=float(full_mix["average_final_d_L_T"]),
+        average_final_beta_L_T=float(full_mix["average_final_beta_L_T"]),
+        average_final_beta_L_T_over_initial=float(full_mix["average_final_beta_L_T_over_initial"]),
         average_final_correction_cosine=float(full_mix["average_final_correction_cosine"]),
         average_final_attn_alpha_over_initial=float(full_mix["average_final_attn_alpha_over_initial"]),
         average_final_mlp_alpha_over_initial=float(full_mix["average_final_mlp_alpha_over_initial"]),
@@ -808,23 +821,10 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path
 
 
 
-def _style_paper_axes(ax, *, x_values: Optional[List[int]] = None) -> None:
-    style_axes_common(ax)
-    ax.minorticks_on()
-    ax.margins(x=0.03, y=0.08)
-    if x_values is not None:
-        ax.set_xticks(x_values)
-
-
-def _save_paper_figure(fig, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
-
 
 def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Tuple[Path, Path]:
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     source_idx = metrics["trajectory"]["source_idx"]
     reference_edge = ctx.edges[0]
@@ -840,15 +840,15 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
         raise ValueError("No token_00 trajectory found for plotting")
     x_values = list(range(source_idx, source_idx + len(full["rho_median"])))
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
         full["rho_median"],
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median ||s_L|| / ||s_T||",
     )
     if rand and rand.get("rho_median"):
@@ -858,40 +858,39 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
             color=ACCENT_BLACK,
             linestyle="--",
             marker=AI_PAPER_MARKERS[1],
-            markerfacecolor="white",
+            markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
             markeredgecolor=ACCENT_BLACK,
-            markeredgewidth=1.4,
+            markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
             label="Random control median ||s_L|| / ||s_T||",
         )
-    ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(1.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax.set_xlabel("Post-window layer boundary index k")
     ax.set_ylabel("Norm ratio relative to Translation Shift ||s_T||")
-    ax.set_title(f"Correction trajectory after injected window {injected_window_label} (token 0)", pad=8)
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     norm_ratio_path = build_norm_ratio_chart_path(run_dir)
     _save_paper_figure(fig, norm_ratio_path)
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
-        full["alpha_over_initial_median"],
+        full["alpha_L_T_over_initial_median"],
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median α_k / ||s_T||",
     )
     ax.plot(
         x_values,
-        full["beta_over_initial_median"],
+        full["beta_L_T_over_initial_median"],
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[2],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median β_k / ||s_T||",
     )
     ax.plot(
@@ -899,17 +898,16 @@ def plot_run_trajectories(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) 
         full["correction_cosine_median"],
         color=ACCENT_PURPLE,
         marker=AI_PAPER_MARKERS[3],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median correction cosine",
     )
-    ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax.set_xlabel("Post-window layer boundary index k")
     ax.set_ylabel("Projected correction relative to Translation Shift ||s_T||")
-    ax.set_title(f"Correction projection trajectory after injected window {injected_window_label} (token 0)", pad=8)
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     projection_path = build_projection_chart_path(run_dir)
     _save_paper_figure(fig, projection_path)
     plt.close(fig)
@@ -923,14 +921,14 @@ def _annotate_ranges(ax, rows: List[CorrectionSummaryRow], y_values: List[float]
             textcoords="offset points",
             xytext=(0, 7),
             ha="center",
-            fontsize=8,
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
         )
 
 
 def plot_summary(summary_path: Path) -> Dict[str, Path]:
-    import matplotlib.pyplot as plt
-
     apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
     rows = read_summary_rows(summary_path)
     if not rows:
@@ -944,8 +942,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     avg_shrink = [row.average_final_shrink_ratio for row in rows]
     median_shrink = [row.median_final_shrink_ratio for row in rows]
     random_shrink = [row.average_random_final_shrink_ratio for row in rows]
-    alpha = [row.average_final_alpha_over_initial for row in rows]
-    beta = [row.average_final_beta_over_initial for row in rows]
+    alpha_L_T_over_initial = [row.average_final_alpha_L_T_over_initial for row in rows]
+    beta_L_T_over_initial = [row.average_final_beta_L_T_over_initial for row in rows]
     attn_alpha = [row.average_final_attn_alpha_over_initial for row in rows]
     mlp_alpha = [row.average_final_mlp_alpha_over_initial for row in rows]
     cosine = [row.average_final_correction_cosine for row in rows]
@@ -954,17 +952,17 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     final_shift = [row.average_final_shift_norm for row in rows]
     structural_shrink_advantage = [rand - full for rand, full in zip(random_shrink, avg_shrink)]
     structural_cosine_advantage = [full - rand for full, rand in zip(cosine, random_cosine)]
-    beta_minus_alpha = [b - a for a, b in zip(alpha, beta)]
+    beta_L_T_minus_alpha_L_T = [b - a for a, b in zip(alpha_L_T_over_initial, beta_L_T_over_initial)]
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
         avg_shrink,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix avg final shrink ratio",
     )
     ax.plot(
@@ -972,9 +970,9 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         median_shrink,
         color=ACCENT_PURPLE,
         marker=AI_PAPER_MARKERS[2],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix median final shrink ratio",
     )
     ax.plot(
@@ -983,161 +981,158 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         color=ACCENT_BLACK,
         linestyle="--",
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_BLACK,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Random control avg final shrink ratio",
     )
-    ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax.axhline(1.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     _annotate_ranges(ax, rows, avg_shrink)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Final ||s_L|| / ||s_T||")
-    ax.set_title("Final post-window shrink ratio vs injected-window start index", pad=8)
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["shrink"] = build_summary_shrink_chart_path(study_dir)
     _save_paper_figure(fig, outputs["shrink"])
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
     ax.plot(
         x_values,
-        alpha,
+        alpha_L_T_over_initial,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
-        label="Total α_L / ||s_T||",
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label=r"Total $\alpha_{T:L}$ / ||s_T||",
     )
     ax.plot(
         x_values,
-        beta,
+        beta_L_T_over_initial,
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[2],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
-        label="Total β_L / ||s_T||",
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label=r"Total $\beta_{T:L}$ / ||s_T||",
     )
     ax.plot(
         x_values,
         attn_alpha,
         color=ACCENT_PURPLE,
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
-        markeredgewidth=1.4,
-        label="Attention α contribution",
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label=r"Attention $\alpha_{T:L}$ contribution",
     )
     ax.plot(
         x_values,
         mlp_alpha,
         color=ACCENT_GREEN,
         marker=AI_PAPER_MARKERS[3],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_GREEN,
-        markeredgewidth=1.4,
-        label="MLP α contribution",
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label=r"MLP $\alpha_{T:L}$ contribution",
     )
     ax.plot(
         x_values,
-        beta_minus_alpha,
+        beta_L_T_minus_alpha_L_T,
         color=ACCENT_ORANGE,
         marker=AI_PAPER_MARKERS[6],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_ORANGE,
-        markeredgewidth=1.4,
-        label="β - α",
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label=r"$\beta_{T:L} - \alpha_{T:L}$",
     )
-    _annotate_ranges(ax, rows, beta)
-    ax.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    _annotate_ranges(ax, rows, beta_L_T_over_initial)
+    ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Translation-shift-normalized magnitude")
-    ax.set_title("Correction decomposition vs injection target layer start index", pad=8)
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["decomposition"] = build_summary_decomposition_chart_path(study_dir)
     _save_paper_figure(fig, outputs["decomposition"])
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.8))
-    raw_alpha = [row.average_final_alpha for row in rows]
-    raw_beta = [row.average_final_beta for row in rows]
-    phase_sizes = [max(40.0, 8.0 * max(v, 1.0)) for v in initial_shift]
-    correction_deficit_coefficients = [row.average_final_correction_deficit_coefficient for row in rows]
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
+    raw_alpha_L_T = [row.average_final_alpha_L_T for row in rows]
+    raw_beta_L_T = [row.average_final_beta_L_T for row in rows]
+    phase_sizes = [max(AI_PAPER_SCATTER_SIZE, 10.0 * max(v, 1.0)) for v in initial_shift]
+    d_L_T_values = [row.average_final_d_L_T for row in rows]
     ax.scatter(
-        raw_beta,
-        raw_alpha,
+        raw_beta_L_T,
+        raw_alpha_L_T,
         s=phase_sizes,
         marker=AI_PAPER_MARKERS[0],
         color=ACCENT_RED,
-        edgecolor="black",
-        linewidth=0.6,
+        edgecolor=AI_PAPER_REFERENCE_COLOR,
+        linewidth=AI_PAPER_MARKER_EDGE_WIDTH * 0.4,
         alpha=0.88,
     )
-    for row, x, y, d_t in zip(rows, raw_beta, raw_alpha, correction_deficit_coefficients):
+    for row, x, y, d_L_T in zip(rows, raw_beta_L_T, raw_alpha_L_T, d_L_T_values):
         ax.annotate(
-            f"L{row.injection_layer_start_idx}\nd_T={d_t:.3f}",
+            f"L{row.injection_layer_start_idx}\n" + r"$\mathbf{d}_{T:L}$" + f"={d_L_T:.3f}",
             (x, y),
             textcoords="offset points",
-            xytext=(5, 4),
-            fontsize=8,
+            xytext=AI_PAPER_ANNOTATION_OFFSET,
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
         )
-    ax.set_xlabel("Total β_L")
-    ax.set_ylabel("Total α_L")
-    ax.set_title("Correction phase scatter: error correction", pad=8)
+    ax.set_xlabel(r"Total $\beta_{T:L}$")
+    ax.set_ylabel(r"Total $\alpha_{T:L}$")
     _style_paper_axes(ax)
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
     _save_paper_figure(fig, outputs["phase"])
     plt.close(fig)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.4, 6.0), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=double_column_figsize(height=5.80), sharex=True)
     ax1.plot(
         x_values,
         structural_shrink_advantage,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Random - Full-Mix shrink ratio",
     )
-    ax1.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax1.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     _annotate_ranges(ax1, rows, structural_shrink_advantage)
     ax1.set_ylabel("Positive is better")
-    ax1.set_title("Structural advantage over random control (post-window correction)", pad=8)
     _style_paper_axes(ax1)
-    ax1.legend(handlelength=2.6)
+    ax1.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     ax2.plot(
         x_values,
         structural_cosine_advantage,
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Full-Mix - Random correction cosine",
     )
-    ax2.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0)
+    ax2.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     ax2.set_xlabel("Injection target layer start index")
     ax2.set_ylabel("Positive is better")
     _style_paper_axes(ax2, x_values=x_values)
-    ax2.legend(handlelength=2.6)
+    ax2.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["random"] = build_summary_random_chart_path(study_dir)
     _save_paper_figure(fig, outputs["random"])
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7.4, 4.2))
+    fig, ax = plt.subplots(figsize=double_column_figsize())
     ax.plot(
         x_values,
         initial_shift,
         color=ACCENT_AQUA,
         marker=AI_PAPER_MARKERS[0],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Translation Shift ||s_T||",
     )
     ax.plot(
@@ -1145,17 +1140,16 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         final_shift,
         color=ACCENT_RED,
         marker=AI_PAPER_MARKERS[1],
-        markerfacecolor="white",
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
-        markeredgewidth=1.4,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Last-State Shift ||s_L||",
     )
     _annotate_ranges(ax, rows, final_shift)
     ax.set_xlabel("Injection target layer start index")
     ax.set_ylabel("Average norm")
-    ax.set_title("Translation Shift ||s_T|| and Last-State Shift ||s_L||", pad=8)
     _style_paper_axes(ax, x_values=x_values)
-    ax.legend(handlelength=2.6)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["shift_norms"] = build_summary_shift_norm_chart_path(study_dir)
     _save_paper_figure(fig, outputs["shift_norms"])
     plt.close(fig)
