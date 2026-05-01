@@ -19,9 +19,30 @@ from exp.exp_util import (
     AI_PAPER_PALETTE,
     AI_PAPER_MARKERS,
     AI_PAPER_LINESTYLES,
+    AI_PAPER_ALGORITHM_LABEL_ROTATION,
+    AI_PAPER_BAR_X_MARGIN,
+    AI_PAPER_BAR_Y_MARGIN,
+    AI_PAPER_BAR_VALUE_FONT_SIZE,
+    AI_PAPER_DEFAULT_X_MARGIN,
+    AI_PAPER_DEFAULT_Y_MARGIN,
+    AI_PAPER_DENSE_WIDTH_SCALE_MAX,
+    AI_PAPER_GROUPED_BAR_TOTAL_WIDTH,
+    AI_PAPER_GROUPED_BAR_WIDTH_SCALE,
+    AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_LINE_WIDTH,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_MARKER_FACE_COLOR,
+    AI_PAPER_MARKER_SIZE,
+    AI_PAPER_REFERENCE_COLOR,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_WRAP_TICK_WIDTH,
+    double_column_figsize,
+    scaled_double_column_figsize,
     apply_ai_paper_style,
     require_matplotlib_pyplot,
     save_paper_figure,
+    style_algorithm_tick_labels,
     style_axes_common,
 )
 
@@ -355,15 +376,13 @@ def plot_line_series(
     num_series = len(series_data)
 
     if num_series <= 5:
-        fig_width = 6.4
-        fig_height = 4.2
+        fig_size = double_column_figsize()
     else:
-        fig_width = 7.4
-        fig_height = 4.8
+        fig_size = double_column_figsize(height=4.80)
 
     plt = require_matplotlib_pyplot()
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = plt.subplots(figsize=fig_size)
 
     for idx, (series_name, points) in enumerate(series_data.items()):
         points = sorted(points, key=lambda pair: pair[0])
@@ -383,11 +402,11 @@ def plot_line_series(
             color=color,
             linestyle=linestyle,
             marker=marker,
-            linewidth=2.2,
-            markersize=6,
-            markerfacecolor="white",
+            linewidth=AI_PAPER_LINE_WIDTH,
+            markersize=AI_PAPER_MARKER_SIZE,
+            markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
             markeredgecolor=color,
-            markeredgewidth=1.4,
+            markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         )
 
     ax.set_xlabel(x_label)
@@ -396,19 +415,19 @@ def plot_line_series(
     style_axes_common(ax)
 
     ax.minorticks_on()
-    ax.margins(x=0.03, y=0.08)
+    ax.margins(x=AI_PAPER_DEFAULT_X_MARGIN, y=AI_PAPER_DEFAULT_Y_MARGIN)
 
     if num_series > 5:
         ax.legend(
             loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
+            bbox_to_anchor=AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
             borderaxespad=0.0,
-            handlelength=2.6,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
     else:
         ax.legend(
             loc="best",
-            handlelength=2.6,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
 
     save_paper_figure(fig, output_path)
@@ -448,15 +467,18 @@ def plot_grouped_bar(
     num_groups = len(group_names)
     num_categories = len(categories)
 
-    fig_width = max(6.4, min(14.0, 1.35 * num_groups + 0.65 * num_categories + 2.0))
-    fig_height = 4.8 if num_groups <= 6 else 5.4
+    width_scale = min(AI_PAPER_DENSE_WIDTH_SCALE_MAX, max(1.0, (1.35 * num_groups + 0.65 * num_categories + 2.0) / 7.16))
+    fig_size = scaled_double_column_figsize(
+        width_scale=width_scale,
+        height=4.80 if num_groups <= 6 else 5.40,
+    )
 
     plt = require_matplotlib_pyplot()
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    fig, ax = plt.subplots(figsize=fig_size)
 
     x_positions = list(range(num_groups))
-    total_width = 0.82
+    total_width = AI_PAPER_GROUPED_BAR_TOTAL_WIDTH
     bar_width = total_width / max(1, num_categories)
 
     for cat_idx, category in enumerate(categories):
@@ -473,11 +495,11 @@ def plot_grouped_bar(
         ax.bar(
             xs,
             ys,
-            width=bar_width * 0.92,
+            width=bar_width * AI_PAPER_GROUPED_BAR_WIDTH_SCALE,
             label=category,
             color=color,
-            edgecolor="black",
-            linewidth=0.6,
+            edgecolor=AI_PAPER_REFERENCE_COLOR,
+            linewidth=AI_PAPER_REFERENCE_LINE_WIDTH * 0.6,
         )
 
     # 요청사항:
@@ -487,28 +509,29 @@ def plot_grouped_bar(
 
     ax.set_xticks(x_positions)
     ax.set_xticklabels(
-        [wrap_tick_label(name, width=28) for name in group_names],
+        [wrap_tick_label(name, width=AI_PAPER_WRAP_TICK_WIDTH) for name in group_names],
         rotation=0,
         ha="center",
     )
 
     style_axes_common(ax)
+    style_algorithm_tick_labels(ax, axis="x")
 
-    ax.margins(x=0.04, y=0.10)
+    ax.margins(x=AI_PAPER_BAR_X_MARGIN, y=AI_PAPER_BAR_Y_MARGIN)
 
     if num_categories > 5 or num_groups > 5:
         ax.legend(
             title=category_label,
             loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
+            bbox_to_anchor=AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
             borderaxespad=0.0,
-            handlelength=1.8,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
     else:
         ax.legend(
             title=category_label,
             loc="best",
-            handlelength=1.8,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
 
     save_paper_figure(fig, output_path)
