@@ -1169,6 +1169,7 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel(metric_label)
     _style_paper_axes(ax, x_values=x_values)
+    ax.set_ylim(bottom=0)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     chart_path = build_metric_controls_chart_path(study_dir, metric_name)

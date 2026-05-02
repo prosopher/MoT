@@ -1005,7 +1005,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"$\alpha_{T:L}$ / ||s_T||",
+        label=r"$\mathbf{\alpha}$ / ||s_T||",
     )
     ax.plot(
         x_values,
@@ -1015,7 +1015,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"$\beta_{T:L}$ / ||s_T||",
+        label=r"$\mathbf{\beta}$ / ||s_T||",
     )
     ax.plot(
         x_values,
@@ -1025,7 +1025,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"Attention $\alpha_{T:L}$ contribution",
+        label=r"Attention $\mathbf{\alpha}$ contribution",
     )
     ax.plot(
         x_values,
@@ -1035,7 +1035,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_GREEN,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"MLP $\alpha_{T:L}$ contribution",
+        label=r"MLP $\mathbf{\alpha}$ contribution",
     )
     ax.plot(
         x_values,
@@ -1045,7 +1045,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_ORANGE,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"$\beta_{T:L} - \alpha_{T:L}$",
+        label=r"$\mathbf{\beta}_{T:L} - \mathbf{\alpha}$",
     )
     _annotate_ranges(ax, rows, beta_L_T_over_initial)
     ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
@@ -1074,15 +1074,15 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     )
     for row, x, y, d_L_T in zip(rows, raw_beta_L_T, raw_alpha_L_T, d_L_T_values):
         ax.annotate(
-            f"L{row.injection_layer_start_idx}\n" + r"$\mathbf{d}_{T:L}$" + f"={d_L_T:.3f}",
+            f"L{row.injection_layer_start_idx}\n" + r"$\mathbf{d}$" + f"={d_L_T:.3f}",
             (x, y),
             textcoords="offset points",
             xytext=AI_PAPER_ANNOTATION_OFFSET,
             fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
             fontweight="bold",
         )
-    ax.set_xlabel(r"$\beta_{T:L}$")
-    ax.set_ylabel(r"$\alpha_{T:L}$")
+    ax.set_xlabel(r"Orthogonal Shift $\mathbf{\beta}$")
+    ax.set_ylabel(r"Anti-Shift Correction $\mathbf{\alpha}$")
     _style_paper_axes(ax)
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
     _save_paper_figure(fig, outputs["phase"])
