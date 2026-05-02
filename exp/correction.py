@@ -1128,7 +1128,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax.plot(
         x_values,
         initial_shift,
-        color=ACCENT_AQUA,
+        color=ACCENT_BLACK,
         marker=AI_PAPER_MARKERS[0],
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
