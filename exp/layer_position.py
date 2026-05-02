@@ -31,11 +31,13 @@ from exp.exp_util import (
     AI_PAPER_REFERENCE_COLOR,
     AI_PAPER_REFERENCE_LINE_WIDTH,
     AI_PAPER_CONTROL_LINESTYLE,
+    AI_PAPER_DOUBLE_COLUMN_TALL_FIGSIZE,
     double_column_figsize,
     apply_ai_paper_style,
     require_matplotlib_pyplot,
     save_paper_figure as _save_paper_figure,
     style_paper_axes as _style_paper_axes,
+    style_axes_common,
 )
 
 
@@ -1421,7 +1423,7 @@ def plot_full_mix_vs_native_kv_similarity_heatmap(
     cbar = fig.colorbar(image, ax=ax)
     cbar.set_label("Cosine Similarity(Native vs Translation)")
 
-    save_paper_figure(fig, output_path, close=True)
+    _save_paper_figure(fig, output_path, close=True)
     return output_path
 
 
