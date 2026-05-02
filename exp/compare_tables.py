@@ -47,7 +47,7 @@ from exp.exp_util import (
 )
 
 
-DEFAULT_Y_COL = "Gen F1 Avg"
+DEFAULT_Y_COL = "F1"
 
 
 ChartMode = Literal["line", "bar"]

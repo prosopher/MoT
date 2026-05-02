@@ -65,9 +65,9 @@ DEFAULT_CATEGORY_ORDER = [
 ]
 
 EVAL_BAR_METRICS = [
-    ("Acc Avg", "acc_avg", "Accuracy (%)"),
-    ("Gen F1 Avg", "gen_f1_avg", "F1"),
-    ("OWT Val GPU Peak Memory", "gpu_peak_memory", "GPU Peak Memory (GiB)"),
+    ("Acc", "acc_avg", "Accuracy (%)"),
+    ("F1", "gen_f1_avg", "F1"),
+    ("GPU Peak Memory", "gpu_peak_memory", "GPU Peak Memory (GiB)"),
 ]
 
 MOT_COLOR = ACCENT_RED
@@ -824,7 +824,7 @@ def plot_eval_metric_bars(
     style_axes_common(ax, grid=True, grid_axis="y")
     style_algorithm_tick_labels(ax, axis="x")
 
-    value_format = "{:.1f}" if metric_name == "Acc Avg" else "{:.3f}"
+    value_format = "{:.1f}" if metric_name == "Acc" else "{:.3f}"
     plotted_values = values + ([native_value] if native_value is not None else [])
     offset = max(plotted_values) * AI_PAPER_VALUE_OFFSET_FRACTION if plotted_values and max(plotted_values) > 0 else AI_PAPER_VALUE_OFFSET_FRACTION
     for bar, value in zip(bars, values):

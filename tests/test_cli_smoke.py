@@ -101,4 +101,4 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
     assert "Preparing validation dataloader for OpenWebText/validation" in eval_log
     assert "[OpenWebText/validation]" in eval_log
     assert "FINAL MARKDOWN SUMMARY" in eval_log
-    assert "OWT Val Loss" in eval_log
+    assert "Loss" in eval_log
