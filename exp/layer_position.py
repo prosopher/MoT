@@ -1166,7 +1166,7 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
         label="Native",
     )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
-    ax.set_xlabel("First Index of Translation Layers")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel(metric_label)
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1241,7 +1241,7 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="KL(full-mix || mag-only)",
     )
-    ax.set_xlabel("First Index of Translation Layers")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel("KL Divergence")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1288,7 +1288,7 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
         label="Native",
     )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
-    ax.set_xlabel("First Index of Translation Layers")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel("Validation Loss")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
