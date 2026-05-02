@@ -145,10 +145,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--exp-path",
+        "exp_path",
         type=Path,
-        required=True,
-        help="Experiment directory. Radar-chart JSON input is read from exp-path/*/mmlu_redux_subject_category_accuracy.json.",
+        help="Experiment directory. Radar-chart JSON input is read from exp_path/*/mmlu_redux_subject_category_accuracy.json.",
     )
     parser.add_argument(
         "--edge-id",
@@ -529,7 +528,7 @@ def plot_edge_radar(
     rticks = [t for t in rticks if t <= radius_max + 1e-9]
     ax.set_rlabel_position(0)
     ax.set_yticks(rticks)
-    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=AI_PAPER_BAR_VALUE_FONT_SIZE)
+    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=AI_PAPER_TICK_LABEL_SIZE)
     ax.set_ylim(0, radius_max)
     style_axes_common(ax, grid=True, grid_axis="both")
 
@@ -950,7 +949,7 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
     if not args.disable_native:
         print(
             "[info] native is taken per edge_id from the first study JSON file "
-            "(sorted order) under exp-path/*/ that actually contains that edge."
+            "(sorted order) under exp_path/*/ that actually contains that edge."
         )
 
     generated: List[Path] = []
@@ -1022,7 +1021,7 @@ def main() -> None:
     generated_paths.extend(eval_artifacts)
     if not generated_paths:
         raise RuntimeError(
-            "No artifacts were generated. Expected mmlu_redux_subject_category_accuracy.json in exp-path/*/ or eval.log files in exp-path/*/."
+            "No artifacts were generated. Expected mmlu_redux_subject_category_accuracy.json in exp_path/*/ or eval.log files in exp_path/*/."
         )
 
 
