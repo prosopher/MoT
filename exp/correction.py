@@ -988,7 +988,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     )
     ax.axhline(1.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     _annotate_ranges(ax, rows, avg_shrink)
-    ax.set_xlabel("Injection target layer start index")
+    ax.set_xlabel("First Index of Translation Layers")
     ax.set_ylabel("Final ||s_L|| / ||s_T||")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1005,7 +1005,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"Total $\alpha_{T:L}$ / ||s_T||",
+        label=r"$\alpha_{T:L}$ / ||s_T||",
     )
     ax.plot(
         x_values,
@@ -1015,7 +1015,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"Total $\beta_{T:L}$ / ||s_T||",
+        label=r"$\beta_{T:L}$ / ||s_T||",
     )
     ax.plot(
         x_values,
@@ -1049,7 +1049,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     )
     _annotate_ranges(ax, rows, beta_L_T_over_initial)
     ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
-    ax.set_xlabel("Injection target layer start index")
+    ax.set_xlabel("First Index of Translation Layers")
     ax.set_ylabel("Translation-shift-normalized magnitude")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1081,8 +1081,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
             fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
             fontweight="bold",
         )
-    ax.set_xlabel(r"Total $\beta_{T:L}$")
-    ax.set_ylabel(r"Total $\alpha_{T:L}$")
+    ax.set_xlabel(r"$\beta_{T:L}$")
+    ax.set_ylabel(r"$\alpha_{T:L}$")
     _style_paper_axes(ax)
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
     _save_paper_figure(fig, outputs["phase"])
@@ -1116,7 +1116,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         label="Full-Mix - Random correction cosine",
     )
     ax2.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
-    ax2.set_xlabel("Injection target layer start index")
+    ax2.set_xlabel("First Index of Translation Layers")
     ax2.set_ylabel("Positive is better")
     _style_paper_axes(ax2, x_values=x_values)
     ax2.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1146,8 +1146,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         label="Last-State Shift ||s_L||",
     )
     _annotate_ranges(ax, rows, final_shift)
-    ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("Average norm")
+    ax.set_xlabel("First Index of Translation Layers")
+    ax.set_ylabel("Average Norm")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["shift_norms"] = build_summary_shift_norm_chart_path(study_dir)
