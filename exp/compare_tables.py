@@ -87,6 +87,18 @@ def normalize_group_label(text: str) -> str:
     return text.replace("\\n", "\n").strip()
 
 
+def is_native_series_name(series_name: str) -> bool:
+    """
+    --native 활성화 시 Native 테이블/섹션을 식별합니다.
+
+    make_unique_name()에 의해 중복 이름이 'Native (2)'처럼 바뀌어도
+    Native 계열로 처리합니다.
+    """
+    normalized = normalize_group_label(series_name)
+    normalized = re.sub(r"\s+\(\d+\)\s*$", "", normalized)
+    return normalized.strip().lower() == "native"
+
+
 def split_markdown_row(line: str) -> list[str]:
     s = line.strip()
 
@@ -332,7 +344,6 @@ def extract_tables(
     )
 
 
-
 def wrap_tick_label(text: str, width: int = 26) -> str:
     """
     x tick label을 적당한 길이로 줄바꿈합니다.
@@ -360,6 +371,22 @@ def wrap_tick_label(text: str, width: int = 26) -> str:
     return "\n".join(wrapped_lines)
 
 
+def collect_exact_x_ticks(
+    series_data: OrderedDict[str, list[tuple[float, float]]],
+) -> list[float]:
+    ticks = set()
+
+    for points in series_data.values():
+        for x, _ in points:
+            if math.isfinite(x):
+                ticks.add(x)
+
+    return sorted(ticks)
+
+
+def format_exact_x_tick(value: float) -> str:
+    return f"{value:g}"
+
 
 def plot_line_series(
     series_data: OrderedDict[str, list[tuple[float, float]]],
@@ -367,6 +394,8 @@ def plot_line_series(
     x_label: str,
     y_label: str,
     title: str | None = None,
+    native: bool = False,
+    exact_x: bool = False,
 ) -> None:
     if not series_data:
         raise RuntimeError("Line chart로 플롯할 데이터가 없습니다.")
@@ -394,6 +423,14 @@ def plot_line_series(
         linestyle = AI_PAPER_LINESTYLES[
             (idx // len(AI_PAPER_MARKERS)) % len(AI_PAPER_LINESTYLES)
         ]
+        markerfacecolor = AI_PAPER_MARKER_FACE_COLOR
+        markeredgecolor = color
+
+        if native and is_native_series_name(series_name):
+            color = "black"
+            linestyle = ":"
+            markerfacecolor = "white"
+            markeredgecolor = "black"
 
         ax.plot(
             xs,
@@ -404,13 +441,18 @@ def plot_line_series(
             marker=marker,
             linewidth=AI_PAPER_LINE_WIDTH,
             markersize=AI_PAPER_MARKER_SIZE,
-            markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
-            markeredgecolor=color,
+            markerfacecolor=markerfacecolor,
+            markeredgecolor=markeredgecolor,
             markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         )
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
+
+    if exact_x:
+        exact_x_ticks = collect_exact_x_ticks(series_data)
+        ax.set_xticks(exact_x_ticks)
+        ax.set_xticklabels([format_exact_x_tick(x) for x in exact_x_ticks])
 
     style_axes_common(ax)
 
@@ -467,7 +509,10 @@ def plot_grouped_bar(
     num_groups = len(group_names)
     num_categories = len(categories)
 
-    width_scale = min(AI_PAPER_DENSE_WIDTH_SCALE_MAX, max(1.0, (1.35 * num_groups + 0.65 * num_categories + 2.0) / 7.16))
+    width_scale = min(
+        AI_PAPER_DENSE_WIDTH_SCALE_MAX,
+        max(1.0, (1.35 * num_groups + 0.65 * num_categories + 2.0) / 7.16),
+    )
     fig_size = scaled_double_column_figsize(
         width_scale=width_scale,
         height=4.80 if num_groups <= 6 else 5.40,
@@ -543,6 +588,8 @@ def plot_extracted_data(
     output_path: Path,
     y_label: str,
     title: str | None = None,
+    native: bool = False,
+    exact_x: bool = False,
 ) -> None:
     if extracted.chart_mode == "line":
         plot_line_series(
@@ -551,6 +598,8 @@ def plot_extracted_data(
             x_label=extracted.x_col_name,
             y_label=y_label,
             title=title,
+            native=native,
+            exact_x=exact_x,
         )
     else:
         plot_grouped_bar(
@@ -586,8 +635,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "출력 파일 경로. "
-            "생략하면 입력 파일명과 같은 이름의 .png 파일로 저장합니다. "
-            "논문용으로는 .pdf 또는 .svg 권장."
+            "생략하면 입력 파일명과 같은 이름의 .pdf 파일로 저장합니다. "
+            "논문용 기본 형식은 .pdf입니다."
         ),
     )
     parser.add_argument(
@@ -598,6 +647,22 @@ def parse_args() -> argparse.Namespace:
             "논문 figure에서는 보통 caption을 사용하므로 기본값은 제목 없음."
         ),
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help=(
+            "Line chart에서 Native 테이블/섹션을 "
+            "흰색 마커가 있는 검은 점선으로 표시합니다."
+        ),
+    )
+    parser.add_argument(
+        "--exact-x",
+        action="store_true",
+        help=(
+            "Line chart에서 자동 등간격 x축 tick 대신 "
+            "실제 데이터 x값에 해당하는 tick만 표시합니다."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -605,7 +670,7 @@ def main() -> None:
     args = parse_args()
 
     input_path = args.input
-    output_path = args.output or input_path.with_suffix(".png")
+    output_path = args.output or input_path.with_suffix(".pdf")
 
     md_text = input_path.read_text(encoding="utf-8")
 
@@ -629,6 +694,8 @@ def main() -> None:
         output_path=output_path,
         y_label=args.y_col,
         title=args.title,
+        native=args.native,
+        exact_x=args.exact_x,
     )
 
     print(f"Saved: {output_path}")

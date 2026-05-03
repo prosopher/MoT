@@ -14,7 +14,6 @@ from exp_util import (
     ACCENT_BLUE,
     ACCENT_GREEN,
     ACCENT_ORANGE,
-    AI_PAPER_AXIS_LABEL_SIZE,
     AI_PAPER_BAR_X_MARGIN,
     AI_PAPER_GRID_ALPHA,
     AI_PAPER_GRID_LINESTYLE,
@@ -40,68 +39,65 @@ OUTPUT_HEIGHT_PX = 1291
 OUTPUT_DPI = 300
 OUTPUT_FIGSIZE = (OUTPUT_WIDTH_PX / OUTPUT_DPI, OUTPUT_HEIGHT_PX / OUTPUT_DPI)
 
-METHOD_ORDER = ["Native", "C2C-Project", "Interlat", "LSC", "MoT"]
-EXCLUDED_METHODS = {"KVComm"}
-EXCLUDED_SOURCE_MODELS = {"opt-125m"}
-
 METHOD_COLORS = {
-    "Native": ACCENT_BLACK,
-    "C2C-Project": ACCENT_BLUE,
+    "C2C": ACCENT_BLUE,
     "Interlat": ACCENT_AQUA,
-    "LSC": ACCENT_ORANGE,
+    "MoT-h": ACCENT_BLACK,
     "MoT": ACCENT_GREEN,
+    "LSC": ACCENT_ORANGE,
 }
 
-FAMILY_ORDER = ["GPT-2", "OPT", "Qwen2.5"]
-CAPACITY_ORDER = {
-    "GPT-2": ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"],
-    "OPT": ["opt-1.3b", "opt-2.7b", "opt-6.7b"],
-    "Qwen2.5": ["Qwen2.5-0.5B", "Qwen2.5-1.5B", "Qwen2.5-3B", "Qwen2.5-7B"],
-}
-CAPACITY_LABELS = {
-    "gpt2": "base",
-    "gpt2-medium": "medium",
-    "gpt2-large": "large",
-    "gpt2-xl": "xl",
-    "opt-1.3b": "1.3B",
-    "opt-2.7b": "2.7B",
-    "opt-6.7b": "6.7B",
-    "Qwen2.5-0.5B": "0.5B",
-    "Qwen2.5-1.5B": "1.5B",
-    "Qwen2.5-3B": "3B",
-    "Qwen2.5-7B": "7B",
+METHOD_ALIASES = {
+    "c2c": "C2C",
+    "c2c_project": "C2C",
+    "c2c_project_": "C2C",
+    "c2c-project": "C2C",
+    "interlat": "Interlat",
+    "kvcomm": "KVComm",
+    "kv_comm": "KVComm",
+    "kv-comm": "KVComm",
+    "mot_h": "MoT-h",
+    "mot-h": "MoT-h",
+    "moth": "MoT-h",
+    "mot": "MoT",
+    "lsc": "LSC",
 }
 
 
 @dataclass(frozen=True)
 class Row:
-    family: str
-    source_model: str
-    target_model: str
     method: str
-    f1: float
-    latency_ms: float
-    throughput_toks: float
+    num_models: int
+    training_duration_sec: float
     peak_memory_gib: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot capacity scalability from a markdown result file."
+        description="Plot scalability by number of models from a markdown result file."
     )
     parser.add_argument(
         "markdown_file",
         type=Path,
-        help="Markdown file containing capacity scalability result tables.",
+        help="Markdown file containing number-of-models scalability result tables.",
     )
     return parser.parse_args()
 
 
 def normalize_header(name: str) -> str:
     key = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
-    if key == "f1_avg":
-        return "f1"
+    if key in {"method", "number_of_models", "num_models"}:
+        return key
+    if key in {"training_duration", "training_duration_sec", "duration"}:
+        return "training_duration"
+    if key in {"gpu_peak_memory", "gpu_peak_memory_gib", "peak_memory", "peak_memory_gib"}:
+        return "gpu_peak_memory"
     return key
+
+
+def normalize_method(name: str) -> str | None:
+    key = re.sub(r"[^a-z0-9-]+", "_", name.strip().lower()).strip("_")
+    return METHOD_ALIASES.get(key)
 
 
 def split_markdown_row(line: str) -> list[str]:
@@ -122,23 +118,14 @@ def parse_number(value: str) -> float:
     return float(match.group(0))
 
 
-def family_for_source(source_model: str) -> str | None:
-    source_lower = source_model.lower()
-    if source_lower.startswith("gpt2"):
-        return "GPT-2"
-    if source_lower.startswith("opt-"):
-        return "OPT"
-    if source_lower.startswith("qwen2.5-"):
-        return "Qwen2.5"
-    return None
+def parse_int(value: str) -> int | None:
+    parsed = parse_number(value)
+    if not np.isfinite(parsed):
+        return None
+    return int(parsed)
 
 
-def parse_table(
-    table_lines: list[str],
-    *,
-    source_model: str,
-    target_model: str,
-) -> list[Row]:
+def parse_table(table_lines: list[str], *, section_method: str) -> list[Row]:
     if len(table_lines) < 3:
         return []
 
@@ -147,14 +134,18 @@ def parse_table(
     if not is_separator_row(separator):
         return []
 
-    headers = [normalize_header(h) for h in raw_header]
+    headers = [normalize_header(header) for header in raw_header]
     header_index = {name: idx for idx, name in enumerate(headers)}
-    required = ["method", "f1", "latency", "throughput", "gpu_peak_memory"]
+    required = ["training_duration", "gpu_peak_memory"]
     if any(name not in header_index for name in required):
         return []
 
-    family = family_for_source(source_model)
-    if family is None or source_model in EXCLUDED_SOURCE_MODELS:
+    count_header = "number_of_models" if "number_of_models" in header_index else "num_models"
+    if count_header not in header_index:
+        # Accept the LSC table variant where the first column is named "Method"
+        # but contains the number of models.
+        count_header = "method"
+    if count_header not in header_index:
         return []
 
     parsed: list[Row] = []
@@ -162,18 +153,14 @@ def parse_table(
         cells = split_markdown_row(line)
         if len(cells) != len(headers):
             continue
-        method = cells[header_index["method"]].strip()
-        if method in EXCLUDED_METHODS or method not in METHOD_ORDER:
+        num_models = parse_int(cells[header_index[count_header]])
+        if num_models is None:
             continue
         parsed.append(
             Row(
-                family=family,
-                source_model=source_model,
-                target_model=target_model,
-                method=method,
-                f1=parse_number(cells[header_index["f1"]]),
-                latency_ms=parse_number(cells[header_index["latency"]]),
-                throughput_toks=parse_number(cells[header_index["throughput"]]),
+                method=section_method,
+                num_models=num_models,
+                training_duration_sec=parse_number(cells[header_index["training_duration"]]),
                 peak_memory_gib=parse_number(cells[header_index["gpu_peak_memory"]]),
             )
         )
@@ -183,31 +170,23 @@ def parse_table(
 def parse_markdown(path: Path) -> list[Row]:
     text = path.read_text(encoding="utf-8")
     rows: list[Row] = []
-    current_source: str | None = None
-    current_target: str | None = None
+    current_method: str | None = None
     table_lines: list[str] = []
 
     def flush_table() -> None:
         nonlocal table_lines
-        if current_source and current_target and table_lines:
-            rows.extend(
-                parse_table(
-                    table_lines,
-                    source_model=current_source,
-                    target_model=current_target,
-                )
-            )
+        if current_method and table_lines:
+            rows.extend(parse_table(table_lines, section_method=current_method))
         table_lines = []
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        heading = re.match(r"^#+\s*(.+?)\s*->\s*(.+?)\s*$", line)
+        heading = re.match(r"^#+\s*(.+?)\s*$", line)
         if heading:
             flush_table()
-            current_source = heading.group(1).strip()
-            current_target = heading.group(2).strip()
+            current_method = normalize_method(heading.group(1))
             continue
-        if current_source and "|" in line:
+        if current_method and "|" in line:
             table_lines.append(line)
         elif table_lines:
             flush_table()
@@ -223,26 +202,16 @@ def darker(color: str, factor: float = 0.72) -> str:
     return mcolors.to_hex(np.clip(rgb * factor, 0.0, 1.0))
 
 
-def metric_value(row: Row, metric: str) -> float:
-    if metric == "f1":
-        return row.f1
-    if metric == "latency_ms":
-        return row.latency_ms
-    if metric == "throughput_toks":
-        return row.throughput_toks
-    if metric == "peak_memory_gib":
-        return row.peak_memory_gib
-    raise KeyError(metric)
-
-
 def finite(values: Iterable[float]) -> list[float]:
-    return [v for v in values if np.isfinite(v)]
+    return [value for value in values if np.isfinite(value)]
 
 
-def set_bar_axis_limits(ax, values: list[float], *, max_fraction: float = 0.55) -> None:
+def set_bar_axis_limits(ax, values: list[float], *, max_fraction: float = 0.60) -> None:
     vals = finite(values)
     if not vals:
         return
+    # Keep bars mostly in the lower band, while allowing a little more overlap
+    # with the line band than scalability_capacity.py.
     top = max(vals) / max_fraction
     ax.set_ylim(0.0, top * 1.02)
 
@@ -251,8 +220,8 @@ def set_line_axis_limits(
     ax,
     values: list[float],
     *,
-    min_fraction: float = 0.64,
-    max_fraction: float = 0.95,
+    min_fraction: float = 0.58,
+    max_fraction: float = 0.96,
 ) -> None:
     vals = finite(values)
     if not vals:
@@ -281,90 +250,98 @@ def hide_negative_y_tick_labels(ax) -> None:
     )
 
 
-def values_by_method_and_capacity(
+def values_by_method_and_model_count(
     rows: list[Row],
-    family: str,
     metric: str,
-) -> dict[tuple[str, str], float]:
-    result: dict[tuple[str, str], float] = {}
+) -> dict[tuple[int, str], float]:
+    result: dict[tuple[int, str], float] = {}
     for row in rows:
-        if row.family == family:
-            result[(row.source_model, row.method)] = metric_value(row, metric)
+        if metric == "training_duration_sec":
+            value = row.training_duration_sec
+        elif metric == "peak_memory_gib":
+            value = row.peak_memory_gib
+        else:
+            raise KeyError(metric)
+        result[(row.num_models, row.method)] = value
     return result
 
 
-def capacity_models_for_family(rows: list[Row], family: str) -> list[str]:
-    seen = {row.source_model for row in rows if row.family == family}
-    ordered = [model for model in CAPACITY_ORDER.get(family, []) if model in seen]
-    extras = sorted(seen - set(ordered))
-    return ordered + extras
+def model_counts_for_rows(rows: list[Row]) -> list[int]:
+    model_counts: list[int] = []
+    seen: set[int] = set()
+    for row in rows:
+        if row.num_models not in seen:
+            seen.add(row.num_models)
+            model_counts.append(row.num_models)
+    return model_counts
 
 
-def draw_dual_axis_plot(
-    *,
-    rows: list[Row],
-    family: str,
-    bar_metric: str,
-    line_metric: str,
-    bar_label: str,
-    line_label: str,
-    output_path: Path,
-) -> None:
+def methods_for_rows(rows: list[Row]) -> list[str]:
+    methods: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if row.method not in seen:
+            seen.add(row.method)
+            methods.append(row.method)
+    return methods
+
+
+def draw_dual_axis_plot(*, rows: list[Row], output_path: Path) -> None:
     plt = require_matplotlib_pyplot()
-    capacities = capacity_models_for_family(rows, family)
-    if not capacities:
+    model_counts = model_counts_for_rows(rows)
+    method_order = methods_for_rows(rows)
+    if not model_counts or not method_order:
         return
 
-    bar_values = values_by_method_and_capacity(rows, family, bar_metric)
-    line_values = values_by_method_and_capacity(rows, family, line_metric)
+    memory_values = values_by_method_and_model_count(rows, "peak_memory_gib")
+    duration_values = values_by_method_and_model_count(rows, "training_duration_sec")
 
-    # Left axis: line metric
-    # Right axis: bar metric
+    # Left axis: training duration line
+    # Right axis: GPU peak memory bar
     fig, ax_line = plt.subplots(figsize=OUTPUT_FIGSIZE)
     ax_bar = ax_line.twinx()
 
-    x = np.arange(len(capacities), dtype=float)
-    n_methods = len(METHOD_ORDER)
+    x = np.arange(len(model_counts), dtype=float)
+    n_methods = len(method_order)
     total_width = 0.82
     bar_width = total_width / n_methods
     offsets = (np.arange(n_methods) - (n_methods - 1) / 2.0) * bar_width
 
-    all_bar_values: list[float] = []
-    all_line_values: list[float] = []
+    all_memory_values: list[float] = []
+    all_duration_values: list[float] = []
 
-    for method_index, method in enumerate(METHOD_ORDER):
-        color = METHOD_COLORS[method]
-        values = [bar_values.get((capacity, method), float("nan")) for capacity in capacities]
-        all_bar_values.extend(values)
+    for method_index, method in enumerate(method_order):
+        color = METHOD_COLORS.get(method, ACCENT_BLACK)
+        values = [memory_values.get((num_models, method), float("nan")) for num_models in model_counts]
+        all_memory_values.extend(values)
         valid_positions = [
             x_pos + offsets[method_index]
-            for x_pos, v in zip(x, values)
-            if np.isfinite(v)
+            for x_pos, value in zip(x, values)
+            if np.isfinite(value)
         ]
-        valid_values = [v for v in values if np.isfinite(v)]
+        valid_values = [value for value in values if np.isfinite(value)]
         if valid_values:
             ax_bar.bar(
                 valid_positions,
                 valid_values,
                 width=bar_width * 0.92,
                 color=color,
-                alpha=0.78 if method != "Native" else 0.88,
+                alpha=0.78 if method != "MoT-h" else 0.88,
                 edgecolor="white",
                 linewidth=0.6,
                 zorder=2,
             )
 
-    for method_index, method in enumerate(METHOD_ORDER):
-        color = darker(METHOD_COLORS[method])
-        values = [line_values.get((capacity, method), float("nan")) for capacity in capacities]
-        all_line_values.extend(values)
-        valid_x = [x_pos for x_pos, v in zip(x, values) if np.isfinite(v)]
-        valid_y = [v for v in values if np.isfinite(v)]
+    for method_index, method in enumerate(method_order):
+        color = darker(METHOD_COLORS.get(method, ACCENT_BLACK))
+        values = [duration_values.get((num_models, method), float("nan")) for num_models in model_counts]
+        all_duration_values.extend(values)
+        valid_x = [x_pos for x_pos, value in zip(x, values) if np.isfinite(value)]
+        valid_y = [value for value in values if np.isfinite(value)]
         if valid_y:
             ax_line.plot(
                 valid_x,
                 valid_y,
-                linestyle="--" if method == "Native" else "-",
                 linewidth=AI_PAPER_LINE_WIDTH,
                 marker=AI_PAPER_MARKERS[method_index % len(AI_PAPER_MARKERS)],
                 markersize=AI_PAPER_MARKER_SIZE * 0.82,
@@ -375,16 +352,16 @@ def draw_dual_axis_plot(
                 zorder=4,
             )
 
-    set_line_axis_limits(ax_line, all_line_values)
+    set_line_axis_limits(ax_line, all_duration_values)
     hide_negative_y_tick_labels(ax_line)
-    set_bar_axis_limits(ax_bar, all_bar_values)
+    set_bar_axis_limits(ax_bar, all_memory_values)
 
     ax_line.set_xticks(x)
-    ax_line.set_xticklabels([CAPACITY_LABELS.get(model, model) for model in capacities])
-    ax_line.set_xlabel("Source Model Capacity")
+    ax_line.set_xticklabels([str(num_models) for num_models in model_counts])
+    ax_line.set_xlabel("Number of Models")
 
-    ax_line.set_ylabel(line_label)
-    ax_bar.set_ylabel(bar_label)
+    ax_line.set_ylabel("Training Duration (Line, sec)")
+    ax_bar.set_ylabel("GPU Peak Memory (Bar, GiB)")
 
     apply_bold_axis_labels(ax_line)
     apply_bold_axis_labels(ax_bar)
@@ -408,17 +385,18 @@ def draw_dual_axis_plot(
     ax_line.patch.set_visible(False)
 
     legend_handles = []
-    for method in METHOD_ORDER:
+    for method in method_order:
+        color = METHOD_COLORS.get(method, ACCENT_BLACK)
         legend_handles.append(
             plt.Line2D(
                 [0],
                 [0],
-                color=METHOD_COLORS[method],
+                color=color,
                 marker="s",
                 linestyle="",
                 markersize=7.5,
-                markerfacecolor=METHOD_COLORS[method],
-                markeredgecolor=METHOD_COLORS[method],
+                markerfacecolor=color,
+                markeredgecolor=color,
                 label=method,
             )
         )
@@ -426,7 +404,7 @@ def draw_dual_axis_plot(
         handles=legend_handles,
         loc="lower center",
         bbox_to_anchor=(0.5, 1.015),
-        ncol=len(METHOD_ORDER),
+        ncol=len(method_order),
         frameon=True,
         edgecolor=AI_PAPER_LEGEND_EDGE_COLOR,
         fontsize=AI_PAPER_LEGEND_FONT_SIZE,
@@ -444,39 +422,9 @@ def draw_dual_axis_plot(
 
 
 def plot_all(rows: list[Row], output_dir: Path) -> list[Path]:
-    outputs: list[Path] = []
-    specs = [
-        (
-            "peak_memory_f1",
-            "peak_memory_gib",
-            "f1",
-            "Peak Memory (Bar, GiB)",
-            "F1 (Line)",
-        ),
-        (
-            "latency_throughput",
-            "latency_ms",
-            "throughput_toks",
-            "Latency (Bar, ms)",
-            "Throughput (Line, tok/s)",
-        ),
-    ]
-    for family in FAMILY_ORDER:
-        safe_family = family.lower().replace(".", "").replace("-", "").replace(" ", "_")
-        for suffix, bar_metric, line_metric, bar_label, line_label in specs:
-            output_path = output_dir / f"capacity_scalability_{safe_family}_{suffix}.pdf"
-            draw_dual_axis_plot(
-                rows=rows,
-                family=family,
-                bar_metric=bar_metric,
-                line_metric=line_metric,
-                bar_label=bar_label,
-                line_label=line_label,
-                output_path=output_path,
-            )
-            if output_path.exists():
-                outputs.append(output_path)
-    return outputs
+    output_path = output_dir / "scalability_num_models.pdf"
+    draw_dual_axis_plot(rows=rows, output_path=output_path)
+    return [output_path] if output_path.exists() else []
 
 
 def main() -> None:
@@ -491,10 +439,10 @@ def main() -> None:
         raise ValueError(f"No usable rows found in {markdown_path}")
 
     outputs = plot_all(rows, markdown_path.parent)
-    if len(outputs) != 6:
+    if len(outputs) != 1:
         print(
-            f"[warn] generated {len(outputs)} plots; expected 6. "
-            "Check whether all three families exist in the markdown."
+            f"[warn] generated {len(outputs)} plots; expected 1. "
+            "Check whether the markdown contains number-of-models tables."
         )
     for output in outputs:
         print(output)
