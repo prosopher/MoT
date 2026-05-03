@@ -247,7 +247,13 @@ def set_bar_axis_limits(ax, values: list[float], *, max_fraction: float = 0.55) 
     ax.set_ylim(0.0, top * 1.02)
 
 
-def set_line_axis_limits(ax, values: list[float], *, min_fraction: float = 0.64, max_fraction: float = 0.95) -> None:
+def set_line_axis_limits(
+    ax,
+    values: list[float],
+    *,
+    min_fraction: float = 0.64,
+    max_fraction: float = 0.95,
+) -> None:
     vals = finite(values)
     if not vals:
         return
@@ -267,7 +273,11 @@ def set_line_axis_limits(ax, values: list[float], *, min_fraction: float = 0.64,
     ax.set_ylim(axis_min, axis_max)
 
 
-def values_by_method_and_capacity(rows: list[Row], family: str, metric: str) -> dict[tuple[str, str], float]:
+def values_by_method_and_capacity(
+    rows: list[Row],
+    family: str,
+    metric: str,
+) -> dict[tuple[str, str], float]:
     result: dict[tuple[str, str], float] = {}
     for row in rows:
         if row.family == family:
@@ -300,8 +310,10 @@ def draw_dual_axis_plot(
     bar_values = values_by_method_and_capacity(rows, family, bar_metric)
     line_values = values_by_method_and_capacity(rows, family, line_metric)
 
-    fig, ax_bar = plt.subplots(figsize=OUTPUT_FIGSIZE)
-    ax_line = ax_bar.twinx()
+    # Left axis: line metric
+    # Right axis: bar metric
+    fig, ax_line = plt.subplots(figsize=OUTPUT_FIGSIZE)
+    ax_bar = ax_line.twinx()
 
     x = np.arange(len(capacities), dtype=float)
     n_methods = len(METHOD_ORDER)
@@ -316,7 +328,11 @@ def draw_dual_axis_plot(
         color = METHOD_COLORS[method]
         values = [bar_values.get((capacity, method), float("nan")) for capacity in capacities]
         all_bar_values.extend(values)
-        valid_positions = [x_pos + offsets[method_index] for x_pos, v in zip(x, values) if np.isfinite(v)]
+        valid_positions = [
+            x_pos + offsets[method_index]
+            for x_pos, v in zip(x, values)
+            if np.isfinite(v)
+        ]
         valid_values = [v for v in values if np.isfinite(v)]
         if valid_values:
             ax_bar.bar(
@@ -340,7 +356,7 @@ def draw_dual_axis_plot(
             ax_line.plot(
                 valid_x,
                 valid_y,
-                linestyle=":",
+                linestyle="--" if method == "Native" else "-",
                 linewidth=AI_PAPER_LINE_WIDTH,
                 marker=AI_PAPER_MARKERS[method_index % len(AI_PAPER_MARKERS)],
                 markersize=AI_PAPER_MARKER_SIZE * 0.82,
@@ -351,30 +367,33 @@ def draw_dual_axis_plot(
                 zorder=4,
             )
 
-    set_bar_axis_limits(ax_bar, all_bar_values)
     set_line_axis_limits(ax_line, all_line_values)
+    set_bar_axis_limits(ax_bar, all_bar_values)
 
-    ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels([CAPACITY_LABELS.get(model, model) for model in capacities])
-    ax_bar.set_xlabel("Source Model Capacity")
-    ax_bar.set_ylabel(bar_label)
+    ax_line.set_xticks(x)
+    ax_line.set_xticklabels([CAPACITY_LABELS.get(model, model) for model in capacities])
+    ax_line.set_xlabel("Source Model Capacity")
+
     ax_line.set_ylabel(line_label)
-    apply_bold_axis_labels(ax_bar)
-    apply_bold_axis_labels(ax_line)
+    ax_bar.set_ylabel(bar_label)
 
-    ax_bar.grid(
+    apply_bold_axis_labels(ax_line)
+    apply_bold_axis_labels(ax_bar)
+
+    ax_line.grid(
         axis="y",
         linestyle=AI_PAPER_GRID_LINESTYLE,
         linewidth=AI_PAPER_GRID_LINE_WIDTH,
         alpha=AI_PAPER_GRID_ALPHA,
         zorder=1,
     )
-    ax_line.grid(False)
-    ax_bar.margins(x=AI_PAPER_BAR_X_MARGIN)
-    ax_bar.tick_params(axis="both", labelsize=AI_PAPER_TICK_LABEL_SIZE)
-    ax_line.tick_params(axis="y", labelsize=AI_PAPER_TICK_LABEL_SIZE)
+    ax_bar.grid(False)
 
-    # Make the primary-axis plot box draw below the secondary line area.
+    ax_line.margins(x=AI_PAPER_BAR_X_MARGIN)
+    ax_line.tick_params(axis="both", labelsize=AI_PAPER_TICK_LABEL_SIZE)
+    ax_bar.tick_params(axis="y", labelsize=AI_PAPER_TICK_LABEL_SIZE)
+
+    # Keep bars visually behind the line plot.
     ax_bar.set_zorder(1)
     ax_line.set_zorder(2)
     ax_line.patch.set_visible(False)
@@ -394,7 +413,7 @@ def draw_dual_axis_plot(
                 label=method,
             )
         )
-    legend = ax_bar.legend(
+    legend = ax_line.legend(
         handles=legend_handles,
         loc="lower center",
         bbox_to_anchor=(0.5, 1.015),
@@ -464,7 +483,10 @@ def main() -> None:
 
     outputs = plot_all(rows, markdown_path.parent)
     if len(outputs) != 6:
-        print(f"[warn] generated {len(outputs)} plots; expected 6. Check whether all three families exist in the markdown.")
+        print(
+            f"[warn] generated {len(outputs)} plots; expected 6. "
+            "Check whether all three families exist in the markdown."
+        )
     for output in outputs:
         print(output)
 
