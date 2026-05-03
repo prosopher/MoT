@@ -363,6 +363,7 @@ def apply_ai_paper_style() -> None:
             "savefig.dpi": AI_PAPER_FIGURE_DPI,
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
+            "savefig.format": "pdf",
 
             # Font: fixed to Times New Roman; no fallback family list.
             "font.family": TIMES_NEW_ROMAN_FONT_FAMILY,

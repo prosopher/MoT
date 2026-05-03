@@ -848,7 +848,7 @@ def plot_eval_metric_bars(
         )
         ax.legend(loc="best", handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
-    output_path = output_dir / f"eval_bar_{sanitize_filename_component(edge_id)}_{metric_slug}.png"
+    output_path = output_dir / f"eval_bar_{sanitize_filename_component(edge_id)}_{metric_slug}.pdf"
     save_paper_figure(fig, output_path, dpi=dpi, show=show)
     plt.close(fig)
     return output_path
@@ -970,7 +970,7 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
                 for category in s.category_to_accuracy.keys()
             }
         )
-        output_path = output_dir / f"subcategory_radar_{edge_id}.png"
+        output_path = output_dir / f"subcategory_radar_{edge_id}.pdf"
         native_accuracy = None
         native_source = None
         if not args.disable_native:

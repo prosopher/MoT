@@ -668,7 +668,7 @@ def _sanitize_edge_id_for_filename(edge_id: str) -> str:
 
 def _build_openwebtext_tsne_plot_path(output_path: Union[str, Path], edge_id: str) -> Path:
     safe_edge_id = _sanitize_edge_id_for_filename(edge_id)
-    return _build_openwebtext_tsne_output_dir(output_path) / f"{OPENWEBTEXT_TSNE_FILE_BASENAME}_{safe_edge_id}.png"
+    return _build_openwebtext_tsne_output_dir(output_path) / f"{OPENWEBTEXT_TSNE_FILE_BASENAME}_{safe_edge_id}.pdf"
 
 
 def _accumulate_openwebtext_tsne_samples(

@@ -586,7 +586,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "출력 파일 경로. "
-            "생략하면 입력 파일명과 같은 이름의 .png 파일로 저장합니다. "
+            "생략하면 입력 파일명과 같은 이름의 .pdf 파일로 저장합니다. "
             "논문용으로는 .pdf 또는 .svg 권장."
         ),
     )
@@ -605,7 +605,7 @@ def main() -> None:
     args = parse_args()
 
     input_path = args.input
-    output_path = args.output or input_path.with_suffix(".png")
+    output_path = args.output or input_path.with_suffix(".pdf")
 
     md_text = input_path.read_text(encoding="utf-8")
 
