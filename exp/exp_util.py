@@ -361,6 +361,7 @@ def apply_ai_paper_style() -> None:
             "figure.figsize": AI_PAPER_DOUBLE_COLUMN_FIGSIZE,
             "figure.dpi": AI_PAPER_PREVIEW_DPI,
             "savefig.dpi": AI_PAPER_FIGURE_DPI,
+            "savefig.format": "pdf",
             "savefig.bbox": "tight",
             "savefig.pad_inches": 0.02,
 

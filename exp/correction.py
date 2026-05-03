@@ -126,35 +126,35 @@ def build_summary_path(study_dir: Path) -> Path:
 
 
 def build_norm_ratio_chart_path(run_dir: Path) -> Path:
-    return run_dir / "correction_norm_ratio_trajectory.png"
+    return run_dir / "correction_norm_ratio_trajectory.pdf"
 
 
 def build_projection_chart_path(run_dir: Path) -> Path:
-    return run_dir / "correction_projection_trajectory.png"
+    return run_dir / "correction_projection_trajectory.pdf"
 
 
 def build_summary_shrink_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_final_shrink_ratio.png"
+    return study_dir / "layer_idx_vs_final_shrink_ratio.pdf"
 
 
 def build_summary_ratio_distribution_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_shrink_ratio_distribution.png"
+    return study_dir / "layer_idx_vs_shrink_ratio_distribution.pdf"
 
 
 def build_summary_decomposition_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_correction_decomposition.png"
+    return study_dir / "layer_idx_vs_correction_decomposition.pdf"
 
 
 def build_summary_random_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_structural_advantage.png"
+    return study_dir / "layer_idx_vs_structural_advantage.pdf"
 
 
 def build_summary_phase_chart_path(study_dir: Path) -> Path:
-    return study_dir / "correction_phase_scatter.png"
+    return study_dir / "correction_phase_scatter.pdf"
 
 
 def build_summary_shift_norm_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_shift_norms.png"
+    return study_dir / "layer_idx_vs_shift_norms.pdf"
 
 
 def format_layer_range(start_idx: int, end_idx: int) -> str:

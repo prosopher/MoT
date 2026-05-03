@@ -455,7 +455,7 @@ def plot_all(rows: list[Row], output_dir: Path) -> list[Path]:
     for family in FAMILY_ORDER:
         safe_family = family.lower().replace(".", "").replace("-", "").replace(" ", "_")
         for suffix, bar_metric, line_metric, bar_label, line_label in specs:
-            output_path = output_dir / f"capacity_scalability_{safe_family}_{suffix}.png"
+            output_path = output_dir / f"capacity_scalability_{safe_family}_{suffix}.pdf"
             draw_dual_axis_plot(
                 rows=rows,
                 family=family,

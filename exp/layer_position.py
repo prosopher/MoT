@@ -1118,15 +1118,15 @@ def build_analysis_metrics_path(run_dir: Path) -> Path:
 
 
 def build_metric_controls_chart_path(study_dir: Path, metric_name: str) -> Path:
-    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}_controls.png"
+    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}_controls.pdf"
 
 
 def build_logit_kl_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_logit_kl.png"
+    return study_dir / "layer_idx_vs_logit_kl.pdf"
 
 
 def build_openwebtext_loss_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_openwebtext_validation_loss.png"
+    return study_dir / "layer_idx_vs_openwebtext_validation_loss.pdf"
 
 
 def plot_metric_controls_summary(summary_path: Path) -> Path:
@@ -1308,9 +1308,9 @@ def remove_stale_summary_artifacts(study_dir: Path, run_dir: Path) -> None:
         study_dir / "drift_summary.md",
         study_dir / "study_summary.csv",
         study_dir / "drift_summary.csv",
-        study_dir / "drift_cosine.png",
-        study_dir / "drift_l2.png",
-        study_dir / "layer_idx_vs_openwebtext_validation_loss.png",
+        study_dir / "drift_cosine.pdf",
+        study_dir / "drift_l2.pdf",
+        study_dir / "layer_idx_vs_openwebtext_validation_loss.pdf",
     ]
     for stale_path in stale_paths:
         if stale_path.exists():
