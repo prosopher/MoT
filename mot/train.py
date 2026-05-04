@@ -1178,7 +1178,7 @@ def run_qwen2_block(
     hidden_states = block.post_attention_layernorm(hidden_states)
     hidden_states = block.mlp(hidden_states)
     hidden_states = residual + hidden_states
-    return hidden_states, (attention_key, attention_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
