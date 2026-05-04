@@ -368,7 +368,7 @@ def draw_plot(*, rows: list[Row], output_path: Path) -> None:
     for center, label in zip(section_centers, section_labels):
         ax_line.text(
             center,
-            -0.26,
+            -0.18,
             label,
             transform=ax_line.get_xaxis_transform(),
             ha="center",
@@ -425,8 +425,10 @@ def draw_plot(*, rows: list[Row], output_path: Path) -> None:
     for text in legend.get_texts():
         text.set_fontweight("bold")
 
-    fig.subplots_adjust(left=0.115, right=0.875, bottom=0.32, top=0.80)
-    fig.savefig(output_path, dpi=OUTPUT_DPI, bbox_inches=None, pad_inches=0.0)
+    fig.subplots_adjust(left=0.095, right=0.895, bottom=0.24, top=0.86)
+    fig.set_size_inches(*OUTPUT_FIGSIZE, forward=True)
+    with plt.rc_context({"savefig.bbox": None, "savefig.pad_inches": 0.0}):
+        fig.savefig(output_path, dpi=OUTPUT_DPI, bbox_inches=None, pad_inches=0.0)
     plt.close(fig)
 
 
