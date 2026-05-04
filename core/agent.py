@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+import logging
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
@@ -17,9 +18,10 @@ class AgentGeneration:
     text: str
     raw_text: str
     generated_token_ids: List[int]
-    cache_seq_len_before: int
-    cache_seq_len_after: int
-    stop_reason: str
+    tokens_before: int
+    tokens_after: int
+    tokens_prompt: int
+    tokens_completion: int
 
     @property
     def generated_tokens(self) -> int:
@@ -66,20 +68,53 @@ class Agent:
         self.stop_sequences = tuple(stop_sequences or ())
         self.max_prompt_tokens = max_prompt_tokens
         self.past_key_values: Optional[PastKeyValues] = None
-        self.transcript_text: str = ""
+        # Token ids corresponding 1:1 to the resident KV cache.
+        # past_key_values itself does not store the input token ids, so the runner
+        # must maintain them explicitly to compute offload deltas without
+        # re-tokenizing text or rebuilding source KV at handoff time.
+        self.cache_token_ids: List[int] = []
+        # Pretranslated target-side KV caches keyed by physical edge id.
+        # These are refreshed immediately after this agent's resident cache changes,
+        # so offload can slice an already-translated cache without translating at handoff time.
+        self.pretranslated_past_by_edge: Dict[str, PastKeyValues] = {}
+        self.pretranslated_token_ids_by_edge: Dict[str, List[int]] = {}
         self.model.eval()
 
     @property
     def cache_seq_len(self) -> int:
         return get_past_seq_len(self.past_key_values)
 
+    def invalidate_pretranslated_caches(self) -> None:
+        self.pretranslated_past_by_edge.clear()
+        self.pretranslated_token_ids_by_edge.clear()
+
+    def set_pretranslated_cache(
+        self,
+        *,
+        edge_id: str,
+        past_key_values: PastKeyValues,
+        cache_token_ids: Sequence[int],
+    ) -> None:
+        token_ids = list(cache_token_ids)
+        actual_tokens = get_past_seq_len(past_key_values)
+        if len(token_ids) != actual_tokens:
+            raise ValueError(
+                f"Pretranslated cache/token-id length mismatch for edge {edge_id}: "
+                f"token_ids={len(token_ids)} past_tokens={actual_tokens}"
+            )
+        self.pretranslated_past_by_edge[edge_id] = past_key_values
+        self.pretranslated_token_ids_by_edge[edge_id] = token_ids
+
     def reset(self) -> None:
         self.past_key_values = None
-        self.transcript_text = ""
+        self.cache_token_ids = []
+        self.invalidate_pretranslated_caches()
 
     def clear_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
-        """Drop this agent's resident KV cache without changing its transcript bookkeeping."""
+        """Drop this agent's resident KV cache and all derived pretranslated caches."""
         self.past_key_values = None
+        self.cache_token_ids = []
+        self.invalidate_pretranslated_caches()
         if empty_cuda_cache and torch.cuda.is_available() and str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -103,25 +138,28 @@ class Agent:
         if input_ids.shape[1] < 1:
             raise ValueError("Agent text must tokenize to at least one token.")
         return input_ids.to(self.device)
-
-    @torch.inference_mode()
-    def extract_past_from_text(self, text: str, *, max_input_tokens: Optional[int] = None) -> PastKeyValues:
-        input_ids = self.encode_text(text, max_input_tokens=max_input_tokens)
-        return extract_past_key_values(self.model, input_ids)
-
-    @torch.inference_mode()
-    def extract_past_from_input_ids(self, input_ids: torch.Tensor) -> PastKeyValues:
-        return extract_past_key_values(self.model, input_ids.to(self.device))
-
-    def set_replayed_cache(self, past_key_values: PastKeyValues, *, transcript_text: str) -> None:
+    def set_replayed_cache(
+        self,
+        past_key_values: PastKeyValues,
+        *,
+        cache_token_ids: Sequence[int],
+    ) -> None:
         self.past_key_values = past_key_values
-        self.transcript_text = transcript_text
+        self.cache_token_ids = list(cache_token_ids)
+        actual_tokens = self.cache_seq_len
+        if len(self.cache_token_ids) != actual_tokens:
+            raise ValueError(
+                f"Replayed cache/token-id length mismatch for Agent {self.node_id}: "
+                f"token_ids={len(self.cache_token_ids)} past_tokens={actual_tokens}"
+            )
+        self.invalidate_pretranslated_caches()
 
     @torch.inference_mode()
-    def _prefill_prompt(self, prompt_text: str) -> Tuple[Optional[PastKeyValues], torch.Tensor]:
+    def _prefill_prompt(self, prompt_text: str) -> Tuple[Optional[PastKeyValues], torch.Tensor, int]:
         prompt_ids = self.encode_text(prompt_text)
+        prompt_tokens = int(prompt_ids.shape[1])
         if prompt_ids.shape[1] == 1:
-            return self.past_key_values, prompt_ids
+            return self.past_key_values, prompt_ids, prompt_tokens
 
         cache_ids = prompt_ids[:, :-1]
         seed_token = prompt_ids[:, -1:]
@@ -133,7 +171,7 @@ class Agent:
                 past_key_values=self.past_key_values,
                 input_ids=cache_ids,
             )
-        return prompt_past, seed_token
+        return prompt_past, seed_token, prompt_tokens
 
     @staticmethod
     def _trim_at_stop_sequence(text: str, stop_sequences: Iterable[str]) -> Tuple[str, Optional[str]]:
@@ -152,11 +190,10 @@ class Agent:
 
     @torch.inference_mode()
     def generate_response(self, prompt_text: str) -> AgentGeneration:
-        cache_seq_len_before = self.cache_seq_len
-        current_past, current_input_ids = self._prefill_prompt(prompt_text)
+        tokens_before = self.cache_seq_len
+        current_past, current_input_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
         eos_token_id = self.tokenizer.eos_token_id
-        stop_reason = "max_new_tokens"
         last_generated_token: Optional[torch.Tensor] = None
 
         for _ in range(max(0, self.max_new_tokens)):
@@ -170,7 +207,6 @@ class Agent:
             next_token_id = int(next_token.item())
 
             if eos_token_id is not None and next_token_id == int(eos_token_id):
-                stop_reason = "eos_token"
                 break
 
             generated_token_ids.append(next_token_id)
@@ -179,7 +215,6 @@ class Agent:
             _, matched_stop = self._trim_at_stop_sequence(decoded_so_far, self.stop_sequences)
             current_input_ids = next_token
             if matched_stop is not None:
-                stop_reason = f"stop_sequence:{matched_stop}"
                 break
 
         # The loop cache contains the token that was fed into the model, not the
@@ -194,21 +229,42 @@ class Agent:
             current_past = outputs.past_key_values
 
         raw_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-        text, matched_stop = self._trim_at_stop_sequence(raw_text, self.stop_sequences)
-        if matched_stop is not None and not stop_reason.startswith("stop_sequence:"):
-            stop_reason = f"stop_sequence:{matched_stop}"
+        text, _ = self._trim_at_stop_sequence(raw_text, self.stop_sequences)
         text = text.strip()
 
+        prompt_token_ids = self.encode_text(prompt_text).squeeze(0).detach().cpu().tolist()
+        expected_cache_token_ids = list(self.cache_token_ids) + prompt_token_ids + list(generated_token_ids)
+
         self.past_key_values = current_past
+        actual_cache_tokens = self.cache_seq_len
+        if len(expected_cache_token_ids) > actual_cache_tokens:
+            # This can happen for unusual settings such as max_new_tokens=0, where
+            # the final prompt seed token was not fed through the model. Keep the
+            # token-id ledger aligned with the actual KV length.
+            expected_cache_token_ids = expected_cache_token_ids[:actual_cache_tokens]
+        elif len(expected_cache_token_ids) < actual_cache_tokens:
+            logging.warning(
+                "Agent %s cache token-id ledger shorter than KV cache: token_ids=%d past_tokens=%d",
+                self.node_id,
+                len(expected_cache_token_ids),
+                actual_cache_tokens,
+            )
+            raise ValueError(
+                f"Agent {self.node_id} cache/token-id length mismatch: "
+                f"token_ids={len(expected_cache_token_ids)} past_tokens={actual_cache_tokens}"
+            )
+        self.cache_token_ids = expected_cache_token_ids
+        self.invalidate_pretranslated_caches()
         return AgentGeneration(
             agent_id=self.node_id,
             prompt_text=prompt_text,
             text=text,
             raw_text=raw_text,
             generated_token_ids=generated_token_ids,
-            cache_seq_len_before=cache_seq_len_before,
-            cache_seq_len_after=self.cache_seq_len,
-            stop_reason=stop_reason,
+            tokens_before=tokens_before,
+            tokens_after=self.cache_seq_len,
+            tokens_prompt=tokens_prompt,
+            tokens_completion=len(generated_token_ids),
         )
 
 

@@ -1,21 +1,23 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import importlib
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from core.agent import Agent, AgentGeneration, HubAgent, get_past_seq_len
-from core.common import PastKeyValues, extract_past_key_values, read_json, set_seed
+from core.agent import Agent, AgentGeneration, HubAgent, get_past_seq_len, slice_past_suffix
+from core.common import PastKeyValues, read_json, set_seed
 from core.config import resolve_device
 from core.context import Context
 from core.eval_util import (
     InferenceProfiler,
+    temporarily_offload_module,
     compute_generation_f1,
-    get_squad_v11_dataset_spec,
     postprocess_generated_answer,
 )
 from core.topology import Edge, build_edge_map, build_nodes_and_edges
@@ -25,6 +27,73 @@ from core.train_util import get_train_config_path
 CACHE_MODE_RETAIN = "retain"
 CACHE_MODE_FREE = "free"
 SUPPORTED_CACHE_MODES = (CACHE_MODE_RETAIN, CACHE_MODE_FREE)
+
+SUPPORTED_ALGS = ("mot", "interlat", "lsc")
+RETAIN_ONLY_ALGS = ("interlat", "lsc")
+TRAIN_MODULE_BY_ALG = {
+    "mot": "mot.train",
+    "interlat": "interlat.train",
+    "lsc": "lsc.train",
+}
+MAX_AGENT_COUNT = 4
+
+
+def normalize_agent_runner_alg(alg: str) -> str:
+    normalized = str(alg).strip().lower()
+    if normalized not in SUPPORTED_ALGS:
+        raise ValueError(f"Unsupported alg={alg!r}; expected one of {SUPPORTED_ALGS}")
+    return normalized
+
+
+def resolve_agent_count(agent_count: Optional[int], total_nodes: int) -> int:
+    max_allowed = min(int(total_nodes), MAX_AGENT_COUNT)
+    if max_allowed < 2:
+        raise ValueError("AgentRunner requires at least two nodes in the checkpoint model pool.")
+    if agent_count is None:
+        return max_allowed
+    resolved = int(agent_count)
+    if resolved < 2:
+        raise ValueError(f"agent_count must be at least 2, got {resolved}")
+    if resolved > max_allowed:
+        raise ValueError(
+            f"agent_count={resolved} exceeds the allowed maximum {max_allowed} "
+            f"(checkpoint nodes={total_nodes}, hard limit={MAX_AGENT_COUNT})."
+        )
+    return resolved
+
+
+OFFLOAD_KIND_DELTA = "delta"
+
+
+def _concat_past_key_values(prefix: Optional[PastKeyValues], suffix: PastKeyValues) -> PastKeyValues:
+    """Append a translated suffix cache to an existing target-side cache."""
+    if prefix is None:
+        return suffix
+    if len(prefix) != len(suffix):
+        raise ValueError(
+            f"Cannot concatenate KV caches with different layer counts: "
+            f"prefix={len(prefix)}, suffix={len(suffix)}"
+        )
+    concatenated = []
+    for layer_idx, ((prefix_key, prefix_value), (suffix_key, suffix_value)) in enumerate(zip(prefix, suffix)):
+        if prefix_key.shape[:2] != suffix_key.shape[:2] or prefix_key.shape[3:] != suffix_key.shape[3:]:
+            raise ValueError(
+                f"Cannot concatenate KV cache layer {layer_idx}: key shape mismatch "
+                f"prefix={tuple(prefix_key.shape)}, suffix={tuple(suffix_key.shape)}"
+            )
+        if prefix_value.shape[:2] != suffix_value.shape[:2] or prefix_value.shape[3:] != suffix_value.shape[3:]:
+            raise ValueError(
+                f"Cannot concatenate KV cache layer {layer_idx}: value shape mismatch "
+                f"prefix={tuple(prefix_value.shape)}, suffix={tuple(suffix_value.shape)}"
+            )
+        concatenated.append(
+            (
+                torch.cat([prefix_key, suffix_key], dim=2).contiguous(),
+                torch.cat([prefix_value, suffix_value], dim=2).contiguous(),
+            )
+        )
+    return tuple(concatenated)
+
 
 
 @dataclass
@@ -39,6 +108,7 @@ class AgentRunnerConfig:
     log_turns: bool = True
     log_max_chars: int = 600
     cache_mode: str = CACHE_MODE_RETAIN
+    agent_count: Optional[int] = None
 
 
 @dataclass
@@ -46,26 +116,19 @@ class AgentTurnRecord:
     agent_id: str
     prompt: str
     response: str
-    raw_response: str
-    stop_reason: str
-    cache_seq_len_before: int
-    cache_seq_len_after: int
+    tokens_before: int
+    tokens_after: int
+    tokens_prompt: int
+    tokens_completion: int
     cache_mode: str = CACHE_MODE_RETAIN
     is_hub: bool = False
-    ring_position: int = 0
-    translated_from: Optional[str] = None
     translated_edge_id: Optional[str] = None
-    translated_source_seq_len: int = 0
-    translated_target_seq_len: int = 0
-    translated_delta_tokens: int = 0
-    offloaded_to: Optional[str] = None
+    translated_offload_kind: Optional[str] = None
+    tokens_received: int = 0
     offload_edge_id: Optional[str] = None
-    offload_source_seq_len: int = 0
-    offload_target_seq_len: int = 0
-    offload_delta_tokens: int = 0
-    cache_cleared_after_turn: bool = False
-    resident_cache_agents_after_turn: int = 0
-    free_mode_peak_cache_agent_bound: Optional[int] = None
+    offload_kind: Optional[str] = None
+    tokens_sent: int = 0
+    tokens_sent_check_passed: bool = True
 
 
 @dataclass
@@ -90,143 +153,280 @@ class AgentRunnerResult:
 
 
 class KVCacheTranslationAdapter:
-    """Dispatches full-prefix cache replay/translation to each implemented algorithm."""
+    """Algorithm-aware helper for pretranslated KV-cache handoff.
+
+    Delta sizing is token-id based. Translation is prepared before offload and
+    stored on the source Agent, so offload_cache() only slices an already
+    translated target-side cache piece.
+    """
 
     def __init__(self, *, ctx: Context, translator_pool, alg: str) -> None:
         self.ctx = ctx
         self.translator_pool = translator_pool
-        self.alg = alg
+        self.alg = normalize_agent_runner_alg(alg)
         self.edge_map = build_edge_map(ctx.edges)
-        self._sent_source_seq_lens: Dict[Tuple[str, str], int] = {}
 
     def _get_edge(self, src_node_id: str, tgt_node_id: str) -> Edge:
         edge_id = f"{src_node_id}_to_{tgt_node_id}"
         edge = self.edge_map.get(edge_id)
         if edge is None:
             raise ValueError(
-                f"Missing translator edge {edge_id!r}. AgentRunner requires every KV transfer edge used by the "
-                f"selected topology/cache mode. In retain mode this is each ring edge; in free mode this is "
-                f"hub<->non-hub edges. Available edges: {sorted(self.edge_map)}"
+                f"Missing translator edge {edge_id!r}. AgentRunner requires every KV offload edge used by the "
+                f"selected hub-centered star topology/cache mode. Non-hub to non-hub handoffs are routed "
+                f"through the hub and therefore require source_to_hub and hub_to_target translator edges. "
+                f"Available edges: {sorted(self.edge_map)}"
             )
         return edge
 
-    def _shared_prefix_ids_for_edge(self, target_agent: Agent, transcript_text: str) -> torch.Tensor:
-        # Existing C2C/LSC/KVComm/MoT eval paths tokenize an edge prefix with the
-        # target tokenizer and feed the same ids to the source model. Keep that
-        # convention here so the runner matches checkpoint-time assumptions.
-        return target_agent.encode_text(transcript_text)
+    @staticmethod
+    def _ids_to_tensor(token_ids: Sequence[int], *, device: str) -> torch.Tensor:
+        ids = list(token_ids)
+        if not ids:
+            raise ValueError("Cannot prepare or offload an empty KV cache.")
+        return torch.tensor([ids], dtype=torch.long, device=device)
 
     @torch.inference_mode()
-    def translate_full_cache(
+    def build_pretranslated_past_for_edge(
         self,
         *,
         source_agent: Agent,
         target_agent: Agent,
-        transcript_text: str,
+        source_past_key_values: PastKeyValues,
+        source_token_ids: Sequence[int],
+    ) -> Tuple[str, PastKeyValues]:
+        """Translate an already-built source cache into the target model space.
+
+        This is used immediately after an Agent cache changes, never inside
+        offload_cache(). The returned full target-side cache can later be sliced
+        by token-id delta during the physical handoff.
+        """
+        token_ids = list(source_token_ids)
+        source_tokens = get_past_seq_len(source_past_key_values)
+        if len(token_ids) != source_tokens:
+            raise ValueError(
+                f"Source token-id ledger is not aligned with KV cache for "
+                f"{source_agent.node_id}->{target_agent.node_id}: "
+                f"token_ids={len(token_ids)} past_tokens={source_tokens}"
+            )
+
+        edge = self._get_edge(source_agent.node_id, target_agent.node_id)
+        edge_id = edge.id
+        prefix_input_ids = self._ids_to_tensor(token_ids, device=target_agent.device)
+        translated_past = self._build_algorithm_translated_past(
+            edge=edge,
+            source_past_key_values=source_past_key_values,
+            prefix_input_ids=prefix_input_ids,
+        )
+        translated_tokens = get_past_seq_len(translated_past)
+        if translated_tokens != source_tokens:
+            raise ValueError(
+                f"Pretranslated cache length mismatch on {edge_id}: "
+                f"source_tokens={source_tokens} translated_tokens={translated_tokens}"
+            )
+        return edge_id, translated_past
+
+    @torch.inference_mode()
+    def _build_algorithm_translated_past(
+        self,
+        *,
+        edge: Edge,
+        source_past_key_values: PastKeyValues,
+        prefix_input_ids: torch.Tensor,
+    ) -> PastKeyValues:
+        tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
+        target_model = self.ctx.mm.get_model(edge.tgt_id)
+
+        if self.alg == "mot":
+            translated_past, _ = self.translator_pool.build_replayed_target_past(
+                source_past_key_values=source_past_key_values,
+                prefix_input_ids=prefix_input_ids,
+                source_model=self.ctx.mm.get_model(edge.src_id),
+                target_model=target_model,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
+                tgt_spec=tgt_spec,
+            )
+            return translated_past
+
+        if self.alg == "lsc":
+            return self.translator_pool.translate_layers(
+                past_key_values=source_past_key_values,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
+                tgt_spec=tgt_spec,
+            )
+
+        if self.alg == "interlat":
+            from interlat.train import build_latent_conditioned_past, extract_last_hidden_states
+
+            source_tokens = get_past_seq_len(source_past_key_values)
+            if int(prefix_input_ids.shape[1]) != source_tokens:
+                raise ValueError(
+                    f"InterLat prefix/token length mismatch on {edge.id}: "
+                    f"prefix_tokens={int(prefix_input_ids.shape[1])} source_tokens={source_tokens}"
+                )
+
+            source_hidden_states = extract_last_hidden_states(
+                self.ctx.mm.get_model(edge.src_id),
+                prefix_input_ids,
+            )
+            translated_latents = self.translator_pool.translate_hidden_states(
+                edge_id=edge.id,
+                source_hidden_states=source_hidden_states,
+            )
+            latent_tokens = int(translated_latents.shape[1])
+            latent_conditioned_past = build_latent_conditioned_past(
+                target_model,
+                prefix_input_ids=prefix_input_ids,
+                latent_prefix=translated_latents,
+            )
+            # InterLat prepends latent tokens to condition the target prefix. The
+            # AgentRunner handoff code tracks deltas with the original token-id
+            # ledger, so remove the synthetic latent prefix after it has
+            # conditioned the target-side KV states.
+            translated_past = slice_past_suffix(latent_conditioned_past, latent_tokens)
+            translated_tokens = get_past_seq_len(translated_past)
+            if translated_tokens != source_tokens:
+                raise ValueError(
+                    f"InterLat translated cache length mismatch on {edge.id}: "
+                    f"source_tokens={source_tokens} translated_tokens={translated_tokens}. "
+                    "Reduce --max-prompt-tokens or the generated context length so the latent-conditioned "
+                    "target prefix is not truncated by the target model context window."
+                )
+            return translated_past
+
+        raise ValueError(f"Unsupported alg={self.alg!r}; expected one of {SUPPORTED_ALGS}")
+
+
+    @torch.inference_mode()
+    def refresh_pretranslated_cache(self, *, source_agent: Agent, target_agent: Agent) -> Dict[str, Any]:
+        """Prepare the full translated target-side cache for source_agent -> target_agent.
+
+        This is the only place where the selected algorithm translates a resident
+        Agent cache. offload_cache() must not call the translator; it only slices
+        this prepared cache according to the token-id delta computed by the runner.
+        """
+        if source_agent.past_key_values is None:
+            raise ValueError(f"Source agent {source_agent.node_id} has no KV cache to pretranslate.")
+        source_token_ids = list(source_agent.cache_token_ids)
+        source_tokens = get_past_seq_len(source_agent.past_key_values)
+        if len(source_token_ids) != source_tokens:
+            raise ValueError(
+                f"Source agent {source_agent.node_id} token-id ledger is not aligned with KV cache: "
+                f"token_ids={len(source_token_ids)} past_tokens={source_tokens}"
+            )
+
+        edge = self._get_edge(source_agent.node_id, target_agent.node_id)
+        edge_id = edge.id
+        cached_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
+        cached_past = source_agent.pretranslated_past_by_edge.get(edge_id)
+        if cached_past is not None and cached_ids == source_token_ids:
+            return {
+                "edge_id": edge_id,
+                "prepared_tokens": source_tokens,
+                "cached": True,
+            }
+
+        edge_id, translated_past = self.build_pretranslated_past_for_edge(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            source_past_key_values=source_agent.past_key_values,
+            source_token_ids=source_token_ids,
+        )
+        source_agent.set_pretranslated_cache(
+            edge_id=edge_id,
+            past_key_values=translated_past,
+            cache_token_ids=source_token_ids,
+        )
+        return {
+            "edge_id": edge_id,
+            "prepared_tokens": source_tokens,
+            "cached": False,
+        }
+
+    def _slice_pretranslated_cache_piece(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        prefix_tokens: int,
+        expected_delta_tokens: int,
     ) -> Tuple[PastKeyValues, Dict[str, Any]]:
         edge = self._get_edge(source_agent.node_id, target_agent.node_id)
         edge_id = edge.id
-        alg = self.alg
-        target_input_ids = target_agent.encode_text(transcript_text)
+        translated_full_past = source_agent.pretranslated_past_by_edge.get(edge_id)
+        translated_token_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
+        source_token_ids = list(source_agent.cache_token_ids)
 
-        if alg == "interlat":
-            train_mod = importlib.import_module("interlat.train")
-            source_input_ids = source_agent.encode_text(transcript_text)
-            source_hidden = train_mod.extract_last_hidden_states(
-                self.ctx.mm.get_model(edge.src_id),
-                source_input_ids,
+        if translated_full_past is None or translated_token_ids is None:
+            raise RuntimeError(
+                f"No pretranslated cache is available for {edge_id}. "
+                "Refresh the source Agent's outbound translation immediately after its cache changes "
+                "and before calling offload_cache()."
             )
-            translated_latents = self.translator_pool.translate_hidden_states(
-                edge_id=edge_id,
-                source_hidden_states=source_hidden,
+        if translated_token_ids != source_token_ids:
+            raise RuntimeError(
+                f"Stale pretranslated cache for {edge_id}: "
+                f"prepared_tokens={len(translated_token_ids)} current_tokens={len(source_token_ids)}"
             )
-            translated_past = train_mod.build_latent_conditioned_past(
-                self.ctx.mm.get_model(edge.tgt_id),
-                prefix_input_ids=target_input_ids,
-                latent_prefix=translated_latents,
-            )
-            source_past_for_delta = extract_past_key_values(
-                self.ctx.mm.get_model(edge.src_id),
-                source_input_ids,
-            )
-        else:
-            shared_input_ids = self._shared_prefix_ids_for_edge(target_agent, transcript_text)
-            source_past = extract_past_key_values(self.ctx.mm.get_model(edge.src_id), shared_input_ids)
-            source_past_for_delta = source_past
 
-            if alg == "c2c":
-                train_mod = importlib.import_module("c2c.train")
-                from core.common import replace_top_layers
+        translated_piece = slice_past_suffix(translated_full_past, prefix_tokens)
+        target_piece_tokens = get_past_seq_len(translated_piece)
+        if target_piece_tokens != expected_delta_tokens:
+            raise ValueError(
+                f"Pretranslated delta slice length mismatch on {edge_id}: "
+                f"expected_delta_tokens={expected_delta_tokens} target_piece_tokens={target_piece_tokens}"
+            )
 
-                native_target_past = extract_past_key_values(self.ctx.mm.get_model(edge.tgt_id), shared_input_ids)
-                translated_top_past = train_mod.translate_top_layers(
-                    translator_pool=self.translator_pool,
-                    train_config=self.ctx.config,
-                    sharer_past_key_values=source_past,
-                    receiver_past_key_values=native_target_past,
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=self.ctx.mm.get_model_spec(edge.tgt_id),
-                )
-                translated_past = replace_top_layers(
-                    base_past_key_values=native_target_past,
-                    translated_top_past_key_values=translated_top_past,
-                )
-            elif alg == "lsc":
-                translated_past = self.translator_pool.translate_layers(
-                    past_key_values=source_past,
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=self.ctx.mm.get_model_spec(edge.tgt_id),
-                )
-            elif alg == "kvcomm":
-                translated_past = self.translator_pool.build_replayed_target_past(
-                    edge_id=edge_id,
-                    source_past_key_values=source_past,
-                )
-            elif alg == "mot":
-                translated_past, _ = self.translator_pool.build_replayed_target_past(
-                    source_past_key_values=source_past,
-                    prefix_input_ids=shared_input_ids,
-                    target_model=self.ctx.mm.get_model(edge.tgt_id),
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=self.ctx.mm.get_model_spec(edge.tgt_id),
-                )
-            elif alg == "mot-h":
-                train_mod = importlib.import_module("mot-h.train")
-                source_past_h, hidden_states = train_mod.extract_model_prefill_artifacts(
-                    self.ctx.mm.get_model(edge.src_id),
-                    shared_input_ids,
-                )
-                source_past_for_delta = source_past_h
-                source_canonical_attn_input_block = train_mod.extract_selected_layer_canonical_attn_input_block(
-                    self.ctx.mm.get_model(edge.src_id),
-                    hidden_states,
-                    self.ctx.cm.get_src_layer_indices(edge_id),
-                )
-                translated_past, _ = self.translator_pool.build_replayed_target_past(
-                    source_past_key_values=source_past_h,
-                    prefix_input_ids=shared_input_ids,
-                    target_model=self.ctx.mm.get_model(edge.tgt_id),
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=self.ctx.mm.get_model_spec(edge.tgt_id),
-                    source_canonical_attn_input_block=source_canonical_attn_input_block,
-                )
-            else:
-                raise ValueError(f"Unsupported AgentRunner alg={alg!r}")
-
-        source_seq_len = get_past_seq_len(source_past_for_delta)
-        previous_seq_len = self._sent_source_seq_lens.get((edge.src_id, edge.tgt_id), 0)
-        delta_tokens = max(0, source_seq_len - previous_seq_len)
-        self._sent_source_seq_lens[(edge.src_id, edge.tgt_id)] = source_seq_len
-        return translated_past, {
+        return translated_piece, {
             "edge_id": edge_id,
-            "source_seq_len": source_seq_len,
-            "target_seq_len": get_past_seq_len(translated_past),
-            "delta_tokens": delta_tokens,
+            "piece_source_tokens": int(expected_delta_tokens),
+            "piece_target_tokens": target_piece_tokens,
         }
+
+    @torch.inference_mode()
+    def offload_cache(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        target_tokens_before_replay: int,
+        expected_delta_tokens: int,
+        delta_prefix_matched: bool,
+    ) -> Tuple[PastKeyValues, Dict[str, Any]]:
+        """Replay a pretranslated KV delta into target_agent.
+
+        No translation is performed here. The translated full cache must already
+        exist on source_agent.pretranslated_past_by_edge; offload_cache() only
+        slices the missing suffix and concatenates it to the target cache.
+        """
+        translated_piece, piece_meta = self._slice_pretranslated_cache_piece(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            prefix_tokens=target_tokens_before_replay,
+            expected_delta_tokens=expected_delta_tokens,
+        )
+
+        if target_agent.past_key_values is None:
+            replayed_target_past = translated_piece
+        else:
+            replayed_target_past = _concat_past_key_values(target_agent.past_key_values, translated_piece)
+
+        source_piece_tokens = int(piece_meta.get("piece_source_tokens", 0))
+        target_piece_tokens = int(piece_meta.get("piece_target_tokens", 0))
+        return replayed_target_past, {
+            "mode": "offload",
+            "offload_kind": OFFLOAD_KIND_DELTA,
+            "edge_id": piece_meta.get("edge_id"),
+            "tokens_sent": source_piece_tokens,
+            "tokens_received": source_piece_tokens,
+            "target_piece_tokens": target_piece_tokens,
+            "target_tokens_before_replay": int(target_tokens_before_replay),
+            "target_tokens_after_replay": get_past_seq_len(replayed_target_past),
+            "expected_delta_tokens": int(expected_delta_tokens),
+            "delta_prefix_matched": bool(delta_prefix_matched),
+        }
+
 
 
 class AgentRunner:
@@ -243,17 +443,19 @@ class AgentRunner:
         log_turns: bool = True,
         log_max_chars: int = 600,
         cache_mode: str = CACHE_MODE_RETAIN,
+        agent_count: Optional[int] = None,
     ) -> None:
-        if len(ctx.nodes) < 2:
-            raise ValueError("AgentRunner requires at least two nodes in the checkpoint model pool.")
+        total_nodes = len(ctx.nodes)
+        resolved_alg = normalize_agent_runner_alg(alg)
         if cache_mode not in SUPPORTED_CACHE_MODES:
             raise ValueError(f"Unsupported cache_mode={cache_mode!r}; expected one of {SUPPORTED_CACHE_MODES}")
-        if not alg:
-            raise ValueError("alg is required")
+        if resolved_alg in RETAIN_ONLY_ALGS and cache_mode != CACHE_MODE_RETAIN:
+            raise ValueError(f"alg={resolved_alg!r} supports only cache_mode='retain'.")
+        resolved_agent_count = resolve_agent_count(agent_count, total_nodes)
 
         self.ctx = ctx
         self.translator_pool = translator_pool
-        self.alg = alg
+        self.alg = resolved_alg
         self.max_turns = int(max_turns)
         self.generation_max_new_tokens = int(generation_max_new_tokens)
         self.max_prompt_tokens = max_prompt_tokens
@@ -261,14 +463,22 @@ class AgentRunner:
         self.log_turns = bool(log_turns)
         self.log_max_chars = max(80, int(log_max_chars))
         self.cache_mode = cache_mode
+        self.agent_count = resolved_agent_count
         self.device = ctx.config.device
         self.profiler = InferenceProfiler(self.device)
         self.cache_translator = KVCacheTranslationAdapter(ctx=ctx, translator_pool=translator_pool, alg=alg)
 
-        self.node_ids = [node.id for node in ctx.nodes]
-        stop_sequences = tuple(f"\nAgent {node.id}:" for node in ctx.nodes) + ("\nQuestion:", "\nPassage:")
+        self.active_nodes = list(ctx.nodes[: self.agent_count])
+        self.node_ids = [node.id for node in self.active_nodes]
+        stop_sequences = tuple(f"\nAgent {node.id}:" for node in self.active_nodes) + (
+            "\n### Instruction:",
+            "\n### Passage:",
+            "\n### Question:",
+            "\nQuestion:",
+            "\nPassage:",
+        )
         self.agent_sequence: List[Agent] = []
-        for index, node in enumerate(ctx.nodes):
+        for index, node in enumerate(self.active_nodes):
             agent_cls = HubAgent if index == 0 else Agent
             self.agent_sequence.append(
                 agent_cls(
@@ -290,22 +500,32 @@ class AgentRunner:
         self.agent_a = self.hub_agent
         self.agent_b = self.agent_sequence[1]
 
+        # For non-hub -> non-hub logical handoffs, the physical path is
+        # source -> hub -> target. The second hop's hub -> target cache is
+        # precomputed right after the source generation, before any offload starts,
+        # then installed on the hub after the first hop updates the hub cache.
+        self._pending_pretranslated_second_hops: Dict[Tuple[str, str], Tuple[str, PastKeyValues, List[int]]] = {}
+        self._kv_peak_memory_bytes: Optional[int] = None
+
     @classmethod
     def from_checkpoint(cls, config: AgentRunnerConfig) -> "AgentRunner":
-        if not config.alg:
-            raise ValueError("alg is required")
+        resolved_alg = normalize_agent_runner_alg(config.alg)
+        if resolved_alg in RETAIN_ONLY_ALGS and config.cache_mode != CACHE_MODE_RETAIN:
+            raise ValueError(f"alg={resolved_alg!r} supports only cache_mode='retain'.")
         if not config.checkpoint_dir_path:
             raise ValueError("checkpoint_dir_path is required")
         train_config_path = get_train_config_path(config.checkpoint_dir_path)
         if not train_config_path.exists():
             raise FileNotFoundError(f"Train config not found: {train_config_path}")
         train_payload = read_json(train_config_path)
-        nodes, edges = build_nodes_and_edges(train_payload["model_ids"], train_payload["model_directions"])
-        train_mod = importlib.import_module(f"{config.alg}.train")
+        all_nodes, all_edges = build_nodes_and_edges(train_payload["model_ids"], train_payload["model_directions"])
+        resolve_agent_count(config.agent_count, len(all_nodes))
+
+        train_mod = importlib.import_module(TRAIN_MODULE_BY_ALG[resolved_alg])
         loaded = train_mod.load_translator_pool_from_checkpoint(
             checkpoint_dir_path=config.checkpoint_dir_path,
-            nodes=nodes,
-            edges=edges,
+            nodes=all_nodes,
+            edges=all_edges,
             device_override=resolve_device(config.device),
         )
         ctx, translator_pool, *_ = loaded
@@ -313,7 +533,7 @@ class AgentRunner:
         return cls(
             ctx=ctx,
             translator_pool=translator_pool,
-            alg=config.alg,
+            alg=resolved_alg,
             max_turns=config.max_turns,
             generation_max_new_tokens=config.generation_max_new_tokens,
             max_prompt_tokens=config.max_prompt_tokens,
@@ -321,29 +541,43 @@ class AgentRunner:
             log_turns=config.log_turns,
             log_max_chars=config.log_max_chars,
             cache_mode=config.cache_mode,
+            agent_count=config.agent_count,
         )
 
     @staticmethod
-    def build_initial_prompt(context: str, question: str, *, hub_agent_id: str = "A", agent_count: int = 2) -> str:
+    def build_initial_prompt(
+        context: str,
+        question: str,
+        *,
+        hub_agent_id: str = "A",
+        agent_count: int = 2,
+        is_final_turn: bool = False,
+    ) -> str:
+        del hub_agent_id, agent_count, is_final_turn
         return (
-            f"You are Agent {hub_agent_id}, the hub agent in a {agent_count}-agent ring-topology QA discussion.\n"
-            "Use the passage to answer the question briefly. If uncertain, propose a candidate answer for the next agent to verify.\n\n"
-            f"Passage:\n{context.strip()}\n\n"
-            f"Question: {question.strip()}\n"
-            f"Agent {hub_agent_id}:"
+            "### Instruction: Use the passage to answer the Question accurately.\n"
+            f"### Passage:\n{context.strip()}\n"
+            "### Question:\n"
+            f"{question.strip()}\n"
+            "### Response:\n"
         )
 
-    def build_followup_prompt(self, agent_id: str, turn_index: int) -> str:
-        if agent_id == self.hub_agent.node_id:
-            return (
-                f"\nAgent {agent_id}: Incorporate the prior agents' replies. "
-                "When enough evidence has been exchanged, start your reply with FINAL followed by a colon and a short answer; otherwise continue briefly.\n"
-                f"Agent {agent_id}:"
-            )
+    def build_followup_prompt(
+        self,
+        agent_id: str,
+        turn_index: int,
+        question: str,
+        *,
+        is_final_turn: bool = False,
+    ) -> str:
+        del agent_id, turn_index, is_final_turn
         return (
-            f"\nAgent {agent_id}: Review the prior ring discussion against the passage. "
-            "Either improve the answer or, when the answer is clear, start your reply with FINAL followed by a colon and a short answer.\n"
-            f"Agent {agent_id}:"
+            "\n### Instruction:\n"
+            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            # "Do not repeat the instruction.\n"
+            "### Question:\n"
+            f"{question.strip()}\n"
+            "### Response:\n"
         )
 
     @staticmethod
@@ -367,20 +601,42 @@ class AgentRunner:
             return clean
         return clean[: max(0, max_chars - 3)] + "..."
 
-    def _free_mode_peak_cache_agent_bound(self) -> Optional[int]:
-        if self.cache_mode != CACHE_MODE_FREE:
-            return None
-        # Hub keeps the canonical KV cache, and at most one non-hub agent is replayed/generated at a time.
-        return min(len(self.agent_sequence), 2)
-
     def _count_resident_cache_agents(self) -> int:
         return sum(1 for agent in self.agent_sequence if agent.past_key_values is not None)
 
     def _agent_for_turn(self, turn_index: int) -> Agent:
         return self.agent_sequence[turn_index % len(self.agent_sequence)]
 
-    def _ring_position(self, agent: Agent) -> int:
-        return self.agent_sequence.index(agent)
+    def _iter_unique_gpu_modules_for_kv_measurement(self):
+        seen = set()
+        modules = [self.translator_pool] + [
+            self.ctx.mm.get_model(node.id)
+            for node in self.ctx.nodes
+        ]
+        for module in modules:
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            yield module
+
+    def _measure_kv_cache_only_memory_bytes(self) -> Optional[int]:
+        if not (torch.cuda.is_available() and str(self.device).startswith("cuda")):
+            return None
+        device_obj = torch.device(self.device)
+        device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+        with ExitStack() as stack:
+            for module in self._iter_unique_gpu_modules_for_kv_measurement():
+                stack.enter_context(temporarily_offload_module(module, self.device))
+            torch.cuda.synchronize(device_index)
+            return int(torch.cuda.memory_allocated(device_index))
+
+    def _update_kv_peak_memory(self) -> None:
+        measured = self._measure_kv_cache_only_memory_bytes()
+        if measured is None:
+            return
+        if self._kv_peak_memory_bytes is None or measured > self._kv_peak_memory_bytes:
+            self._kv_peak_memory_bytes = measured
 
     def _log_example_start(
         self,
@@ -393,15 +649,14 @@ class AgentRunner:
             return
         label = "?" if example_index is None else str(example_index)
         logging.info(
-            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | hub=%s | ring=%s | "
-            "free_peak_cache_agent_bound=%s | question=%s | gold=%s",
+            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | hub=%s | topology=star | turn_order=%s | "
+            "question=%s | gold=%s",
             label,
             self.cache_mode,
             self.alg,
             len(self.agent_sequence),
             self.hub_agent.node_id,
             "->".join(self.node_ids + [self.node_ids[0]]),
-            self._free_mode_peak_cache_agent_bound(),
             self._preview_text(question, self.log_max_chars),
             list(gold_answers)[:3],
         )
@@ -410,49 +665,28 @@ class AgentRunner:
         if not self.log_turns:
             return
         label = "?" if example_index is None else str(example_index)
-        direction = "native-prefill" if record.translated_from is None else f"{record.translated_from}->{record.agent_id}"
-        if record.cache_mode == CACHE_MODE_FREE and record.is_hub and record.translated_from is None:
-            direction = "hub-retained"
         logging.info(
-            "[AgentRunner][example=%s][turn=%d] mode=%s | agent=%s | hub=%s | ring_pos=%d | source=%s | "
-            "stop=%s | cache=%d->%d | translated_delta_tokens=%d | cleared=%s | resident_cache_agents=%d | "
-            "free_peak_cache_agent_bound=%s",
+            "[AgentRunner][example=%s][turn=%d] mode=%s | agent=%s | hub=%s | "
+            "translated_edge_id=%s(%s) | offload_edge_id=%s(%s) | "
+            "tokens_before=%d | tokens_after=%d | tokens_prompt=%d | tokens_completion=%d | "
+            "tokens_received=%d | tokens_sent=%d | tokens_sent_check_passed=%s",
             label,
             turn_index,
             record.cache_mode,
             record.agent_id,
             record.is_hub,
-            record.ring_position,
-            direction,
-            record.stop_reason,
-            record.cache_seq_len_before,
-            record.cache_seq_len_after,
-            record.translated_delta_tokens,
-            record.cache_cleared_after_turn,
-            record.resident_cache_agents_after_turn,
-            record.free_mode_peak_cache_agent_bound,
+            record.translated_edge_id or "null",
+            record.translated_offload_kind or "none",
+            record.offload_edge_id or "null",
+            record.offload_kind or "none",
+            record.tokens_before,
+            record.tokens_after,
+            record.tokens_prompt,
+            record.tokens_completion,
+            record.tokens_received,
+            record.tokens_sent,
+            record.tokens_sent_check_passed,
         )
-        if record.translated_from is not None:
-            logging.info(
-                "[AgentRunner][example=%s][turn=%d] replay edge=%s | source_seq_len=%d | target_seq_len=%d",
-                label,
-                turn_index,
-                record.translated_edge_id,
-                record.translated_source_seq_len,
-                record.translated_target_seq_len,
-            )
-        if record.offloaded_to is not None:
-            logging.info(
-                "[AgentRunner][example=%s][turn=%d] offload edge=%s | %s->%s | source_seq_len=%d | target_seq_len=%d | delta_tokens=%d",
-                label,
-                turn_index,
-                record.offload_edge_id,
-                record.agent_id,
-                record.offloaded_to,
-                record.offload_source_seq_len,
-                record.offload_target_seq_len,
-                record.offload_delta_tokens,
-            )
         logging.info(
             "[AgentRunner][example=%s][turn=%d] prompt: %s",
             label,
@@ -463,7 +697,7 @@ class AgentRunner:
             "[AgentRunner][example=%s][turn=%d] response: %s",
             label,
             turn_index,
-            self._preview_text(record.response or record.raw_response, self.log_max_chars),
+            self._preview_text(record.response, self.log_max_chars),
         )
 
     def _log_example_end(self, *, example_index: Optional[int], prediction: str, f1: float) -> None:
@@ -471,28 +705,400 @@ class AgentRunner:
             return
         label = "?" if example_index is None else str(example_index)
         logging.info(
-            "[AgentRunner][example=%s] end | mode=%s | resident_cache_agents=%d | prediction=%s | f1=%.4f",
+            "[AgentRunner][example=%s] end | mode=%s | prediction=%s | f1=%.4f",
             label,
             self.cache_mode,
-            self._count_resident_cache_agents(),
             self._preview_text(prediction, self.log_max_chars),
             f1,
         )
 
-    def _translate_into(self, *, source_agent: Agent, target_agent: Agent, transcript: str) -> Dict[str, Any]:
-        translated_past, metadata = self.cache_translator.translate_full_cache(
+    def _should_clear_source_after_offload(self, source_agent: Agent) -> bool:
+        # In free mode, the non-hub agent that just transmitted its newly generated
+        # cache delta is freed. The hub stays resident so it can always receive and
+        # accumulate deltas from the other agent(s).
+        return self.cache_mode == CACHE_MODE_FREE and source_agent.node_id != self.hub_agent.node_id
+
+    def _prepare_outgoing_route_translation(self, *, source_agent: Agent, logical_target_agent: Agent) -> None:
+        """Pretranslate the physical star-topology route before the next handoff.
+
+        Direct hub-involved handoffs prepare source->target. Non-hub->non-hub
+        handoffs prepare both physical hops in advance: source->hub is stored on
+        the source Agent, and the future hub->target cache is kept pending until
+        the first hop installs the corresponding hub cache. No translator call is
+        made inside offload_cache().
+        """
+        self._pending_pretranslated_second_hops.pop((source_agent.node_id, logical_target_agent.node_id), None)
+        if source_agent.past_key_values is None:
+            return
+
+        source_is_hub = source_agent.node_id == self.hub_agent.node_id
+        target_is_hub = logical_target_agent.node_id == self.hub_agent.node_id
+        if source_is_hub or target_is_hub:
+            self.cache_translator.refresh_pretranslated_cache(
+                source_agent=source_agent,
+                target_agent=logical_target_agent,
+            )
+            return
+
+        # First physical hop: source non-hub -> hub.
+        first_meta = self.cache_translator.refresh_pretranslated_cache(
+            source_agent=source_agent,
+            target_agent=self.hub_agent,
+        )
+        first_edge_id = str(first_meta["edge_id"])
+        first_full_hub_past = source_agent.pretranslated_past_by_edge[first_edge_id]
+
+        # Build the exact future hub cache that will exist after the first hop by
+        # slicing the already-pretranslated source->hub cache. This is still route
+        # preparation, not offload; the actual handoff later only slices/copies.
+        prefix_tokens, expected_delta_tokens, _ = self._build_missing_cache_delta(
+            source_agent=source_agent,
+            target_agent=self.hub_agent,
+        )
+        first_delta_piece = slice_past_suffix(first_full_hub_past, prefix_tokens)
+        if get_past_seq_len(first_delta_piece) != expected_delta_tokens:
+            raise ValueError(
+                f"Prepared source->hub delta length mismatch on {first_edge_id}: "
+                f"expected_delta_tokens={expected_delta_tokens} "
+                f"piece_tokens={get_past_seq_len(first_delta_piece)}"
+            )
+        if self.hub_agent.past_key_values is None:
+            future_hub_past = first_delta_piece
+        else:
+            future_hub_past = _concat_past_key_values(self.hub_agent.past_key_values, first_delta_piece)
+
+        # Second physical hop: future hub -> logical target.
+        second_edge_id, second_full_target_past = self.cache_translator.build_pretranslated_past_for_edge(
+            source_agent=self.hub_agent,
+            target_agent=logical_target_agent,
+            source_past_key_values=future_hub_past,
+            source_token_ids=source_agent.cache_token_ids,
+        )
+        self._pending_pretranslated_second_hops[(source_agent.node_id, logical_target_agent.node_id)] = (
+            second_edge_id,
+            second_full_target_past,
+            list(source_agent.cache_token_ids),
+        )
+
+    def _build_missing_cache_delta(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+    ) -> Tuple[int, int, bool]:
+        """Return token-only metadata for the source suffix absent from target_agent.
+
+        past_key_values does not contain token ids. Each Agent carries a
+        cache_token_ids ledger aligned with its resident KV cache. Delta size is
+        computed only from these ledgers; no KV delta is sliced or translated here.
+        """
+        if source_agent.past_key_values is None:
+            raise ValueError(f"Source agent {source_agent.node_id} has no KV cache to offload.")
+        if len(source_agent.cache_token_ids) != get_past_seq_len(source_agent.past_key_values):
+            raise ValueError(
+                f"Source agent {source_agent.node_id} token-id ledger is not aligned with KV cache: "
+                f"token_ids={len(source_agent.cache_token_ids)} past_tokens={get_past_seq_len(source_agent.past_key_values)}"
+            )
+        if target_agent.past_key_values is not None and len(target_agent.cache_token_ids) != get_past_seq_len(target_agent.past_key_values):
+            raise ValueError(
+                f"Target agent {target_agent.node_id} token-id ledger is not aligned with KV cache: "
+                f"token_ids={len(target_agent.cache_token_ids)} past_tokens={get_past_seq_len(target_agent.past_key_values)}"
+            )
+
+        source_ids = list(source_agent.cache_token_ids)
+        target_ids = list(target_agent.cache_token_ids) if target_agent.past_key_values is not None else []
+        if not target_ids:
+            prefix_tokens = 0
+            prefix_matched = True
+        elif source_ids[: len(target_ids)] == target_ids:
+            prefix_tokens = len(target_ids)
+            prefix_matched = True
+        else:
+            raise ValueError(
+                f"Cannot offload a token-id delta because target cache is not a prefix of source cache "
+                f"on {source_agent.node_id}->{target_agent.node_id}: "
+                f"source_tokens={len(source_ids)} target_tokens={len(target_ids)}"
+            )
+
+        expected_delta_tokens = len(source_ids) - prefix_tokens
+        if expected_delta_tokens <= 0:
+            raise ValueError(
+                f"No KV delta to offload on {source_agent.node_id}->{target_agent.node_id}: "
+                f"source_tokens={len(source_ids)} target_prefix_tokens={prefix_tokens}"
+            )
+        return prefix_tokens, expected_delta_tokens, prefix_matched
+
+    def _offload_into(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        target_tokens_before_replay: int,
+        expected_delta_tokens: int,
+        delta_prefix_matched: bool,
+    ) -> Tuple[Dict[str, Any], bool]:
+        translated_past, metadata = self.cache_translator.offload_cache(
             source_agent=source_agent,
             target_agent=target_agent,
-            transcript_text=transcript,
+            target_tokens_before_replay=target_tokens_before_replay,
+            expected_delta_tokens=expected_delta_tokens,
+            delta_prefix_matched=delta_prefix_matched,
         )
-        target_agent.set_replayed_cache(translated_past, transcript_text=transcript)
-        return metadata
+        # After replay, the target owns the same logical token-id span that the
+        # source had at handoff time. Future deltas are computed from token ids.
+        target_agent.set_replayed_cache(
+            translated_past,
+            cache_token_ids=source_agent.cache_token_ids,
+        )
 
-    def _clear_non_hub_cache(self, agent: Agent) -> bool:
-        if agent.node_id == self.hub_agent.node_id:
-            return False
-        agent.clear_kv_cache(empty_cuda_cache=True)
-        return True
+        cleared = False
+        if self._should_clear_source_after_offload(source_agent):
+            if source_agent.past_key_values is not None:
+                source_agent.clear_kv_cache(empty_cuda_cache=True)
+                cleared = True
+        return metadata, cleared
+
+    def _offload_delta_hop(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Run one physical star-topology offload hop.
+
+        Delta still means the KV suffix that exists in source_agent but does not
+        exist in target_agent. If target_agent has no resident cache, this delta
+        naturally spans source_agent's whole resident cache without introducing
+        a separate full-offload mode.
+        """
+        target_tokens_before_replay, expected_delta_tokens, delta_prefix_matched = self._build_missing_cache_delta(
+            source_agent=source_agent,
+            target_agent=target_agent,
+        )
+        return self._offload_into(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            target_tokens_before_replay=target_tokens_before_replay,
+            expected_delta_tokens=expected_delta_tokens,
+            delta_prefix_matched=delta_prefix_matched,
+        )
+
+    def _star_offload_to_turn_target(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+    ) -> Tuple[Agent, Dict[str, Any], bool, Agent, Dict[str, Any]]:
+        """Route KV handoff through the hub when both endpoints are non-hub.
+
+        Returns:
+            record_target_agent: the physical target of source_agent's outgoing
+                offload, used for source_agent's turn record.
+            source_offload_meta: metadata for source_agent's physical outgoing hop.
+            source_cache_cleared: whether source_agent's cache was cleared.
+            incoming_from_agent: the physical source that supplied target_agent's
+                replayed cache for the next generation.
+            incoming_meta: metadata for the hop that actually entered target_agent.
+        """
+        source_is_hub = source_agent.node_id == self.hub_agent.node_id
+        target_is_hub = target_agent.node_id == self.hub_agent.node_id
+
+        if source_is_hub or target_is_hub:
+            offload_meta, cleared = self._offload_delta_hop(
+                source_agent=source_agent,
+                target_agent=target_agent,
+            )
+            return target_agent, offload_meta, cleared, source_agent, offload_meta
+
+        # Non-hub -> non-hub is never direct in the star topology. The physical
+        # route is source -> Hub, then Hub -> target. The second hop cache must
+        # already have been prepared after the source generation; this method only
+        # installs that prepared cache after the hub receives the first hop.
+        pending_key = (source_agent.node_id, target_agent.node_id)
+        pending_second_hop = self._pending_pretranslated_second_hops.pop(pending_key, None)
+        if pending_second_hop is None:
+            raise RuntimeError(
+                f"Missing pretranslated second-hop cache for {source_agent.node_id}->"
+                f"{self.hub_agent.node_id}->{target_agent.node_id}."
+            )
+
+        first_meta, source_cleared = self._offload_delta_hop(
+            source_agent=source_agent,
+            target_agent=self.hub_agent,
+        )
+
+        second_edge_id, second_full_target_past, second_token_ids = pending_second_hop
+        if list(self.hub_agent.cache_token_ids) != list(second_token_ids):
+            raise RuntimeError(
+                f"Prepared second-hop cache is stale for {second_edge_id}: "
+                f"prepared_tokens={len(second_token_ids)} hub_tokens={len(self.hub_agent.cache_token_ids)}"
+            )
+        self.hub_agent.set_pretranslated_cache(
+            edge_id=second_edge_id,
+            past_key_values=second_full_target_past,
+            cache_token_ids=second_token_ids,
+        )
+        second_meta, _ = self._offload_delta_hop(
+            source_agent=self.hub_agent,
+            target_agent=target_agent,
+        )
+        return self.hub_agent, first_meta, source_cleared, self.hub_agent, second_meta
+
+    def _tokens_sent_check_passed(self, record: AgentTurnRecord, offload_meta: Dict[str, Any]) -> bool:
+        # Every handoff is a delta. The expected amount is
+        # source_cache_tokens_after_generation - target_cache_tokens_before_replay.
+        tokens_sent = int(offload_meta.get("tokens_sent", 0))
+        expected_delta_tokens = int(offload_meta.get("expected_delta_tokens", 0))
+        return tokens_sent == expected_delta_tokens
+
+    def _apply_offload_metadata_to_record(
+        self,
+        record: AgentTurnRecord,
+        *,
+        target_agent: Agent,
+        offload_meta: Dict[str, Any],
+        source_was_freed: bool,
+    ) -> None:
+        """Record the outgoing handoff on the agent that actually sent the KV cache."""
+        edge_id = str(offload_meta.get("edge_id", "")) or None
+        offload_kind = str(offload_meta.get("offload_kind", "")) or None
+        tokens_sent = int(offload_meta.get("tokens_sent", 0))
+        del target_agent, source_was_freed
+        record.offload_edge_id = edge_id
+        record.offload_kind = offload_kind
+        record.tokens_sent = tokens_sent
+        record.tokens_sent_check_passed = self._tokens_sent_check_passed(record, offload_meta)
+
+    def _run_offload_turns(
+        self,
+        *,
+        transcript: str,
+        initial_generation: AgentGeneration,
+        turns: List[AgentTurnRecord],
+        question: str,
+        example_index: Optional[int],
+    ) -> Tuple[str, str]:
+        last_response = initial_generation.text
+        effective_max_turns = max(1, self.max_turns)
+        last_turn_index = effective_max_turns - 1
+        needs_extra_hub_final = self._agent_for_turn(last_turn_index).node_id != self.hub_agent.node_id
+
+        # Each turn record has two distinct directions:
+        #   - translated_*: the incoming KV delta used by this agent's generation.
+        #   - offload_*:   the physical outgoing KV delta sent by this agent after generation.
+        # There is no separate whole-cache offload mode. The delta is always the source cache suffix
+        # that the target does not currently have. Handoffs use a hub-centered star topology:
+        # direct if source or target is the hub, otherwise source->hub followed by hub->target.
+        # In free mode, a cleared non-hub target has no cache, so its next incoming delta
+        # spans the entire source cache.
+        for turn_index in range(1, effective_max_turns):
+            current_source = self._agent_for_turn(turn_index - 1)
+            current_target = self._agent_for_turn(turn_index)
+            source_record = turns[turn_index - 1]
+
+            (
+                record_offload_target,
+                source_offload_meta,
+                source_cache_cleared,
+                incoming_from_agent,
+                incoming_meta,
+            ) = self._star_offload_to_turn_target(
+                source_agent=current_source,
+                target_agent=current_target,
+            )
+
+            self._apply_offload_metadata_to_record(
+                source_record,
+                target_agent=record_offload_target,
+                offload_meta=source_offload_meta,
+                source_was_freed=source_cache_cleared,
+            )
+            self._update_kv_peak_memory()
+            self._log_turn(example_index=example_index, turn_index=turn_index - 1, record=source_record)
+
+            edge_id = str(incoming_meta.get("edge_id", "")) or None
+            incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
+            tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
+
+            prompt = self.build_followup_prompt(
+                current_target.node_id,
+                turn_index,
+                question,
+            )
+            generation = current_target.generate_response(prompt)
+            if turn_index < last_turn_index:
+                self._prepare_outgoing_route_translation(
+                    source_agent=current_target,
+                    logical_target_agent=self._agent_for_turn(turn_index + 1),
+                )
+            elif needs_extra_hub_final:
+                self._prepare_outgoing_route_translation(
+                    source_agent=current_target,
+                    logical_target_agent=self.hub_agent,
+                )
+            self._update_kv_peak_memory()
+            transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
+
+            del incoming_from_agent
+            record = self._turn_record(
+                generation,
+                translated_edge_id=edge_id,
+                translated_offload_kind=incoming_offload_kind,
+                tokens_received=tokens_received,
+            )
+            turns.append(record)
+            last_response = generation.text
+
+        if needs_extra_hub_final:
+            final_turn_index = len(turns)
+            current_source = self._agent_for_turn(last_turn_index)
+            source_record = turns[-1]
+
+            (
+                record_offload_target,
+                source_offload_meta,
+                source_cache_cleared,
+                incoming_from_agent,
+                incoming_meta,
+            ) = self._star_offload_to_turn_target(
+                source_agent=current_source,
+                target_agent=self.hub_agent,
+            )
+            self._apply_offload_metadata_to_record(
+                source_record,
+                target_agent=record_offload_target,
+                offload_meta=source_offload_meta,
+                source_was_freed=source_cache_cleared,
+            )
+            self._update_kv_peak_memory()
+            self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
+
+            edge_id = str(incoming_meta.get("edge_id", "")) or None
+            incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
+            tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
+            prompt = self.build_followup_prompt(
+                self.hub_agent.node_id,
+                final_turn_index,
+                question,
+            )
+            generation = self.hub_agent.generate_response(prompt)
+            self._update_kv_peak_memory()
+            transcript = self._append_turn_to_transcript(transcript + prompt, self.hub_agent.node_id, generation.text)
+            del incoming_from_agent
+            record = self._turn_record(
+                generation,
+                translated_edge_id=edge_id,
+                translated_offload_kind=incoming_offload_kind,
+                tokens_received=tokens_received,
+            )
+            turns.append(record)
+            last_response = generation.text
+
+        # The last generated turn has no following offload inside this run. Log it after
+        # all earlier source records have been annotated with their outgoing handoffs.
+        self._log_turn(example_index=example_index, turn_index=len(turns) - 1, record=turns[-1])
+
+        return transcript, last_response
 
     def _run_retain_turns(
         self,
@@ -500,34 +1106,16 @@ class AgentRunner:
         transcript: str,
         initial_generation: AgentGeneration,
         turns: List[AgentTurnRecord],
+        question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
-        last_response = initial_generation.text
-        for turn_index in range(1, max(1, self.max_turns)):
-            current_source = self._agent_for_turn(turn_index - 1)
-            current_target = self._agent_for_turn(turn_index)
-            translation_meta = self._translate_into(
-                source_agent=current_source,
-                target_agent=current_target,
-                transcript=transcript,
-            )
-            prompt = self.build_followup_prompt(current_target.node_id, turn_index)
-            generation = current_target.generate_response(prompt)
-            transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
-            record = self._turn_record(
-                generation,
-                translated_from=current_source.node_id,
-                translated_edge_id=str(translation_meta.get("edge_id", "")) or None,
-                translated_source_seq_len=int(translation_meta.get("source_seq_len", 0)),
-                translated_target_seq_len=int(translation_meta.get("target_seq_len", 0)),
-                translated_delta_tokens=int(translation_meta.get("delta_tokens", 0)),
-            )
-            turns.append(record)
-            self._log_turn(example_index=example_index, turn_index=turn_index, record=record)
-            last_response = generation.text
-            if "FINAL" in generation.text.upper():
-                break
-        return transcript, last_response
+        return self._run_offload_turns(
+            transcript=transcript,
+            initial_generation=initial_generation,
+            turns=turns,
+            question=question,
+            example_index=example_index,
+        )
 
     def _run_free_turns(
         self,
@@ -535,57 +1123,16 @@ class AgentRunner:
         transcript: str,
         initial_generation: AgentGeneration,
         turns: List[AgentTurnRecord],
+        question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
-        last_response = initial_generation.text
-        for turn_index in range(1, max(1, self.max_turns)):
-            current_target = self._agent_for_turn(turn_index)
-            if current_target.node_id == self.hub_agent.node_id:
-                # Hub keeps the canonical full conversation KV cache across turns.
-                prompt = self.build_followup_prompt(current_target.node_id, turn_index)
-                generation = current_target.generate_response(prompt)
-                transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
-                record = self._turn_record(generation)
-            else:
-                # Non-hub agents own no KV cache between turns in free mode.
-                # They receive Hub's full cache, replay/generate, offload the full extended cache to Hub,
-                # then immediately drop their resident KV cache.
-                current_target.clear_kv_cache(empty_cuda_cache=True)
-                translation_meta = self._translate_into(
-                    source_agent=self.hub_agent,
-                    target_agent=current_target,
-                    transcript=transcript,
-                )
-                prompt = self.build_followup_prompt(current_target.node_id, turn_index)
-                generation = current_target.generate_response(prompt)
-                transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
-                offload_meta = self._translate_into(
-                    source_agent=current_target,
-                    target_agent=self.hub_agent,
-                    transcript=transcript,
-                )
-                cleared = self._clear_non_hub_cache(current_target)
-                record = self._turn_record(
-                    generation,
-                    translated_from=self.hub_agent.node_id,
-                    translated_edge_id=str(translation_meta.get("edge_id", "")) or None,
-                    translated_source_seq_len=int(translation_meta.get("source_seq_len", 0)),
-                    translated_target_seq_len=int(translation_meta.get("target_seq_len", 0)),
-                    translated_delta_tokens=int(translation_meta.get("delta_tokens", 0)),
-                    offloaded_to=self.hub_agent.node_id,
-                    offload_edge_id=str(offload_meta.get("edge_id", "")) or None,
-                    offload_source_seq_len=int(offload_meta.get("source_seq_len", 0)),
-                    offload_target_seq_len=int(offload_meta.get("target_seq_len", 0)),
-                    offload_delta_tokens=int(offload_meta.get("delta_tokens", 0)),
-                    cache_cleared_after_turn=cleared,
-                )
-
-            turns.append(record)
-            self._log_turn(example_index=example_index, turn_index=turn_index, record=record)
-            last_response = generation.text
-            if "FINAL" in generation.text.upper():
-                break
-        return transcript, last_response
+        return self._run_offload_turns(
+            transcript=transcript,
+            initial_generation=initial_generation,
+            turns=turns,
+            question=question,
+            example_index=example_index,
+        )
 
     def _run_example_impl(
         self,
@@ -595,9 +1142,10 @@ class AgentRunner:
         gold_answers: Sequence[str],
         example_index: Optional[int] = None,
     ) -> AgentRunnerResult:
+        self._kv_peak_memory_bytes = None
         for agent in self.agent_sequence:
             agent.reset()
-        self.cache_translator._sent_source_seq_lens.clear()
+        self._pending_pretranslated_second_hops.clear()
         self.translator_pool.eval()
         for node in self.ctx.nodes:
             self.ctx.mm.get_model(node.id).eval()
@@ -613,27 +1161,33 @@ class AgentRunner:
 
         # The first node is the HubAgent and starts from native Base Context + Prompt.
         generation = self.hub_agent.generate_response(transcript)
+        if max(1, self.max_turns) > 1:
+            self._prepare_outgoing_route_translation(
+                source_agent=self.hub_agent,
+                logical_target_agent=self._agent_for_turn(1),
+            )
+        self._update_kv_peak_memory()
         transcript = self._append_turn_to_transcript(transcript, self.hub_agent.node_id, generation.text)
         record = self._turn_record(generation)
         turns.append(record)
-        self._log_turn(example_index=example_index, turn_index=0, record=record)
 
         last_response = generation.text
-        if "FINAL" not in generation.text.upper():
-            if self.cache_mode == CACHE_MODE_FREE:
-                transcript, last_response = self._run_free_turns(
-                    transcript=transcript,
-                    initial_generation=generation,
-                    turns=turns,
-                    example_index=example_index,
-                )
-            else:
-                transcript, last_response = self._run_retain_turns(
-                    transcript=transcript,
-                    initial_generation=generation,
-                    turns=turns,
-                    example_index=example_index,
-                )
+        if self.cache_mode == CACHE_MODE_FREE:
+            transcript, last_response = self._run_free_turns(
+                transcript=transcript,
+                initial_generation=generation,
+                turns=turns,
+                question=question,
+                example_index=example_index,
+            )
+        else:
+            transcript, last_response = self._run_retain_turns(
+                transcript=transcript,
+                initial_generation=generation,
+                turns=turns,
+                question=question,
+                example_index=example_index,
+            )
 
         prediction = self.extract_final_answer(transcript, last_response)
         f1 = compute_generation_f1(prediction, list(gold_answers))
@@ -655,43 +1209,32 @@ class AgentRunner:
         self,
         generation: AgentGeneration,
         *,
-        translated_from: Optional[str] = None,
         translated_edge_id: Optional[str] = None,
-        translated_source_seq_len: int = 0,
-        translated_target_seq_len: int = 0,
-        translated_delta_tokens: int = 0,
-        offloaded_to: Optional[str] = None,
+        translated_offload_kind: Optional[str] = None,
+        tokens_received: int = 0,
         offload_edge_id: Optional[str] = None,
-        offload_source_seq_len: int = 0,
-        offload_target_seq_len: int = 0,
-        offload_delta_tokens: int = 0,
-        cache_cleared_after_turn: bool = False,
+        offload_kind: Optional[str] = None,
+        tokens_sent: int = 0,
+        tokens_sent_check_passed: bool = True,
     ) -> AgentTurnRecord:
         agent = self.agents[generation.agent_id]
         return AgentTurnRecord(
             agent_id=generation.agent_id,
             prompt=generation.prompt_text,
             response=generation.text,
-            raw_response=generation.raw_text,
-            stop_reason=generation.stop_reason,
-            cache_seq_len_before=generation.cache_seq_len_before,
-            cache_seq_len_after=generation.cache_seq_len_after,
+            tokens_before=generation.tokens_before,
+            tokens_after=generation.tokens_after,
+            tokens_prompt=generation.tokens_prompt,
+            tokens_completion=generation.tokens_completion,
             cache_mode=self.cache_mode,
             is_hub=agent.node_id == self.hub_agent.node_id,
-            ring_position=self._ring_position(agent),
-            translated_from=translated_from,
             translated_edge_id=translated_edge_id,
-            translated_source_seq_len=translated_source_seq_len,
-            translated_target_seq_len=translated_target_seq_len,
-            translated_delta_tokens=translated_delta_tokens,
-            offloaded_to=offloaded_to,
+            translated_offload_kind=translated_offload_kind,
+            tokens_received=tokens_received,
             offload_edge_id=offload_edge_id,
-            offload_source_seq_len=offload_source_seq_len,
-            offload_target_seq_len=offload_target_seq_len,
-            offload_delta_tokens=offload_delta_tokens,
-            cache_cleared_after_turn=cache_cleared_after_turn,
-            resident_cache_agents_after_turn=self._count_resident_cache_agents(),
-            free_mode_peak_cache_agent_bound=self._free_mode_peak_cache_agent_bound(),
+            offload_kind=offload_kind,
+            tokens_sent=tokens_sent,
+            tokens_sent_check_passed=tokens_sent_check_passed,
         )
 
     def run(
@@ -702,18 +1245,31 @@ class AgentRunner:
         gold_answers: Sequence[str],
         example_index: Optional[int] = None,
     ) -> AgentRunnerResult:
-        token_budget = max(1, self.max_turns) * max(1, self.generation_max_new_tokens)
-        result, profile = self.profiler.measure(
-            lambda: self._run_example_impl(
-                context=context,
-                question=question,
-                gold_answers=gold_answers,
-                example_index=example_index,
-            ),
-            tokens=token_budget,
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            device_obj = torch.device(self.device)
+            device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+            torch.cuda.synchronize(device_index)
+        started_at = time.perf_counter()
+        result = self._run_example_impl(
+            context=context,
+            question=question,
+            gold_answers=gold_answers,
+            example_index=example_index,
         )
-        result.profile = profile
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            device_obj = torch.device(self.device)
+            device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+            torch.cuda.synchronize(device_index)
+        latency_sec = time.perf_counter() - started_at
+        result.profile = {
+            "latency_sec": float(latency_sec),
+            "tokens": len(result.turns) * max(1, self.generation_max_new_tokens),
+            "num_agent_turns": len(result.turns),
+            "requested_max_turns": max(1, self.max_turns),
+            "peak_memory_bytes": self._kv_peak_memory_bytes,
+        }
         return result
+
 
 
 __all__ = [
@@ -725,5 +1281,4 @@ __all__ = [
     "AgentRunnerResult",
     "AgentTurnRecord",
     "KVCacheTranslationAdapter",
-    "get_squad_v11_dataset_spec",
 ]
