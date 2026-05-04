@@ -514,8 +514,18 @@ def plot_edge_radar(
     ax.set_theta_offset(np.pi / 2)
     ax.set_theta_direction(-1)
 
+    radar_label_fontsize = AI_PAPER_TICK_LABEL_SIZE + 3
+    radar_rtick_fontsize = AI_PAPER_TICK_LABEL_SIZE + 2
+    radar_legend_fontsize = AI_PAPER_TICK_LABEL_SIZE + 2
+
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([display_name_for_subcategory(category) for category in categories], fontsize=AI_PAPER_TICK_LABEL_SIZE)
+    ax.set_xticklabels(
+        [display_name_for_subcategory(category) for category in categories],
+        fontsize=radar_label_fontsize,
+        fontweight="bold",
+    )
+    for tick_label in ax.get_xticklabels():
+        tick_label.set_clip_on(False)
 
     if radius_max <= 0.4:
         rticks = [0.1, 0.2, 0.3, 0.4]
@@ -529,7 +539,7 @@ def plot_edge_radar(
     rticks = [t for t in rticks if t <= radius_max + 1e-9]
     ax.set_rlabel_position(0)
     ax.set_yticks(rticks)
-    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=AI_PAPER_TICK_LABEL_SIZE)
+    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=radar_rtick_fontsize)
     ax.set_ylim(0, radius_max)
     style_axes_common(ax, grid=True, grid_axis="both")
 
@@ -551,7 +561,19 @@ def plot_edge_radar(
         values += values[:1]
         ax.plot(angles, values, linewidth=AI_PAPER_LINE_WIDTH, label=label, color=color)
         ax.fill(angles, values, alpha=AI_PAPER_RADAR_FILL_ALPHA, color=color)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.08, 1.10), frameon=False)
+    legend = fig.legend(
+        loc="upper right",
+        bbox_to_anchor=(0.998, 0.998),
+        bbox_transform=fig.transFigure,
+        frameon=True,
+        fontsize=radar_legend_fontsize,
+        handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
+        borderaxespad=0.0,
+    )
+    for text in legend.get_texts():
+        text.set_fontweight("bold")
+
+    ax.set_position([0.04, 0.20, 0.92, 0.76])
 
     save_paper_figure(fig, output_path, dpi=dpi, show=show)
     plt.close(fig)
