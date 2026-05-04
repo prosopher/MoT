@@ -410,9 +410,11 @@ class LayerWindowTranslatorPool(nn.Module):
         adapters = {}
         for edge in self.edges:
             channels = self.cm.get_channels(edge.id)
+            src_spec = self.mm.get_model_spec(edge.src_id)
+            tgt_spec = self.mm.get_model_spec(edge.tgt_id)
             adapters[edge.id] = LayerWindowDirectionalTranslator(
-                src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
-                tgt_hidden_size=self.mm.get_model_spec(edge.tgt_id).hidden_size,
+                src_hidden_size=src_spec.kv_hidden_size,
+                tgt_hidden_size=tgt_spec.kv_hidden_size,
                 num_layers=len(channels),
                 translator_dim=translator_dim,
                 translator_heads=translator_heads,
@@ -472,7 +474,7 @@ class LayerWindowTranslatorPool(nn.Module):
         translated_window_past = blocks_to_partial_past_key_values(
             key_block=translated_key,
             value_block=translated_value,
-            num_heads=tgt_spec.num_heads,
+            num_heads=tgt_spec.num_key_value_heads,
             head_dim=tgt_spec.head_dim,
         )
         src_spec = self.mm.get_model_spec(src_node_id)
@@ -575,6 +577,8 @@ def extract_layer_window_blocks(
 
 def normalize_model_family(model_id: str) -> Optional[str]:
     normalized = str(model_id).strip().lower()
+    if "qwen2" in normalized or "qwen2.5" in normalized or "qwen/qwen2" in normalized:
+        return "qwen2"
     if "facebook/opt" in normalized or "/opt-" in normalized or normalized.startswith("opt-"):
         return "opt"
     if "gpt2" in normalized:
@@ -591,9 +595,20 @@ def resolve_target_model_family(
     if model_family is not None:
         return model_family
 
+    config_model_type = str(getattr(getattr(target_model, "config", None), "model_type", "")).lower()
+    if config_model_type in {"qwen2", "qwen2_5"}:
+        return "qwen2"
+
     if getattr(target_model, "transformer", None) is not None and hasattr(target_model.transformer, "h"):
         return "gpt2"
     model_wrapper = getattr(target_model, "model", None)
+    if (
+        model_wrapper is not None
+        and hasattr(model_wrapper, "layers")
+        and hasattr(model_wrapper, "embed_tokens")
+        and any(hasattr(layer, "input_layernorm") for layer in getattr(model_wrapper, "layers", [])[:1])
+    ):
+        return "qwen2"
     decoder = getattr(model_wrapper, "decoder", None)
     if decoder is not None and hasattr(decoder, "layers"):
         return "opt"
@@ -602,7 +617,7 @@ def resolve_target_model_family(
         return "opt"
 
     raise ValueError(
-        "mot target-model replay supports GPT-2 and OPT decoder stacks only "
+        "mot target-model replay supports GPT-2, OPT, and Qwen2/Qwen2.5 decoder stacks only "
         f"(target_model_id={target_model_id!r})."
     )
 
@@ -628,6 +643,20 @@ def require_opt_decoder(model: PreTrainedModel):
             "(expected model.model.decoder.layers or model.decoder.layers to exist)."
         )
     return decoder
+
+
+
+
+def require_qwen2_model(model: PreTrainedModel):
+    model_wrapper = getattr(model, "model", None)
+    if model_wrapper is None and hasattr(model, "layers") and hasattr(model, "embed_tokens"):
+        model_wrapper = model
+    if model_wrapper is None or not hasattr(model_wrapper, "layers") or not hasattr(model_wrapper, "embed_tokens"):
+        raise ValueError(
+            "mot currently supports Qwen2/Qwen2.5 style decoder stacks only "
+            "(expected model.model.layers/model.model.embed_tokens to exist)."
+        )
+    return model_wrapper
 
 
 def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
@@ -681,6 +710,29 @@ def build_opt_input_hidden_states(
     return hidden_states, token_attention_mask, attention_mask
 
 
+
+def build_qwen2_input_hidden_states(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    qwen_model = require_qwen2_model(model)
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
+    batch_size, seq_len = input_ids.shape
+    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    hidden_states = qwen_model.embed_tokens(input_ids)
+    attention_mask = build_causal_attention_mask(hidden_states)
+
+    position_embeddings = None
+    rotary_emb = getattr(qwen_model, "rotary_emb", None)
+    if rotary_emb is not None:
+        try:
+            position_embeddings = rotary_emb(hidden_states, position_ids)
+        except TypeError:
+            position_embeddings = None
+    return hidden_states, position_ids, attention_mask, position_embeddings
+
+
 def extract_source_attention_topk_indices(
     source_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
@@ -698,7 +750,7 @@ def extract_source_attention_topk_indices(
         "output_attentions": True,
         "return_dict": True,
     }
-    if model_family == "opt":
+    if model_family in {"opt", "qwen2"}:
         model_kwargs["attention_mask"] = torch.ones_like(prefix_input_ids)
     with torch.no_grad():
         outputs = source_model(**model_kwargs)
@@ -829,6 +881,49 @@ def build_sparse_query_mask(sparse_attention_indices: torch.Tensor, seq_len: int
     sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
     query_positions = torch.arange(seq_len, device=sparse_attention_indices.device).view(1, 1, seq_len, 1)
     return sparse_attention_indices > query_positions
+
+
+
+def repeat_key_value_heads(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand grouped-query KV heads from [batch, kv_heads, seq, head_dim] to query heads."""
+    if n_rep == 1:
+        return hidden_states
+    batch_size, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch_size,
+        num_key_value_heads,
+        n_rep,
+        seq_len,
+        head_dim,
+    )
+    return hidden_states.reshape(batch_size, num_key_value_heads * n_rep, seq_len, head_dim)
+
+
+def get_qwen2_attention_shape(attn: nn.Module, hidden_size: int) -> Tuple[int, int, int, int]:
+    config = getattr(attn, "config", None)
+    num_query_heads = getattr(attn, "num_heads", None)
+    if num_query_heads is None:
+        num_query_heads = getattr(attn, "num_attention_heads", None)
+    if num_query_heads is None and config is not None:
+        num_query_heads = getattr(config, "num_attention_heads", None)
+    if num_query_heads is None:
+        raise ValueError("Unable to determine Qwen2 attention query head count.")
+    num_query_heads = int(num_query_heads)
+
+    num_key_value_heads = getattr(attn, "num_key_value_heads", None)
+    if num_key_value_heads is None and config is not None:
+        num_key_value_heads = getattr(config, "num_key_value_heads", num_query_heads)
+    if num_key_value_heads is None:
+        num_key_value_heads = num_query_heads
+    num_key_value_heads = int(num_key_value_heads)
+
+    head_dim = int(getattr(attn, "head_dim", hidden_size // num_query_heads))
+    if num_query_heads % num_key_value_heads != 0:
+        raise ValueError(
+            "Qwen2 num_attention_heads must be divisible by num_key_value_heads, "
+            f"got {num_query_heads} and {num_key_value_heads}"
+        )
+    return num_query_heads, num_key_value_heads, num_query_heads // num_key_value_heads, head_dim
 
 
 def run_gpt2_block(
@@ -990,6 +1085,102 @@ def run_opt_block(
     return hidden_states, (native_like_key, native_like_value)
 
 
+
+def run_qwen2_block(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
+    injected_key: Optional[torch.Tensor] = None,
+    injected_value: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if (injected_key is None) != (injected_value is None):
+        raise ValueError("injected_key and injected_value must be provided together.")
+    if injected_key is not None and injected_key.shape != injected_value.shape:
+        raise ValueError(
+            "Injected key/value must have identical shapes, "
+            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
+        )
+
+    attn = block.self_attn
+    batch_size, seq_len, hidden_size = hidden_states.shape
+    num_query_heads, num_key_value_heads, num_key_value_groups, head_dim = get_qwen2_attention_shape(attn, hidden_size)
+    expected_cache_shape = (batch_size, num_key_value_heads, seq_len, head_dim)
+
+    residual = hidden_states
+    attn_input = block.input_layernorm(hidden_states)
+
+    query_states = attn.q_proj(attn_input).view(batch_size, seq_len, num_query_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+
+    if position_embeddings is not None:
+        cos, sin = position_embeddings
+        query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin)
+    else:
+        rotary_emb = getattr(attn, "rotary_emb", None)
+        if rotary_emb is None:
+            raise ValueError("Qwen2 replay requires rotary embeddings from model.model.rotary_emb or layer.self_attn.rotary_emb.")
+        try:
+            cos, sin = rotary_emb(native_like_value, seq_len=seq_len)
+        except TypeError:
+            cos, sin = rotary_emb(native_like_value, position_ids)
+        query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin, position_ids)
+
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
+    if tuple(attention_key.shape) != expected_cache_shape:
+        raise ValueError(
+            "Attention cache shape mismatch for Qwen2/Qwen2.5 layer replay: "
+            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
+        )
+
+    expanded_attention_key = repeat_key_value_heads(attention_key, num_key_value_groups)
+    expanded_attention_value = repeat_key_value_heads(attention_value, num_key_value_groups)
+    scaling = float(getattr(attn, "scaling", head_dim ** -0.5))
+
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
+        attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
+        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_query_heads)
+        attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    else:
+        attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
+        effective_attention_mask = attention_mask
+        sliding_window = getattr(attn, "sliding_window", None)
+        if sliding_window is not None and int(sliding_window) > 0:
+            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            sliding_mask = key_positions <= (query_positions - int(sliding_window))
+            sliding_bias = torch.zeros_like(attn_weights).masked_fill(sliding_mask, torch.finfo(attn_weights.dtype).min)
+            effective_attention_mask = effective_attention_mask + sliding_bias if effective_attention_mask is not None else sliding_bias
+        if effective_attention_mask is not None:
+            attn_weights = attn_weights + effective_attention_mask
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
+        attn_output = torch.matmul(attn_weights, expanded_attention_value)
+
+    attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_query_heads * head_dim)
+    attn_output = attn.o_proj(attn_output)
+    hidden_states = residual + attn_output
+
+    residual = hidden_states
+    hidden_states = block.post_attention_layernorm(hidden_states)
+    hidden_states = block.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states, (native_like_key, native_like_value)
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -1047,7 +1238,7 @@ def replay_target_prefill_with_injected_window(
     injected_window = blocks_to_partial_past_key_values(
         key_block=injected_key_block,
         value_block=injected_value_block,
-        num_heads=tgt_spec.num_heads,
+        num_heads=tgt_spec.num_key_value_heads,
         head_dim=tgt_spec.head_dim,
     )
     translated_num_layers = len(injected_window)
@@ -1114,6 +1305,34 @@ def replay_target_prefill_with_injected_window(
                 hidden_states,
                 attention_mask=attention_mask,
                 token_attention_mask=token_attention_mask,
+                sparse_attention_indices=sparse_attention_indices,
+                injected_key=injected_key,
+                injected_value=injected_value,
+            )
+
+    elif model_family == "qwen2":
+        qwen_model = require_qwen2_model(target_model)
+        target_blocks = qwen_model.layers
+
+        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+            return build_qwen2_input_hidden_states(target_model, prefix_input_ids)
+
+        def run_block(
+            block: nn.Module,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+            sparse_attention_indices: Optional[torch.Tensor],
+            injected_key: Optional[torch.Tensor] = None,
+            injected_value: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_qwen2_block(
+                block,
+                hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
@@ -1211,7 +1430,7 @@ def build_translator_pool(
         mot_num_translators=config.mot_num_translators,
         mot_top_k=config.mot_top_k,
     )
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     return translator_pool
 
 
@@ -1261,7 +1480,7 @@ def load_translator_pool_from_checkpoint(
 
     translator_pool = build_translator_pool(ctx)
     translator_pool.load_state_dict(translator_pool_state_dict)
-    translator_pool.to(config.device)
+    move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
 

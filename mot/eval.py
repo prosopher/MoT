@@ -246,7 +246,7 @@ def run_eval(
         return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.src_id],
             layer_indices=ctx.cm.get_src_layer_indices(edge.id),
-            num_heads=ctx.mm.get_model_spec(edge.src_id).num_heads,
+            num_heads=ctx.mm.get_model_spec(edge.src_id).num_key_value_heads,
             head_dim=ctx.mm.get_model_spec(edge.src_id).head_dim,
         )
 
@@ -254,7 +254,7 @@ def run_eval(
         return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.tgt_id],
             layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-            num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
+            num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_key_value_heads,
             head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
         )
 

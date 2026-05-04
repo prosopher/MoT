@@ -15,7 +15,7 @@ from .common import (
 )
 from .context import Context
 from .topology import Edge, build_node_map
-from .train_util import InfiniteDataLoader
+from .train_util import InfiniteDataLoader, get_training_dtype
 
 
 @dataclass(frozen=True)
@@ -582,9 +582,11 @@ class ChannelProfiler:
             self._format_channels(channels),
             self.profile_config.max_steps,
         )
+        src_spec = self.mm.get_model_spec(edge.src_id)
+        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
         proxy = LayerWindowDirectionalTranslator(
-            src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
-            tgt_hidden_size=self.mm.get_model_spec(edge.tgt_id).hidden_size,
+            src_hidden_size=src_spec.kv_hidden_size,
+            tgt_hidden_size=tgt_spec.kv_hidden_size,
             num_layers=len(channels),
             translator_dim=self.profile_config.translator_dim,
             translator_heads=self.profile_config.translator_heads,
@@ -593,7 +595,7 @@ class ChannelProfiler:
             variant="single",
             mot_num_translators=1,
             mot_top_k=1,
-        ).to(self.config.device)
+        ).to(device=self.config.device, dtype=get_training_dtype(self.config))
         if self.profile_config.max_steps < 1:
             return proxy
 
