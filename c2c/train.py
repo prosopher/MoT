@@ -16,6 +16,16 @@ from core.train_util import *
 
 
 C2C_VARIANTS = {"c2c", "c2c-pr"}
+TERMINAL_ALIGNMENT_LAYER_RANGE = "terminal_alignment"
+_TERMINAL_ALIGNMENT_LAYER_RANGE_ALIASES = {
+    "terminal",
+    "terminal_alignment",
+    "terminal-alignment",
+    "all",
+    "auto",
+    "full",
+}
+TopLayersToTranslate = Union[int, str]
 
 
 @dataclass
@@ -34,7 +44,7 @@ class TrainConfig(Config):
     log_every: int
     seed: int
     shuffle_buffer: int
-    top_layers_to_translate: int
+    top_layers_to_translate: TopLayersToTranslate
     fuser_dim: int
     fuser_heads: int
     fuser_depth: int
@@ -51,6 +61,7 @@ class TrainConfig(Config):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.variant = validate_c2c_variant(self.variant)
+        self.top_layers_to_translate = normalize_top_layers_to_translate(self.top_layers_to_translate)
         initialize_train_output_paths(self)
 
 
@@ -67,8 +78,66 @@ def is_projection_only_variant(variant_or_config: Union[str, TrainConfig]) -> bo
     return validate_c2c_variant(variant_or_config) == "c2c-pr"
 
 
-def get_top_layers_to_translate(config: TrainConfig) -> int:
+def normalize_top_layers_to_translate(value: TopLayersToTranslate) -> TopLayersToTranslate:
+    if isinstance(value, bool):
+        raise ValueError("top_layers_to_translate must be a positive integer or 'terminal_alignment'.")
+    if isinstance(value, int):
+        if value < 1:
+            raise ValueError("top_layers_to_translate must be >= 1, or use 'terminal_alignment'.")
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TERMINAL_ALIGNMENT_LAYER_RANGE_ALIASES:
+            return TERMINAL_ALIGNMENT_LAYER_RANGE
+        try:
+            parsed = int(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                "top_layers_to_translate must be a positive integer or 'terminal_alignment'. "
+                f"Got: {value!r}"
+            ) from exc
+        if parsed < 1:
+            raise ValueError("top_layers_to_translate must be >= 1, or use 'terminal_alignment'.")
+        return parsed
+    raise ValueError(
+        "top_layers_to_translate must be a positive integer or 'terminal_alignment'. "
+        f"Got type: {type(value).__name__}"
+    )
+
+
+def is_terminal_alignment_layer_range(value: TopLayersToTranslate) -> bool:
+    return normalize_top_layers_to_translate(value) == TERMINAL_ALIGNMENT_LAYER_RANGE
+
+
+def resolve_top_layers_to_translate(
+    value: TopLayersToTranslate,
+    src_spec: ModelSpec,
+    tgt_spec: ModelSpec,
+    edge_id: Optional[str] = None,
+) -> int:
+    normalized = normalize_top_layers_to_translate(value)
+    max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
+    if normalized == TERMINAL_ALIGNMENT_LAYER_RANGE:
+        return max_allowed
+    if normalized > max_allowed:
+        edge_suffix = "" if edge_id is None else f" for edge {edge_id}"
+        raise ValueError(
+            f"top_layers_to_translate={normalized} exceeds terminal alignment range {max_allowed}{edge_suffix}."
+        )
+    return int(normalized)
+
+
+def get_top_layers_to_translate(config: TrainConfig) -> TopLayersToTranslate:
     return config.top_layers_to_translate
+
+
+def get_top_layers_to_translate_for_edge(config: TrainConfig, ctx: Context, edge: Edge) -> int:
+    return resolve_top_layers_to_translate(
+        value=config.top_layers_to_translate,
+        src_spec=ctx.mm.get_model_spec(edge.src_id),
+        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        edge_id=edge.id,
+    )
 
 
 def get_translation_loss_name(config: TrainConfig) -> str:
@@ -76,9 +145,10 @@ def get_translation_loss_name(config: TrainConfig) -> str:
 
 
 def get_translation_mode_name(config: TrainConfig) -> str:
+    layer_range_label = "terminal_alignment_range" if is_terminal_alignment_layer_range(config.top_layers_to_translate) else "top_layers"
     if is_projection_only_variant(config):
-        return "project_top_layers_and_replace_target_top_layers"
-    return "fuse_top_layers_after_target_forward"
+        return f"project_{layer_range_label}_and_replace_target_{layer_range_label}"
+    return f"fuse_{layer_range_label}_after_target_forward"
 
 
 def get_trainable_module_label(config: TrainConfig) -> str:
@@ -320,7 +390,7 @@ class C2CFuserPool(nn.Module):
     def __init__(
         self,
         ctx: Context,
-        top_layers_to_translate: int,
+        top_layers_to_translate: TopLayersToTranslate,
         fuser_dim: int,
         fuser_heads: int,
         fuser_depth: int,
@@ -329,8 +399,7 @@ class C2CFuserPool(nn.Module):
         hard_gate_eval: bool,
             ) -> None:
         super().__init__()
-        if top_layers_to_translate < 1:
-            raise ValueError("top_layers_to_translate must be >= 1")
+        top_layers_to_translate = normalize_top_layers_to_translate(top_layers_to_translate)
 
         self.mm = ctx.mm
         self.top_layers_to_translate = top_layers_to_translate
@@ -339,20 +408,22 @@ class C2CFuserPool(nn.Module):
         self.edges_by_id = build_edge_map(ctx.edges)
 
         adapters = {}
+        top_layers_by_edge_id = {}
         for edge in self.edges:
             src_spec = self.mm.get_model_spec(edge.src_id)
             tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-            max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
-            if top_layers_to_translate > max_allowed:
-                raise ValueError(
-                    f"top_layers_to_translate={top_layers_to_translate} exceeds min layer count {max_allowed} "
-                    f"for edge {edge.id}."
-                )
+            edge_top_layers_to_translate = resolve_top_layers_to_translate(
+                value=top_layers_to_translate,
+                src_spec=src_spec,
+                tgt_spec=tgt_spec,
+                edge_id=edge.id,
+            )
+            top_layers_by_edge_id[edge.id] = edge_top_layers_to_translate
 
             adapters[edge.id] = DirectionalCacheFuser(
                 src_hidden_size=src_spec.kv_hidden_size,
                 tgt_hidden_size=tgt_spec.kv_hidden_size,
-                top_layers_to_translate=top_layers_to_translate,
+                top_layers_to_translate=edge_top_layers_to_translate,
                 fuser_dim=fuser_dim,
                 fuser_heads=fuser_heads,
                 fuser_depth=fuser_depth,
@@ -362,6 +433,7 @@ class C2CFuserPool(nn.Module):
             )
 
         self.adapters = nn.ModuleDict(adapters)
+        self.top_layers_by_edge_id = top_layers_by_edge_id
 
     def set_temperature(self, temperature: float) -> None:
         for module in self.adapters.values():
@@ -405,13 +477,19 @@ class C2CFuserPool(nn.Module):
         tgt_node_id: str,
         tgt_spec: ModelSpec,
     ) -> PastKeyValues:
+        adapter_name = f"{src_node_id}_to_{tgt_node_id}"
+        if adapter_name not in self.adapters:
+            raise ValueError(
+                f"C2C edge {adapter_name} is not available. Active edges: {list(self.edge_ids)}"
+            )
+        top_layers_to_translate = self.adapters[adapter_name].top_layers_to_translate
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
-            top_layers_to_translate=self.top_layers_to_translate,
+            top_layers_to_translate=top_layers_to_translate,
         )
         receiver_key_block, receiver_value_block = extract_top_layer_blocks(
             past_key_values=receiver_past_key_values,
-            top_layers_to_translate=self.top_layers_to_translate,
+            top_layers_to_translate=top_layers_to_translate,
         )
         fused_key, fused_value = self.fuse_top_layer_blocks(
             receiver_key_block=receiver_key_block,
@@ -523,14 +601,13 @@ class C2CProjectorPool(nn.Module):
     def __init__(
         self,
         ctx: Context,
-        top_layers_to_translate: int,
+        top_layers_to_translate: TopLayersToTranslate,
         projector_dim: int,
         projector_depth: int,
         mlp_ratio: int,
             ) -> None:
         super().__init__()
-        if top_layers_to_translate < 1:
-            raise ValueError("top_layers_to_translate must be >= 1")
+        top_layers_to_translate = normalize_top_layers_to_translate(top_layers_to_translate)
 
         self.mm = ctx.mm
         self.top_layers_to_translate = top_layers_to_translate
@@ -539,24 +616,27 @@ class C2CProjectorPool(nn.Module):
         self.edges_by_id = build_edge_map(ctx.edges)
 
         adapters = {}
+        top_layers_by_edge_id = {}
         for edge in self.edges:
             src_spec = self.mm.get_model_spec(edge.src_id)
             tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-            max_allowed = min(src_spec.num_layers, tgt_spec.num_layers)
-            if top_layers_to_translate > max_allowed:
-                raise ValueError(
-                    f"top_layers_to_translate={top_layers_to_translate} exceeds min layer count {max_allowed} "
-                    f"for edge {edge.id}."
-                )
+            edge_top_layers_to_translate = resolve_top_layers_to_translate(
+                value=top_layers_to_translate,
+                src_spec=src_spec,
+                tgt_spec=tgt_spec,
+                edge_id=edge.id,
+            )
+            top_layers_by_edge_id[edge.id] = edge_top_layers_to_translate
             adapters[edge.id] = DirectionalCacheProjector(
                 src_hidden_size=src_spec.kv_hidden_size,
                 tgt_hidden_size=tgt_spec.kv_hidden_size,
-                top_layers_to_translate=top_layers_to_translate,
+                top_layers_to_translate=edge_top_layers_to_translate,
                 hidden_dim=projector_dim,
                 depth=projector_depth,
                 mlp_ratio=mlp_ratio,
             )
         self.adapters = nn.ModuleDict(adapters)
+        self.top_layers_by_edge_id = top_layers_by_edge_id
     def mean_gate_probability(self) -> float:
         if not self.adapters:
             return float("nan")
@@ -575,11 +655,12 @@ class C2CProjectorPool(nn.Module):
                 f"C2C-Project edge {adapter_name} is not available. "
                 f"Active edges: {list(self.edge_ids)}"
             )
+        adapter = self.adapters[adapter_name]
         sharer_key_block, sharer_value_block = extract_top_layer_blocks(
             past_key_values=sharer_past_key_values,
-            top_layers_to_translate=self.top_layers_to_translate,
+            top_layers_to_translate=adapter.top_layers_to_translate,
         )
-        projected_key, projected_value = self.adapters[adapter_name](
+        projected_key, projected_value = adapter(
             sharer_key_block=sharer_key_block,
             sharer_value_block=sharer_value_block,
         )
@@ -710,7 +791,13 @@ def run_train(
             spec.num_heads,
         )
     logging.info("[Setup] variant = %s", config.variant)
-    logging.info("[Setup] top_layers_to_translate = %d", config.top_layers_to_translate)
+    logging.info("[Setup] top_layers_to_translate = %s", config.top_layers_to_translate)
+    for edge in edges:
+        logging.info(
+            "[Setup] top_layers_to_translate[%s] = %d",
+            edge.id,
+            get_top_layers_to_translate_for_edge(config, ctx, edge),
+        )
     logging.info("[Setup] trainable %s params = %s", get_trainable_module_label(config), f"{count_trainable_parameters(translator_pool):,}")
 
     dataloaders_by_target = build_training_dataloaders_by_target(ctx)
