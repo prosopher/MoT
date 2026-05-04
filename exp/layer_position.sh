@@ -87,10 +87,10 @@ done
 
 SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}"
 SUMMARY_PATH="${SUMMARY_ROOT}/summary.csv"
-METRIC_CONTROLS_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}_controls.png"
-LOGIT_KL_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_logit_kl.png"
+METRIC_CONTROLS_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}_controls.pdf"
+LOGIT_KL_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_logit_kl.pdf"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
-echo "[LayerPosition] metric_controls_chart_png=${METRIC_CONTROLS_CHART_PATH}"
-echo "[LayerPosition] logit_kl_chart_png=${LOGIT_KL_CHART_PATH}"
+echo "[LayerPosition] metric_controls_chart_pdf=${METRIC_CONTROLS_CHART_PATH}"
+echo "[LayerPosition] logit_kl_chart_pdf=${LOGIT_KL_CHART_PATH}"

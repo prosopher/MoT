@@ -459,7 +459,7 @@ class LayerWindowTranslatorPool(nn.Module):
         *,
         source_past_key_values: PastKeyValues,
         prefix_input_ids: torch.Tensor,
-        source_model: Optional[PreTrainedModel] = None,
+        source_model: PreTrainedModel,
         target_model: PreTrainedModel,
         src_node_id: str,
         tgt_node_id: str,
@@ -477,19 +477,17 @@ class LayerWindowTranslatorPool(nn.Module):
             num_heads=tgt_spec.num_key_value_heads,
             head_dim=tgt_spec.head_dim,
         )
-        sparse_attention_indices = None
-        if source_model is not None:
-            src_spec = self.mm.get_model_spec(src_node_id)
-            sparse_attention_indices = build_extrapolated_sparse_attention_indices(
-                source_model,
-                prefix_input_ids,
-                source_layer_indices=self.cm.get_src_layer_indices(edge_id),
-                target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
-                num_source_layers=src_spec.num_layers,
-                num_target_layers=tgt_spec.num_layers,
-                source_model_id=self.node_model_ids.get(src_node_id),
-                top_k=self.ctx.config.topk_sparse_attn,
-            )
+        src_spec = self.mm.get_model_spec(src_node_id)
+        sparse_attention_indices = build_extrapolated_sparse_attention_indices(
+            source_model,
+            prefix_input_ids,
+            source_layer_indices=self.cm.get_src_layer_indices(edge_id),
+            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
+            num_source_layers=src_spec.num_layers,
+            num_target_layers=tgt_spec.num_layers,
+            source_model_id=self.node_model_ids.get(src_node_id),
+            top_k=self.ctx.config.topk_sparse_attn,
+        )
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             target_model_id=self.node_model_ids.get(tgt_node_id),
@@ -950,7 +948,7 @@ def run_gpt2_block(
 
     qkv = attn.c_attn(attn_input)
     split_size = getattr(attn, "split_size", qkv.shape[-1] // 3)
-    query, native_key, native_value = qkv.split(split_size, dim=2)
+    query, native_like_key, native_like_value = qkv.split(split_size, dim=2)
 
     batch_size, seq_len, _ = query.shape
     num_heads = attn.num_heads
@@ -958,11 +956,11 @@ def run_gpt2_block(
     expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
 
     query = query.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    native_key = native_key.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    native_value = native_value.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    native_like_key = native_like_key.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    native_like_value = native_like_value.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
 
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for GPT-2 layer replay: "
@@ -997,7 +995,7 @@ def run_gpt2_block(
     attn_output = attn.resid_dropout(attn_output)
     hidden_states = residual + attn_output
     hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
-    return hidden_states, (native_key, native_value)
+    return hidden_states, (attention_key, attention_value)
 
 
 def run_opt_block(
@@ -1033,14 +1031,14 @@ def run_opt_block(
         hidden_states = block.self_attn_layer_norm(hidden_states)
 
     query_states = attn.q_proj(hidden_states) * float(getattr(attn, "scaling", head_dim ** -0.5))
-    native_key = attn.k_proj(hidden_states)
-    native_value = attn.v_proj(hidden_states)
+    native_like_key = attn.k_proj(hidden_states)
+    native_like_value = attn.v_proj(hidden_states)
     query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    native_key = native_key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
-    native_value = native_value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_key = native_like_key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_value = native_like_value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2).contiguous()
 
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for OPT layer replay: "
@@ -1084,7 +1082,7 @@ def run_opt_block(
     hidden_states = (residual + hidden_states).view(hidden_states_shape)
     if not getattr(block, "do_layer_norm_before", False):
         hidden_states = block.final_layer_norm(hidden_states)
-    return hidden_states, (native_key, native_value)
+    return hidden_states, (attention_key, attention_value)
 
 
 
@@ -1116,24 +1114,24 @@ def run_qwen2_block(
     attn_input = block.input_layernorm(hidden_states)
 
     query_states = attn.q_proj(attn_input).view(batch_size, seq_len, num_query_heads, head_dim).transpose(1, 2).contiguous()
-    native_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
-    native_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+    native_like_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
 
     if position_embeddings is not None:
         cos, sin = position_embeddings
-        query_states, native_key = apply_rotary_pos_emb(query_states, native_key, cos, sin)
+        query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin)
     else:
         rotary_emb = getattr(attn, "rotary_emb", None)
         if rotary_emb is None:
             raise ValueError("Qwen2 replay requires rotary embeddings from model.model.rotary_emb or layer.self_attn.rotary_emb.")
         try:
-            cos, sin = rotary_emb(native_value, seq_len=seq_len)
+            cos, sin = rotary_emb(native_like_value, seq_len=seq_len)
         except TypeError:
-            cos, sin = rotary_emb(native_value, position_ids)
-        query_states, native_key = apply_rotary_pos_emb(query_states, native_key, cos, sin, position_ids)
+            cos, sin = rotary_emb(native_like_value, position_ids)
+        query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin, position_ids)
 
-    attention_key = native_key if injected_key is None else injected_key
-    attention_value = native_value if injected_value is None else injected_value
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for Qwen2/Qwen2.5 layer replay: "
@@ -1180,7 +1178,7 @@ def run_qwen2_block(
     hidden_states = block.post_attention_layernorm(hidden_states)
     hidden_states = block.mlp(hidden_states)
     hidden_states = residual + hidden_states
-    return hidden_states, (native_key, native_value)
+    return hidden_states, (attention_key, attention_value)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:

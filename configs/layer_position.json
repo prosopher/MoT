@@ -33,9 +33,9 @@
   "eval_shuffle_stream": false,
   "benchmark_mode": "gen_qa",
   "generation_max_new_tokens": 64,
-  "variant": "mot",
-  "mot_num_translators": 2,
+  "variant": "single",
+  "mot_num_translators": 1,
   "mot_top_k": 1,
   "topk_sparse_attn": 32,
-  "num_bottom_full_attn": 2
+  "num_bottom_full_attn": 12
 }

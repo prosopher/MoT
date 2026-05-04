@@ -641,6 +641,7 @@ def _load_openwebtext_tsne_plotting_deps():
     try:
         import matplotlib
         matplotlib.use("Agg", force=True)
+        matplotlib.rcParams["savefig.format"] = "pdf"
         import matplotlib.pyplot as plt
         from sklearn.manifold import TSNE
     except ModuleNotFoundError as exc:
@@ -668,7 +669,7 @@ def _sanitize_edge_id_for_filename(edge_id: str) -> str:
 
 def _build_openwebtext_tsne_plot_path(output_path: Union[str, Path], edge_id: str) -> Path:
     safe_edge_id = _sanitize_edge_id_for_filename(edge_id)
-    return _build_openwebtext_tsne_output_dir(output_path) / f"{OPENWEBTEXT_TSNE_FILE_BASENAME}_{safe_edge_id}.png"
+    return _build_openwebtext_tsne_output_dir(output_path) / f"{OPENWEBTEXT_TSNE_FILE_BASENAME}_{safe_edge_id}.pdf"
 
 
 def _accumulate_openwebtext_tsne_samples(
@@ -3350,7 +3351,7 @@ def build_edge_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc | SQuAD | NewsQA | F1 | Loss | Latency | Throughput | GPU Peak Memory |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (Native) | N/A | "

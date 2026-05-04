@@ -4,37 +4,50 @@ import re
 import math
 import argparse
 import textwrap
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal
 from collections import OrderedDict
 
-import matplotlib.pyplot as plt
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from exp.exp_util import (
+    AI_PAPER_PALETTE,
+    AI_PAPER_MARKERS,
+    AI_PAPER_LINESTYLES,
+    AI_PAPER_ALGORITHM_LABEL_ROTATION,
+    AI_PAPER_BAR_X_MARGIN,
+    AI_PAPER_BAR_Y_MARGIN,
+    AI_PAPER_BAR_VALUE_FONT_SIZE,
+    AI_PAPER_DEFAULT_X_MARGIN,
+    AI_PAPER_DEFAULT_Y_MARGIN,
+    AI_PAPER_DENSE_WIDTH_SCALE_MAX,
+    AI_PAPER_GROUPED_BAR_TOTAL_WIDTH,
+    AI_PAPER_GROUPED_BAR_WIDTH_SCALE,
+    AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_LINE_WIDTH,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_MARKER_FACE_COLOR,
+    AI_PAPER_MARKER_SIZE,
+    AI_PAPER_REFERENCE_COLOR,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_WRAP_TICK_WIDTH,
+    double_column_figsize,
+    scaled_double_column_figsize,
+    apply_ai_paper_style,
+    require_matplotlib_pyplot,
+    save_paper_figure,
+    style_algorithm_tick_labels,
+    style_axes_common,
+)
 
 
-DEFAULT_Y_COL = "Gen F1 Avg"
-
-
-# Colorblind-friendly palette, commonly used in academic plots
-AI_PAPER_PALETTE = [
-    "#C0504D",  # Accent Red
-    "#4BACC6",  # Accent Aqua
-    "#8064A2",  # Accent Purple
-    "#4F81BD",  # Accent Blue
-    "#9BBB59",  # Accent Green
-    "#F79646",  # Accent Orange
-    "#000000",  # black
-]
-
-
-AI_PAPER_MARKERS = [
-    "o", "s", "^", "D", "v", "P", "X", "*", "h", "<", ">"
-]
-
-
-AI_PAPER_LINESTYLES = [
-    "-", "--", "-.", ":"
-]
+DEFAULT_Y_COL = "F1"
 
 
 ChartMode = Literal["line", "bar"]
@@ -72,6 +85,18 @@ def normalize_group_label(text: str) -> str:
     Ratio=0.5'
     """
     return text.replace("\\n", "\n").strip()
+
+
+def is_native_series_name(series_name: str) -> bool:
+    """
+    --native 활성화 시 Native 테이블/섹션을 식별합니다.
+
+    make_unique_name()에 의해 중복 이름이 'Native (2)'처럼 바뀌어도
+    Native 계열로 처리합니다.
+    """
+    normalized = normalize_group_label(series_name)
+    normalized = re.sub(r"\s+\(\d+\)\s*$", "", normalized)
+    return normalized.strip().lower() == "native"
 
 
 def split_markdown_row(line: str) -> list[str]:
@@ -319,63 +344,6 @@ def extract_tables(
     )
 
 
-def apply_ai_paper_style() -> None:
-    """
-    AI 논문 figure에 자주 쓰이는 Matplotlib 스타일 설정.
-
-    특징:
-    - serif font
-    - PDF/SVG 저장 시 텍스트 편집 가능
-    - 적당한 linewidth와 tick size
-    - 과하지 않은 grid
-    """
-    plt.rcParams.update(
-        {
-            # Figure and save quality
-            "figure.dpi": 120,
-            "savefig.dpi": 300,
-            "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.02,
-
-            # Font
-            "font.family": "serif",
-            "font.serif": [
-                "Times New Roman",
-                "Times",
-                "DejaVu Serif",
-            ],
-            "mathtext.fontset": "stix",
-
-            # Editable text in vector outputs
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-            "svg.fonttype": "none",
-
-            # Axes
-            "axes.labelsize": 13,
-            "axes.titlesize": 13,
-            "axes.linewidth": 1.0,
-
-            # Ticks
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 11,
-            "xtick.direction": "out",
-            "ytick.direction": "out",
-
-            # Legend
-            "legend.fontsize": 10,
-            "legend.frameon": True,
-            "legend.framealpha": 0.95,
-            "legend.fancybox": False,
-            "legend.edgecolor": "0.85",
-
-            # Lines
-            "lines.linewidth": 2.2,
-            "lines.markersize": 6,
-        }
-    )
-
-
 def wrap_tick_label(text: str, width: int = 26) -> str:
     """
     x tick label을 적당한 길이로 줄바꿈합니다.
@@ -403,28 +371,21 @@ def wrap_tick_label(text: str, width: int = 26) -> str:
     return "\n".join(wrapped_lines)
 
 
-def style_axes_common(ax) -> None:
-    # 논문형 plot: top/right spine 제거
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+def collect_exact_x_ticks(
+    series_data: OrderedDict[str, list[tuple[float, float]]],
+) -> list[float]:
+    ticks = set()
 
-    ax.spines["left"].set_linewidth(1.0)
-    ax.spines["bottom"].set_linewidth(1.0)
+    for points in series_data.values():
+        for x, _ in points:
+            if math.isfinite(x):
+                ticks.add(x)
 
-    ax.tick_params(axis="both", which="major", length=4, width=1.0)
-    ax.tick_params(axis="both", which="minor", length=2, width=0.8)
+    return sorted(ticks)
 
-    ax.set_axisbelow(True)
 
-    # 과하지 않은 grid
-    ax.grid(
-        True,
-        which="major",
-        axis="y",
-        linestyle="--",
-        linewidth=0.7,
-        alpha=0.35,
-    )
+def format_exact_x_tick(value: float) -> str:
+    return f"{value:g}"
 
 
 def plot_line_series(
@@ -433,6 +394,8 @@ def plot_line_series(
     x_label: str,
     y_label: str,
     title: str | None = None,
+    native: bool = False,
+    exact_x: bool = False,
 ) -> None:
     if not series_data:
         raise RuntimeError("Line chart로 플롯할 데이터가 없습니다.")
@@ -442,13 +405,13 @@ def plot_line_series(
     num_series = len(series_data)
 
     if num_series <= 5:
-        fig_width = 6.4
-        fig_height = 4.2
+        fig_size = double_column_figsize()
     else:
-        fig_width = 7.4
-        fig_height = 4.8
+        fig_size = double_column_figsize(height=4.80)
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    plt = require_matplotlib_pyplot()
+
+    fig, ax = plt.subplots(figsize=fig_size)
 
     for idx, (series_name, points) in enumerate(series_data.items()):
         points = sorted(points, key=lambda pair: pair[0])
@@ -460,6 +423,14 @@ def plot_line_series(
         linestyle = AI_PAPER_LINESTYLES[
             (idx // len(AI_PAPER_MARKERS)) % len(AI_PAPER_LINESTYLES)
         ]
+        markerfacecolor = AI_PAPER_MARKER_FACE_COLOR
+        markeredgecolor = color
+
+        if native and is_native_series_name(series_name):
+            color = "black"
+            linestyle = ":"
+            markerfacecolor = "white"
+            markeredgecolor = "black"
 
         ax.plot(
             xs,
@@ -468,39 +439,40 @@ def plot_line_series(
             color=color,
             linestyle=linestyle,
             marker=marker,
-            linewidth=2.2,
-            markersize=6,
-            markerfacecolor="white",
-            markeredgecolor=color,
-            markeredgewidth=1.4,
+            linewidth=AI_PAPER_LINE_WIDTH,
+            markersize=AI_PAPER_MARKER_SIZE,
+            markerfacecolor=markerfacecolor,
+            markeredgecolor=markeredgecolor,
+            markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         )
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
 
-    if title:
-        ax.set_title(title, pad=8)
+    if exact_x:
+        exact_x_ticks = collect_exact_x_ticks(series_data)
+        ax.set_xticks(exact_x_ticks)
+        ax.set_xticklabels([format_exact_x_tick(x) for x in exact_x_ticks])
 
     style_axes_common(ax)
 
     ax.minorticks_on()
-    ax.margins(x=0.03, y=0.08)
+    ax.margins(x=AI_PAPER_DEFAULT_X_MARGIN, y=AI_PAPER_DEFAULT_Y_MARGIN)
 
     if num_series > 5:
         ax.legend(
             loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
+            bbox_to_anchor=AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
             borderaxespad=0.0,
-            handlelength=2.6,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
     else:
         ax.legend(
             loc="best",
-            handlelength=2.6,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    save_paper_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -537,13 +509,21 @@ def plot_grouped_bar(
     num_groups = len(group_names)
     num_categories = len(categories)
 
-    fig_width = max(6.4, min(14.0, 1.35 * num_groups + 0.65 * num_categories + 2.0))
-    fig_height = 4.8 if num_groups <= 6 else 5.4
+    width_scale = min(
+        AI_PAPER_DENSE_WIDTH_SCALE_MAX,
+        max(1.0, (1.35 * num_groups + 0.65 * num_categories + 2.0) / 7.16),
+    )
+    fig_size = scaled_double_column_figsize(
+        width_scale=width_scale,
+        height=4.80 if num_groups <= 6 else 5.40,
+    )
 
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    plt = require_matplotlib_pyplot()
+
+    fig, ax = plt.subplots(figsize=fig_size)
 
     x_positions = list(range(num_groups))
-    total_width = 0.82
+    total_width = AI_PAPER_GROUPED_BAR_TOTAL_WIDTH
     bar_width = total_width / max(1, num_categories)
 
     for cat_idx, category in enumerate(categories):
@@ -560,11 +540,11 @@ def plot_grouped_bar(
         ax.bar(
             xs,
             ys,
-            width=bar_width * 0.92,
+            width=bar_width * AI_PAPER_GROUPED_BAR_WIDTH_SCALE,
             label=category,
             color=color,
-            edgecolor="black",
-            linewidth=0.6,
+            edgecolor=AI_PAPER_REFERENCE_COLOR,
+            linewidth=AI_PAPER_REFERENCE_LINE_WIDTH * 0.6,
         )
 
     # 요청사항:
@@ -572,37 +552,34 @@ def plot_grouped_bar(
     # 즉, ax.set_xlabel("Markdown Section")을 호출하지 않습니다.
     ax.set_ylabel(y_label)
 
-    if title:
-        ax.set_title(title, pad=8)
-
     ax.set_xticks(x_positions)
     ax.set_xticklabels(
-        [wrap_tick_label(name, width=28) for name in group_names],
+        [wrap_tick_label(name, width=AI_PAPER_WRAP_TICK_WIDTH) for name in group_names],
         rotation=0,
         ha="center",
     )
 
     style_axes_common(ax)
+    style_algorithm_tick_labels(ax, axis="x")
 
-    ax.margins(x=0.04, y=0.10)
+    ax.margins(x=AI_PAPER_BAR_X_MARGIN, y=AI_PAPER_BAR_Y_MARGIN)
 
     if num_categories > 5 or num_groups > 5:
         ax.legend(
             title=category_label,
             loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
+            bbox_to_anchor=AI_PAPER_LEGEND_OUTSIDE_ANCHOR,
             borderaxespad=0.0,
-            handlelength=1.8,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
     else:
         ax.legend(
             title=category_label,
             loc="best",
-            handlelength=1.8,
+            handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    save_paper_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -611,6 +588,8 @@ def plot_extracted_data(
     output_path: Path,
     y_label: str,
     title: str | None = None,
+    native: bool = False,
+    exact_x: bool = False,
 ) -> None:
     if extracted.chart_mode == "line":
         plot_line_series(
@@ -619,6 +598,8 @@ def plot_extracted_data(
             x_label=extracted.x_col_name,
             y_label=y_label,
             title=title,
+            native=native,
+            exact_x=exact_x,
         )
     else:
         plot_grouped_bar(
@@ -654,8 +635,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "출력 파일 경로. "
-            "생략하면 입력 파일명과 같은 이름의 .png 파일로 저장합니다. "
-            "논문용으로는 .pdf 또는 .svg 권장."
+            "생략하면 입력 파일명과 같은 이름의 .pdf 파일로 저장합니다. "
+            "논문용 기본 형식은 .pdf입니다."
         ),
     )
     parser.add_argument(
@@ -666,6 +647,22 @@ def parse_args() -> argparse.Namespace:
             "논문 figure에서는 보통 caption을 사용하므로 기본값은 제목 없음."
         ),
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        help=(
+            "Line chart에서 Native 테이블/섹션을 "
+            "흰색 마커가 있는 검은 점선으로 표시합니다."
+        ),
+    )
+    parser.add_argument(
+        "--exact-x",
+        action="store_true",
+        help=(
+            "Line chart에서 자동 등간격 x축 tick 대신 "
+            "실제 데이터 x값에 해당하는 tick만 표시합니다."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -673,7 +670,7 @@ def main() -> None:
     args = parse_args()
 
     input_path = args.input
-    output_path = args.output or input_path.with_suffix(".png")
+    output_path = args.output or input_path.with_suffix(".pdf")
 
     md_text = input_path.read_text(encoding="utf-8")
 
@@ -697,6 +694,8 @@ def main() -> None:
         output_path=output_path,
         y_label=args.y_col,
         title=args.title,
+        native=args.native,
+        exact_x=args.exact_x,
     )
 
     print(f"Saved: {output_path}")

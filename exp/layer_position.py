@@ -19,7 +19,33 @@ from core.eval_util import *
 from mot.train import *
 from core.train_util import *
 from transformers import AutoConfig
+from exp.exp_util import (
+    AI_PAPER_PALETTE,
+    AI_PAPER_MARKERS,
+    AI_PAPER_ANNOTATION_FONT_SIZE,
+    AI_PAPER_ANNOTATION_OFFSET,
+    AI_PAPER_LEGEND_HANDLE_LENGTH,
+    AI_PAPER_MARKER_EDGE_WIDTH,
+    AI_PAPER_MARKER_FACE_COLOR,
+    AI_PAPER_NATIVE_LINESTYLE,
+    AI_PAPER_REFERENCE_COLOR,
+    AI_PAPER_REFERENCE_LINE_WIDTH,
+    AI_PAPER_CONTROL_LINESTYLE,
+    double_column_figsize,
+    apply_ai_paper_style,
+    require_matplotlib_pyplot,
+    save_paper_figure as _save_paper_figure,
+    style_paper_axes as _style_paper_axes,
+)
 
+
+ACCENT_RED = AI_PAPER_PALETTE[0]
+ACCENT_AQUA = AI_PAPER_PALETTE[1]
+ACCENT_PURPLE = AI_PAPER_PALETTE[2]
+ACCENT_BLUE = AI_PAPER_PALETTE[3]
+ACCENT_GREEN = AI_PAPER_PALETTE[4]
+ACCENT_ORANGE = AI_PAPER_PALETTE[5]
+ACCENT_BLACK = AI_PAPER_PALETTE[6]
 
 
 @dataclass
@@ -1080,8 +1106,11 @@ def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
             textcoords="offset points",
             xytext=(0, 7),
             ha="center",
-            fontsize=8,
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
         )
+
+
 
 
 def build_analysis_metrics_path(run_dir: Path) -> Path:
@@ -1089,15 +1118,15 @@ def build_analysis_metrics_path(run_dir: Path) -> Path:
 
 
 def build_metric_controls_chart_path(study_dir: Path, metric_name: str) -> Path:
-    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}_controls.png"
+    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}_controls.pdf"
 
 
 def build_logit_kl_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_logit_kl.png"
+    return study_dir / "layer_idx_vs_logit_kl.pdf"
 
 
 def build_openwebtext_loss_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_openwebtext_validation_loss.png"
+    return study_dir / "layer_idx_vs_openwebtext_validation_loss.pdf"
 
 
 def plot_metric_controls_summary(summary_path: Path) -> Path:
@@ -1109,28 +1138,42 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
     x_values = [row.injection_layer_start_idx for row in rows]
     metric_name = rows[0].metric_name or "metric"
     metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
-    window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
-    import matplotlib.pyplot as plt
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, [row.average_native_metric for row in rows], marker="o", label=f"Native {metric_label}")
-    ax.plot(x_values, [row.average_dir_only_metric for row in rows], marker="s", label=f"Dir-only {metric_label}")
-    ax.plot(x_values, [row.average_mag_only_metric for row in rows], marker="^", label=f"Mag-only {metric_label}")
-    ax.plot(x_values, [row.average_full_mix_metric for row in rows], marker="D", label=f"Full-mix {metric_label}")
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
+    ax.plot(
+        x_values,
+        [row.average_full_mix_metric for row in rows],
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[3],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="MoT",
+    )
+    ax.plot(
+        x_values,
+        [row.average_native_metric for row in rows],
+        color=ACCENT_BLACK,
+        linestyle=AI_PAPER_NATIVE_LINESTYLE,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_BLACK,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="Native",
+    )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
-    ax.set_xlabel("Injection target layer start index")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} decomposition vs injection target layer start index ({window_title})")
-    ax.set_xticks(x_values)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    _style_paper_axes(ax, x_values=x_values)
+    ax.set_ylim(bottom=0)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     chart_path = build_metric_controls_chart_path(study_dir, metric_name)
-    fig.savefig(chart_path, dpi=200)
+    _save_paper_figure(fig, chart_path)
     plt.close(fig)
     return chart_path
 
@@ -1145,25 +1188,67 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
-    import matplotlib.pyplot as plt
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, [row.average_native_to_dir_only_logit_kl for row in rows], marker="o", label="KL(native || dir-only)")
-    ax.plot(x_values, [row.average_native_to_mag_only_logit_kl for row in rows], marker="s", label="KL(native || mag-only)")
-    ax.plot(x_values, [row.average_native_to_full_mix_logit_kl for row in rows], marker="^", label="KL(native || full-mix)")
-    ax.plot(x_values, [row.average_full_mix_to_dir_only_logit_kl for row in rows], marker="x", label="KL(full-mix || dir-only)")
-    ax.plot(x_values, [row.average_full_mix_to_mag_only_logit_kl for row in rows], marker="d", label="KL(full-mix || mag-only)")
-    ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("KL divergence")
-    ax.set_title(f"Logit KL comparison vs layer index ({window_title})")
-    ax.set_xticks(x_values)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
+    ax.plot(
+        x_values,
+        [row.average_native_to_full_mix_logit_kl for row in rows],
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[2],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="KL(native || full-mix)",
+    )
+    ax.plot(
+        x_values,
+        [row.average_native_to_dir_only_logit_kl for row in rows],
+        color=ACCENT_AQUA,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_AQUA,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="KL(native || dir-only)",
+    )
+    ax.plot(
+        x_values,
+        [row.average_native_to_mag_only_logit_kl for row in rows],
+        color=ACCENT_PURPLE,
+        marker=AI_PAPER_MARKERS[1],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_PURPLE,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="KL(native || mag-only)",
+    )
+    ax.plot(
+        x_values,
+        [row.average_full_mix_to_dir_only_logit_kl for row in rows],
+        color=ACCENT_GREEN,
+        marker=AI_PAPER_MARKERS[6],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_GREEN,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="KL(full-mix || dir-only)",
+    )
+    ax.plot(
+        x_values,
+        [row.average_full_mix_to_mag_only_logit_kl for row in rows],
+        color=ACCENT_ORANGE,
+        marker=AI_PAPER_MARKERS[3],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_ORANGE,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="KL(full-mix || mag-only)",
+    )
+    ax.set_xlabel("First Layer Index of Translation Channels")
+    ax.set_ylabel("KL Divergence")
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     chart_path = build_logit_kl_chart_path(study_dir)
-    fig.savefig(chart_path, dpi=200)
+    _save_paper_figure(fig, chart_path)
     plt.close(fig)
     return chart_path
 
@@ -1178,23 +1263,39 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
     window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
-    import matplotlib.pyplot as plt
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
 
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, [row.average_native_loss for row in rows], marker="o", label="Native Loss")
-    ax.plot(x_values, [row.average_full_mix_loss for row in rows], marker="D", label="Full-mix Loss")
+    fig, ax = plt.subplots(figsize=double_column_figsize(height=4.80))
+    ax.plot(
+        x_values,
+        [row.average_full_mix_loss for row in rows],
+        color=ACCENT_RED,
+        marker=AI_PAPER_MARKERS[3],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_RED,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="MoT",
+    )
+    ax.plot(
+        x_values,
+        [row.average_native_loss for row in rows],
+        color=ACCENT_BLACK,
+        linestyle=AI_PAPER_NATIVE_LINESTYLE,
+        marker=AI_PAPER_MARKERS[0],
+        markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
+        markeredgecolor=ACCENT_BLACK,
+        markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
+        label="Native",
+    )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
-    ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("OpenWebText validation Loss")
-    ax.set_title(f"OpenWebText validation Loss vs layer index ({window_title})")
-    ax.set_xticks(x_values)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+    ax.set_xlabel("First Layer Index of Translation Channels")
+    ax.set_ylabel("Validation Loss")
+    _style_paper_axes(ax, x_values=x_values)
+    ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     chart_path = build_openwebtext_loss_chart_path(study_dir)
-    fig.savefig(chart_path, dpi=200)
+    _save_paper_figure(fig, chart_path)
     plt.close(fig)
     return chart_path
 
@@ -1207,9 +1308,9 @@ def remove_stale_summary_artifacts(study_dir: Path, run_dir: Path) -> None:
         study_dir / "drift_summary.md",
         study_dir / "study_summary.csv",
         study_dir / "drift_summary.csv",
-        study_dir / "drift_cosine.png",
-        study_dir / "drift_l2.png",
-        study_dir / "layer_idx_vs_openwebtext_validation_loss.png",
+        study_dir / "drift_cosine.pdf",
+        study_dir / "drift_l2.pdf",
+        study_dir / "layer_idx_vs_openwebtext_validation_loss.pdf",
     ]
     for stale_path in stale_paths:
         if stale_path.exists():
@@ -1542,7 +1643,7 @@ def main() -> None:
     print(f"Metric controls chart: {metric_controls_chart_path}")
     print(f"Control analysis metrics: {analysis_metrics_path}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
-    print(f"OpenWebText validation Loss chart: {openwebtext_loss_chart_path}")
+    print(f"Validation Loss chart: {openwebtext_loss_chart_path}")
 
 
 if __name__ == "__main__":
