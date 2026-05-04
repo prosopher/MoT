@@ -995,7 +995,7 @@ def run_gpt2_block(
     attn_output = attn.resid_dropout(attn_output)
     hidden_states = residual + attn_output
     hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
-    return hidden_states, (attention_key, attention_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 def run_opt_block(
@@ -1082,7 +1082,7 @@ def run_opt_block(
     hidden_states = (residual + hidden_states).view(hidden_states_shape)
     if not getattr(block, "do_layer_norm_before", False):
         hidden_states = block.final_layer_norm(hidden_states)
-    return hidden_states, (attention_key, attention_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 
