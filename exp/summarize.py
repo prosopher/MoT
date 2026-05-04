@@ -92,6 +92,7 @@ ALGORITHM_DISPLAY_NAMES = {
     "lsc": "LSC",
     "mot": "MoT",
     "mot-h": "MoT-h",
+    "mot-single": "MoT (single)",
     "native": "Native",
 }
 
