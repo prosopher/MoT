@@ -47,7 +47,8 @@ ACCENT_BLUE = AI_PAPER_PALETTE[3]
 ACCENT_GREEN = AI_PAPER_PALETTE[4]
 ACCENT_ORANGE = AI_PAPER_PALETTE[5]
 ACCENT_BLACK = AI_PAPER_PALETTE[6]
-PHASE_SCATTER_L0_COLOR = "#BDBDBD"
+PHASE_SCATTER_FIRST_COLOR = "#BDBDBD"
+PHASE_SCATTER_LAST_COLOR = "#E53935"
 
 
 def _hex_to_rgb(color: str) -> Tuple[float, float, float]:
@@ -71,11 +72,11 @@ def _interpolate_hex_color(start_color: str, end_color: str, ratio: float) -> st
 def _phase_scatter_layer_colors(rows: List["CorrectionSummaryRow"]) -> List[str]:
     top_layer_idx = max((row.injection_layer_start_idx for row in rows), default=0)
     if top_layer_idx <= 0:
-        return [PHASE_SCATTER_L0_COLOR for _ in rows]
+        return [PHASE_SCATTER_FIRST_COLOR for _ in rows]
     return [
         _interpolate_hex_color(
-            PHASE_SCATTER_L0_COLOR,
-            ACCENT_RED,
+            PHASE_SCATTER_FIRST_COLOR,
+            PHASE_SCATTER_LAST_COLOR,
             row.injection_layer_start_idx / top_layer_idx,
         )
         for row in rows
