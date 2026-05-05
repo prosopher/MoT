@@ -1418,7 +1418,43 @@ def plot_full_mix_vs_native_kv_similarity_heatmap(
 
     ax.set_xlabel(f"Token Groups (Group Size={token_group_size})")
     ax.set_ylabel("Layer Index")
+
+    for boundary_after_group in (7, 16):
+        if 0 <= boundary_after_group < num_groups - 1:
+            ax.axvline(
+                boundary_after_group + 0.5,
+                color="black",
+                linestyle="--",
+                linewidth=1.2,
+                zorder=3,
+            )
+
+    segment_labels = (
+        (0, 7, "Context"),
+        (8, 16, "Prompt"),
+        (17, 24, "Completion"),
+    )
+    for start_group, end_group, label in segment_labels:
+        if num_groups == 0 or start_group >= num_groups or end_group < 0:
+            continue
+        visible_start = max(start_group, 0)
+        visible_end = min(end_group, num_groups - 1)
+        center_group = (visible_start + visible_end) / 2.0
+        ax.text(
+            center_group,
+            1.025,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
+            color="black",
+            clip_on=False,
+        )
+
     style_axes_common(ax, grid=False)
+    fig.subplots_adjust(top=0.86)
 
     cbar = fig.colorbar(image, ax=ax)
     cbar.set_label("Cosine Similarity(Native vs Translation)")
