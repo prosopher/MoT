@@ -194,7 +194,10 @@ class Agent:
         current_past, current_input_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
         eos_token_id = self.tokenizer.eos_token_id
-        last_generated_token: Optional[torch.Tensor] = None
+        # A generated token is not added to past_key_values at prediction time;
+        # it is added only when it is fed back as input in the next decoding step.
+        # Track only the generated token that is still visible but not yet cached.
+        uncached_generated_token: Optional[torch.Tensor] = None
 
         for _ in range(max(0, self.max_new_tokens)):
             outputs = self.model(
@@ -203,6 +206,11 @@ class Agent:
                 use_cache=True,
             )
             current_past = outputs.past_key_values
+            # The input token for this step has now been incorporated into KV.
+            # If it was a previously generated visible token, it no longer needs
+            # the final one-token cache append below.
+            uncached_generated_token = None
+
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             next_token_id = int(next_token.item())
 
@@ -210,19 +218,21 @@ class Agent:
                 break
 
             generated_token_ids.append(next_token_id)
-            last_generated_token = next_token
+            uncached_generated_token = next_token
             decoded_so_far = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
             _, matched_stop = self._trim_at_stop_sequence(decoded_so_far, self.stop_sequences)
             current_input_ids = next_token
             if matched_stop is not None:
                 break
 
-        # The loop cache contains the token that was fed into the model, not the
-        # final predicted token. Feed the last non-EOS generated token once so
-        # the stateful cache represents the visible response text as well.
-        if last_generated_token is not None:
+        # The final predicted visible token has not entered the KV cache if the
+        # loop ended before another decoding step consumed it. Append only that
+        # still-uncached token. When decoding stops because EOS is predicted, the
+        # last visible token was already consumed in the EOS-prediction step, so
+        # this block is correctly skipped and the token ledger stays aligned.
+        if uncached_generated_token is not None:
             outputs = self.model(
-                input_ids=last_generated_token,
+                input_ids=uncached_generated_token,
                 past_key_values=current_past,
                 use_cache=True,
             )

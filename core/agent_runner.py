@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from core.agent import Agent, AgentGeneration, HubAgent, get_past_seq_len, slice_past_suffix
-from core.common import PastKeyValues, read_json, set_seed
+from core.common import PastKeyValues, extract_past_key_values, read_json, replace_top_layers, set_seed
 from core.config import resolve_device
 from core.context import Context
 from core.eval_util import (
@@ -20,7 +20,7 @@ from core.eval_util import (
     compute_generation_f1,
     postprocess_generated_answer,
 )
-from core.topology import Edge, build_edge_map, build_nodes_and_edges
+from core.topology import Edge, Node, build_edge_map, build_nodes_and_edges, index_to_node_id
 from core.train_util import get_train_config_path
 
 
@@ -28,14 +28,19 @@ CACHE_MODE_RETAIN = "retain"
 CACHE_MODE_FREE = "free"
 SUPPORTED_CACHE_MODES = (CACHE_MODE_RETAIN, CACHE_MODE_FREE)
 
-SUPPORTED_ALGS = ("mot", "interlat", "lsc")
-RETAIN_ONLY_ALGS = ("interlat", "lsc")
+SUPPORTED_ALGS = ("mot", "interlat", "lsc", "c2c-pr", "kvcomm")
+RETAIN_ONLY_ALGS = ("interlat", "lsc", "c2c-pr", "kvcomm")
 TRAIN_MODULE_BY_ALG = {
     "mot": "mot.train",
     "interlat": "interlat.train",
     "lsc": "lsc.train",
+    "c2c-pr": "c2c.train",
+    "kvcomm": "kvcomm.train",
 }
-MAX_AGENT_COUNT = 4
+
+
+def _is_homogeneous_model_pool(nodes: Sequence[Node]) -> bool:
+    return len({node.model_id for node in nodes}) == 1
 
 
 def normalize_agent_runner_alg(alg: str) -> str:
@@ -45,19 +50,24 @@ def normalize_agent_runner_alg(alg: str) -> str:
     return normalized
 
 
-def resolve_agent_count(agent_count: Optional[int], total_nodes: int) -> int:
-    max_allowed = min(int(total_nodes), MAX_AGENT_COUNT)
-    if max_allowed < 2:
+def resolve_agent_count(
+    agent_count: Optional[int],
+    total_nodes: int,
+    *,
+    allow_unbounded_homogeneous_agents: bool = False,
+) -> int:
+    total_nodes = int(total_nodes)
+    if total_nodes < 2:
         raise ValueError("AgentRunner requires at least two nodes in the checkpoint model pool.")
     if agent_count is None:
-        return max_allowed
+        return total_nodes
     resolved = int(agent_count)
-    if resolved < 2:
-        raise ValueError(f"agent_count must be at least 2, got {resolved}")
-    if resolved > max_allowed:
+    if resolved < 1:
+        raise ValueError(f"agent_count must be at least 1, got {resolved}")
+    if not allow_unbounded_homogeneous_agents and resolved > total_nodes:
         raise ValueError(
-            f"agent_count={resolved} exceeds the allowed maximum {max_allowed} "
-            f"(checkpoint nodes={total_nodes}, hard limit={MAX_AGENT_COUNT})."
+            f"agent_count={resolved} exceeds checkpoint nodes={total_nodes}. "
+            "Use a homogeneous checkpoint model pool to run more logical agents than trained nodes."
         )
     return resolved
 
@@ -165,18 +175,26 @@ class KVCacheTranslationAdapter:
         self.translator_pool = translator_pool
         self.alg = normalize_agent_runner_alg(alg)
         self.edge_map = build_edge_map(ctx.edges)
+        self._homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
+        self._canonical_edge = next(iter(ctx.edges), None)
 
     def _get_edge(self, src_node_id: str, tgt_node_id: str) -> Edge:
         edge_id = f"{src_node_id}_to_{tgt_node_id}"
         edge = self.edge_map.get(edge_id)
-        if edge is None:
-            raise ValueError(
-                f"Missing translator edge {edge_id!r}. AgentRunner requires every KV offload edge used by the "
-                f"selected hub-centered star topology/cache mode. Non-hub to non-hub handoffs are routed "
-                f"through the hub and therefore require source_to_hub and hub_to_target translator edges. "
-                f"Available edges: {sorted(self.edge_map)}"
-            )
-        return edge
+        if edge is not None:
+            return edge
+        if self._homogeneous_model_pool and self._canonical_edge is not None:
+            # When every logical Agent is backed by the same model family/checkpoint, a single
+            # trained direction such as A_to_B can be reused as a universal logical edge.
+            # The canonical physical edge supplies the learned adapter weights and target
+            # model space; logical source/target ids are still used by AgentRunner records.
+            return self._canonical_edge
+        raise ValueError(
+            f"Missing translator edge {edge_id!r}. AgentRunner requires every KV offload edge used by the "
+            f"selected hub-centered star topology/cache mode. Non-hub to non-hub handoffs are routed "
+            f"through the hub and therefore require source_to_hub and hub_to_target translator edges. "
+            f"Available edges: {sorted(self.edge_map)}"
+        )
 
     @staticmethod
     def _ids_to_tensor(token_ids: Sequence[int], *, device: str) -> torch.Tensor:
@@ -292,6 +310,58 @@ class KVCacheTranslationAdapter:
                     f"source_tokens={source_tokens} translated_tokens={translated_tokens}. "
                     "Reduce --max-prompt-tokens or the generated context length so the latent-conditioned "
                     "target prefix is not truncated by the target model context window."
+                )
+            return translated_past
+
+        if self.alg == "c2c-pr":
+            from c2c.train import translate_top_layers
+
+            source_tokens = get_past_seq_len(source_past_key_values)
+            if int(prefix_input_ids.shape[1]) != source_tokens:
+                raise ValueError(
+                    f"C2C-PR prefix/token length mismatch on {edge.id}: "
+                    f"prefix_tokens={int(prefix_input_ids.shape[1])} source_tokens={source_tokens}"
+                )
+            native_target_past = extract_past_key_values(target_model, prefix_input_ids)
+            translated_top_past = translate_top_layers(
+                translator_pool=self.translator_pool,
+                train_config=self.ctx.config,
+                sharer_past_key_values=source_past_key_values,
+                receiver_past_key_values=native_target_past,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
+                tgt_spec=tgt_spec,
+            )
+            translated_past = replace_top_layers(
+                base_past_key_values=native_target_past,
+                translated_top_past_key_values=translated_top_past,
+            )
+            translated_tokens = get_past_seq_len(translated_past)
+            if translated_tokens != source_tokens:
+                raise ValueError(
+                    f"C2C-PR translated cache length mismatch on {edge.id}: "
+                    f"source_tokens={source_tokens} translated_tokens={translated_tokens}"
+                )
+            return translated_past
+
+        if self.alg == "kvcomm":
+            source_tokens = get_past_seq_len(source_past_key_values)
+            if int(prefix_input_ids.shape[1]) != source_tokens:
+                raise ValueError(
+                    f"KVComm prefix/token length mismatch on {edge.id}: "
+                    f"prefix_tokens={int(prefix_input_ids.shape[1])} source_tokens={source_tokens}"
+                )
+            translated_past = self.translator_pool.build_replayed_target_past(
+                source_past_key_values=source_past_key_values,
+                edge_id=edge.id,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
+            )
+            translated_tokens = get_past_seq_len(translated_past)
+            if translated_tokens != source_tokens:
+                raise ValueError(
+                    f"KVComm translated cache length mismatch on {edge.id}: "
+                    f"source_tokens={source_tokens} translated_tokens={translated_tokens}"
                 )
             return translated_past
 
@@ -446,12 +516,17 @@ class AgentRunner:
         agent_count: Optional[int] = None,
     ) -> None:
         total_nodes = len(ctx.nodes)
+        homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
         resolved_alg = normalize_agent_runner_alg(alg)
         if cache_mode not in SUPPORTED_CACHE_MODES:
             raise ValueError(f"Unsupported cache_mode={cache_mode!r}; expected one of {SUPPORTED_CACHE_MODES}")
         if resolved_alg in RETAIN_ONLY_ALGS and cache_mode != CACHE_MODE_RETAIN:
             raise ValueError(f"alg={resolved_alg!r} supports only cache_mode='retain'.")
-        resolved_agent_count = resolve_agent_count(agent_count, total_nodes)
+        resolved_agent_count = resolve_agent_count(
+            agent_count,
+            total_nodes,
+            allow_unbounded_homogeneous_agents=homogeneous_model_pool,
+        )
 
         self.ctx = ctx
         self.translator_pool = translator_pool
@@ -467,10 +542,26 @@ class AgentRunner:
         self.device = ctx.config.device
         self.profiler = InferenceProfiler(self.device)
         self.cache_translator = KVCacheTranslationAdapter(ctx=ctx, translator_pool=translator_pool, alg=alg)
+        self._homogeneous_model_pool = homogeneous_model_pool
+        self._canonical_model_node_id = (
+            self.cache_translator._canonical_edge.tgt_id
+            if self._homogeneous_model_pool and self.cache_translator._canonical_edge is not None
+            else ctx.nodes[0].id
+        )
 
-        self.active_nodes = list(ctx.nodes[: self.agent_count])
+        if self.agent_count <= total_nodes:
+            self.active_nodes = list(ctx.nodes[: self.agent_count])
+        else:
+            model_id = ctx.nodes[0].model_id
+            self.active_nodes = [
+                Node(id=index_to_node_id(index), model_id=model_id)
+                for index in range(self.agent_count)
+            ]
         self.node_ids = [node.id for node in self.active_nodes]
         stop_sequences = tuple(f"\nAgent {node.id}:" for node in self.active_nodes) + (
+            "<|im_end|>",
+            "\n<|im_start|>",
+            "<|endoftext|>",
             "\n### Instruction:",
             "\n### Passage:",
             "\n### Question:",
@@ -478,13 +569,18 @@ class AgentRunner:
             "\nPassage:",
         )
         self.agent_sequence: List[Agent] = []
+        self.logical_to_physical_node_id: Dict[str, str] = {}
         for index, node in enumerate(self.active_nodes):
             agent_cls = HubAgent if index == 0 else Agent
+            physical_node_id = node.id if node.id in {ctx_node.id for ctx_node in ctx.nodes} else self._canonical_model_node_id
+            if self._homogeneous_model_pool:
+                physical_node_id = self._canonical_model_node_id
+            self.logical_to_physical_node_id[node.id] = physical_node_id
             self.agent_sequence.append(
                 agent_cls(
                     node_id=node.id,
-                    model=ctx.mm.get_model(node.id),
-                    tokenizer=ctx.mm.get_tokenizer(node.id),
+                    model=ctx.mm.get_model(physical_node_id),
+                    tokenizer=ctx.mm.get_tokenizer(physical_node_id),
                     device=self.device,
                     max_new_tokens=self.generation_max_new_tokens,
                     stop_sequences=stop_sequences,
@@ -497,8 +593,9 @@ class AgentRunner:
         self.agents = {agent.node_id: agent for agent in self.agent_sequence}
 
         # Backward-compatible aliases for older two-agent experiments/tests.
+        # agent_count=1 is a valid Hub-only baseline, so agent_b is absent there.
         self.agent_a = self.hub_agent
-        self.agent_b = self.agent_sequence[1]
+        self.agent_b = self.agent_sequence[1] if len(self.agent_sequence) > 1 else None
 
         # For non-hub -> non-hub logical handoffs, the physical path is
         # source -> hub -> target. The second hop's hub -> target cache is
@@ -519,7 +616,12 @@ class AgentRunner:
             raise FileNotFoundError(f"Train config not found: {train_config_path}")
         train_payload = read_json(train_config_path)
         all_nodes, all_edges = build_nodes_and_edges(train_payload["model_ids"], train_payload["model_directions"])
-        resolve_agent_count(config.agent_count, len(all_nodes))
+        allow_unbounded = _is_homogeneous_model_pool(all_nodes)
+        resolve_agent_count(
+            config.agent_count,
+            len(all_nodes),
+            allow_unbounded_homogeneous_agents=allow_unbounded,
+        )
 
         train_mod = importlib.import_module(TRAIN_MODULE_BY_ALG[resolved_alg])
         loaded = train_mod.load_translator_pool_from_checkpoint(
@@ -545,6 +647,91 @@ class AgentRunner:
         )
 
     @staticmethod
+    def _build_plain_initial_prompt(context: str, question: str) -> str:
+        return (
+            "### Instruction: Use the passage to answer the Question accurately.\n"
+            f"### Passage:\n{context.strip()}\n"
+            "### Question:\n"
+            f"{question.strip()}\n"
+            "### Response:\n"
+        )
+
+    @staticmethod
+    def _build_plain_followup_prompt(question: str) -> str:
+        return (
+            "\n### Instruction:\n"
+            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            "### Question:\n"
+            f"{question.strip()}\n"
+            "### Response:\n"
+        )
+
+    @staticmethod
+    def _is_qwen_agent(agent: Agent) -> bool:
+        model_id = str(getattr(getattr(agent.model, "config", None), "_name_or_path", ""))
+        tokenizer_id = str(getattr(agent.tokenizer, "name_or_path", ""))
+        model_type = str(getattr(getattr(agent.model, "config", None), "model_type", ""))
+        haystack = " ".join([model_id, tokenizer_id, model_type]).lower()
+        return "qwen" in haystack
+
+    @staticmethod
+    def _qwen_system_prompt() -> str:
+        return (
+            "You are a helpful QA assistant. "
+            "Answer the given question accurately, using only the provided passage and prior agent response when available."
+        )
+
+    @staticmethod
+    def _build_qwen_initial_user_content(context: str, question: str) -> str:
+        return (
+            "### Instruction:\n"
+            "Use the passage to answer the Question accurately.\n"
+            "### Passage:\n"
+            f"{context.strip()}\n"
+            "### Question:\n"
+            f"{question.strip()}"
+        )
+
+    @staticmethod
+    def _build_qwen_followup_user_content(question: str) -> str:
+        return (
+            "### Instruction:\n"
+            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            "### Question:\n"
+            f"{question.strip()}"
+        )
+
+    @staticmethod
+    def _render_qwen_chat_prompt(agent: Agent, user_content: str) -> str:
+        system_content = AgentRunner._qwen_system_prompt()
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content.strip()},
+        ]
+        try:
+            rendered = agent.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            if rendered:
+                return str(rendered)
+        except Exception:
+            pass
+        return (
+            "<|im_start|>system\n"
+            f"{system_content}<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"{user_content.strip()}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+    def _format_agent_prompt(self, agent: Agent, user_content: str, fallback_prompt: str) -> str:
+        if self._is_qwen_agent(agent):
+            return self._render_qwen_chat_prompt(agent, user_content)
+        return fallback_prompt
+
+    @staticmethod
     def build_initial_prompt(
         context: str,
         question: str,
@@ -554,12 +741,24 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del hub_agent_id, agent_count, is_final_turn
-        return (
-            "### Instruction: Use the passage to answer the Question accurately.\n"
-            f"### Passage:\n{context.strip()}\n"
-            "### Question:\n"
-            f"{question.strip()}\n"
-            "### Response:\n"
+        return AgentRunner._build_plain_initial_prompt(context, question)
+
+    def build_initial_prompt_for_agent(
+        self,
+        agent: Agent,
+        context: str,
+        question: str,
+        *,
+        hub_agent_id: str = "A",
+        agent_count: int = 2,
+        is_final_turn: bool = False,
+    ) -> str:
+        del hub_agent_id, agent_count, is_final_turn
+        user_content = self._build_qwen_initial_user_content(context, question)
+        return self._format_agent_prompt(
+            agent,
+            user_content,
+            self._build_plain_initial_prompt(context, question),
         )
 
     def build_followup_prompt(
@@ -570,15 +769,16 @@ class AgentRunner:
         *,
         is_final_turn: bool = False,
     ) -> str:
-        del agent_id, turn_index, is_final_turn
-        return (
-            "\n### Instruction:\n"
-            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
-            # "Do not repeat the instruction.\n"
-            "### Question:\n"
-            f"{question.strip()}\n"
-            "### Response:\n"
-        )
+        del turn_index, is_final_turn
+        user_content = self._build_qwen_followup_user_content(question)
+        agent = self.agents.get(agent_id)
+        if agent is not None:
+            return self._format_agent_prompt(
+                agent,
+                user_content,
+                self._build_plain_followup_prompt(question),
+            )
+        return self._build_plain_followup_prompt(question)
 
     @staticmethod
     def _append_turn_to_transcript(transcript: str, agent_id: str, response: str) -> str:
@@ -648,6 +848,7 @@ class AgentRunner:
         if not self.log_turns:
             return
         label = "?" if example_index is None else str(example_index)
+        turn_order = "->".join(self.node_ids + ([self.node_ids[0]] if len(self.node_ids) > 1 else []))
         logging.info(
             "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | hub=%s | topology=star | turn_order=%s | "
             "question=%s | gold=%s",
@@ -656,7 +857,7 @@ class AgentRunner:
             self.alg,
             len(self.agent_sequence),
             self.hub_agent.node_id,
-            "->".join(self.node_ids + [self.node_ids[0]]),
+            turn_order,
             self._preview_text(question, self.log_max_chars),
             list(gold_answers)[:3],
         )
@@ -979,7 +1180,7 @@ class AgentRunner:
         example_index: Optional[int],
     ) -> Tuple[str, str]:
         last_response = initial_generation.text
-        effective_max_turns = max(1, self.max_turns)
+        effective_max_turns = 1 if len(self.agent_sequence) == 1 else max(1, self.max_turns)
         last_turn_index = effective_max_turns - 1
         needs_extra_hub_final = self._agent_for_turn(last_turn_index).node_id != self.hub_agent.node_id
 
@@ -1151,7 +1352,8 @@ class AgentRunner:
             self.ctx.mm.get_model(node.id).eval()
 
         self._log_example_start(question=question, gold_answers=gold_answers, example_index=example_index)
-        transcript = self.build_initial_prompt(
+        transcript = self.build_initial_prompt_for_agent(
+            self.hub_agent,
             context,
             question,
             hub_agent_id=self.hub_agent.node_id,
@@ -1161,7 +1363,7 @@ class AgentRunner:
 
         # The first node is the HubAgent and starts from native Base Context + Prompt.
         generation = self.hub_agent.generate_response(transcript)
-        if max(1, self.max_turns) > 1:
+        if len(self.agent_sequence) > 1 and max(1, self.max_turns) > 1:
             self._prepare_outgoing_route_translation(
                 source_agent=self.hub_agent,
                 logical_target_agent=self._agent_for_turn(1),

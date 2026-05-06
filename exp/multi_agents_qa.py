@@ -36,9 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
             "immediately following consecutive agent turns are merged into the gold answer."
         )
     )
-    parser.add_argument("alg", choices=["mot", "interlat", "lsc"], help="Algorithm to run.")
+    parser.add_argument("alg", choices=["mot", "interlat", "lsc", "c2c-pr", "kvcomm"], help="Algorithm to run.")
     parser.add_argument("--checkpoint-dir-path", required=True)
-    parser.add_argument("--outputs-path", default="outputs")
+    parser.add_argument("--outputs-path", default="outputs/multiagent_scalability/Qwen-instruct")
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--device", default="auto")
 
@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Number of agents to use from the checkpoint translator-pool nodes. "
+            "Use 1 to evaluate the Hub-only single-turn baseline without communication. "
             "Default: use all available nodes, preserving the previous behavior."
         ),
     )
@@ -126,7 +127,7 @@ def _example_row(result, example: Doc2DialQAPair) -> Dict[str, Any]:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.alg in {"interlat", "lsc"} and args.cache_mode != "retain":
+    if args.alg in {"interlat", "lsc", "c2c-pr", "kvcomm"} and args.cache_mode != "retain":
         raise ValueError(f"alg={args.alg!r} supports only --cache-mode retain; free mode is not supported.")
     timestamp = build_timestamp_string()
     output_path = Path(args.output_path) if args.output_path else Path(args.outputs_path) / f"doc2dial_agent_runner_{args.alg}_{timestamp}"
