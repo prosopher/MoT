@@ -372,7 +372,7 @@ def draw_dual_axis_plot(*, rows: list[Row], output_path: Path) -> None:
         ncol=len(series_names),
         frameon=True,
         edgecolor=AI_PAPER_LEGEND_EDGE_COLOR,
-        fontsize=AI_PAPER_LEGEND_FONT_SIZE,
+        fontsize=12,
         handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH * 0.42,
         columnspacing=0.85,
         handletextpad=0.35,

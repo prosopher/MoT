@@ -1,10 +1,9 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.channel_manager import (
@@ -19,161 +18,20 @@ from core.model_manager import ModelManager
 from core.model_spec import ModelSpec
 from core.train_util import *
 from mot.train import (
+    CrossLayerWindowTranslator,
     TrainConfig,
     build_window_translator,
     collect_mot_balance_metrics,
     require_channel_profiler,
-    require_gpt2_transformer,
-    replay_target_prefill_with_injected_window,
     resolve_channels,
     uses_channel_alignment,
 )
 
 
 
-
-class CrossLayerWindowTranslator(nn.Module):
+class LayerWindowIntermediateActivationTranslator(nn.Module):
     """
-    Local MOT-H copy of the recurrent cross-attention translator, specialized for
-    hidden-state translation.
-
-    Compared with mot.train.CrossLayerWindowTranslator, this variant keeps the
-    output in a signed continuous hidden-state space and uses independent
-    per-layer output heads for calibration.
-    """
-
-    def __init__(
-        self,
-        src_hidden_size: int,
-        tgt_hidden_size: int,
-        num_layers: int,
-        translator_dim: int,
-        translator_heads: int,
-        translator_depth: int,
-        mlp_ratio: int,
-    ) -> None:
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError("num_layers must be >= 1")
-        if translator_depth < 1:
-            raise ValueError("translator_depth must be >= 1")
-        self.num_layers = num_layers
-        self.translator_depth = translator_depth
-        self.input_proj = nn.Linear(src_hidden_size, translator_dim)
-        self.recurrent_blocks = nn.ModuleList(
-            [
-                nn.ModuleList(
-                    [
-                        CrossAttentionBlock(
-                            dim=translator_dim,
-                            num_heads=translator_heads,
-                            mlp_ratio=mlp_ratio,
-                        )
-                        for _ in range(num_layers)
-                    ]
-                )
-                for _ in range(translator_depth)
-            ]
-        )
-        # Keep per-layer calibration heads independent so each translated target
-        # attention-input slot can preserve its own scale/bias statistics.
-        self.output_norms = nn.ModuleList(
-            [nn.LayerNorm(translator_dim) for _ in range(num_layers)]
-        )
-        self.output_projs = nn.ModuleList(
-            [nn.Linear(translator_dim, tgt_hidden_size) for _ in range(num_layers)]
-        )
-
-    def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
-        if layer_window_cache.ndim != 4:
-            raise ValueError(
-                "CrossLayerWindowTranslator expects [batch, seq, num_layers, hidden], "
-                f"got {tuple(layer_window_cache.shape)}"
-            )
-        if layer_window_cache.shape[2] != self.num_layers:
-            raise ValueError(
-                f"CrossLayerWindowTranslator expected {self.num_layers} layers, got {layer_window_cache.shape[2]}"
-            )
-
-        batch_size, seq_len, _, _ = layer_window_cache.shape
-        projected = self.input_proj(layer_window_cache)
-
-        hidden = projected[:, :, 0, :]
-        collected = []
-        for stage_blocks in self.recurrent_blocks:
-            stage_hidden = hidden
-            stage_collected = []
-            for layer_idx, block in enumerate(stage_blocks):
-                stage_hidden = block(stage_hidden, projected[:, :, layer_idx, :])
-                stage_collected.append(stage_hidden)
-            hidden = stage_hidden
-            collected = stage_collected
-
-        translated_layers = []
-        for layer_idx, layer_hidden in enumerate(collected):
-            calibrated = self.output_norms[layer_idx](layer_hidden)
-            translated_layers.append(self.output_projs[layer_idx](calibrated))
-        return torch.stack(translated_layers, dim=2)
-
-
-class PerLayerPerHeadKVAdapter(nn.Module):
-    def __init__(self, num_layers: int, num_heads: int, head_dim: int) -> None:
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError("num_layers must be >= 1")
-        if num_heads < 1:
-            raise ValueError("num_heads must be >= 1")
-        if head_dim < 1:
-            raise ValueError("head_dim must be >= 1")
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        shape = (num_layers, num_heads, head_dim)
-        self.key_scale = nn.Parameter(torch.ones(shape))
-        self.key_bias = nn.Parameter(torch.zeros(shape))
-        self.value_scale = nn.Parameter(torch.ones(shape))
-        self.value_bias = nn.Parameter(torch.zeros(shape))
-
-    def forward(
-        self,
-        key_block: torch.Tensor,
-        value_block: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if key_block.shape != value_block.shape:
-            raise ValueError(
-                "key_block and value_block must have identical shapes, "
-                f"got {tuple(key_block.shape)} vs {tuple(value_block.shape)}"
-            )
-        if key_block.ndim != 4:
-            raise ValueError(
-                "PerLayerPerHeadKVAdapter expects [batch, seq, num_layers, hidden], "
-                f"got {tuple(key_block.shape)}"
-            )
-        batch_size, seq_len, num_layers, hidden_size = key_block.shape
-        expected_hidden = self.num_heads * self.head_dim
-        if num_layers != self.num_layers:
-            raise ValueError(
-                f"Adapter expected {self.num_layers} layers, got {num_layers}"
-            )
-        if hidden_size != expected_hidden:
-            raise ValueError(
-                f"Adapter expected hidden size {expected_hidden}, got {hidden_size}"
-            )
-
-        key = key_block.view(batch_size, seq_len, num_layers, self.num_heads, self.head_dim)
-        value = value_block.view(batch_size, seq_len, num_layers, self.num_heads, self.head_dim)
-        key = key * self.key_scale.unsqueeze(0).unsqueeze(0) + self.key_bias.unsqueeze(0).unsqueeze(0)
-        value = value * self.value_scale.unsqueeze(0).unsqueeze(0) + self.value_bias.unsqueeze(0).unsqueeze(0)
-        return (
-            key.view(batch_size, seq_len, num_layers, expected_hidden),
-            value.view(batch_size, seq_len, num_layers, expected_hidden),
-        )
-
-
-
-class LayerWindowAttnInputTranslator(nn.Module):
-    """
-    Attention-input variant of the window translator.
+    Intermediate-activation variant of the window translator.
 
     Input:  [batch, seq, num_layers, src_hidden]
     Output: [batch, seq, num_layers, tgt_hidden]
@@ -196,7 +54,7 @@ class LayerWindowAttnInputTranslator(nn.Module):
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         self.num_layers = num_layers
-        self.attn_input_translator = build_window_translator(
+        self.activation_translator = build_window_translator(
             variant=variant,
             src_hidden_size=src_hidden_size,
             tgt_hidden_size=tgt_hidden_size,
@@ -210,17 +68,107 @@ class LayerWindowAttnInputTranslator(nn.Module):
             translator_cls=CrossLayerWindowTranslator,
         )
 
-    def forward(self, attn_input_block: torch.Tensor) -> torch.Tensor:
-        if attn_input_block.ndim != 4:
+    def forward(self, activation_block: torch.Tensor) -> torch.Tensor:
+        if activation_block.ndim != 4:
             raise ValueError(
-                "Layer-window hidden states must have shape [batch, seq, num_layers, hidden], "
-                f"got {tuple(attn_input_block.shape)}"
+                "Layer-window intermediate activations must have shape [batch, seq, num_layers, hidden], "
+                f"got {tuple(activation_block.shape)}"
             )
-        if attn_input_block.shape[2] != self.num_layers:
+        if activation_block.shape[2] != self.num_layers:
             raise ValueError(
-                f"Expected {self.num_layers} layers in the translation window, got {attn_input_block.shape[2]}"
+                f"Expected {self.num_layers} layers in the translation window, got {activation_block.shape[2]}"
             )
-        return self.attn_input_translator(attn_input_block)
+        return self.activation_translator(activation_block)
+
+
+_LAYER_CONTAINER_PATHS = (
+    ("transformer", "h"),
+    ("transformer", "layers"),
+    ("transformer", "blocks"),
+    ("model", "layers"),
+    ("model", "decoder", "layers"),
+    ("decoder", "layers"),
+    ("gpt_neox", "layers"),
+    ("model", "gpt_neox", "layers"),
+    ("backbone", "layers"),
+    ("language_model", "model", "layers"),
+)
+
+
+def _get_nested_attr(root: Any, path: Sequence[str]) -> Optional[Any]:
+    current = root
+    for name in path:
+        current = getattr(current, name, None)
+        if current is None:
+            return None
+    return current
+
+
+def _as_module_sequence(candidate: Any) -> Optional[Tuple[nn.Module, ...]]:
+    if isinstance(candidate, (nn.ModuleList, list, tuple)) and all(isinstance(layer, nn.Module) for layer in candidate):
+        return tuple(candidate)
+    return None
+
+
+def resolve_transformer_layers(model: PreTrainedModel) -> Tuple[nn.Module, ...]:
+    for path in _LAYER_CONTAINER_PATHS:
+        layers = _as_module_sequence(_get_nested_attr(model, path))
+        if layers:
+            return layers
+
+    config = getattr(model, "config", None)
+    expected_num_layers = None
+    for field_name in ("num_hidden_layers", "n_layer", "n_layers"):
+        value = getattr(config, field_name, None)
+        if value is not None:
+            expected_num_layers = int(value)
+            break
+    if expected_num_layers is not None:
+        for _, module in model.named_modules():
+            layers = _as_module_sequence(module)
+            if layers and len(layers) == expected_num_layers:
+                return layers
+
+    raise ValueError(
+        "Unable to locate a transformer layer stack. Expected one of: "
+        + ", ".join(".".join(path) for path in _LAYER_CONTAINER_PATHS)
+    )
+
+
+def _read_layer_hidden_from_hook_args(
+    args: Tuple[Any, ...],
+    kwargs: dict,
+    *,
+    layer_idx: int,
+) -> torch.Tensor:
+    if args and torch.is_tensor(args[0]):
+        hidden_states = args[0]
+    elif "hidden_states" in kwargs and torch.is_tensor(kwargs["hidden_states"]):
+        hidden_states = kwargs["hidden_states"]
+    else:
+        raise ValueError(
+            f"Unable to read hidden_states from transformer layer {layer_idx} hook inputs."
+        )
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            "Intermediate activations must have shape [batch, seq, hidden], "
+            f"got {tuple(hidden_states.shape)} at layer {layer_idx}"
+        )
+    return hidden_states
+
+
+def _replace_layer_hidden_in_hook_args(
+    args: Tuple[Any, ...],
+    kwargs: dict,
+    replacement: torch.Tensor,
+) -> Tuple[Tuple[Any, ...], dict]:
+    if args and torch.is_tensor(args[0]):
+        return (replacement, *args[1:]), kwargs
+    if "hidden_states" in kwargs and torch.is_tensor(kwargs["hidden_states"]):
+        new_kwargs = dict(kwargs)
+        new_kwargs["hidden_states"] = replacement
+        return args, new_kwargs
+    raise ValueError("Unable to replace hidden_states in transformer layer hook inputs.")
 
 
 @torch.no_grad()
@@ -228,147 +176,148 @@ def extract_model_prefill_artifacts(
     model: PreTrainedModel,
     input_ids: torch.Tensor,
 ) -> Tuple[PastKeyValues, Tuple[torch.Tensor, ...]]:
-    outputs = model(
-        input_ids=input_ids,
-        use_cache=True,
-        output_hidden_states=True,
-    )
-    hidden_states = getattr(outputs, "hidden_states", None)
-    if hidden_states is None:
-        raise ValueError("Model forward did not return hidden_states; expected GPT-2 style outputs.")
-    return outputs.past_key_values, tuple(hidden_states)
+    """Return native KV cache plus per-layer intermediate activations.
+
+    The collected activation for layer i is the tensor passed into that
+    transformer layer, matching HCache's layer-input activation view rather
+    than HuggingFace's optional output_hidden_states tuple.
+    """
+    layers = resolve_transformer_layers(model)
+    intermediate_activations: List[Optional[torch.Tensor]] = [None] * len(layers)
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook(module: nn.Module, args: Tuple[Any, ...], kwargs: dict):
+            del module
+            hidden_states = _read_layer_hidden_from_hook_args(args, kwargs, layer_idx=layer_idx)
+            intermediate_activations[layer_idx] = hidden_states.detach()
+            return None
+
+        return hook
+
+    for layer_idx, layer in enumerate(layers):
+        handles.append(layer.register_forward_pre_hook(make_hook(layer_idx), with_kwargs=True))
+    try:
+        outputs = model(
+            input_ids=input_ids,
+            use_cache=True,
+            return_dict=True,
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    past_key_values = getattr(outputs, "past_key_values", None)
+    if past_key_values is None:
+        raise ValueError("Model forward did not return past_key_values.")
+    missing = [idx for idx, activation in enumerate(intermediate_activations) if activation is None]
+    if missing:
+        raise ValueError(f"Failed to collect intermediate activations for layers: {missing}")
+    return tuple(past_key_values), tuple(activation for activation in intermediate_activations if activation is not None)
 
 
-def extract_selected_layer_canonical_attn_input_block(
-    model: PreTrainedModel,
-    hidden_states: Sequence[torch.Tensor],
+def extract_selected_layer_intermediate_activation_block(
+    intermediate_activations: Sequence[torch.Tensor],
     layer_indices: Sequence[int],
 ) -> torch.Tensor:
     if not layer_indices:
         raise ValueError("layer_indices must contain at least one layer.")
-    max_valid_layer_idx = len(hidden_states) - 2
+    max_valid_layer_idx = len(intermediate_activations) - 1
     if max_valid_layer_idx < 0:
-        raise ValueError("hidden_states must include at least embeddings and one transformer layer state.")
+        raise ValueError("intermediate_activations must include at least one transformer layer input.")
 
-    transformer = require_gpt2_transformer(model)
     selected_layers = []
     for layer_idx in layer_indices:
         layer_idx = int(layer_idx)
         if not (0 <= layer_idx <= max_valid_layer_idx):
             raise ValueError(
-                f"layer_idx={layer_idx} is outside [0, {max_valid_layer_idx}] for hidden_states tuple of length {len(hidden_states)}"
+                f"layer_idx={layer_idx} is outside [0, {max_valid_layer_idx}] "
+                f"for intermediate activation tuple of length {len(intermediate_activations)}"
             )
-        ln_1 = transformer.h[layer_idx].ln_1
-        selected_layers.append(
-            F.layer_norm(
-                hidden_states[layer_idx],
-                ln_1.normalized_shape,
-                weight=None,
-                bias=None,
-                eps=ln_1.eps,
-            )
-        )
+        selected_layers.append(intermediate_activations[layer_idx])
     return torch.stack(selected_layers, dim=2)
 
 
-def decanonicalize_gpt2_attn_inputs(
-    block: nn.Module,
-    canonical_attn_inputs: torch.Tensor,
-) -> torch.Tensor:
-    if canonical_attn_inputs.ndim != 3:
-        raise ValueError(
-            "canonical_attn_inputs must have shape [batch, seq, hidden], "
-            f"got {tuple(canonical_attn_inputs.shape)}"
-        )
-
-    ln_1 = block.ln_1
-    weight = getattr(ln_1, "weight", None)
-    if weight is None:
-        raise ValueError("GPT-2 ln_1 is expected to expose affine weight for de-canonicalization.")
-    bias = getattr(ln_1, "bias", None)
-    attn_inputs = canonical_attn_inputs * weight.view(1, 1, -1)
-    if bias is not None:
-        attn_inputs = attn_inputs + bias.view(1, 1, -1)
-    return attn_inputs
-
-
-def reconstruct_gpt2_kv_from_attn_inputs(
-    block: nn.Module,
-    attn_inputs: torch.Tensor,
+def build_partial_past_from_layer_indices(
+    past_key_values: PastKeyValues,
+    layer_indices: Sequence[int],
     *,
-    attn_input_scale: Optional[torch.Tensor] = None,
-    attn_input_bias: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if attn_inputs.ndim != 3:
-        raise ValueError(
-            "attn_inputs must have shape [batch, seq, hidden], "
-            f"got {tuple(attn_inputs.shape)}"
-        )
-
-    attn = block.attn
-    if attn_input_scale is not None:
-        if attn_input_scale.ndim != 1 or attn_input_scale.shape[0] != attn_inputs.shape[-1]:
-            raise ValueError(
-                "attn_input_scale must have shape [hidden], "
-                f"got {tuple(attn_input_scale.shape)} for hidden={attn_inputs.shape[-1]}"
-            )
-        attn_inputs = attn_inputs * attn_input_scale.view(1, 1, -1)
-    if attn_input_bias is not None:
-        if attn_input_bias.ndim != 1 or attn_input_bias.shape[0] != attn_inputs.shape[-1]:
-            raise ValueError(
-                "attn_input_bias must have shape [hidden], "
-                f"got {tuple(attn_input_bias.shape)} for hidden={attn_inputs.shape[-1]}"
-            )
-        attn_inputs = attn_inputs + attn_input_bias.view(1, 1, -1)
-    qkv = attn.c_attn(attn_inputs)
-    split_size = getattr(attn, "split_size", qkv.shape[-1] // 3)
-    _, key, value = qkv.split(split_size, dim=2)
-
-    batch_size, seq_len, _ = key.shape
-    num_heads = attn.num_heads
-    head_dim = attn.head_dim
-
-    key = key.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    value = value.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    return key, value
+    num_key_value_heads: int,
+    head_dim: int,
+) -> PastKeyValues:
+    selected_past = tuple(past_key_values[int(layer_idx)] for layer_idx in layer_indices)
+    key_block, value_block = past_key_values_to_blocks(selected_past)
+    return blocks_to_partial_past_key_values(
+        key_block=key_block,
+        value_block=value_block,
+        num_heads=num_key_value_heads,
+        head_dim=head_dim,
+    )
 
 
-def reconstruct_kv_block_from_attn_input_block(
+def prefill_target_with_injected_intermediate_activations(
+    *,
     target_model: PreTrainedModel,
-    attn_input_block: torch.Tensor,
+    prefix_input_ids: torch.Tensor,
     target_layer_indices: Sequence[int],
-    tgt_spec: ModelSpec,
-    *,
-    kv_adapter: Optional[PerLayerPerHeadKVAdapter] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if attn_input_block.ndim != 4:
+    injected_activation_block: torch.Tensor,
+) -> PastKeyValues:
+    if injected_activation_block.ndim != 4:
         raise ValueError(
-            "attn_input_block must have shape [batch, seq, num_layers, hidden], "
-            f"got {tuple(attn_input_block.shape)}"
+            "injected_activation_block must have shape [batch, seq, num_layers, hidden], "
+            f"got {tuple(injected_activation_block.shape)}"
         )
-    if attn_input_block.shape[2] != len(target_layer_indices):
+    if injected_activation_block.shape[2] != len(target_layer_indices):
         raise ValueError(
-            "Number of translated attention-input layers must match target_layer_indices, "
-            f"got {attn_input_block.shape[2]} vs {len(target_layer_indices)}"
+            "Number of injected activation layers must match target_layer_indices, "
+            f"got {injected_activation_block.shape[2]} vs {len(target_layer_indices)}"
         )
 
-    transformer = require_gpt2_transformer(target_model)
-    reconstructed_layers = []
+    layers = resolve_transformer_layers(target_model)
+    slot_by_layer_idx = {}
     for slot_idx, layer_idx in enumerate(target_layer_indices):
-        target_block = transformer.h[layer_idx]
-        target_attn_inputs = decanonicalize_gpt2_attn_inputs(
-            target_block,
-            attn_input_block[:, :, slot_idx, :],
+        layer_idx = int(layer_idx)
+        if not (0 <= layer_idx < len(layers)):
+            raise ValueError(
+                f"target layer_idx={layer_idx} is outside [0, {len(layers) - 1}]"
+            )
+        slot_by_layer_idx[layer_idx] = slot_idx
+
+    handles = []
+
+    def make_hook(layer_idx: int, slot_idx: int):
+        def hook(module: nn.Module, args: Tuple[Any, ...], kwargs: dict):
+            del module
+            native_hidden_states = _read_layer_hidden_from_hook_args(args, kwargs, layer_idx=layer_idx)
+            injected = injected_activation_block[:, :, slot_idx, :].to(
+                device=native_hidden_states.device,
+                dtype=native_hidden_states.dtype,
+            )
+            if tuple(injected.shape) != tuple(native_hidden_states.shape):
+                raise ValueError(
+                    "Injected intermediate activation shape mismatch at target layer "
+                    f"{layer_idx}: expected {tuple(native_hidden_states.shape)}, got {tuple(injected.shape)}"
+                )
+            return _replace_layer_hidden_in_hook_args(args, kwargs, injected)
+
+        return hook
+
+    for layer_idx, slot_idx in slot_by_layer_idx.items():
+        handles.append(layers[layer_idx].register_forward_pre_hook(make_hook(layer_idx, slot_idx), with_kwargs=True))
+    try:
+        outputs = target_model(
+            input_ids=prefix_input_ids,
+            use_cache=True,
+            return_dict=True,
         )
-        key, value = reconstruct_gpt2_kv_from_attn_inputs(
-            target_block,
-            target_attn_inputs,
-        )
-        reconstructed_layers.append((key, value))
-    key_block, value_block = past_key_values_to_blocks(tuple(reconstructed_layers))
-    if kv_adapter is not None:
-        key_block, value_block = kv_adapter(key_block, value_block)
-    return key_block, value_block
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    past_key_values = getattr(outputs, "past_key_values", None)
+    if past_key_values is None:
+        raise ValueError("Target model forward did not return past_key_values.")
+    return tuple(past_key_values)
 
 
 class LayerWindowTranslatorPool(nn.Module):
@@ -394,10 +343,9 @@ class LayerWindowTranslatorPool(nn.Module):
         self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
 
         adapters = {}
-        kv_adapters = {}
         for edge in self.edges:
             channels = self.cm.get_channels(edge.id)
-            adapters[edge.id] = LayerWindowAttnInputTranslator(
+            adapters[edge.id] = LayerWindowIntermediateActivationTranslator(
                 src_hidden_size=self.mm.get_model_spec(edge.src_id).hidden_size,
                 tgt_hidden_size=self.mm.get_model_spec(edge.tgt_id).hidden_size,
                 num_layers=len(channels),
@@ -409,17 +357,11 @@ class LayerWindowTranslatorPool(nn.Module):
                 mot_num_translators=mot_num_translators,
                 mot_top_k=mot_top_k,
             )
-            kv_adapters[edge.id] = PerLayerPerHeadKVAdapter(
-                num_layers=len(channels),
-                num_heads=self.mm.get_model_spec(edge.tgt_id).num_heads,
-                head_dim=self.mm.get_model_spec(edge.tgt_id).head_dim,
-            )
         self.adapters = nn.ModuleDict(adapters)
-        self.kv_adapters = nn.ModuleDict(kv_adapters)
 
     def translate_layer_window(
         self,
-        source_attn_input_block: torch.Tensor,
+        source_intermediate_activation_block: torch.Tensor,
         src_node_id: str,
         tgt_node_id: str,
     ) -> torch.Tensor:
@@ -429,7 +371,7 @@ class LayerWindowTranslatorPool(nn.Module):
                 f"Translator edge {edge_id} is not available. "
                 f"Active edges: {list(self.edge_ids)}"
             )
-        return self.adapters[edge_id](source_attn_input_block)
+        return self.adapters[edge_id](source_intermediate_activation_block)
 
     def build_replayed_target_past(
         self,
@@ -440,50 +382,39 @@ class LayerWindowTranslatorPool(nn.Module):
         src_node_id: str,
         tgt_node_id: str,
         tgt_spec: ModelSpec,
-        source_canonical_attn_input_block: Optional[torch.Tensor] = None,
+        source_intermediate_activation_block: Optional[torch.Tensor] = None,
     ) -> Tuple[PastKeyValues, PastKeyValues]:
         del source_past_key_values  # Interface compatibility with other translator pools.
 
         edge_id = f"{src_node_id}_to_{tgt_node_id}"
         target_layer_indices = self.cm.get_tgt_layer_indices(edge_id)
 
-        if source_canonical_attn_input_block is None:
-            _, source_hidden_states = extract_model_prefill_artifacts(
+        if source_intermediate_activation_block is None:
+            _, source_intermediate_activations = extract_model_prefill_artifacts(
                 self.mm.get_model(src_node_id),
                 prefix_input_ids,
             )
-            source_canonical_attn_input_block = extract_selected_layer_canonical_attn_input_block(
-                self.mm.get_model(src_node_id),
-                source_hidden_states,
+            source_intermediate_activation_block = extract_selected_layer_intermediate_activation_block(
+                source_intermediate_activations,
                 self.cm.get_src_layer_indices(edge_id),
             )
 
-        translated_attn_input_block = self.translate_layer_window(
-            source_attn_input_block=source_canonical_attn_input_block,
+        translated_activation_block = self.translate_layer_window(
+            source_intermediate_activation_block=source_intermediate_activation_block,
             src_node_id=src_node_id,
             tgt_node_id=tgt_node_id,
         )
-        translated_key, translated_value = reconstruct_kv_block_from_attn_input_block(
-            target_model=target_model,
-            attn_input_block=translated_attn_input_block,
-            target_layer_indices=target_layer_indices,
-            tgt_spec=tgt_spec,
-            kv_adapter=self.kv_adapters[edge_id],
-        )
-        translated_window_past = blocks_to_partial_past_key_values(
-            key_block=translated_key,
-            value_block=translated_value,
-            num_heads=tgt_spec.num_heads,
-            head_dim=tgt_spec.head_dim,
-        )
-        mixed_target_past = replay_target_prefill_with_injected_window(
+        mixed_target_past = prefill_target_with_injected_intermediate_activations(
             target_model=target_model,
             prefix_input_ids=prefix_input_ids,
             target_layer_indices=target_layer_indices,
-            injected_key_block=translated_key,
-            injected_value_block=translated_value,
-            tgt_spec=tgt_spec,
-            target_model_id=self.node_model_ids.get(tgt_node_id),
+            injected_activation_block=translated_activation_block,
+        )
+        translated_window_past = build_partial_past_from_layer_indices(
+            mixed_target_past,
+            target_layer_indices,
+            num_key_value_heads=tgt_spec.num_key_value_heads,
+            head_dim=tgt_spec.head_dim,
         )
         return mixed_target_past, translated_window_past
 
@@ -583,7 +514,7 @@ def run_train(
         save_channel_profile_config(output_path, cp.profile_config)
 
     log_path = get_train_log_path(output_path)
-    logging.info("Starting canonicalized attn-input translator training")
+    logging.info("Starting intermediate-activation translator training")
     logging.info("train_config=%s", asdict(config))
 
     logging.info("nodes=%s", [asdict(node) for node in nodes])
@@ -606,7 +537,7 @@ def run_train(
             spec.num_heads,
         )
     logging.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
-    logging.info("[Setup] translation_mode=translate_canonical_attn_input_window_and_restore_target_kv")
+    logging.info("[Setup] translation_mode=translate_intermediate_activation_window_and_restore_target_kv")
 
     dataloaders_by_target = build_training_dataloaders_by_target(ctx)
 
@@ -650,18 +581,17 @@ def run_train(
                         node.id: prefill_by_node_id[node.id][0]
                         for node in nodes
                     }
-                    hidden_states_by_node_id = {
+                    intermediate_activations_by_node_id = {
                         node.id: prefill_by_node_id[node.id][1]
                         for node in nodes
                     }
-                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id, hidden_states_by_node_id)
+                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id, intermediate_activations_by_node_id)
 
             total_direction_loss = 0.0
             for edge in edges:
-                prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id, hidden_states_by_node_id = target_batches[edge.tgt_id]
-                source_attn_input_block = extract_selected_layer_canonical_attn_input_block(
-                    ctx.mm.get_model(edge.src_id),
-                    hidden_states_by_node_id[edge.src_id],
+                prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id, intermediate_activations_by_node_id = target_batches[edge.tgt_id]
+                source_intermediate_activation_block = extract_selected_layer_intermediate_activation_block(
+                    intermediate_activations_by_node_id[edge.src_id],
                     ctx.cm.get_src_layer_indices(edge.id),
                 )
                 mixed_target_past, _ = translator_pool.build_replayed_target_past(
@@ -671,7 +601,7 @@ def run_train(
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-                    source_canonical_attn_input_block=source_attn_input_block,
+                    source_intermediate_activation_block=source_intermediate_activation_block,
                 )
                 direction_loss = compute_prefix_correction_and_suffix_lm_loss(
                     target_model=ctx.mm.get_model(edge.tgt_id),

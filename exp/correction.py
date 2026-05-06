@@ -47,6 +47,40 @@ ACCENT_BLUE = AI_PAPER_PALETTE[3]
 ACCENT_GREEN = AI_PAPER_PALETTE[4]
 ACCENT_ORANGE = AI_PAPER_PALETTE[5]
 ACCENT_BLACK = AI_PAPER_PALETTE[6]
+PHASE_SCATTER_FIRST_COLOR = "#BDBDBD"
+PHASE_SCATTER_LAST_COLOR = "#E53935"
+
+
+def _hex_to_rgb(color: str) -> Tuple[float, float, float]:
+    color = color.lstrip("#")
+    if len(color) != 6:
+        raise ValueError(f"Expected a 6-digit hex color, got {color!r}")
+    return tuple(int(color[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb: Tuple[float, float, float]) -> str:
+    return "#" + "".join(f"{round(max(0.0, min(1.0, value)) * 255):02X}" for value in rgb)
+
+
+def _interpolate_hex_color(start_color: str, end_color: str, ratio: float) -> str:
+    ratio = max(0.0, min(1.0, ratio))
+    start_rgb = _hex_to_rgb(start_color)
+    end_rgb = _hex_to_rgb(end_color)
+    return _rgb_to_hex(tuple(start + (end - start) * ratio for start, end in zip(start_rgb, end_rgb)))
+
+
+def _phase_scatter_layer_colors(rows: List["CorrectionSummaryRow"]) -> List[str]:
+    top_layer_idx = max((row.injection_layer_start_idx for row in rows), default=0)
+    if top_layer_idx <= 0:
+        return [PHASE_SCATTER_FIRST_COLOR for _ in rows]
+    return [
+        _interpolate_hex_color(
+            PHASE_SCATTER_FIRST_COLOR,
+            PHASE_SCATTER_LAST_COLOR,
+            row.injection_layer_start_idx / top_layer_idx,
+        )
+        for row in rows
+    ]
 
 
 @dataclass
@@ -1061,13 +1095,14 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     raw_alpha_L_T = [row.average_final_alpha_L_T for row in rows]
     raw_beta_L_T = [row.average_final_beta_L_T for row in rows]
     phase_sizes = [max(AI_PAPER_SCATTER_SIZE, 10.0 * max(v, 1.0)) for v in initial_shift]
+    phase_colors = _phase_scatter_layer_colors(rows)
     d_L_T_values = [row.average_final_d_L_T for row in rows]
     ax.scatter(
         raw_beta_L_T,
         raw_alpha_L_T,
         s=phase_sizes,
         marker=AI_PAPER_MARKERS[0],
-        color=ACCENT_RED,
+        color=phase_colors,
         edgecolor=AI_PAPER_REFERENCE_COLOR,
         linewidth=AI_PAPER_MARKER_EDGE_WIDTH * 0.4,
         alpha=0.88,
