@@ -115,8 +115,6 @@ class TrainConfig(Config):
     model_directions: str
     calibration_dataset: str
 
-    layer_from: int
-    layer_to: int
     layers_list: List[int]
     top_layers: float
     calib_size: int
@@ -147,10 +145,6 @@ class TrainConfig(Config):
             raise ValueError("alpha must be in [0, 1]")
         if self.sigma <= 0.0:
             raise ValueError("sigma must be > 0")
-        if self.layer_from < 0:
-            raise ValueError("layer_from must be >= 0")
-        if self.layer_to < self.layer_from:
-            raise ValueError("layer_to must be >= layer_from")
         if self.max_input_length < 8:
             raise ValueError("max_input_length must be >= 8")
         initialize_train_output_paths(self)
@@ -305,9 +299,11 @@ def _resolve_candidate_target_layers(
             )
         return selected, manual_layers, len(selected)
 
-    upper = min(config.layer_to, target_num_layers - 1)
-    lower = min(config.layer_from, upper)
-    candidate_layers = list(range(lower, upper + 1))
+    # KVComm selects from the full target layer range by default.  The original
+    # method defines selection over {1, ..., L}; here we resolve that range only
+    # after the target model depth is known, avoiding model-specific config such
+    # as GPT-2's last layer index (11).
+    candidate_layers = list(range(target_num_layers))
     if not candidate_layers:
         raise ValueError("No candidate target layers were resolved for KVComm selection.")
 
