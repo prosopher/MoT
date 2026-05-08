@@ -1659,9 +1659,8 @@ def evaluate_openwebtext_losses_and_kv_similarity(
         native_loss = float(loss_sums[edge.id]["native"] / count) if count > 0 else float("nan")
         full_mix_loss = float(loss_sums[edge.id]["full_mix"] / count) if count > 0 else float("nan")
         loss_summary_by_edge[edge.id] = {
+            "loss": full_mix_loss,
             "native_loss": native_loss,
-            "full_mix_loss": full_mix_loss,
-            "delta_full_mix_loss": full_mix_loss - native_loss if math.isfinite(native_loss) and math.isfinite(full_mix_loss) else float("nan"),
             "count": count,
         }
         heatmap_path, metadata_path = summarize_full_mix_vs_native_kv_similarity_artifacts(
