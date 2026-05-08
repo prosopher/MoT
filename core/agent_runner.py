@@ -275,7 +275,7 @@ class KVCacheTranslationAdapter:
             )
 
         if self.alg == "interlat":
-            from interlat.train import build_latent_conditioned_past, extract_last_hidden_states
+            from interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states
 
             source_tokens = get_past_seq_len(source_past_key_values)
             if int(prefix_input_ids.shape[1]) != source_tokens:
@@ -284,32 +284,27 @@ class KVCacheTranslationAdapter:
                     f"prefix_tokens={int(prefix_input_ids.shape[1])} source_tokens={source_tokens}"
                 )
 
-            source_hidden_states = extract_last_hidden_states(
-                self.ctx.mm.get_model(edge.src_id),
-                prefix_input_ids,
+            source_model = self.ctx.mm.get_model(edge.src_id)
+            source_input_ids = prefix_input_ids.to(source_model.device)
+            source_hidden_states = extract_interlat_source_hidden_states(
+                source_model,
+                source_input_ids,
             )
             translated_latents = self.translator_pool.translate_hidden_states(
                 edge_id=edge.id,
                 source_hidden_states=source_hidden_states,
             )
-            latent_tokens = int(translated_latents.shape[1])
-            latent_conditioned_past = build_latent_conditioned_past(
+            translated_past = build_latent_conditioned_past(
                 target_model,
-                prefix_input_ids=prefix_input_ids,
                 latent_prefix=translated_latents,
             )
-            # InterLat prepends latent tokens to condition the target prefix. The
-            # AgentRunner handoff code tracks deltas with the original token-id
-            # ledger, so remove the synthetic latent prefix after it has
-            # conditioned the target-side KV states.
-            translated_past = slice_past_suffix(latent_conditioned_past, latent_tokens)
             translated_tokens = get_past_seq_len(translated_past)
             if translated_tokens != source_tokens:
                 raise ValueError(
                     f"InterLat translated cache length mismatch on {edge.id}: "
                     f"source_tokens={source_tokens} translated_tokens={translated_tokens}. "
-                    "Reduce --max-prompt-tokens or the generated context length so the latent-conditioned "
-                    "target prefix is not truncated by the target model context window."
+                    "InterLat should communicate one latent per source prefix token; check the "
+                    "InterLat translator output length and target model context window."
                 )
             return translated_past
 

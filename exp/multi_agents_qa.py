@@ -13,7 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.agent_runner import AgentRunner, AgentRunnerConfig
-from core.common import build_timestamp_string, setup_logging, write_json
+from core.common import setup_logging, write_json
 from core.doc2dial_dataset import (
     DOC2DIAL_DEFAULT_DATA_DIR,
     DOC2DIAL_DEFAULT_URL,
@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("alg", choices=["mot", "interlat", "lsc", "c2c-pr", "kvcomm"], help="Algorithm to run.")
     parser.add_argument("--checkpoint-dir-path", required=True)
-    parser.add_argument("--outputs-path", default="outputs/multiagent_scalability/Qwen-instruct")
+    parser.add_argument("--outputs-path", default="outputs/multi_agents", help="Root output directory. Default run directory: {algorithm}_{cache_mode}_{agent_count}.")
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--device", default="auto")
 
@@ -71,7 +71,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional character truncation for Base Context after referenced text_sp spans are joined.",
     )
 
-    parser.add_argument("--max-examples", type=int, default=10, help="Number of collapsed Doc2Dial QA examples to run.")
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=10,
+        help=(
+            "Number of collapsed Doc2Dial QA examples to run. When --start-example is greater than 1, "
+            "this many examples are run starting from that 1-based global example index unless --end-example is set."
+        ),
+    )
+    parser.add_argument(
+        "--start-example",
+        "--example-start",
+        dest="start_example",
+        type=int,
+        default=1,
+        help=(
+            "1-based global Doc2Dial QA example index to start from after split/domain/shuffle/context filters. "
+            "Use 16 to resume from the same example 16 used by every algorithm with the same dataset arguments."
+        ),
+    )
+    parser.add_argument(
+        "--end-example",
+        "--example-end",
+        dest="end_example",
+        type=int,
+        default=None,
+        help=(
+            "Optional 1-based inclusive global Doc2Dial QA example index to stop at. "
+            "For example, --start-example 16 --end-example 30 runs exactly examples 16 through 30."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-eval-stream", nargs="?", const=True, default=False, type=_str_to_bool)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
@@ -100,8 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _example_row(result, example: Doc2DialQAPair) -> Dict[str, Any]:
+def _example_row(result, example: Doc2DialQAPair, *, example_index: int) -> Dict[str, Any]:
     return {
+        "example_index": example_index,
         "id": example.id,
         "dial_id": example.dial_id,
         "doc_id": example.doc_id,
@@ -129,16 +160,30 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.alg in {"interlat", "lsc", "c2c-pr", "kvcomm"} and args.cache_mode != "retain":
         raise ValueError(f"alg={args.alg!r} supports only --cache-mode retain; free mode is not supported.")
-    timestamp = build_timestamp_string()
-    output_path = Path(args.output_path) if args.output_path else Path(args.outputs_path) / f"doc2dial_agent_runner_{args.alg}_{timestamp}"
-    output_path.mkdir(parents=True, exist_ok=True)
-    setup_logging(str(output_path / "eval.log"))
+    if args.start_example < 1:
+        raise ValueError(f"--start-example must be at least 1, got {args.start_example}")
+    if args.end_example is not None and args.end_example < args.start_example:
+        raise ValueError(
+            f"--end-example must be greater than or equal to --start-example: "
+            f"start={args.start_example}, end={args.end_example}"
+        )
+    if args.max_examples is not None and args.max_examples <= 0:
+        raise ValueError(f"--max-examples must be positive when set, got {args.max_examples}")
+
+    if args.end_example is not None:
+        load_max_examples = args.end_example
+    elif args.max_examples is not None:
+        load_max_examples = args.start_example + args.max_examples - 1
+    else:
+        load_max_examples = None
 
     examples = load_doc2dial_qa_pairs(
         data_dir=args.data_dir,
         url=args.doc2dial_url,
         split=args.split,
-        max_examples=args.max_examples,
+        # Load enough examples from the original deterministic stream first, then slice below.
+        # This keeps --start-example/--end-example aligned across algorithms.
+        max_examples=load_max_examples,
         shuffle=bool(args.shuffle_eval_stream),
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
@@ -149,6 +194,26 @@ def main() -> None:
     if not examples:
         raise RuntimeError(
             "No Doc2Dial QA examples were produced. Check --data-dir, --split, --domain, and turn references."
+        )
+
+    indexed_examples = list(enumerate(examples, start=1))
+    if args.end_example is not None:
+        selected_examples = [
+            (example_index, example)
+            for example_index, example in indexed_examples
+            if args.start_example <= example_index <= args.end_example
+        ]
+    else:
+        selected_examples = indexed_examples[args.start_example - 1 :]
+        if args.max_examples is not None:
+            selected_examples = selected_examples[: args.max_examples]
+
+    if not selected_examples:
+        available = len(examples)
+        raise RuntimeError(
+            f"No Doc2Dial QA examples selected for start={args.start_example}, "
+            f"end={args.end_example}, max_examples={args.max_examples}. "
+            f"Only {available} example(s) were available after filters."
         )
 
     runner = AgentRunner.from_checkpoint(
@@ -167,24 +232,32 @@ def main() -> None:
         )
     )
 
+    effective_agent_count = len(runner.agent_sequence)
+    run_dir_name = f"{args.alg.replace('-', '_')}_{args.cache_mode}_{effective_agent_count}"
+    output_path = Path(args.output_path) if args.output_path else Path(args.outputs_path) / run_dir_name
+    output_path.mkdir(parents=True, exist_ok=True)
+    setup_logging(str(output_path / "eval.log"))
+
     rows: List[Dict[str, Any]] = []
     total_f1 = 0.0
     peak_memory_bytes: Optional[int] = None
 
-    for idx, example in enumerate(examples, start=1):
+    selected_count = len(selected_examples)
+    for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
         result = runner.run(
             context=example.context,
             question=example.question,
             gold_answers=example.answers,
-            example_index=idx,
+            example_index=example_index,
         )
         total_f1 += float(result.f1)
         current_peak = result.profile.get("peak_memory_bytes")
         if current_peak is not None:
             peak_memory_bytes = int(current_peak) if peak_memory_bytes is None else max(peak_memory_bytes, int(current_peak))
-        rows.append(_example_row(result, example))
+        rows.append(_example_row(result, example, example_index=example_index))
         print(
-            f"[{idx}/{len(examples)}] dial_id={example.dial_id} user_turns={example.user_turn_ids} "
+            f"[{local_idx}/{selected_count} | example={example_index}] "
+            f"dial_id={example.dial_id} user_turns={example.user_turn_ids} "
             f"agent_turns={example.agent_turn_ids} F1={result.f1:.4f} | "
             f"prediction={result.prediction!r} | gold={result.gold_answers[:1]}"
         )
@@ -209,6 +282,13 @@ def main() -> None:
             "context_reference_roles": args.context_reference_roles,
             "context_max_chars": args.context_max_chars,
         },
+        "example_range": {
+            "start_example": args.start_example,
+            "end_example": args.end_example,
+            "max_examples": args.max_examples,
+            "loaded_example_count": len(examples),
+            "selected_example_indices": [example_index for example_index, _ in selected_examples],
+        },
         "count": count,
         "f1": mean_f1,
         "gpu_peak_memory_bytes": peak_memory_bytes,
@@ -216,7 +296,7 @@ def main() -> None:
         "examples": rows,
         "args": vars(args),
     }
-    metrics_path = output_path / "doc2dial_agent_runner_metrics.json"
+    metrics_path = output_path / "agent_runner_metrics.json"
     write_json(str(metrics_path), metrics)
 
     print("===== AgentRunner Doc2Dial sample =====")
