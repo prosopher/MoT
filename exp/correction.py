@@ -47,6 +47,40 @@ ACCENT_BLUE = AI_PAPER_PALETTE[3]
 ACCENT_GREEN = AI_PAPER_PALETTE[4]
 ACCENT_ORANGE = AI_PAPER_PALETTE[5]
 ACCENT_BLACK = AI_PAPER_PALETTE[6]
+PHASE_SCATTER_FIRST_COLOR = "#BDBDBD"
+PHASE_SCATTER_LAST_COLOR = "#E53935"
+
+
+def _hex_to_rgb(color: str) -> Tuple[float, float, float]:
+    color = color.lstrip("#")
+    if len(color) != 6:
+        raise ValueError(f"Expected a 6-digit hex color, got {color!r}")
+    return tuple(int(color[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb: Tuple[float, float, float]) -> str:
+    return "#" + "".join(f"{round(max(0.0, min(1.0, value)) * 255):02X}" for value in rgb)
+
+
+def _interpolate_hex_color(start_color: str, end_color: str, ratio: float) -> str:
+    ratio = max(0.0, min(1.0, ratio))
+    start_rgb = _hex_to_rgb(start_color)
+    end_rgb = _hex_to_rgb(end_color)
+    return _rgb_to_hex(tuple(start + (end - start) * ratio for start, end in zip(start_rgb, end_rgb)))
+
+
+def _phase_scatter_layer_colors(rows: List["CorrectionSummaryRow"]) -> List[str]:
+    top_layer_idx = max((row.injection_layer_start_idx for row in rows), default=0)
+    if top_layer_idx <= 0:
+        return [PHASE_SCATTER_FIRST_COLOR for _ in rows]
+    return [
+        _interpolate_hex_color(
+            PHASE_SCATTER_FIRST_COLOR,
+            PHASE_SCATTER_LAST_COLOR,
+            row.injection_layer_start_idx / top_layer_idx,
+        )
+        for row in rows
+    ]
 
 
 @dataclass
@@ -988,7 +1022,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     )
     ax.axhline(1.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
     _annotate_ranges(ax, rows, avg_shrink)
-    ax.set_xlabel("Injection target layer start index")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel("Final ||s_L|| / ||s_T||")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1005,7 +1039,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_RED,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"Total $\alpha_{T:L}$ / ||s_T||",
+        label=r"$\mathbf{\alpha}$ / ||s_T||",
     )
     ax.plot(
         x_values,
@@ -1015,7 +1049,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_AQUA,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"Total $\beta_{T:L}$ / ||s_T||",
+        label=r"$\mathbf{\beta}$ / ||s_T||",
     )
     ax.plot(
         x_values,
@@ -1025,7 +1059,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_PURPLE,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"Attention $\alpha_{T:L}$ contribution",
+        label=r"Attention $\mathbf{\alpha}$ contribution",
     )
     ax.plot(
         x_values,
@@ -1035,7 +1069,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_GREEN,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"MLP $\alpha_{T:L}$ contribution",
+        label=r"MLP $\mathbf{\alpha}$ contribution",
     )
     ax.plot(
         x_values,
@@ -1045,11 +1079,11 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
         markeredgecolor=ACCENT_ORANGE,
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
-        label=r"$\beta_{T:L} - \alpha_{T:L}$",
+        label=r"$\mathbf{\beta}_{T:L} - \mathbf{\alpha}$",
     )
     _annotate_ranges(ax, rows, beta_L_T_over_initial)
     ax.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
-    ax.set_xlabel("Injection target layer start index")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel("Translation-shift-normalized magnitude")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1061,28 +1095,29 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     raw_alpha_L_T = [row.average_final_alpha_L_T for row in rows]
     raw_beta_L_T = [row.average_final_beta_L_T for row in rows]
     phase_sizes = [max(AI_PAPER_SCATTER_SIZE, 10.0 * max(v, 1.0)) for v in initial_shift]
+    phase_colors = _phase_scatter_layer_colors(rows)
     d_L_T_values = [row.average_final_d_L_T for row in rows]
     ax.scatter(
         raw_beta_L_T,
         raw_alpha_L_T,
         s=phase_sizes,
         marker=AI_PAPER_MARKERS[0],
-        color=ACCENT_RED,
+        color=phase_colors,
         edgecolor=AI_PAPER_REFERENCE_COLOR,
         linewidth=AI_PAPER_MARKER_EDGE_WIDTH * 0.4,
         alpha=0.88,
     )
     for row, x, y, d_L_T in zip(rows, raw_beta_L_T, raw_alpha_L_T, d_L_T_values):
         ax.annotate(
-            f"L{row.injection_layer_start_idx}\n" + r"$\mathbf{d}_{T:L}$" + f"={d_L_T:.3f}",
+            f"L{row.injection_layer_start_idx}\n" + r"$\mathbf{d}$" + f"={d_L_T:.3f}",
             (x, y),
             textcoords="offset points",
             xytext=AI_PAPER_ANNOTATION_OFFSET,
             fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
             fontweight="bold",
         )
-    ax.set_xlabel(r"Total $\beta_{T:L}$")
-    ax.set_ylabel(r"Total $\alpha_{T:L}$")
+    ax.set_xlabel(r"Orthogonal Shift $\mathbf{\beta}$")
+    ax.set_ylabel(r"Anti-Shift Correction $\mathbf{\alpha}$")
     _style_paper_axes(ax)
     outputs["phase"] = build_summary_phase_chart_path(study_dir)
     _save_paper_figure(fig, outputs["phase"])
@@ -1116,7 +1151,7 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         label="Full-Mix - Random correction cosine",
     )
     ax2.axhline(0.0, color=AI_PAPER_REFERENCE_COLOR, linestyle="--", linewidth=AI_PAPER_REFERENCE_LINE_WIDTH)
-    ax2.set_xlabel("Injection target layer start index")
+    ax2.set_xlabel("First Layer Index of Translation Channels")
     ax2.set_ylabel("Positive is better")
     _style_paper_axes(ax2, x_values=x_values)
     ax2.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
@@ -1128,10 +1163,10 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
     ax.plot(
         x_values,
         initial_shift,
-        color=ACCENT_AQUA,
+        color="#505050",
         marker=AI_PAPER_MARKERS[0],
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
-        markeredgecolor=ACCENT_AQUA,
+        markeredgecolor="#505050",
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="Translation Shift ||s_T||",
     )
@@ -1146,8 +1181,8 @@ def plot_summary(summary_path: Path) -> Dict[str, Path]:
         label="Last-State Shift ||s_L||",
     )
     _annotate_ranges(ax, rows, final_shift)
-    ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("Average norm")
+    ax.set_xlabel("First Layer Index of Translation Channels")
+    ax.set_ylabel("Average Norm")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
     outputs["shift_norms"] = build_summary_shift_norm_chart_path(study_dir)

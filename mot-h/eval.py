@@ -7,40 +7,11 @@ from torch.utils.data import DataLoader
 
 from core.context import Context
 from core.eval_util import *
-from core.train_util import blocks_to_partial_past_key_values
 from .train import (
     extract_model_prefill_artifacts,
-    extract_selected_layer_canonical_attn_input_block,
+    build_partial_past_from_layer_indices,
+    extract_selected_layer_intermediate_activation_block,
 )
-
-
-
-def extract_selected_layer_blocks(
-    past_key_values: PastKeyValues,
-    layer_indices: List[int],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    selected_past = tuple(past_key_values[layer_idx] for layer_idx in layer_indices)
-    return past_key_values_to_blocks(selected_past)
-
-
-
-def build_partial_past_from_layer_indices(
-    past_key_values: PastKeyValues,
-    layer_indices: List[int],
-    *,
-    num_heads: int,
-    head_dim: int,
-) -> PastKeyValues:
-    key_block, value_block = extract_selected_layer_blocks(
-        past_key_values=past_key_values,
-        layer_indices=layer_indices,
-    )
-    return blocks_to_partial_past_key_values(
-        key_block=key_block,
-        value_block=value_block,
-        num_heads=num_heads,
-        head_dim=head_dim,
-    )
 
 
 def _build_logit_example_state(
@@ -58,7 +29,7 @@ def _build_logit_example_state(
             node.id: prefill_by_node_id[node.id][0]
             for node in ctx.nodes
         },
-        "hidden_states_by_node_id": {
+        "intermediate_activations_by_node_id": {
             node.id: prefill_by_node_id[node.id][1]
             for node in ctx.nodes
         },
@@ -75,7 +46,7 @@ def _build_logit_edge_artifacts(
     **_,
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
-    hidden_states_by_node_id = example_state["hidden_states_by_node_id"]
+    intermediate_activations_by_node_id = example_state["intermediate_activations_by_node_id"]
     mixed_target_past, _ = translator_pool.build_replayed_target_past(
         source_past_key_values=past_by_node_id[edge.src_id],
         prefix_input_ids=prefix_input_ids,
@@ -83,9 +54,8 @@ def _build_logit_edge_artifacts(
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
         tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-        source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
-            ctx.mm.get_model(edge.src_id),
-            hidden_states_by_node_id[edge.src_id],
+        source_intermediate_activation_block=extract_selected_layer_intermediate_activation_block(
+            intermediate_activations_by_node_id[edge.src_id],
             ctx.cm.get_src_layer_indices(edge.id),
         ),
     )
@@ -163,7 +133,7 @@ def evaluate_generation_dataset(
                     node.id: prefill_by_node_id[node.id][0]
                     for node in nodes
                 }
-                hidden_states_by_node_id = {
+                intermediate_activations_by_node_id = {
                     node.id: prefill_by_node_id[node.id][1]
                     for node in nodes
                 }
@@ -175,9 +145,8 @@ def evaluate_generation_dataset(
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-                    source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
-                        ctx.mm.get_model(edge.src_id),
-                        hidden_states_by_node_id[edge.src_id],
+                    source_intermediate_activation_block=extract_selected_layer_intermediate_activation_block(
+                        intermediate_activations_by_node_id[edge.src_id],
                         ctx.cm.get_src_layer_indices(edge.id),
                     ),
                 )
@@ -265,7 +234,7 @@ def run_eval(
             for edge in edges
         },
     )
-    logging.info("translation_mode=translate_canonical_attn_input_window_and_restore_target_kv")
+    logging.info("translation_mode=translate_intermediate_activation_window_and_restore_target_kv")
     logging.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
@@ -277,7 +246,7 @@ def run_eval(
         return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.src_id],
             layer_indices=ctx.cm.get_src_layer_indices(edge.id),
-            num_heads=ctx.mm.get_model_spec(edge.src_id).num_heads,
+            num_key_value_heads=ctx.mm.get_model_spec(edge.src_id).num_key_value_heads,
             head_dim=ctx.mm.get_model_spec(edge.src_id).head_dim,
         )
 
@@ -285,7 +254,7 @@ def run_eval(
         return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.tgt_id],
             layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-            num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_heads,
+            num_key_value_heads=ctx.mm.get_model_spec(edge.tgt_id).num_key_value_heads,
             head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
         )
 
@@ -295,7 +264,7 @@ def run_eval(
         prefix_cache_ids: torch.Tensor,
         past_by_node_id,
     ) -> PastKeyValues:
-        _, source_hidden_states = extract_model_prefill_artifacts(
+        _, source_intermediate_activations = extract_model_prefill_artifacts(
             ctx.mm.get_model(edge.src_id),
             prefix_cache_ids,
         )
@@ -306,9 +275,8 @@ def run_eval(
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
-                ctx.mm.get_model(edge.src_id),
-                source_hidden_states,
+            source_intermediate_activation_block=extract_selected_layer_intermediate_activation_block(
+                source_intermediate_activations,
                 ctx.cm.get_src_layer_indices(edge.id),
             ),
         )
@@ -321,7 +289,7 @@ def run_eval(
         past_by_node_id,
         **_,
     ) -> Dict[str, PastKeyValues]:
-        _, source_hidden_states = extract_model_prefill_artifacts(
+        _, source_intermediate_activations = extract_model_prefill_artifacts(
             ctx.mm.get_model(edge.src_id),
             prefix_cache_ids,
         )
@@ -332,9 +300,8 @@ def run_eval(
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            source_canonical_attn_input_block=extract_selected_layer_canonical_attn_input_block(
-                ctx.mm.get_model(edge.src_id),
-                source_hidden_states,
+            source_intermediate_activation_block=extract_selected_layer_intermediate_activation_block(
+                source_intermediate_activations,
                 ctx.cm.get_src_layer_indices(edge.id),
             ),
         )

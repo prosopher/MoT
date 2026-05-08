@@ -65,9 +65,9 @@ DEFAULT_CATEGORY_ORDER = [
 ]
 
 EVAL_BAR_METRICS = [
-    ("Acc Avg", "acc_avg", "Accuracy (%)"),
-    ("Gen F1 Avg", "gen_f1_avg", "F1"),
-    ("OWT Val GPU Peak Memory", "gpu_peak_memory", "GPU Peak Memory (GiB)"),
+    ("Acc", "acc_avg", "Accuracy (%)"),
+    ("F1", "gen_f1_avg", "F1"),
+    ("GPU Peak Memory", "gpu_peak_memory", "GPU Peak Memory (GiB)"),
 ]
 
 MOT_COLOR = ACCENT_RED
@@ -92,6 +92,7 @@ ALGORITHM_DISPLAY_NAMES = {
     "lsc": "LSC",
     "mot": "MoT",
     "mot-h": "MoT-h",
+    "mot-single": "MoT (single)",
     "native": "Native",
 }
 
@@ -145,10 +146,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--exp-path",
+        "exp_path",
         type=Path,
-        required=True,
-        help="Experiment directory. Radar-chart JSON input is read from exp-path/*/mmlu_redux_subject_category_accuracy.json.",
+        help="Experiment directory. Radar-chart JSON input is read from exp_path/*/mmlu_redux_subject_category_accuracy.json.",
     )
     parser.add_argument(
         "--edge-id",
@@ -514,8 +514,18 @@ def plot_edge_radar(
     ax.set_theta_offset(np.pi / 2)
     ax.set_theta_direction(-1)
 
+    radar_label_fontsize = AI_PAPER_TICK_LABEL_SIZE + 3
+    radar_rtick_fontsize = AI_PAPER_TICK_LABEL_SIZE + 2
+    radar_legend_fontsize = AI_PAPER_TICK_LABEL_SIZE + 2
+
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels([display_name_for_subcategory(category) for category in categories], fontsize=AI_PAPER_TICK_LABEL_SIZE)
+    ax.set_xticklabels(
+        [display_name_for_subcategory(category) for category in categories],
+        fontsize=radar_label_fontsize,
+        fontweight="bold",
+    )
+    for tick_label in ax.get_xticklabels():
+        tick_label.set_clip_on(False)
 
     if radius_max <= 0.4:
         rticks = [0.1, 0.2, 0.3, 0.4]
@@ -529,7 +539,7 @@ def plot_edge_radar(
     rticks = [t for t in rticks if t <= radius_max + 1e-9]
     ax.set_rlabel_position(0)
     ax.set_yticks(rticks)
-    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=AI_PAPER_BAR_VALUE_FONT_SIZE)
+    ax.set_yticklabels([f"{t:.1f}" for t in rticks], fontsize=radar_rtick_fontsize)
     ax.set_ylim(0, radius_max)
     style_axes_common(ax, grid=True, grid_axis="both")
 
@@ -551,7 +561,19 @@ def plot_edge_radar(
         values += values[:1]
         ax.plot(angles, values, linewidth=AI_PAPER_LINE_WIDTH, label=label, color=color)
         ax.fill(angles, values, alpha=AI_PAPER_RADAR_FILL_ALPHA, color=color)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.08, 1.10), frameon=False)
+    legend = fig.legend(
+        loc="upper right",
+        bbox_to_anchor=(0.998, 0.998),
+        bbox_transform=fig.transFigure,
+        frameon=True,
+        fontsize=radar_legend_fontsize,
+        handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH,
+        borderaxespad=0.0,
+    )
+    for text in legend.get_texts():
+        text.set_fontweight("bold")
+
+    ax.set_position([0.04, 0.20, 0.92, 0.76])
 
     save_paper_figure(fig, output_path, dpi=dpi, show=show)
     plt.close(fig)
@@ -824,7 +846,7 @@ def plot_eval_metric_bars(
     style_axes_common(ax, grid=True, grid_axis="y")
     style_algorithm_tick_labels(ax, axis="x")
 
-    value_format = "{:.1f}" if metric_name == "Acc Avg" else "{:.3f}"
+    value_format = "{:.1f}" if metric_name == "Acc" else "{:.3f}"
     plotted_values = values + ([native_value] if native_value is not None else [])
     offset = max(plotted_values) * AI_PAPER_VALUE_OFFSET_FRACTION if plotted_values and max(plotted_values) > 0 else AI_PAPER_VALUE_OFFSET_FRACTION
     for bar, value in zip(bars, values):
@@ -950,7 +972,7 @@ def generate_redux_radar_charts(args: argparse.Namespace, exp_path: Path, output
     if not args.disable_native:
         print(
             "[info] native is taken per edge_id from the first study JSON file "
-            "(sorted order) under exp-path/*/ that actually contains that edge."
+            "(sorted order) under exp_path/*/ that actually contains that edge."
         )
 
     generated: List[Path] = []
@@ -1022,7 +1044,7 @@ def main() -> None:
     generated_paths.extend(eval_artifacts)
     if not generated_paths:
         raise RuntimeError(
-            "No artifacts were generated. Expected mmlu_redux_subject_category_accuracy.json in exp-path/*/ or eval.log files in exp-path/*/."
+            "No artifacts were generated. Expected mmlu_redux_subject_category_accuracy.json in exp_path/*/ or eval.log files in exp_path/*/."
         )
 
 

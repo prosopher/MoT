@@ -1722,9 +1722,10 @@ def plot_metric_controls_summary(summary_path: Path) -> Path:
         label="Native",
     )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
-    ax.set_xlabel("Injection target layer start index")
+    ax.set_xlabel("First Layer Index of Translation Channels")
     ax.set_ylabel(metric_label)
     _style_paper_axes(ax, x_values=x_values)
+    ax.set_ylim(bottom=0)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
     chart_path = build_metric_controls_chart_path(study_dir, metric_name)
@@ -1797,8 +1798,8 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
         markeredgewidth=AI_PAPER_MARKER_EDGE_WIDTH,
         label="KL(full-mix || mag-only)",
     )
-    ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("KL divergence")
+    ax.set_xlabel("First Layer Index of Translation Channels")
+    ax.set_ylabel("KL Divergence")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
@@ -1844,8 +1845,8 @@ def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
         label="Native",
     )
     annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
-    ax.set_xlabel("Injection target layer start index")
-    ax.set_ylabel("OpenWebText validation Loss")
+    ax.set_xlabel("First Layer Index of Translation Channels")
+    ax.set_ylabel("Validation Loss")
     _style_paper_axes(ax, x_values=x_values)
     ax.legend(handlelength=AI_PAPER_LEGEND_HANDLE_LENGTH)
 
@@ -2170,10 +2171,10 @@ def main() -> None:
     print(f"Metric controls chart: {metric_controls_chart_path}")
     print(f"Control analysis metrics: {analysis_metrics_path}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
-    print(f"OpenWebText validation Loss chart: {openwebtext_loss_chart_path}")
+    print(f"Validation Loss chart: {openwebtext_loss_chart_path}")
     kv_similarity_heatmaps = combined_metrics.get("openwebtext_kv_similarity_heatmaps", {})
     if kv_similarity_heatmaps:
-        print("OpenWebText Full-Mix vs Native KV similarity heatmaps:")
+        print("Full-Mix vs Native KV similarity heatmaps:")
         for edge_id, heatmap_path in kv_similarity_heatmaps.items():
             print(f"  {edge_id}: {heatmap_path}")
 

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from core.context import Context
 from core.eval_util import *
 from c2c.train import (
+    get_top_layers_to_translate_for_edge,
     get_top_layers_to_translate,
     get_translation_mode_name,
     translate_top_layers,
@@ -208,7 +209,13 @@ def run_eval(
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
     logging.info("edges=%s", [edge.id for edge in edges])
-    logging.info("top_layers_to_translate=%d", get_top_layers_to_translate(train_config))
+    logging.info("top_layers_to_translate=%s", get_top_layers_to_translate(train_config))
+    for edge in edges:
+        logging.info(
+            "top_layers_to_translate[%s]=%d",
+            edge.id,
+            get_top_layers_to_translate_for_edge(train_config, ctx, edge),
+        )
     logging.info("translation_mode=%s", get_translation_mode_name(train_config))
     logging.info("qa_eval_log_path=%s", log_path)
 
@@ -236,7 +243,7 @@ def run_eval(
         return build_openwebtext_tsne_named_pasts(
             source_top_past_key_values=slice_top_layers(
                 past_key_values=past_by_node_id[edge.src_id],
-                top_layers_to_translate=get_top_layers_to_translate(train_config),
+                top_layers_to_translate=get_top_layers_to_translate_for_edge(train_config, ctx, edge),
             ),
             translated_past_key_values=translate_top_layers(
                 translator_pool=translator_pool,
@@ -249,7 +256,7 @@ def run_eval(
             ),
             target_top_past_key_values=slice_top_layers(
                 past_key_values=past_by_node_id[edge.tgt_id],
-                top_layers_to_translate=get_top_layers_to_translate(train_config),
+                top_layers_to_translate=get_top_layers_to_translate_for_edge(train_config, ctx, edge),
             ),
         )
 

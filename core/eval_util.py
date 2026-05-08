@@ -641,6 +641,7 @@ def _load_openwebtext_tsne_plotting_deps():
     try:
         import matplotlib
         matplotlib.use("Agg", force=True)
+        matplotlib.rcParams["savefig.format"] = "pdf"
         import matplotlib.pyplot as plt
         from sklearn.manifold import TSNE
     except ModuleNotFoundError as exc:
@@ -3350,7 +3351,7 @@ def build_edge_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss | OWT Val Latency | OWT Val Throughput | OWT Val GPU Peak Memory |",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc | SQuAD | NewsQA | F1 | Loss | Latency | Throughput | GPU Peak Memory |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (Native) | N/A | "
