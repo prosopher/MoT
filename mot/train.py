@@ -930,6 +930,7 @@ def run_gpt2_block(
     block: nn.Module,
     hidden_states: torch.Tensor,
     *,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -966,20 +967,35 @@ def run_gpt2_block(
             f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
         )
 
-    attn_output, _ = attn._attn(
-        query,
-        attention_key,
-        attention_value,
-        attention_mask=None,
-        head_mask=None,
-    )
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
+        attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
+        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_heads)
+        attn_scores = attn_scores.masked_fill(invalid_mask, torch.finfo(attn_scores.dtype).min)
+        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_dropout = getattr(attn, "attn_dropout", None)
+        if isinstance(attn_dropout, nn.Dropout):
+            attn_weights = attn_dropout(attn_weights)
+        else:
+            attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "attn_pdrop", 0.0)), training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    else:
+        attn_output, _ = attn._attn(
+            query,
+            attention_key,
+            attention_value,
+            attention_mask=None,
+            head_mask=None,
+        )
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
     attn_output = attn.c_proj(attn_output)
     attn_output = attn.resid_dropout(attn_output)
     hidden_states = residual + attn_output
     hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
-    return hidden_states, (attention_key, attention_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 def run_opt_block(
@@ -988,6 +1004,7 @@ def run_opt_block(
     *,
     attention_mask: torch.Tensor,
     token_attention_mask: torch.Tensor,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1028,12 +1045,23 @@ def run_opt_block(
             f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
         )
 
-    attn_weights = torch.matmul(query_states, attention_key.transpose(-1, -2))
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
-    attn_output = torch.matmul(attn_weights, attention_value)
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
+        attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1)
+        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_heads)
+        attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    else:
+        attn_weights = torch.matmul(query_states, attention_key.transpose(-1, -2))
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
+        attn_output = torch.matmul(attn_weights, attention_value)
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_heads * head_dim)
     attn_output = attn.out_proj(attn_output)
     attn_output = F.dropout(attn_output, p=float(getattr(block, "dropout", 0.0)), training=block.training)
@@ -1054,7 +1082,7 @@ def run_opt_block(
     hidden_states = (residual + hidden_states).view(hidden_states_shape)
     if not getattr(block, "do_layer_norm_before", False):
         hidden_states = block.final_layer_norm(hidden_states)
-    return hidden_states, (attention_key, attention_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 
@@ -1065,6 +1093,7 @@ def run_qwen2_block(
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1113,21 +1142,33 @@ def run_qwen2_block(
     expanded_attention_value = repeat_key_value_heads(attention_value, num_key_value_groups)
     scaling = float(getattr(attn, "scaling", head_dim ** -0.5))
 
-    attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
-    effective_attention_mask = attention_mask
-    sliding_window = getattr(attn, "sliding_window", None)
-    if sliding_window is not None and int(sliding_window) > 0:
-        query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
-        key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
-        sliding_mask = key_positions <= (query_positions - int(sliding_window))
-        sliding_bias = torch.zeros_like(attn_weights).masked_fill(sliding_mask, torch.finfo(attn_weights.dtype).min)
-        effective_attention_mask = effective_attention_mask + sliding_bias if effective_attention_mask is not None else sliding_bias
-    if effective_attention_mask is not None:
-        attn_weights = attn_weights + effective_attention_mask
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
-    attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
-    attn_output = torch.matmul(attn_weights, expanded_attention_value)
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
+        attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
+        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_query_heads)
+        attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    else:
+        attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
+        effective_attention_mask = attention_mask
+        sliding_window = getattr(attn, "sliding_window", None)
+        if sliding_window is not None and int(sliding_window) > 0:
+            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            sliding_mask = key_positions <= (query_positions - int(sliding_window))
+            sliding_bias = torch.zeros_like(attn_weights).masked_fill(sliding_mask, torch.finfo(attn_weights.dtype).min)
+            effective_attention_mask = effective_attention_mask + sliding_bias if effective_attention_mask is not None else sliding_bias
+        if effective_attention_mask is not None:
+            attn_weights = attn_weights + effective_attention_mask
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
+        attn_output = torch.matmul(attn_weights, expanded_attention_value)
 
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_query_heads * head_dim)
     attn_output = attn.o_proj(attn_output)
@@ -1137,7 +1178,7 @@ def run_qwen2_block(
     hidden_states = block.post_attention_layernorm(hidden_states)
     hidden_states = block.mlp(hidden_states)
     hidden_states = residual + hidden_states
-    return hidden_states, (attention_key, attention_value)
+    return hidden_states, (native_like_key, native_like_value)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -1230,12 +1271,14 @@ def replay_target_prefill_with_injected_window(
             _: Any,
             __: Any,
             ___: Any,
+            sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
             return run_gpt2_block(
                 block,
                 hidden_states,
+                sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
             )
@@ -1254,6 +1297,7 @@ def replay_target_prefill_with_injected_window(
             token_attention_mask: torch.Tensor,
             attention_mask: torch.Tensor,
             _: Any,
+            sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1262,6 +1306,7 @@ def replay_target_prefill_with_injected_window(
                 hidden_states,
                 attention_mask=attention_mask,
                 token_attention_mask=token_attention_mask,
+                sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
             )
@@ -1279,6 +1324,7 @@ def replay_target_prefill_with_injected_window(
             position_ids: torch.Tensor,
             attention_mask: torch.Tensor,
             position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+            sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1288,6 +1334,7 @@ def replay_target_prefill_with_injected_window(
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 position_embeddings=position_embeddings,
+                sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
             )
@@ -1297,6 +1344,11 @@ def replay_target_prefill_with_injected_window(
 
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
     target_start_layer_idx = target_layer_indices[0]
+    layer_sparse_attention_indices = sparse_attention_indices if sparse_attention_indices is not None else [None] * tgt_spec.num_layers
+
+    def native_sparse_attention_for_layer(layer_idx: int) -> Optional[torch.Tensor]:
+        # Keep the lowest num_bottom_full_attn native-only layers exact: do not sparsify their attention.
+        return None if layer_idx < num_bottom_full_attn else layer_sparse_attention_indices[layer_idx]
 
     if torch.is_grad_enabled():
         with torch.no_grad():
@@ -1308,6 +1360,7 @@ def replay_target_prefill_with_injected_window(
                     position_ids,
                     attention_mask,
                     position_embeddings,
+                    native_sparse_attention_for_layer(lower_idx),
                 )
                 rebuilt_past.append((present[0].detach(), present[1].detach()))
         hidden_states = hidden_states.detach()
@@ -1320,6 +1373,7 @@ def replay_target_prefill_with_injected_window(
                 position_ids,
                 attention_mask,
                 position_embeddings,
+                native_sparse_attention_for_layer(lower_idx),
             )
             rebuilt_past.append(present)
 
@@ -1332,6 +1386,7 @@ def replay_target_prefill_with_injected_window(
                 position_ids,
                 attention_mask,
                 position_embeddings,
+                native_sparse_attention_for_layer(native_layer_idx),
             )
             rebuilt_past.append(present)
         hidden_states, present = run_block(
@@ -1340,6 +1395,7 @@ def replay_target_prefill_with_injected_window(
             position_ids,
             attention_mask,
             position_embeddings,
+            layer_sparse_attention_indices[layer_idx],
             injected_present[0],
             injected_present[1],
         )
@@ -1357,6 +1413,7 @@ def replay_target_prefill_with_injected_window(
             position_ids,
             attention_mask,
             position_embeddings,
+            native_sparse_attention_for_layer(upper_idx),
         )
         rebuilt_past.append(present)
 
