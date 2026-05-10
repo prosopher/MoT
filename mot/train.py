@@ -1234,6 +1234,7 @@ def replay_target_prefill_with_injected_window(
     target_model_id: Optional[str] = None,
     sparse_attention_indices: Optional[List[torch.Tensor]] = None,
     num_bottom_full_attn: int = 3,
+    cache_injected_window: bool = False,
 ) -> PastKeyValues:
     injected_window = blocks_to_partial_past_key_values(
         key_block=injected_key_block,
@@ -1398,7 +1399,11 @@ def replay_target_prefill_with_injected_window(
             injected_present[0],
             injected_present[1],
         )
-        rebuilt_past.append(present)
+        # run_block uses injected_key/injected_value for attention, but returns the
+        # native-like KV cache that should be used by training/loss paths. Heatmap
+        # analysis can opt in to caching the injected KV itself so the plotted
+        # "full_mix" cache reflects the translated window rather than native-like KV.
+        rebuilt_past.append(injected_present if cache_injected_window else present)
         previous_layer_idx = layer_idx
 
     for upper_idx in range(previous_layer_idx + 1, len(target_blocks)):
