@@ -33,10 +33,11 @@
   "eval_shuffle_stream": false,
   "benchmark_mode": "gen_qa",
   "generation_max_new_tokens": 64,
-  "correction_max_analysis_tokens": 4,
   "variant": "single",
   "mot_num_translators": 1,
   "mot_top_k": 1,
   "topk_sparse_attn": 32,
-  "num_bottom_full_attn": 12
+  "num_bottom_full_attn": 12,
+  "kv_similarity_token_group_size": 8,
+  "correction_max_analysis_tokens": 4
 }

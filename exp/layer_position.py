@@ -31,11 +31,13 @@ from exp.exp_util import (
     AI_PAPER_REFERENCE_COLOR,
     AI_PAPER_REFERENCE_LINE_WIDTH,
     AI_PAPER_CONTROL_LINESTYLE,
+    AI_PAPER_DOUBLE_COLUMN_TALL_FIGSIZE,
     double_column_figsize,
     apply_ai_paper_style,
     require_matplotlib_pyplot,
     save_paper_figure as _save_paper_figure,
     style_paper_axes as _style_paper_axes,
+    style_axes_common,
 )
 
 
@@ -60,6 +62,7 @@ class LayerPositionConfig(TrainConfig):
     eval_shuffle_stream: bool
     benchmark_mode: str
     generation_max_new_tokens: int
+    kv_similarity_token_group_size: int
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -77,6 +80,8 @@ class LayerPositionConfig(TrainConfig):
             raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
+        if self.kv_similarity_token_group_size < 1:
+            raise ValueError("kv_similarity_token_group_size must be >= 1")
 
 
 class AccuracyMeter:
@@ -937,6 +942,235 @@ def compute_average_metric(
     return sum(values) / len(values)
 
 
+class KVSimilarityAccumulator:
+    def __init__(self, num_layers: int) -> None:
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        self.num_layers = num_layers
+        self.sum_matrix = torch.zeros((num_layers, 0), dtype=torch.float64)
+        self.count_matrix = torch.zeros((num_layers, 0), dtype=torch.float64)
+        self.group_labels: List[str] = []
+        self.segment_group_counts = {"prefix": 0, "suffix": 0, "generated": 0}
+
+    def _ensure_width(self, width: int) -> None:
+        if width <= self.sum_matrix.shape[1]:
+            return
+        pad_width = width - self.sum_matrix.shape[1]
+        self.sum_matrix = torch.cat(
+            [self.sum_matrix, torch.zeros((self.num_layers, pad_width), dtype=self.sum_matrix.dtype)],
+            dim=1,
+        )
+        self.count_matrix = torch.cat(
+            [self.count_matrix, torch.zeros((self.num_layers, pad_width), dtype=self.count_matrix.dtype)],
+            dim=1,
+        )
+
+    def update(
+        self,
+        similarity_matrix: torch.Tensor,
+        group_labels: List[str],
+        segment_group_counts: Dict[str, int],
+    ) -> None:
+        matrix = similarity_matrix.detach().cpu().to(dtype=torch.float64)
+        if matrix.ndim != 2 or matrix.shape[0] != self.num_layers:
+            raise ValueError(
+                f"similarity_matrix must have shape ({self.num_layers}, G), got {tuple(matrix.shape)}"
+            )
+        self._ensure_width(matrix.shape[1])
+        self.sum_matrix[:, : matrix.shape[1]] += matrix
+        self.count_matrix[:, : matrix.shape[1]] += 1.0
+        if len(group_labels) > len(self.group_labels):
+            self.group_labels = list(group_labels)
+        for segment_name in self.segment_group_counts:
+            self.segment_group_counts[segment_name] = max(
+                self.segment_group_counts[segment_name],
+                int(segment_group_counts.get(segment_name, 0)),
+            )
+
+    def summary(self) -> Dict[str, Any]:
+        if self.sum_matrix.shape[1] == 0:
+            return {
+                "matrix": torch.empty((self.num_layers, 0), dtype=torch.float32),
+                "count_matrix": torch.empty((self.num_layers, 0), dtype=torch.float32),
+                "group_labels": [],
+                "segment_group_counts": dict(self.segment_group_counts),
+            }
+        average_matrix = torch.full_like(self.sum_matrix, float("nan"))
+        valid_mask = self.count_matrix > 0
+        average_matrix[valid_mask] = self.sum_matrix[valid_mask] / self.count_matrix[valid_mask]
+        return {
+            "matrix": average_matrix.to(dtype=torch.float32),
+            "count_matrix": self.count_matrix.to(dtype=torch.float32),
+            "group_labels": list(self.group_labels),
+            "segment_group_counts": dict(self.segment_group_counts),
+        }
+
+
+def slice_past_key_values_batch(
+    past_key_values: PastKeyValues,
+    batch_idx: int,
+) -> PastKeyValues:
+    return tuple(
+        (key[batch_idx : batch_idx + 1].contiguous(), value[batch_idx : batch_idx + 1].contiguous())
+        for key, value in past_key_values
+    )
+
+
+def build_token_group_layout(
+    *,
+    prefix_tokens: int,
+    suffix_tokens: int,
+    generated_tokens: int,
+    token_group_size: int,
+) -> Tuple[List[Tuple[int, int]], List[str], Dict[str, int]]:
+    if token_group_size < 1:
+        raise ValueError("token_group_size must be >= 1")
+
+    spans: List[Tuple[int, int]] = []
+    labels: List[str] = []
+    segment_group_counts: Dict[str, int] = {}
+    cursor = 0
+    segment_specs = [
+        ("prefix", "P", prefix_tokens),
+        ("suffix", "S", suffix_tokens),
+        ("generated", "G", generated_tokens),
+    ]
+    for segment_name, label_prefix, token_count in segment_specs:
+        group_idx = 0
+        for local_start in range(0, max(0, token_count), token_group_size):
+            start = cursor + local_start
+            end = cursor + min(local_start + token_group_size, token_count)
+            spans.append((start, end))
+            labels.append(f"{label_prefix}{group_idx:02d}")
+            group_idx += 1
+        segment_group_counts[segment_name] = group_idx
+        cursor += max(0, token_count)
+    return spans, labels, segment_group_counts
+
+
+def compute_flat_cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_flat = a.float().reshape(-1)
+    b_flat = b.float().reshape(-1)
+    a_norm = torch.linalg.norm(a_flat)
+    b_norm = torch.linalg.norm(b_flat)
+    denom = (a_norm * b_norm).clamp_min(1e-8)
+    return float(torch.dot(a_flat, b_flat).div(denom).item())
+
+
+def compute_full_mix_vs_native_kv_similarity_matrix(
+    *,
+    native_past_key_values: PastKeyValues,
+    full_mix_past_key_values: PastKeyValues,
+    prefix_tokens: int,
+    suffix_tokens: int,
+    generated_tokens: int,
+    token_group_size: int,
+) -> Tuple[torch.Tensor, List[str], Dict[str, int]]:
+    if len(native_past_key_values) != len(full_mix_past_key_values):
+        raise ValueError(
+            "Native/full-mix pasts must have the same number of layers, "
+            f"got {len(native_past_key_values)} vs {len(full_mix_past_key_values)}"
+        )
+
+    total_tokens = prefix_tokens + suffix_tokens + generated_tokens
+    spans, group_labels, segment_group_counts = build_token_group_layout(
+        prefix_tokens=prefix_tokens,
+        suffix_tokens=suffix_tokens,
+        generated_tokens=generated_tokens,
+        token_group_size=token_group_size,
+    )
+    matrix = torch.empty((len(native_past_key_values), len(spans)), dtype=torch.float32)
+
+    for layer_idx, ((native_key, native_value), (full_mix_key, full_mix_value)) in enumerate(
+        zip(native_past_key_values, full_mix_past_key_values)
+    ):
+        if native_key.shape[2] < total_tokens or native_value.shape[2] < total_tokens:
+            raise ValueError(
+                f"Native cache at layer {layer_idx} is shorter than required total_tokens={total_tokens}"
+            )
+        if full_mix_key.shape[2] < total_tokens or full_mix_value.shape[2] < total_tokens:
+            raise ValueError(
+                f"Full-mix cache at layer {layer_idx} is shorter than required total_tokens={total_tokens}"
+            )
+
+        for group_idx, (start, end) in enumerate(spans):
+            key_cosine = compute_flat_cosine_similarity(
+                native_key[:, :, start:end, :],
+                full_mix_key[:, :, start:end, :],
+            )
+            value_cosine = compute_flat_cosine_similarity(
+                native_value[:, :, start:end, :],
+                full_mix_value[:, :, start:end, :],
+            )
+            matrix[layer_idx, group_idx] = 0.5 * (key_cosine + value_cosine)
+
+    return matrix, group_labels, segment_group_counts
+
+
+@torch.inference_mode()
+def generate_greedy_with_final_past(
+    *,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+    max_new_tokens: int,
+) -> Dict[str, Any]:
+    if seed_token.ndim != 2 or seed_token.shape[0] != 1:
+        raise ValueError(f"seed_token must have shape [1, 1], got {tuple(seed_token.shape)}")
+
+    current_past = past_key_values
+    current_input_ids = seed_token
+    current_input_in_past = False
+    generated_token_ids: List[int] = []
+    past_after_seed: Optional[PastKeyValues] = None
+    eos_token_id = tokenizer.eos_token_id
+
+    for _ in range(max_new_tokens):
+        outputs = model(
+            input_ids=current_input_ids,
+            past_key_values=current_past,
+            use_cache=True,
+        )
+        current_past = outputs.past_key_values
+        current_input_in_past = True
+        if past_after_seed is None:
+            past_after_seed = current_past
+
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token_id = int(next_token.item())
+        if eos_token_id is not None and next_token_id == eos_token_id:
+            break
+
+        generated_token_ids.append(next_token_id)
+        current_input_ids = next_token
+        current_input_in_past = False
+
+    if past_after_seed is None:
+        past_after_seed = append_input_ids_to_past(
+            model=model,
+            past_key_values=past_key_values,
+            input_ids=seed_token,
+        )
+        current_past = past_after_seed
+        current_input_in_past = True
+
+    if not current_input_in_past:
+        current_past = append_input_ids_to_past(
+            model=model,
+            past_key_values=current_past,
+            input_ids=current_input_ids,
+        )
+
+    generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    return {
+        "past_after_seed": past_after_seed,
+        "final_past": current_past,
+        "generated_token_ids": generated_token_ids,
+        "generated_text": postprocess_generated_answer(generated_text),
+    }
+
+
 @dataclass
 class SummaryRow:
     study_id: str
@@ -1008,6 +1242,8 @@ def extract_analysis_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]
         "openwebtext_validation_loss": combined_metrics["openwebtext_validation_loss"],
         "average_native_loss": combined_metrics["average_native_loss"],
         "average_full_mix_loss": combined_metrics["average_full_mix_loss"],
+        "openwebtext_kv_similarity_heatmaps": combined_metrics.get("openwebtext_kv_similarity_heatmaps", {}),
+        "openwebtext_kv_similarity_metadata": combined_metrics.get("openwebtext_kv_similarity_metadata", {}),
     }
 
 
@@ -1128,6 +1364,326 @@ def build_logit_kl_chart_path(study_dir: Path) -> Path:
 def build_openwebtext_loss_chart_path(study_dir: Path) -> Path:
     return study_dir / "layer_idx_vs_openwebtext_validation_loss.pdf"
 
+
+def build_kv_similarity_heatmap_path(run_dir: Path, edge_id: str) -> Path:
+    return run_dir / f"{sanitize_slug(edge_id)}_full_mix_vs_native_kv_similarity_heatmap.pdf"
+
+
+def build_kv_similarity_metadata_path(run_dir: Path, edge_id: str) -> Path:
+    return run_dir / f"{sanitize_slug(edge_id)}_full_mix_vs_native_kv_similarity_metadata.json"
+
+
+def plot_full_mix_vs_native_kv_similarity_heatmap(
+    *,
+    similarity_matrix: torch.Tensor,
+    group_labels: List[str],
+    segment_group_counts: Dict[str, int],
+    token_group_size: int,
+    title: str,
+    output_path: Path,
+) -> Path:
+    if similarity_matrix.ndim != 2:
+        raise ValueError(f"similarity_matrix must be 2D, got {tuple(similarity_matrix.shape)}")
+
+    apply_ai_paper_style()
+    plt = require_matplotlib_pyplot()
+    import numpy as np
+
+    matrix_np = similarity_matrix.detach().cpu().numpy()
+    masked_matrix = np.ma.masked_invalid(matrix_np)
+    num_layers, num_groups = masked_matrix.shape
+
+    fig = plt.figure(figsize=AI_PAPER_DOUBLE_COLUMN_TALL_FIGSIZE)
+    ax = fig.add_subplot(111)
+    image = ax.imshow(
+        masked_matrix,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        vmin=-1.0,
+        vmax=1.0,
+    )
+
+    x_tick_step = max(1, num_groups // 24) if num_groups > 0 else 1
+    x_tick_positions = list(range(0, num_groups, x_tick_step))
+    if num_groups > 0 and (num_groups - 1) not in x_tick_positions:
+        x_tick_positions.append(num_groups - 1)
+    ax.set_xticks(x_tick_positions)
+    ax.set_xticklabels([str(idx) for idx in x_tick_positions], rotation=90)
+
+    y_tick_step = max(1, num_layers // 16) if num_layers > 0 else 1
+    y_tick_positions = list(range(0, num_layers, y_tick_step))
+    if num_layers > 0 and (num_layers - 1) not in y_tick_positions:
+        y_tick_positions.append(num_layers - 1)
+    ax.set_yticks(y_tick_positions)
+    ax.set_yticklabels([str(idx) for idx in y_tick_positions])
+
+    ax.set_xlabel(f"Token Groups (Group Size={token_group_size})")
+    ax.set_ylabel("Layer Index")
+
+    for boundary_after_group in (7, 16):
+        if 0 <= boundary_after_group < num_groups - 1:
+            ax.axvline(
+                boundary_after_group + 0.5,
+                color="black",
+                linestyle="--",
+                linewidth=1.2,
+                zorder=3,
+            )
+
+    segment_labels = (
+        (0, 7, "Context"),
+        (8, 16, "Prompt"),
+        (17, 24, "Completion"),
+    )
+    for start_group, end_group, label in segment_labels:
+        if num_groups == 0 or start_group >= num_groups or end_group < 0:
+            continue
+        visible_start = max(start_group, 0)
+        visible_end = min(end_group, num_groups - 1)
+        center_group = (visible_start + visible_end) / 2.0
+        ax.text(
+            center_group,
+            1.025,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=AI_PAPER_ANNOTATION_FONT_SIZE,
+            fontweight="bold",
+            color="black",
+            clip_on=False,
+        )
+
+    style_axes_common(ax, grid=False)
+    fig.subplots_adjust(top=0.86)
+
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label("Cosine Similarity(Native vs Translation)")
+
+    _save_paper_figure(fig, output_path, close=True)
+    return output_path
+
+
+def summarize_full_mix_vs_native_kv_similarity_artifacts(
+    *,
+    run_dir: Path,
+    edge_id: str,
+    accumulator: KVSimilarityAccumulator,
+    token_group_size: int,
+    title: str,
+) -> Tuple[Path, Path]:
+    summary = accumulator.summary()
+    heatmap_path = build_kv_similarity_heatmap_path(run_dir, edge_id)
+    metadata_path = build_kv_similarity_metadata_path(run_dir, edge_id)
+
+    plot_full_mix_vs_native_kv_similarity_heatmap(
+        similarity_matrix=summary["matrix"],
+        group_labels=summary["group_labels"],
+        segment_group_counts=summary["segment_group_counts"],
+        token_group_size=token_group_size,
+        title=title,
+        output_path=heatmap_path,
+    )
+
+    coverage_by_group = []
+    count_matrix = summary["count_matrix"]
+    if count_matrix.numel() > 0:
+        coverage_by_group = [float(value) for value in count_matrix[0].tolist()]
+
+    write_json(
+        str(metadata_path),
+        {
+            "edge_id": edge_id,
+            "token_group_size": token_group_size,
+            "group_labels": summary["group_labels"],
+            "segment_group_counts": summary["segment_group_counts"],
+            "group_coverage": coverage_by_group,
+            "mean_similarity_matrix": summary["matrix"].tolist(),
+        },
+    )
+    return heatmap_path, metadata_path
+
+
+@torch.inference_mode()
+def evaluate_openwebtext_losses_and_kv_similarity(
+    *,
+    ctx: Context,
+    run_dir: Path,
+    translator_pool: LayerWindowTranslatorPool,
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, str], Dict[str, str]]:
+    config = ctx.config
+    max_examples = max(1, config.eval_max_examples_per_dataset)
+    node_map = build_node_map(ctx.nodes)
+    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+    edges_by_target = {
+        target_node_id: [edge for edge in ctx.edges if edge.tgt_id == target_node_id]
+        for target_node_id in target_node_ids
+    }
+
+    loss_sums = {edge.id: {"native": 0.0, "full_mix": 0.0} for edge in ctx.edges}
+    counts = {edge.id: 0 for edge in ctx.edges}
+    similarity_accumulators: Dict[str, KVSimilarityAccumulator] = {
+        edge.id: KVSimilarityAccumulator(num_layers=ctx.mm.get_model_spec(edge.tgt_id).num_layers)
+        for edge in ctx.edges
+    }
+
+    for target_node_id in target_node_ids:
+        dataloader = build_openwebtext_eval_dataloader(
+            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+            config=config,
+            batch_size=config.eval_batch_size,
+            num_workers=config.eval_num_workers,
+            shuffle=config.eval_shuffle_stream,
+            seed=config.seed,
+            shuffle_buffer=config.shuffle_buffer,
+        )
+        processed_examples = 0
+
+        for batch_idx, input_ids in enumerate(dataloader, start=1):
+            if processed_examples >= max_examples:
+                break
+
+            remaining_examples = max_examples - processed_examples
+            if input_ids.shape[0] > remaining_examples:
+                input_ids = input_ids[:remaining_examples]
+            input_ids = input_ids.to(config.device)
+
+            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+                input_ids=input_ids,
+                prefix_tokens=config.prefix_tokens,
+            )
+            past_by_node_id = {
+                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                for node in ctx.nodes
+            }
+
+            batch_examples = input_ids.shape[0]
+            for edge in edges_by_target[target_node_id]:
+                edge_losses = compute_openwebtext_native_and_full_mix_losses(
+                    ctx=ctx,
+                    edge=edge,
+                    prefix_cache_ids=prefix_cache_ids,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                    past_by_node_id=past_by_node_id,
+                    translator_pool=translator_pool,
+                )
+                for metric_name in ["native", "full_mix"]:
+                    loss_sums[edge.id][metric_name] += float(edge_losses[metric_name]) * batch_examples
+                counts[edge.id] += batch_examples
+
+                translated_key, translated_value = translator_pool.translate_layer_window(
+                    past_key_values=past_by_node_id[edge.src_id],
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
+                )
+                full_mix_prefix_past = replay_target_prefill_with_injected_window(
+                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    prefix_input_ids=prefix_cache_ids,
+                    target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
+                    injected_key_block=translated_key,
+                    injected_value_block=translated_value,
+                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    target_model_id=node_map[edge.tgt_id].model_id,
+                    cache_injected_window=True,
+                )
+                native_prefix_past = past_by_node_id[edge.tgt_id]
+                target_model = ctx.mm.get_model(edge.tgt_id)
+                target_tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+
+                for example_idx in range(batch_examples):
+                    native_prefix_example = slice_past_key_values_batch(native_prefix_past, example_idx)
+                    full_mix_prefix_example = slice_past_key_values_batch(full_mix_prefix_past, example_idx)
+                    example_lm_input_ids = lm_input_ids[example_idx : example_idx + 1]
+                    example_seed_token = lm_labels[example_idx : example_idx + 1, -1:]
+
+                    native_past_before_seed = append_input_ids_to_past(
+                        model=target_model,
+                        past_key_values=native_prefix_example,
+                        input_ids=example_lm_input_ids,
+                    )
+                    full_mix_past_before_seed = append_input_ids_to_past(
+                        model=target_model,
+                        past_key_values=full_mix_prefix_example,
+                        input_ids=example_lm_input_ids,
+                    )
+
+                    native_generation = generate_greedy_with_final_past(
+                        model=target_model,
+                        tokenizer=target_tokenizer,
+                        past_key_values=native_past_before_seed,
+                        seed_token=example_seed_token,
+                        max_new_tokens=config.generation_max_new_tokens,
+                    )
+                    full_mix_generation = generate_greedy_with_final_past(
+                        model=target_model,
+                        tokenizer=target_tokenizer,
+                        past_key_values=full_mix_past_before_seed,
+                        seed_token=example_seed_token,
+                        max_new_tokens=config.generation_max_new_tokens,
+                    )
+
+                    comparable_generated_tokens = min(
+                        len(native_generation["generated_token_ids"]),
+                        len(full_mix_generation["generated_token_ids"]),
+                    )
+                    similarity_matrix, group_labels, segment_group_counts = compute_full_mix_vs_native_kv_similarity_matrix(
+                        native_past_key_values=native_generation["final_past"],
+                        full_mix_past_key_values=full_mix_generation["final_past"],
+                        prefix_tokens=prefix_cache_ids.shape[1],
+                        suffix_tokens=example_lm_input_ids.shape[1] + 1,
+                        generated_tokens=comparable_generated_tokens,
+                        token_group_size=config.kv_similarity_token_group_size,
+                    )
+                    similarity_accumulators[edge.id].update(
+                        similarity_matrix=similarity_matrix,
+                        group_labels=group_labels,
+                        segment_group_counts=segment_group_counts,
+                    )
+
+            processed_examples += batch_examples
+            if batch_idx % 10 == 0:
+                logging.info(
+                    "[OpenWebText/validation][target=%s] loss+kv-sim progress: %d/%d sequences",
+                    target_node_id,
+                    processed_examples,
+                    max_examples,
+                )
+
+    loss_summary_by_edge: Dict[str, Dict[str, float]] = {}
+    heatmap_paths: Dict[str, str] = {}
+    metadata_paths: Dict[str, str] = {}
+    for edge in ctx.edges:
+        count = counts[edge.id]
+        native_loss = float(loss_sums[edge.id]["native"] / count) if count > 0 else float("nan")
+        full_mix_loss = float(loss_sums[edge.id]["full_mix"] / count) if count > 0 else float("nan")
+        loss_summary_by_edge[edge.id] = {
+            "loss": full_mix_loss,
+            "native_loss": native_loss,
+            "count": count,
+        }
+        heatmap_path, metadata_path = summarize_full_mix_vs_native_kv_similarity_artifacts(
+            run_dir=run_dir,
+            edge_id=edge.id,
+            accumulator=similarity_accumulators[edge.id],
+            token_group_size=config.kv_similarity_token_group_size,
+            title=(
+                f"Full-Mix vs Native KV similarity ({edge.id})\n"
+                f"OpenWebText | grouped tokens across prefix, observed suffix, and generated suffix"
+            ),
+        )
+        heatmap_paths[edge.id] = str(heatmap_path)
+        metadata_paths[edge.id] = str(metadata_path)
+        logging.info(
+            "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | kv_similarity_heatmap=%s",
+            edge.id,
+            native_loss,
+            full_mix_loss,
+            heatmap_path,
+        )
+
+    return loss_summary_by_edge, heatmap_paths, metadata_paths
 
 def plot_metric_controls_summary(summary_path: Path) -> Path:
     rows = read_summary_rows(summary_path)
@@ -1367,40 +1923,10 @@ def run_eval(
     dataset_logit_kl_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     logging.info("Preparing validation dataloader for OpenWebText/validation")
-
-    def evaluate_openwebtext_control_losses(
-        *,
-        edge_id: str,
-        edge: Edge,
-        prefix_cache_ids: torch.Tensor,
-        lm_input_ids: torch.Tensor,
-        lm_labels: torch.Tensor,
-        past_by_node_id,
-    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        edge_losses = compute_openwebtext_native_and_full_mix_losses(
-            ctx=ctx,
-            edge=edge,
-            prefix_cache_ids=prefix_cache_ids,
-            lm_input_ids=lm_input_ids,
-            lm_labels=lm_labels,
-            past_by_node_id=past_by_node_id,
-            translator_pool=translator_pool,
-        )
-        return {
-            "native": edge_losses["native"],
-            "translated": edge_losses["full_mix"],
-        }, {}
-
-    raw_openwebtext_loss_by_edge = evaluate_openwebtext_validation_loss_metrics(
+    raw_openwebtext_loss_by_edge, openwebtext_kv_similarity_heatmaps, openwebtext_kv_similarity_metadata = evaluate_openwebtext_losses_and_kv_similarity(
         ctx=ctx,
-        output_path=eval_config.output_path,
-        batch_size=config.eval_batch_size,
-        num_workers=config.eval_num_workers,
-        shuffle=config.eval_shuffle_stream,
-        seed=config.seed,
-        shuffle_buffer=config.shuffle_buffer,
-        max_examples=config.eval_max_examples_per_dataset,
-        evaluate_edge_losses_fn=evaluate_openwebtext_control_losses,
+        run_dir=run_dir,
+        translator_pool=translator_pool,
     )
 
     openwebtext_loss_by_edge: Dict[str, Dict[str, float]] = {}
@@ -1555,6 +2081,8 @@ def run_eval(
         "average_native_to_full_mix_logit_kl": average_native_to_full_mix_logit_kl,
         "average_full_mix_to_dir_only_logit_kl": average_full_mix_to_dir_only_logit_kl,
         "average_full_mix_to_mag_only_logit_kl": average_full_mix_to_mag_only_logit_kl,
+        "openwebtext_kv_similarity_heatmaps": openwebtext_kv_similarity_heatmaps,
+        "openwebtext_kv_similarity_metadata": openwebtext_kv_similarity_metadata,
     }
 
 
@@ -1644,6 +2172,11 @@ def main() -> None:
     print(f"Control analysis metrics: {analysis_metrics_path}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
     print(f"Validation Loss chart: {openwebtext_loss_chart_path}")
+    kv_similarity_heatmaps = combined_metrics.get("openwebtext_kv_similarity_heatmaps", {})
+    if kv_similarity_heatmaps:
+        print("Full-Mix vs Native KV similarity heatmaps:")
+        for edge_id, heatmap_path in kv_similarity_heatmaps.items():
+            print(f"  {edge_id}: {heatmap_path}")
 
 
 if __name__ == "__main__":
