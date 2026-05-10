@@ -62,7 +62,7 @@ class LayerPositionConfig(TrainConfig):
     eval_shuffle_stream: bool
     benchmark_mode: str
     generation_max_new_tokens: int
-    kv_similarity_token_group_size: int = 8
+    kv_similarity_token_group_size: int
 
     def __post_init__(self) -> None:
         super().__post_init__()
