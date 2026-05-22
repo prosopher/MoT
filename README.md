@@ -1,11 +1,15 @@
-# Mixture-of-Translators
+# MoT(Mixture-of-Translators)
 
-## 설치
+## 🔔 News
+
+* [2026-05-22] Released our Mixture-of-Translators code for the NeurIPS 2026 submission as `v0.1.0-neurips`.
+
+## Installation
 ```console
 pip install -r requirements.txt
 ```
 
-## 학습
+## Train
 ```console
 python train.py mot
 python train.py mot --default-config-path configs/train_mot_toy.json
@@ -14,7 +18,7 @@ python train.py lsc
 python train.py lsc --default-config-path configs/train_lsc_toy.json
 ```
 
-## 평가
+## Evalation
 ```console
 python eval.py
 python eval.py --default-config-path configs/eval_toy.json
