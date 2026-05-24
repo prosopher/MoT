@@ -31,11 +31,11 @@ SUPPORTED_CACHE_MODES = (CACHE_MODE_RETAIN, CACHE_MODE_FREE)
 SUPPORTED_ALGS = ("mot", "interlat", "lsc", "c2c-pr", "kvcomm")
 RETAIN_ONLY_ALGS = ("interlat", "lsc", "c2c-pr", "kvcomm")
 TRAIN_MODULE_BY_ALG = {
-    "mot": "mot.train",
-    "interlat": "interlat.train",
-    "lsc": "lsc.train",
-    "c2c-pr": "c2c.train",
-    "kvcomm": "kvcomm.train",
+    "mot": "alg.mot.train",
+    "interlat": "alg.interlat.train",
+    "lsc": "alg.lsc.train",
+    "c2c-pr": "alg.c2c.train",
+    "kvcomm": "alg.kvcomm.train",
 }
 
 
@@ -275,7 +275,7 @@ class KVCacheTranslationAdapter:
             )
 
         if self.alg == "interlat":
-            from interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states
+            from alg.interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states
 
             source_tokens = get_past_seq_len(source_past_key_values)
             if int(prefix_input_ids.shape[1]) != source_tokens:
@@ -309,7 +309,7 @@ class KVCacheTranslationAdapter:
             return translated_past
 
         if self.alg == "c2c-pr":
-            from c2c.train import translate_top_layers
+            from alg.c2c.train import translate_top_layers
 
             source_tokens = get_past_seq_len(source_past_key_values)
             if int(prefix_input_ids.shape[1]) != source_tokens:

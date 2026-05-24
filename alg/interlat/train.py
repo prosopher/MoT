@@ -38,8 +38,8 @@ from core.train_util import (
     move_trainable_module_to_config_dtype
 )
 from core.topology import Edge, Node
-from interlat.vender import ModelArguments as VendorModelArguments
-from interlat.vender.hidden_model.custom_model import HiddenStateProcessor
+from alg.interlat.vender import ModelArguments as VendorModelArguments
+from alg.interlat.vender.hidden_model.custom_model import HiddenStateProcessor
 
 
 _VENDOR_MODEL_ARGUMENTS = VendorModelArguments()

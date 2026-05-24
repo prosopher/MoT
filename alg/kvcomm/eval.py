@@ -18,7 +18,7 @@ from core.common import (
 from core.context import Context
 from core.eval_util import *
 from core.topology import Edge
-from kvcomm.train import KVCommSelectionPool
+from alg.kvcomm.train import KVCommSelectionPool
 
 
 

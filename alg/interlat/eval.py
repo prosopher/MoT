@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict
@@ -7,12 +9,67 @@ from torch.utils.data import DataLoader
 
 from core.context import Context
 from core.eval_util import *
-from c2c.train import (
-    get_top_layers_to_translate_for_edge,
-    get_top_layers_to_translate,
-    get_translation_mode_name,
-    translate_top_layers,
+from alg.interlat.train import (
+    build_latent_conditioned_past,
+    extract_interlat_source_hidden_states,
 )
+
+
+def _slice_past_to_last_tokens(past_key_values, *, target_seq_len: int):
+    if target_seq_len < 1:
+        raise ValueError(f"target_seq_len must be >= 1, got {target_seq_len}")
+    sliced_layers = []
+    for key, value in past_key_values:
+        if key.shape[2] < target_seq_len or value.shape[2] < target_seq_len:
+            raise ValueError(
+                "Cannot align InterLat past lengths for cosine: "
+                f"source_seq_len={key.shape[2]}, target_seq_len={target_seq_len}"
+            )
+        sliced_layers.append(
+            (
+                key[:, :, -target_seq_len:, :].contiguous(),
+                value[:, :, -target_seq_len:, :].contiguous(),
+            )
+        )
+    return tuple(sliced_layers)
+
+
+def _cosine_similarity_for_interlat_past(translated_past, native_past) -> float:
+    if len(translated_past) != len(native_past):
+        raise ValueError(
+            "InterLat past cosine requires the same number of layers: "
+            f"translated={len(translated_past)}, native={len(native_past)}"
+        )
+    aligned_seq_len = min(
+        min(int(key.shape[2]) for key, _ in translated_past),
+        min(int(key.shape[2]) for key, _ in native_past),
+    )
+    aligned_translated_past = _slice_past_to_last_tokens(translated_past, target_seq_len=aligned_seq_len)
+    aligned_native_past = _slice_past_to_last_tokens(native_past, target_seq_len=aligned_seq_len)
+    return cosine_similarity_between_past(aligned_translated_past, aligned_native_past)
+
+
+@torch.inference_mode()
+def _build_interlat_target_past(
+    *,
+    ctx: Context,
+    edge: Edge,
+    prefix_input_ids: torch.Tensor,
+    translator_pool,
+) -> PastKeyValues:
+    target_model = ctx.mm.get_model(edge.tgt_id)
+    source_hidden_states = extract_interlat_source_hidden_states(
+        ctx.mm.get_model(edge.src_id),
+        prefix_input_ids,
+    )
+    translated_latents = translator_pool.translate_hidden_states(
+        edge_id=edge.id,
+        source_hidden_states=source_hidden_states,
+    )
+    return build_latent_conditioned_past(
+        target_model,
+        latent_prefix=translated_latents,
+    )
 
 
 def _build_logit_example_state(
@@ -33,32 +90,117 @@ def _build_logit_edge_artifacts(
     *,
     ctx: Context,
     edge: Edge,
+    prefix_input_ids: torch.Tensor,
+    prepared_inputs,
     example_state,
     translator_pool,
     **_,
 ) -> LogitEvalEdgeArtifacts:
-    train_config = ctx.config
-    past_by_node_id = example_state["past_by_node_id"]
-
-    translated_top_past = translate_top_layers(
+    del prepared_inputs
+    translated_past = _build_interlat_target_past(
+        ctx=ctx,
+        edge=edge,
+        prefix_input_ids=prefix_input_ids,
         translator_pool=translator_pool,
-        train_config=train_config,
-        sharer_past_key_values=past_by_node_id[edge.src_id],
-        receiver_past_key_values=past_by_node_id[edge.tgt_id],
-        src_node_id=edge.src_id,
-        tgt_node_id=edge.tgt_id,
-        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+    )
+    native_past = example_state["past_by_node_id"][edge.tgt_id]
+    return LogitEvalEdgeArtifacts(
+        translated_past_key_values=translated_past,
+        native_past_key_values=native_past,
+        cosine_value=_cosine_similarity_for_interlat_past(translated_past, native_past),
     )
 
-    native_past = past_by_node_id[edge.tgt_id]
-    translated_target_past = replace_top_layers(
-        base_past_key_values=native_past,
-        translated_top_past_key_values=translated_top_past,
-    )
-    return LogitEvalEdgeArtifacts(
-        translated_past_key_values=translated_target_past,
-        native_past_key_values=native_past,
-        cosine_value=cosine_similarity_between_past(translated_target_past, native_past),
+
+@torch.inference_mode()
+def evaluate_openwebtext_validation_loss_interlat(
+    ctx: Context,
+    eval_config: EvalConfig,
+    translator_pool,
+    *,
+    build_visualization_pasts_fn=None,
+) -> Dict[str, Dict[str, float]]:
+    """OpenWebText evaluation using the common metric loop and true source hidden states.
+
+    InterLat communicates last-layer hidden states, so the translated past must be
+    built from the same prefix ids used by the common evaluation split rather than
+    from a KV value cache.
+    """
+
+    train_config = ctx.config
+    profiler = InferenceProfiler(train_config.device)
+
+    def evaluate_edge_losses_fn(
+        *,
+        edge_id: str,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        lm_input_ids: torch.Tensor,
+        lm_labels: torch.Tensor,
+        past_by_node_id,
+    ):
+        del edge_id
+        profile_tokens = int(lm_labels.numel())
+        seed_token = lm_input_ids[:, :1]
+        generation_steps = int(lm_labels.shape[1])
+
+        translated_target_past = _build_interlat_target_past(
+            ctx=ctx,
+            edge=edge,
+            prefix_input_ids=prefix_cache_ids,
+            translator_pool=translator_pool,
+        )
+        translated_loss = float(
+            compute_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=translated_target_past,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        native_loss = float(
+            compute_suffix_lm_loss(
+                target_model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+
+        def run_translated_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=translated_target_past,
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
+            )
+
+        def run_native_inference() -> int:
+            return run_openwebtext_greedy_inference(
+                model=ctx.mm.get_model(edge.tgt_id),
+                past_key_values=past_by_node_id[edge.tgt_id],
+                seed_token=seed_token,
+                max_new_tokens=generation_steps,
+            )
+
+        _, translated_profile = profiler.measure(run_translated_inference, tokens=profile_tokens)
+        with temporarily_offload_module(translator_pool, train_config.device):
+            _, native_profile = profiler.measure(run_native_inference, tokens=profile_tokens)
+        return (
+            {"translated": translated_loss, "native": native_loss},
+            {"translated": translated_profile, "native": native_profile},
+        )
+
+    return evaluate_openwebtext_validation_loss_metrics(
+        ctx=ctx,
+        output_path=eval_config.output_path,
+        batch_size=eval_config.batch_size,
+        num_workers=eval_config.num_workers,
+        shuffle=eval_config.shuffle_eval_stream,
+        seed=eval_config.seed,
+        shuffle_buffer=eval_config.shuffle_buffer,
+        max_examples=eval_config.max_examples_per_dataset,
+        evaluate_edge_losses_fn=evaluate_edge_losses_fn,
+        build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
 
 
@@ -71,7 +213,6 @@ def evaluate_generation_dataset(
     translator_pool,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    nodes = ctx.nodes
     edges = ctx.edges
     device = train_config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
@@ -122,30 +263,21 @@ def evaluate_generation_dataset(
 
                 past_by_node_id = {
                     node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
-                    for node in nodes
+                    for node in ctx.nodes
                 }
-
-                translated_top_past = translate_top_layers(
+                translated_past = _build_interlat_target_past(
+                    ctx=ctx,
+                    edge=edge,
+                    prefix_input_ids=prefix_input_ids,
                     translator_pool=translator_pool,
-                    train_config=train_config,
-                    sharer_past_key_values=past_by_node_id[edge.src_id],
-                    receiver_past_key_values=past_by_node_id[edge.tgt_id],
-                    src_node_id=edge.src_id,
-                    tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
                 )
-
                 native_past = past_by_node_id[edge.tgt_id]
-                translated_target_past = replace_top_layers(
-                    base_past_key_values=native_past,
-                    translated_top_past_key_values=translated_top_past,
-                )
-                cosine_value = cosine_similarity_between_past(translated_target_past, native_past)
+                cosine_value = _cosine_similarity_for_interlat_past(translated_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
-                    past_key_values=translated_target_past,
+                    past_key_values=translated_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
@@ -153,7 +285,7 @@ def evaluate_generation_dataset(
                 native_answer = predict_generation_task_answer(
                     model=ctx.mm.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
-                    past_key_values=past_by_node_id[edge.tgt_id],
+                    past_key_values=native_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     suffix_cache_ids=suffix_cache_ids,
@@ -198,7 +330,7 @@ def run_eval(
     write_json(str(config_path), asdict(eval_config))
 
     log_path = get_eval_log_path(eval_config.output_path)
-    logging.info("Starting evaluation")
+    logging.info("Starting InterLat evaluation")
     logging.info("checkpoint_dir_path=%s", checkpoint_dir_path)
     logging.info("eval_config=%s", asdict(eval_config))
 
@@ -209,14 +341,9 @@ def run_eval(
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
     logging.info("edges=%s", [edge.id for edge in edges])
-    logging.info("top_layers_to_translate=%s", get_top_layers_to_translate(train_config))
-    for edge in edges:
-        logging.info(
-            "top_layers_to_translate[%s]=%d",
-            edge.id,
-            get_top_layers_to_translate_for_edge(train_config, ctx, edge),
-        )
-    logging.info("translation_mode=%s", get_translation_mode_name(train_config))
+    logging.info(
+        "translation_mode=interlat_latent_prefix_from_source_hidden_states"
+    )
     logging.info("qa_eval_log_path=%s", log_path)
 
     all_logit_results = {}
@@ -224,47 +351,29 @@ def run_eval(
 
     logging.info("Preparing validation dataloader for OpenWebText/validation")
 
-    def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        translated_top_past = translate_top_layers(
+    def build_visualization_pasts_fn(
+        *,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        past_by_node_id,
+        **_,
+    ) -> Dict[str, PastKeyValues]:
+        translated_past = _build_interlat_target_past(
+            ctx=ctx,
+            edge=edge,
+            prefix_input_ids=prefix_cache_ids,
             translator_pool=translator_pool,
-            train_config=train_config,
-            sharer_past_key_values=past_by_node_id[edge.src_id],
-            receiver_past_key_values=past_by_node_id[edge.tgt_id],
-            src_node_id=edge.src_id,
-            tgt_node_id=edge.tgt_id,
-            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
         )
-        return replace_top_layers(
-            base_past_key_values=past_by_node_id[edge.tgt_id],
-            translated_top_past_key_values=translated_top_past,
-        )
-
-    def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
         return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=slice_top_layers(
-                past_key_values=past_by_node_id[edge.src_id],
-                top_layers_to_translate=get_top_layers_to_translate_for_edge(train_config, ctx, edge),
-            ),
-            translated_past_key_values=translate_top_layers(
-                translator_pool=translator_pool,
-                train_config=train_config,
-                sharer_past_key_values=past_by_node_id[edge.src_id],
-                receiver_past_key_values=past_by_node_id[edge.tgt_id],
-                src_node_id=edge.src_id,
-                tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
-            ),
-            target_top_past_key_values=slice_top_layers(
-                past_key_values=past_by_node_id[edge.tgt_id],
-                top_layers_to_translate=get_top_layers_to_translate_for_edge(train_config, ctx, edge),
-            ),
+            source_top_past_key_values=past_by_node_id[edge.src_id],
+            translated_past_key_values=translated_past,
+            target_top_past_key_values=past_by_node_id[edge.tgt_id],
         )
 
-    openwebtext_loss_results = evaluate_openwebtext_validation_loss(
+    openwebtext_loss_results = evaluate_openwebtext_validation_loss_interlat(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,
-        build_translated_target_past_fn=build_translated_target_past_fn,
         build_visualization_pasts_fn=build_visualization_pasts_fn,
     )
     for edge in edges:
@@ -278,12 +387,9 @@ def run_eval(
             build_openwebtext_profile_cell(row),
             row["count"],
         )
-        if row.get("tsne_plot_path"):
-            logging.info(
-                "[OpenWebText/validation] %s | tsne_plot=%s",
-                edge.id,
-                row["tsne_plot_path"],
-            )
+        tsne_plot_path = row.get("tsne_plot_path")
+        if isinstance(tsne_plot_path, str) and tsne_plot_path:
+            logging.info("[OpenWebText/validation] %s | tsne_plot=%s", edge.id, tsne_plot_path)
 
     logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:
@@ -350,6 +456,5 @@ def run_eval(
         openwebtext_loss_results=openwebtext_loss_results,
     )
     logging.info("===== FINAL MARKDOWN SUMMARY =====\n%s", final_summary_markdown)
-
-    logging.info("Done. Saved log to %s", log_path)
+    logging.info("Saved eval log to %s", log_path)
     return log_path

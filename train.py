@@ -11,7 +11,7 @@ from core.train_util import build_models_and_tokenizers, get_train_log_path
 
 
 def load_train_module(alg: str):
-    module_name = f"{alg}.train"
+    module_name = f"alg.{alg}.train"
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError as exc:

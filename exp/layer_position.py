@@ -16,7 +16,7 @@ from core.context import Context
 from core.model_manager import ModelManager
 from core.model_spec import ModelSpec, infer_model_spec_from_config
 from core.eval_util import *
-from mot.train import *
+from alg.mot.train import *
 from core.train_util import *
 from transformers import AutoConfig
 from exp.exp_util import (

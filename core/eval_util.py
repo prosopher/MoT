@@ -1690,7 +1690,7 @@ def load_train_config_from_checkpoint(
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
 
-    module_name = f"{alg}.train"
+    module_name = f"alg.{alg}.train"
     try:
         train_module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
@@ -1717,7 +1717,7 @@ def build_eval_context(
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
 
-    module_name = f"{alg}.train"
+    module_name = f"alg.{alg}.train"
     try:
         train_module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:

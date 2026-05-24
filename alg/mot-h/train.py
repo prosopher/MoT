@@ -17,7 +17,7 @@ from core.context import Context
 from core.model_manager import ModelManager
 from core.model_spec import ModelSpec
 from core.train_util import *
-from mot.train import (
+from alg.mot.train import (
     CrossLayerWindowTranslator,
     TrainConfig,
     build_window_translator,

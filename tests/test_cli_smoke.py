@@ -5,7 +5,7 @@ import pytest
 
 import eval as eval_entry
 import train as train_entry
-import mot.train as mot_train_module
+import alg.mot.train as mot_train_module
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

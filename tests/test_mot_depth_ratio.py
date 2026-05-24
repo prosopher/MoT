@@ -8,8 +8,8 @@ from core.channel_profiler import ChannelProfileConfig, ChannelProfiler, ProxyVa
 from core.context import Context
 from core.model_spec import ModelSpec
 from core.topology import Edge
-from mot.train import replay_target_prefill_with_injected_window
-import mot.train as mot_train_module
+from alg.mot.train import replay_target_prefill_with_injected_window
+import alg.mot.train as mot_train_module
 
 
 class DummyModelManager:

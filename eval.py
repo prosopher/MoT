@@ -7,7 +7,7 @@ from core.topology import build_nodes_and_edges
 
 
 def load_eval_module(alg: str):
-    module_name = f"{alg}.eval"
+    module_name = f"alg.{alg}.eval"
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError as exc:

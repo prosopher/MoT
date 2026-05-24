@@ -567,7 +567,7 @@ class ChannelProfiler:
         channels: List[Channel],
         train_bank: List[Dict[str, Any]],
     ):
-        from mot.train import LayerWindowDirectionalTranslator
+        from alg.mot.train import LayerWindowDirectionalTranslator
 
         random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
@@ -657,7 +657,7 @@ class ChannelProfiler:
         sample: Dict[str, Any],
     ) -> torch.Tensor:
         from .common import compute_prefix_correction_and_suffix_lm_loss, past_key_values_to_blocks
-        from mot.train import replay_target_prefill_with_injected_window
+        from alg.mot.train import replay_target_prefill_with_injected_window
 
         src_layer_indices = self._get_src_layer_indices(channels)
         target_layer_indices = self._get_tgt_layer_indices(channels)
@@ -692,7 +692,7 @@ class ChannelProfiler:
         sample: Dict[str, Any],
     ) -> torch.Tensor:
         from .common import compute_prefix_correction_and_suffix_lm_loss, past_key_values_to_blocks
-        from mot.train import replay_target_prefill_with_injected_window
+        from alg.mot.train import replay_target_prefill_with_injected_window
 
         src_layer_indices = self._get_src_layer_indices(channels)
         target_layer_indices = self._get_tgt_layer_indices(channels)
