@@ -71,7 +71,6 @@ EVAL_BAR_METRICS = [
 ]
 
 MOT_COLOR = ACCENT_RED
-MOT_H_COLOR = AI_PAPER_PALETTE[2]
 OTHER_BAR_COLOR = "#C7CDD6"
 NATIVE_COLOR = AI_PAPER_PALETTE[6]
 NON_RED_ORANGE_PURPLE_RADAR_PALETTES = (
@@ -91,7 +90,6 @@ ALGORITHM_DISPLAY_NAMES = {
     "kvcomm": "KVComm",
     "lsc": "LSC",
     "mot": "MoT",
-    "mot-h": "MoT-h",
     "mot-single": "MoT (single)",
     "native": "Native",
 }
@@ -432,7 +430,7 @@ def non_red_orange_purple_radar_palette(sample_count: int) -> List[tuple[float, 
 
 
 def radar_colors_for_series(series_list: Sequence[Series]) -> List[tuple[float, float, float, float] | str]:
-    other_count = sum(1 for series in series_list if series.algorithm.strip().lower() not in {"mot", "mot-h"})
+    other_count = sum(1 for series in series_list if series.algorithm.strip().lower() != "mot")
     other_colors = non_red_orange_purple_radar_palette(other_count)
     other_color_iter = iter(other_colors)
 
@@ -441,8 +439,6 @@ def radar_colors_for_series(series_list: Sequence[Series]) -> List[tuple[float, 
         normalized = series.algorithm.strip().lower()
         if normalized == "mot":
             colors.append(MOT_COLOR)
-        elif normalized == "mot-h":
-            colors.append(MOT_H_COLOR)
         else:
             colors.append(next(other_color_iter))
     return colors
@@ -792,8 +788,6 @@ def bar_color_for_method(method: str) -> str:
     normalized = method.strip().lower()
     if normalized == "native":
         return NATIVE_COLOR
-    if normalized == "mot-h":
-        return MOT_H_COLOR
     if normalized == "mot":
         return MOT_COLOR
     return OTHER_BAR_COLOR

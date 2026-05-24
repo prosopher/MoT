@@ -1292,7 +1292,7 @@ def evaluate_openwebtext_validation_loss(
     build_translated_target_past_fn: Optional[Callable[..., PastKeyValues]] = None,
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    if eval_config.alg in {"mot", "mot-h"}:
+    if eval_config.alg == "mot":
         return evaluate_openwebtext_validation_loss_replay(
             ctx=ctx,
             eval_config=eval_config,

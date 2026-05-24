@@ -42,7 +42,6 @@ OUTPUT_FIGSIZE = (OUTPUT_WIDTH_PX / OUTPUT_DPI, OUTPUT_HEIGHT_PX / OUTPUT_DPI)
 METHOD_COLORS = {
     "C2C": ACCENT_BLUE,
     "Interlat": ACCENT_AQUA,
-    "MoT-h": ACCENT_BLACK,
     "MoT": ACCENT_GREEN,
     "LSC": ACCENT_ORANGE,
 }
@@ -56,9 +55,6 @@ METHOD_ALIASES = {
     "kvcomm": "KVComm",
     "kv_comm": "KVComm",
     "kv-comm": "KVComm",
-    "mot_h": "MoT-h",
-    "mot-h": "MoT-h",
-    "moth": "MoT-h",
     "mot": "MoT",
     "lsc": "LSC",
 }
@@ -326,7 +322,7 @@ def draw_dual_axis_plot(*, rows: list[Row], output_path: Path) -> None:
                 valid_values,
                 width=bar_width * 0.92,
                 color=color,
-                alpha=0.78 if method != "MoT-h" else 0.88,
+                alpha=0.78,
                 edgecolor="white",
                 linewidth=0.6,
                 zorder=2,
