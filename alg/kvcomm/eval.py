@@ -526,7 +526,6 @@ def run_eval(
     summary_path.write_text(summary_markdown, encoding="utf-8")
 
     logging.info("===== FINAL MARKDOWN SUMMARY =====\n%s", summary_markdown)
-    logging.info("Saved metrics to %s", metrics_path)
     logging.info("Saved summary to %s", summary_path)
     logging.info("Done. Saved log to %s", log_path)
     return log_path
