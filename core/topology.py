@@ -96,6 +96,18 @@ def parse_model_directions(model_directions: str, allowed_directions: Optional[I
     return deduped
 
 
+def get_translator_id(src_model_id: str, tgt_model_id: str) -> str:
+    """Return a stable ModuleDict-safe id for a source-model -> target-model translator."""
+
+    def normalize(model_id: str) -> str:
+        normalized = str(model_id).strip().strip("/")
+        normalized = re.sub(r"[^0-9A-Za-z_-]+", "_", normalized)
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        return normalized or "model"
+
+    return f"{normalize(src_model_id)}_to_{normalize(tgt_model_id)}"
+
+
 def build_node_map(nodes: Iterable[Node]) -> Dict[str, Node]:
     return {node.id: node for node in nodes}
 

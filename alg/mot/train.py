@@ -22,6 +22,7 @@ from core.context import Context
 from core.model_manager import ModelManager
 from core.model_spec import ModelSpec
 from core.train_util import *
+from core.topology import get_translator_id
 
 
 MOT_VARIANTS = {"single", "mot"}
@@ -407,24 +408,27 @@ class LayerWindowTranslatorPool(nn.Module):
         self.edges_by_id = build_edge_map(ctx.edges)
         self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
 
-        adapters = {}
+        translators = {}
         for edge in self.edges:
-            channels = self.cm.get_channels(edge.id)
             src_spec = self.mm.get_model_spec(edge.src_id)
             tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-            adapters[edge.id] = LayerWindowDirectionalTranslator(
-                src_hidden_size=src_spec.kv_hidden_size,
-                tgt_hidden_size=tgt_spec.kv_hidden_size,
-                num_layers=len(channels),
-                translator_dim=translator_dim,
-                translator_heads=translator_heads,
-                translator_depth=translator_depth,
-                mlp_ratio=mlp_ratio,
-                variant=variant,
-                mot_num_translators=mot_num_translators,
-                mot_top_k=mot_top_k,
-            )
-        self.adapters = nn.ModuleDict(adapters)
+            translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
+            if translator_id not in translators:
+                channels = self.cm.get_channels(edge.id)
+                translators[translator_id] = LayerWindowDirectionalTranslator(
+                    src_hidden_size=src_spec.kv_hidden_size,
+                    tgt_hidden_size=tgt_spec.kv_hidden_size,
+                    num_layers=len(channels),
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                    variant=variant,
+                    mot_num_translators=mot_num_translators,
+                    mot_top_k=mot_top_k,
+                )
+        self.translators = nn.ModuleDict(translators)
+        self.translator_ids = tuple(self.translators.keys())
 
     def _extract_channel_blocks(
         self,
@@ -442,16 +446,22 @@ class LayerWindowTranslatorPool(nn.Module):
         tgt_node_id: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         edge_id = f"{src_node_id}_to_{tgt_node_id}"
-        if edge_id not in self.adapters:
+        if edge_id not in self.edges_by_id:
             raise ValueError(
                 f"Translator edge {edge_id} is not available. "
                 f"Active edges: {list(self.edge_ids)}"
+            )
+        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
+        if translator_id not in self.translators:
+            raise ValueError(
+                f"Translator {translator_id} is not available. "
+                f"Active translators: {list(self.translator_ids)}"
             )
         key_block, value_block = self._extract_channel_blocks(
             past_key_values=past_key_values,
             edge_id=edge_id,
         )
-        translated_key, translated_value = self.adapters[edge_id](key_block, value_block)
+        translated_key, translated_value = self.translators[translator_id](key_block, value_block)
         return translated_key, translated_value
 
     def build_replayed_target_past(

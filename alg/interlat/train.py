@@ -37,7 +37,7 @@ from core.train_util import (
     initialize_train_output_paths,
     move_trainable_module_to_config_dtype
 )
-from core.topology import Edge, Node
+from core.topology import Edge, Node, get_translator_id
 from alg.interlat.vender import ModelArguments as VendorModelArguments
 from alg.interlat.vender.hidden_model.custom_model import HiddenStateProcessor
 
@@ -80,10 +80,10 @@ class TrainConfig(Config):
 
 
 class InterLatEdgeTranslator(nn.Module):
-    """Interlat-style hidden-state adapter.
+    """Interlat-style hidden-state translator.
 
     The upstream Interlat path directly communicates last-layer hidden states and
-    lets a compact hidden-state processor adapt their numerical range before
+    lets a compact hidden-state processor translate their numerical range before
     insertion into the receiver.  This module intentionally avoids the previous
     benchmark-specific query-token cross-attention compressor and hidden-state
     regression target.
@@ -111,18 +111,36 @@ class InterLatTranslatorPool(nn.Module):
     def __init__(self, ctx: Context) -> None:
         super().__init__()
         config = ctx.config
-        self.edge_translators = nn.ModuleDict()
+        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+        translators = {}
         for edge in ctx.edges:
+            translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
+            if translator_id in translators:
+                continue
             src_spec = ctx.mm.get_model_spec(edge.src_id)
             tgt_spec = ctx.mm.get_model_spec(edge.tgt_id)
-            self.edge_translators[edge.id] = InterLatEdgeTranslator(
+            translators[translator_id] = InterLatEdgeTranslator(
                 source_hidden_size=src_spec.hidden_size,
                 target_hidden_size=tgt_spec.hidden_size,
                 prepended_num_heads=config.prepended_num_heads,
             )
+        self.translators = nn.ModuleDict(translators)
+        self.translator_ids = tuple(self.translators.keys())
 
-    def translate_hidden_states(self, *, edge_id: str, source_hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.edge_translators[edge_id](source_hidden_states)
+    def translate_hidden_states(
+        self,
+        *,
+        source_hidden_states: torch.Tensor,
+        src_node_id: str,
+        tgt_node_id: str,
+    ) -> torch.Tensor:
+        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
+        if translator_id not in self.translators:
+            raise ValueError(
+                f"InterLat translator {translator_id} is not available. "
+                f"Active translators: {list(self.translator_ids)}"
+            )
+        return self.translators[translator_id](source_hidden_states)
 
 
 def get_model_context_limit(model) -> int:
@@ -449,7 +467,8 @@ def run_train(
                 )
 
                 translated_latents = translator_pool.translate_hidden_states(
-                    edge_id=edge.id,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
                     source_hidden_states=source_hidden_states,
                 )
                 if translated_latents.shape[1] + lm_input_ids.shape[1] > tgt_model_context_limit:
@@ -479,7 +498,8 @@ def run_train(
                         lm_labels=lm_labels,
                     )
                     random_latents = translator_pool.translate_hidden_states(
-                        edge_id=edge.id,
+                        src_node_id=edge.src_id,
+                        tgt_node_id=edge.tgt_id,
                         source_hidden_states=build_mismatched_source_hidden_states(source_hidden_states),
                     )
                     random_past = build_latent_conditioned_past(

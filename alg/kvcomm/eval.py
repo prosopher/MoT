@@ -504,27 +504,6 @@ def run_eval(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    aggregate_metrics = {
-        "train_config": asdict(train_config),
-        "selection_source": f"{train_config.calibration_dataset}/train",
-        "selection_total_tokens": _openwebtext_total_tokens(train_config),
-        "selection_prefix_tokens": _openwebtext_prefix_tokens(train_config),
-        "selected_target_layers_by_edge": {
-            edge.id: translator_pool.get_selected_target_layers(edge.id)
-            for edge in edges
-        },
-        "selected_source_layers_by_edge": {
-            edge.id: translator_pool.get_selected_source_layers(edge.id)
-            for edge in edges
-        },
-        "openwebtext_loss_results": openwebtext_loss_results,
-        "logit_results": all_logit_results,
-        "generation_results": all_generation_results,
-    }
-
-    metrics_path = Path(eval_config.output_path) / "metrics.json"
-    write_json(str(metrics_path), aggregate_metrics)
-
     selected_layer_lines: List[str] = ["## KVComm selected replay layers", ""]
     for edge in edges:
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)

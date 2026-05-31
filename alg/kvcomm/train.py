@@ -14,7 +14,7 @@ from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, read_json, 
 from core.config import Config, resolve_device
 from core.context import Context
 from core.model_manager import ModelManager
-from core.topology import Edge, Node, build_edge_map
+from core.topology import Edge, Node, build_edge_map, get_translator_id
 from core.train_util import (
     build_models_and_tokenizers,
     get_train_checkpoint_path,
@@ -163,17 +163,18 @@ class KVCommSelectionPool:
     def __init__(
         self,
         ctx: Context,
-        selected_target_layers_by_edge: Dict[str, List[int]],
-        selected_source_layers_by_edge: Optional[Dict[str, List[int]]] = None,
+        selected_target_layers_by_translator_id: Dict[str, List[int]],
+        selected_source_layers_by_translator_id: Optional[Dict[str, List[int]]] = None,
     ) -> None:
         self.ctx = ctx
-        self.selected_target_layers_by_edge = {
-            edge_id: [int(layer_idx) for layer_idx in layers]
-            for edge_id, layers in selected_target_layers_by_edge.items()
+        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+        self.selected_target_layers_by_translator_id = {
+            translator_id: [int(layer_idx) for layer_idx in layers]
+            for translator_id, layers in selected_target_layers_by_translator_id.items()
         }
-        self.selected_source_layers_by_edge = {
-            edge_id: [int(layer_idx) for layer_idx in layers]
-            for edge_id, layers in (selected_source_layers_by_edge or {}).items()
+        self.selected_source_layers_by_translator_id = {
+            translator_id: [int(layer_idx) for layer_idx in layers]
+            for translator_id, layers in (selected_source_layers_by_translator_id or {}).items()
         }
         self.edge_map = build_edge_map(ctx.edges)
         self._validate_all_edges()
@@ -226,16 +227,19 @@ class KVCommSelectionPool:
         }
 
     def get_selected_target_layers(self, edge_id: str) -> List[int]:
-        return list(self.selected_target_layers_by_edge[edge_id])
+        edge = self.edge_map[edge_id]
+        translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
+        return list(self.selected_target_layers_by_translator_id[translator_id])
 
     def get_selected_source_layers(self, edge_id: str) -> List[int]:
-        if edge_id in self.selected_source_layers_by_edge:
-            return list(self.selected_source_layers_by_edge[edge_id])
         edge = self.edge_map[edge_id]
+        translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
+        if translator_id in self.selected_source_layers_by_translator_id:
+            return list(self.selected_source_layers_by_translator_id[translator_id])
         src_spec = self.ctx.mm.get_model_spec(edge.src_id)
         tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
         tgt_to_src = self.target_to_source_layer_map(src_spec.num_layers, tgt_spec.num_layers)
-        return sorted({tgt_to_src[idx] for idx in self.selected_target_layers_by_edge[edge_id]})
+        return sorted({tgt_to_src[idx] for idx in self.selected_target_layers_by_translator_id[translator_id]})
 
     def build_replayed_target_past(
         self,
@@ -251,10 +255,11 @@ class KVCommSelectionPool:
                 raise ValueError("Either edge_id or both src_node_id/tgt_node_id must be provided.")
             edge_id = f"{src_node_id}_to_{tgt_node_id}"
         edge = self.edge_map[edge_id]
+        translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
         src_spec = self.ctx.mm.get_model_spec(edge.src_id)
         tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
         tgt_to_src = self.target_to_source_layer_map(src_spec.num_layers, tgt_spec.num_layers)
-        selected_target_layers = set(self.selected_target_layers_by_edge[edge_id])
+        selected_target_layers = set(self.selected_target_layers_by_translator_id[translator_id])
 
         replayed = []
         for tgt_layer_idx in range(tgt_spec.num_layers):
@@ -410,7 +415,9 @@ def _select_layers_for_edge(
 ) -> EdgeCalibrationResult:
     target_spec = ctx.mm.get_model_spec(edge.tgt_id)
     source_spec = ctx.mm.get_model_spec(edge.src_id)
-    pool_probe = KVCommSelectionPool(ctx, selected_target_layers_by_edge={edge.id: [0]})
+    node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    translator_id = get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id])
+    pool_probe = KVCommSelectionPool(ctx, selected_target_layers_by_translator_id={translator_id: [0]})
     del pool_probe
 
     candidate_layers, manual_layers, num_layers_to_select = _resolve_candidate_target_layers(
@@ -556,50 +563,54 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
             raise RuntimeError(f"Failed to sample any {config.calibration_dataset} sequences for target {target_node_id}.")
         logging.info("Collected %d %s batch(es) for target=%s layer selection", len(calibration_batches), config.calibration_dataset, target_node_id)
 
-    calibration_by_edge: Dict[str, EdgeCalibrationResult] = {}
+    node_model_ids = {node.id: node.model_id for node in nodes}
+    calibration_by_translator_id: Dict[str, EdgeCalibrationResult] = {}
     for edge in edges:
-        calibration_batches = calibration_batches_by_target[edge.tgt_id]
-        result = _select_layers_for_edge(
-            ctx=ctx,
-            edge=edge,
-            config=config,
-            calibration_batches=calibration_batches,
-        )
-        calibration_by_edge[edge.id] = result
+        translator_id = get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id])
+        if translator_id not in calibration_by_translator_id:
+            calibration_batches = calibration_batches_by_target[edge.tgt_id]
+            calibration_by_translator_id[translator_id] = _select_layers_for_edge(
+                ctx=ctx,
+                edge=edge,
+                config=config,
+                calibration_batches=calibration_batches,
+            )
+        result = calibration_by_translator_id[translator_id]
         logging.info(
-            "%s | selected_target_layers=%s | selected_source_layers=%s | calibration_score=%s",
+            "%s | translator_id=%s | selected_target_layers=%s | selected_source_layers=%s | calibration_score=%s",
             edge.id,
+            translator_id,
             result.selected_target_layers,
             result.selected_source_layers,
             "N/A" if result.calibration_score is None else f"{result.calibration_score:.6f}",
         )
         if result.layer_ranking is not None:
-            logging.info("%s | layer_ranking=%s", edge.id, result.layer_ranking)
+            logging.info("%s | translator_id=%s | layer_ranking=%s", edge.id, translator_id, result.layer_ranking)
 
     checkpoint_payload = {
         "train_config": asdict(config),
         "selection_source": f"{config.calibration_dataset}/train",
         "selection_total_tokens": _openwebtext_total_tokens(config),
         "selection_prefix_tokens": _openwebtext_prefix_tokens(config),
-        "selected_target_layers_by_edge": {
-            edge_id: result.selected_target_layers
-            for edge_id, result in calibration_by_edge.items()
+        "selected_target_layers_by_translator_id": {
+            translator_id: result.selected_target_layers
+            for translator_id, result in calibration_by_translator_id.items()
         },
-        "selected_source_layers_by_edge": {
-            edge_id: result.selected_source_layers
-            for edge_id, result in calibration_by_edge.items()
+        "selected_source_layers_by_translator_id": {
+            translator_id: result.selected_source_layers
+            for translator_id, result in calibration_by_translator_id.items()
         },
-        "layer_ranking_by_edge": {
-            edge_id: result.layer_ranking
-            for edge_id, result in calibration_by_edge.items()
+        "layer_ranking_by_translator_id": {
+            translator_id: result.layer_ranking
+            for translator_id, result in calibration_by_translator_id.items()
         },
-        "calibration_score_by_edge": {
-            edge_id: result.calibration_score
-            for edge_id, result in calibration_by_edge.items()
+        "calibration_score_by_translator_id": {
+            translator_id: result.calibration_score
+            for translator_id, result in calibration_by_translator_id.items()
         },
-        "attention_importance_by_edge": {
-            edge_id: result.attention_importance
-            for edge_id, result in calibration_by_edge.items()
+        "attention_importance_by_translator_id": {
+            translator_id: result.attention_importance
+            for translator_id, result in calibration_by_translator_id.items()
         },
         "note": (
             "KVComm has no gradient-based training in this repository wrapper. "
@@ -643,9 +654,26 @@ def load_translator_pool_from_checkpoint(
         ChannelManager(edges),
     )
     payload = torch.load(str(checkpoint_path), map_location="cpu")
+    node_model_ids = {node.id: node.model_id for node in nodes}
+    selected_target_layers_by_translator_id = payload.get("selected_target_layers_by_translator_id")
+    selected_source_layers_by_translator_id = payload.get("selected_source_layers_by_translator_id")
+    if selected_target_layers_by_translator_id is None:
+        selected_target_layers_by_translator_id = {
+            get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id]): layers
+            for edge in edges
+            for edge_id, layers in payload["selected_target_layers_by_edge"].items()
+            if edge.id == edge_id
+        }
+    if selected_source_layers_by_translator_id is None:
+        selected_source_layers_by_translator_id = {
+            get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id]): layers
+            for edge in edges
+            for edge_id, layers in payload["selected_source_layers_by_edge"].items()
+            if edge.id == edge_id
+        }
     translator_pool = KVCommSelectionPool(
         ctx=ctx,
-        selected_target_layers_by_edge=payload["selected_target_layers_by_edge"],
-        selected_source_layers_by_edge=payload["selected_source_layers_by_edge"],
+        selected_target_layers_by_translator_id=selected_target_layers_by_translator_id,
+        selected_source_layers_by_translator_id=selected_source_layers_by_translator_id,
     )
     return ctx, translator_pool

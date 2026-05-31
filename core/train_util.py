@@ -122,14 +122,19 @@ def build_models_and_tokenizers(
     config,
     nodes: List[Node],
 ) -> Tuple[Dict[str, PreTrainedModel], Dict[str, PreTrainedTokenizerBase]]:
-    tokenizers = {
-        node.id: load_tokenizer(node.model_id)
-        for node in nodes
-    }
-    models = {
-        node.id: load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
-        for node in nodes
-    }
+    unique_tokenizers: Dict[str, PreTrainedTokenizerBase] = {}
+    unique_models: Dict[str, PreTrainedModel] = {}
+
+    tokenizers: Dict[str, PreTrainedTokenizerBase] = {}
+    models: Dict[str, PreTrainedModel] = {}
+    for node in nodes:
+        if node.model_id not in unique_tokenizers:
+            unique_tokenizers[node.model_id] = load_tokenizer(node.model_id)
+        if node.model_id not in unique_models:
+            unique_models[node.model_id] = load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
+        tokenizers[node.id] = unique_tokenizers[node.model_id]
+        models[node.id] = unique_models[node.model_id]
+
     return models, tokenizers
 
 

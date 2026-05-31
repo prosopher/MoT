@@ -63,7 +63,8 @@ def _build_interlat_target_past(
         prefix_input_ids,
     )
     translated_latents = translator_pool.translate_hidden_states(
-        edge_id=edge.id,
+        src_node_id=edge.src_id,
+        tgt_node_id=edge.tgt_id,
         source_hidden_states=source_hidden_states,
     )
     return build_latent_conditioned_past(
