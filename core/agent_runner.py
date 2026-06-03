@@ -255,7 +255,10 @@ class KVCacheTranslationAdapter:
         target_model = self.ctx.mm.get_model(edge.tgt_id)
 
         if self.alg == "mot":
-            translated_past, _ = self.translator_pool.build_replayed_target_past(
+            from alg.mot.train import build_replayed_target_past
+
+            translated_past, _ = build_replayed_target_past(
+                self.ctx,
                 source_past_key_values=source_past_key_values,
                 prefix_input_ids=prefix_input_ids,
                 source_model=self.ctx.mm.get_model(edge.src_id),

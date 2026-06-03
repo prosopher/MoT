@@ -1,6 +1,7 @@
 from dataclasses import asdict, dataclass
 import math
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -19,7 +20,7 @@ from core.channel_manager import (
 )
 from core.channel_profiler import ChannelProfiler, load_channel_profile_config
 from core.context import Context
-from core.model_manager import ModelManager
+from core.translator_pool import TranslatorPool
 from core.model_spec import ModelSpec
 from core.train_util import *
 from core.topology import get_translator_id
@@ -386,131 +387,132 @@ class LayerWindowDirectionalTranslator(nn.Module):
         return translated_key, translated_value
 
 
-class LayerWindowTranslatorPool(nn.Module):
-    def __init__(
-        self,
-        ctx: Context,
-        translator_dim: int,
-        translator_heads: int,
-        translator_depth: int,
-        mlp_ratio: int,
-        variant: str,
-        mot_num_translators: int,
-        mot_top_k: int,
-    ) -> None:
-        super().__init__()
+def initialize_translators(
+    ctx: Context,
+    translator_dim: int,
+    translator_heads: int,
+    translator_depth: int,
+    mlp_ratio: int,
+    variant: str,
+    mot_num_translators: int,
+    mot_top_k: int,
+) -> TranslatorPool:
+    tp = ctx.tp
+    node_model_ids = {node.id: node.model_id for node in ctx.nodes}
 
-        self.ctx = ctx
-        self.mm = ctx.mm
-        self.cm = ctx.cm
-        self.edges = tuple(ctx.edges)
-        self.edge_ids = tuple(edge.id for edge in ctx.edges)
-        self.edges_by_id = build_edge_map(ctx.edges)
-        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
-
-        translators = {}
-        for edge in self.edges:
-            src_spec = self.mm.get_model_spec(edge.src_id)
-            tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-            translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-            if translator_id not in translators:
-                channels = self.cm.get_channels(edge.id)
-                translators[translator_id] = LayerWindowDirectionalTranslator(
-                    src_hidden_size=src_spec.kv_hidden_size,
-                    tgt_hidden_size=tgt_spec.kv_hidden_size,
-                    num_layers=len(channels),
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                    variant=variant,
-                    mot_num_translators=mot_num_translators,
-                    mot_top_k=mot_top_k,
-                )
-        self.translators = nn.ModuleDict(translators)
-        self.translator_ids = tuple(self.translators.keys())
-
-    def _extract_channel_blocks(
-        self,
-        past_key_values: PastKeyValues,
-        edge_id: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        channels = self.cm.get_channels(edge_id)
-        selected_past = tuple(past_key_values[channel.src_layer_idx] for channel in channels)
-        return past_key_values_to_blocks(selected_past)
-
-    def translate_layer_window(
-        self,
-        past_key_values: PastKeyValues,
-        src_node_id: str,
-        tgt_node_id: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        edge_id = f"{src_node_id}_to_{tgt_node_id}"
-        if edge_id not in self.edges_by_id:
-            raise ValueError(
-                f"Translator edge {edge_id} is not available. "
-                f"Active edges: {list(self.edge_ids)}"
-            )
-        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
-        if translator_id not in self.translators:
-            raise ValueError(
-                f"Translator {translator_id} is not available. "
-                f"Active translators: {list(self.translator_ids)}"
-            )
-        key_block, value_block = self._extract_channel_blocks(
-            past_key_values=past_key_values,
-            edge_id=edge_id,
+    for edge in ctx.edges:
+        translator_id = get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id])
+        if translator_id in tp.translators:
+            continue
+        src_spec = tp.get_model_spec(edge.src_id)
+        tgt_spec = tp.get_model_spec(edge.tgt_id)
+        channels = ctx.cm.get_channels(edge.id)
+        tp.add_translator(
+            translator_id,
+            LayerWindowDirectionalTranslator(
+                src_hidden_size=src_spec.kv_hidden_size,
+                tgt_hidden_size=tgt_spec.kv_hidden_size,
+                num_layers=len(channels),
+                translator_dim=translator_dim,
+                translator_heads=translator_heads,
+                translator_depth=translator_depth,
+                mlp_ratio=mlp_ratio,
+                variant=variant,
+                mot_num_translators=mot_num_translators,
+                mot_top_k=mot_top_k,
+            ),
         )
-        translated_key, translated_value = self.translators[translator_id](key_block, value_block)
-        return translated_key, translated_value
+    return tp
 
-    def build_replayed_target_past(
-        self,
-        *,
-        source_past_key_values: PastKeyValues,
-        prefix_input_ids: torch.Tensor,
-        source_model: PreTrainedModel,
-        target_model: PreTrainedModel,
-        src_node_id: str,
-        tgt_node_id: str,
-        tgt_spec: ModelSpec,
-    ) -> Tuple[PastKeyValues, PastKeyValues]:
-        edge_id = f"{src_node_id}_to_{tgt_node_id}"
-        translated_key, translated_value = self.translate_layer_window(
-            past_key_values=source_past_key_values,
-            src_node_id=src_node_id,
-            tgt_node_id=tgt_node_id,
-        )
-        translated_window_past = blocks_to_partial_past_key_values(
-            key_block=translated_key,
-            value_block=translated_value,
-            num_heads=tgt_spec.num_key_value_heads,
-            head_dim=tgt_spec.head_dim,
-        )
-        src_spec = self.mm.get_model_spec(src_node_id)
-        sparse_attention_indices = build_extrapolated_sparse_attention_indices(
-            source_model,
-            prefix_input_ids,
-            source_layer_indices=self.cm.get_src_layer_indices(edge_id),
-            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
-            num_source_layers=src_spec.num_layers,
-            num_target_layers=tgt_spec.num_layers,
-            source_model_id=self.node_model_ids.get(src_node_id),
-            top_k=self.ctx.config.topk_sparse_attn,
-        )
-        mixed_target_past = replay_target_prefill_with_injected_window(
-            target_model=target_model,
-            target_model_id=self.node_model_ids.get(tgt_node_id),
-            prefix_input_ids=prefix_input_ids,
-            target_layer_indices=self.cm.get_tgt_layer_indices(edge_id),
-            injected_key_block=translated_key,
-            injected_value_block=translated_value,
-            tgt_spec=tgt_spec,
-            sparse_attention_indices=sparse_attention_indices,
-            num_bottom_full_attn=self.ctx.config.num_bottom_full_attn,
-        )
-        return mixed_target_past, translated_window_past
 
+def extract_channel_blocks(
+    ctx: Context,
+    past_key_values: PastKeyValues,
+    edge_id: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    channels = ctx.cm.get_channels(edge_id)
+    selected_past = tuple(past_key_values[channel.src_layer_idx] for channel in channels)
+    return past_key_values_to_blocks(selected_past)
+
+
+def translate_layer_window(
+    ctx: Context,
+    past_key_values: PastKeyValues,
+    src_node_id: str,
+    tgt_node_id: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    edge_id = f"{src_node_id}_to_{tgt_node_id}"
+    edge_ids = tuple(edge.id for edge in ctx.edges)
+    if edge_id not in build_edge_map(ctx.edges):
+        raise ValueError(
+            f"Translator edge {edge_id} is not available. "
+            f"Active edges: {list(edge_ids)}"
+        )
+
+    node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    translator_id = get_translator_id(node_model_ids[src_node_id], node_model_ids[tgt_node_id])
+    if translator_id not in ctx.tp.translators:
+        raise ValueError(
+            f"Translator {translator_id} is not available. "
+            f"Active translators: {list(ctx.tp.translators.keys())}"
+        )
+    key_block, value_block = extract_channel_blocks(
+        ctx=ctx,
+        past_key_values=past_key_values,
+        edge_id=edge_id,
+    )
+    translated_key, translated_value = ctx.tp.translators[translator_id](key_block, value_block)
+    return translated_key, translated_value
+
+
+def build_replayed_target_past(
+    ctx: Context,
+    *,
+    source_past_key_values: PastKeyValues,
+    prefix_input_ids: torch.Tensor,
+    source_model: PreTrainedModel,
+    target_model: PreTrainedModel,
+    src_node_id: str,
+    tgt_node_id: str,
+    tgt_spec: ModelSpec,
+) -> Tuple[PastKeyValues, PastKeyValues]:
+    edge_id = f"{src_node_id}_to_{tgt_node_id}"
+    translated_key, translated_value = translate_layer_window(
+        ctx=ctx,
+        past_key_values=source_past_key_values,
+        src_node_id=src_node_id,
+        tgt_node_id=tgt_node_id,
+    )
+    translated_window_past = blocks_to_partial_past_key_values(
+        key_block=translated_key,
+        value_block=translated_value,
+        num_heads=tgt_spec.num_key_value_heads,
+        head_dim=tgt_spec.head_dim,
+    )
+    node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    src_spec = ctx.tp.get_model_spec(src_node_id)
+    sparse_attention_indices = build_extrapolated_sparse_attention_indices(
+        source_model,
+        prefix_input_ids,
+        source_layer_indices=ctx.cm.get_src_layer_indices(edge_id),
+        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
+        num_source_layers=src_spec.num_layers,
+        num_target_layers=tgt_spec.num_layers,
+        source_model_id=node_model_ids.get(src_node_id),
+        top_k=ctx.config.topk_sparse_attn,
+    )
+    mixed_target_past = replay_target_prefill_with_injected_window(
+        target_model=target_model,
+        target_model_id=node_model_ids.get(tgt_node_id),
+        prefix_input_ids=prefix_input_ids,
+        target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
+        injected_key_block=translated_key,
+        injected_value_block=translated_value,
+        tgt_spec=tgt_spec,
+        sparse_attention_indices=sparse_attention_indices,
+        num_bottom_full_attn=ctx.config.num_bottom_full_attn,
+    )
+    return mixed_target_past, translated_window_past
 
 def build_channel_map(
     ctx: Context,
@@ -521,8 +523,8 @@ def build_channel_map(
     injection_layer_start_idx = config.injection_layer_start_idx
 
     for edge in edges:
-        src_spec = ctx.mm.get_model_spec(edge.src_id)
-        tgt_spec = ctx.mm.get_model_spec(edge.tgt_id)
+        src_spec = ctx.tp.get_model_spec(edge.src_id)
+        tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
 
         tgt_layer_start_idx = injection_layer_start_idx
         tgt_layer_end_idx = tgt_layer_start_idx + requested_window_size - 1
@@ -1430,12 +1432,15 @@ def replay_target_prefill_with_injected_window(
     return tuple(rebuilt_past)
 
 
+TRANSLATOR_CHECKPOINT_DIR_NAME = "translators"
+
+
 def build_translator_pool(
     ctx: Context,
-) -> LayerWindowTranslatorPool:
+) -> TranslatorPool:
     config = ctx.config
     resolve_channels(ctx)
-    translator_pool = LayerWindowTranslatorPool(
+    translator_pool = initialize_translators(
         ctx=ctx,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
@@ -1449,6 +1454,57 @@ def build_translator_pool(
     return translator_pool
 
 
+def get_translator_checkpoint_dir(checkpoint_dir_path: Path) -> Path:
+    return checkpoint_dir_path / TRANSLATOR_CHECKPOINT_DIR_NAME
+
+
+def get_translator_checkpoint_filename(translator_id: str) -> str:
+    return f"{quote(translator_id, safe='')}.pt"
+
+
+def save_translator_checkpoints(output_path: Path, translator_pool: TranslatorPool) -> Path:
+    checkpoint_path = get_train_checkpoint_path(output_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    translator_checkpoint_dir = get_translator_checkpoint_dir(checkpoint_path.parent)
+    translator_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    files: Dict[str, str] = {}
+    for translator_id, translator in translator_pool.translators.items():
+        filename = get_translator_checkpoint_filename(translator_id)
+        torch.save(translator.state_dict(), translator_checkpoint_dir / filename)
+        files[translator_id] = f"{TRANSLATOR_CHECKPOINT_DIR_NAME}/{filename}"
+
+    write_json(
+        str(checkpoint_path),
+        {
+            "format": "mot-translator-pool-v1",
+            "translator_ids": list(translator_pool.translators.keys()),
+            "files": files,
+        },
+    )
+    return checkpoint_path
+
+
+def load_translator_checkpoints(checkpoint_dir_path: Path, translator_pool: TranslatorPool) -> None:
+    manifest_path = get_train_checkpoint_path(checkpoint_dir_path)
+    manifest = read_json(manifest_path)
+    files = manifest.get("files", {})
+    if not isinstance(files, dict):
+        raise ValueError(f"Invalid MOT checkpoint manifest: {manifest_path}")
+
+    for translator_id, relative_path in files.items():
+        if translator_id not in translator_pool.translators:
+            raise ValueError(
+                f"Translator {translator_id} exists in checkpoint but not in the current topology. "
+                f"Active translators: {list(translator_pool.translators.keys())}"
+            )
+        checkpoint_path = checkpoint_dir_path / relative_path
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Translator checkpoint not found: {checkpoint_path}")
+        state_dict = torch.load(str(checkpoint_path), map_location="cpu")
+        translator_pool.translators[translator_id].load_state_dict(state_dict)
+
+
 def load_translator_pool_from_checkpoint(
     checkpoint_dir_path: str,
     nodes: List[Node],
@@ -1456,14 +1512,14 @@ def load_translator_pool_from_checkpoint(
     device_override: Optional[str] = None,
 ) -> Tuple[
     Context,
-    LayerWindowTranslatorPool,
+    TranslatorPool,
 ]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
     checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
     if not checkpoint_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
+        raise FileNotFoundError(f"Checkpoint manifest not found: {checkpoint_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
@@ -1471,13 +1527,12 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
-    translator_pool_state_dict = torch.load(str(checkpoint_path_obj), map_location="cpu")
     models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models, tokenizers),
+        TranslatorPool(models, tokenizers),
         ChannelManager(edges),
     )
     if uses_channel_alignment(config.layer_alignment):
@@ -1494,7 +1549,7 @@ def load_translator_pool_from_checkpoint(
         )
 
     translator_pool = build_translator_pool(ctx)
-    translator_pool.load_state_dict(translator_pool_state_dict)
+    load_translator_checkpoints(checkpoint_dir_path_obj, translator_pool)
     move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
@@ -1535,7 +1590,7 @@ def run_train(
 
     logging.info("[Setup] full model specs")
     for node in nodes:
-        spec = ctx.mm.get_model_spec(node.id)
+        spec = ctx.tp.get_model_spec(node.id)
         logging.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
@@ -1580,7 +1635,7 @@ def run_train(
                 )
                 with torch.no_grad():
                     past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
                         for node in nodes
                     }
                 target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
@@ -1588,17 +1643,18 @@ def run_train(
             total_direction_loss = 0.0
             for edge in edges:
                 prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
-                mixed_target_past, _ = translator_pool.build_replayed_target_past(
+                mixed_target_past, _ = build_replayed_target_past(
+                    ctx,
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_cache_ids,
-                    source_model=ctx.mm.get_model(edge.src_id),
-                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    source_model=ctx.tp.get_model(edge.src_id),
+                    target_model=ctx.tp.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                 )
                 direction_loss = compute_prefix_correction_and_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    target_model=ctx.tp.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -1648,11 +1704,7 @@ def run_train(
             running_gate_load_cv2 = 0.0
             running_gate_importance_entropy = 0.0
 
-    final_path = get_train_checkpoint_path(output_path)
-    save_checkpoint(
-        output_path=final_path,
-        translator_pool=translator_pool,
-    )
+    final_path = save_translator_checkpoints(output_path, translator_pool)
     final_gpu_memory = gpu_memory_tracker.summary()
     logging.info(
         "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",

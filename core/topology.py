@@ -97,7 +97,7 @@ def parse_model_directions(model_directions: str, allowed_directions: Optional[I
 
 
 def get_translator_id(src_model_id: str, tgt_model_id: str) -> str:
-    """Return a stable ModuleDict-safe id for a source-model -> target-model translator."""
+    """Return a stable id for a source-model -> target-model translator."""
 
     def normalize(model_id: str) -> str:
         normalized = str(model_id).strip().strip("/")

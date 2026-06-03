@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from core.context import Context
 from core.eval_util import *
 from core.train_util import blocks_to_partial_past_key_values
+from alg.mot.train import build_replayed_target_past
 
 
 
@@ -46,7 +47,7 @@ def _build_logit_example_state(
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
             for node in ctx.nodes
         }
     }
@@ -62,14 +63,15 @@ def _build_logit_edge_artifacts(
     **_,
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
-    mixed_target_past, _ = translator_pool.build_replayed_target_past(
+    mixed_target_past, _ = build_replayed_target_past(
+        ctx,
         source_past_key_values=past_by_node_id[edge.src_id],
         prefix_input_ids=prefix_input_ids,
-        source_model=ctx.mm.get_model(edge.src_id),
-        target_model=ctx.mm.get_model(edge.tgt_id),
+        source_model=ctx.tp.get_model(edge.src_id),
+        target_model=ctx.tp.get_model(edge.tgt_id),
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
-        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
     )
     native_past = past_by_node_id[edge.tgt_id]
     return LogitEvalEdgeArtifacts(
@@ -102,7 +104,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in edges:
-                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -138,24 +140,25 @@ def evaluate_generation_dataset(
                     )
 
                 past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
                     for node in nodes
                 }
 
-                mixed_target_past, _ = translator_pool.build_replayed_target_past(
+                mixed_target_past, _ = build_replayed_target_past(
+                    ctx,
                     source_past_key_values=past_by_node_id[edge.src_id],
                     prefix_input_ids=prefix_input_ids,
-                    source_model=ctx.mm.get_model(edge.src_id),
-                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    source_model=ctx.tp.get_model(edge.src_id),
+                    target_model=ctx.tp.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                 )
                 native_past = past_by_node_id[edge.tgt_id]
                 cosine_value = cosine_similarity_between_past(mixed_target_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
@@ -163,7 +166,7 @@ def evaluate_generation_dataset(
                     suffix_cache_ids=suffix_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
@@ -216,7 +219,7 @@ def run_eval(
 
     translator_pool.eval()
     for node in nodes:
-        ctx.mm.get_model(node.id).eval()
+        ctx.tp.get_model(node.id).eval()
 
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
@@ -246,16 +249,16 @@ def run_eval(
         return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.src_id],
             layer_indices=ctx.cm.get_src_layer_indices(edge.id),
-            num_heads=ctx.mm.get_model_spec(edge.src_id).num_key_value_heads,
-            head_dim=ctx.mm.get_model_spec(edge.src_id).head_dim,
+            num_heads=ctx.tp.get_model_spec(edge.src_id).num_key_value_heads,
+            head_dim=ctx.tp.get_model_spec(edge.src_id).head_dim,
         )
 
     def build_target_window_past(edge: Edge, past_by_node_id) -> PastKeyValues:
         return build_partial_past_from_layer_indices(
             past_key_values=past_by_node_id[edge.tgt_id],
             layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
-            num_heads=ctx.mm.get_model_spec(edge.tgt_id).num_key_value_heads,
-            head_dim=ctx.mm.get_model_spec(edge.tgt_id).head_dim,
+            num_heads=ctx.tp.get_model_spec(edge.tgt_id).num_key_value_heads,
+            head_dim=ctx.tp.get_model_spec(edge.tgt_id).head_dim,
         )
 
     def build_translated_target_past_fn(
@@ -264,14 +267,15 @@ def run_eval(
         prefix_cache_ids: torch.Tensor,
         past_by_node_id,
     ) -> PastKeyValues:
-        mixed_target_past, _ = translator_pool.build_replayed_target_past(
+        mixed_target_past, _ = build_replayed_target_past(
+            ctx,
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
-            source_model=ctx.mm.get_model(edge.src_id),
-            target_model=ctx.mm.get_model(edge.tgt_id),
+            source_model=ctx.tp.get_model(edge.src_id),
+            target_model=ctx.tp.get_model(edge.tgt_id),
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
-            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
         )
         return mixed_target_past
 
@@ -282,14 +286,15 @@ def run_eval(
         past_by_node_id,
         **_,
     ) -> Dict[str, PastKeyValues]:
-        _, translated_window_past = translator_pool.build_replayed_target_past(
+        _, translated_window_past = build_replayed_target_past(
+            ctx,
             source_past_key_values=past_by_node_id[edge.src_id],
             prefix_input_ids=prefix_cache_ids,
-            source_model=ctx.mm.get_model(edge.src_id),
-            target_model=ctx.mm.get_model(edge.tgt_id),
+            source_model=ctx.tp.get_model(edge.src_id),
+            target_model=ctx.tp.get_model(edge.tgt_id),
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
-            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
         )
         return build_openwebtext_tsne_named_pasts(
             source_top_past_key_values=build_source_window_past(edge, past_by_node_id),

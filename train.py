@@ -5,7 +5,7 @@ from pathlib import Path
 from core.channel_manager import ChannelManager
 from core.common import GPUMemoryTracker, add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, setup_logging
 from core.context import Context
-from core.model_manager import ModelManager
+from core.translator_pool import TranslatorPool
 from core.topology import build_nodes_and_edges
 from core.train_util import build_models_and_tokenizers, get_train_log_path
 
@@ -71,7 +71,7 @@ def main() -> None:
         config,
         nodes,
         edges,
-        ModelManager(models, tokenizers),
+        TranslatorPool(models, tokenizers),
         ChannelManager(edges),
     )
     if hasattr(train_module, "ChannelProfiler") and train_module.uses_channel_alignment(getattr(config, "layer_alignment", "")):
