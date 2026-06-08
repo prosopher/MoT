@@ -18,7 +18,12 @@ from core.common import (
 from core.context import Context
 from core.eval_util import *
 from core.topology import Edge
-from alg.kvcomm.train import KVCommSelectionPool
+from core.translator_pool import TranslatorPool
+from alg.kvcomm.train import (
+    build_replayed_target_past,
+    get_selected_source_layers,
+    get_selected_target_layers,
+)
 
 
 
@@ -96,7 +101,8 @@ def _predict_direct_context_generation(
 @torch.inference_mode()
 def _predict_kvcomm_logit(
     *,
-    pool: KVCommSelectionPool,
+    ctx: Context,
+    pool: TranslatorPool,
     edge_id: str,
     source_model,
     target_model,
@@ -121,7 +127,9 @@ def _predict_kvcomm_logit(
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
     source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
-    kvcomm_past = pool.build_replayed_target_past(
+    kvcomm_past = build_replayed_target_past(
+        ctx,
+        pool,
         edge_id=edge_id,
         source_past_key_values=source_past,
     )
@@ -143,7 +151,8 @@ def _predict_kvcomm_logit(
 @torch.inference_mode()
 def _predict_kvcomm_generation(
     *,
-    pool: KVCommSelectionPool,
+    ctx: Context,
+    pool: TranslatorPool,
     edge_id: str,
     source_model,
     target_model,
@@ -164,7 +173,9 @@ def _predict_kvcomm_generation(
         max_input_tokens=context_budget,
     )
     source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
-    kvcomm_past = pool.build_replayed_target_past(
+    kvcomm_past = build_replayed_target_past(
+        ctx,
+        pool,
         edge_id=edge_id,
         source_past_key_values=source_past,
     )
@@ -186,7 +197,7 @@ def _build_logit_example_state(
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
             for node in ctx.nodes
         }
     }
@@ -194,18 +205,22 @@ def _build_logit_example_state(
 
 def _build_logit_edge_artifacts(
     *,
+    ctx: Context,
     edge: Edge,
     example_state,
-    translator_pool: KVCommSelectionPool,
+    translator_pool: TranslatorPool,
     **_,
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
-    kvcomm_past = translator_pool.build_replayed_target_past(
+    kvcomm_past = build_replayed_target_past(
+        ctx,
+        translator_pool,
         edge_id=edge.id,
         source_past_key_values=past_by_node_id[edge.src_id],
     )
     native_past = past_by_node_id[edge.tgt_id]
     kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
+        ctx=ctx,
         edge=edge,
         translator_pool=translator_pool,
         replayed_past=kvcomm_past,
@@ -228,12 +243,13 @@ def _prepare_kvcomm_scoring_past(*, model, past_key_values, suffix_cache_ids):
 
 def _build_full_length_kvcomm_past_for_cosine(
     *,
+    ctx: Context,
     edge: Edge,
-    translator_pool: KVCommSelectionPool,
+    translator_pool: TranslatorPool,
     replayed_past: PastKeyValues,
     native_target_past: PastKeyValues,
 ) -> PastKeyValues:
-    selected_target_layers = set(translator_pool.get_selected_target_layers(edge.id))
+    selected_target_layers = set(get_selected_target_layers(ctx, translator_pool, edge.id))
     selected_target_layers.add(0)
     full_length_past = []
     for layer_idx, (replayed_layer, native_layer) in enumerate(zip(replayed_past, native_target_past)):
@@ -266,7 +282,7 @@ def evaluate_generation_dataset(
     spec,
     dataloader: DataLoader,
     eval_config: EvalConfig,
-    translator_pool: KVCommSelectionPool,
+    translator_pool: TranslatorPool,
 ) -> Dict[str, Dict[str, float]]:
     device = ctx.config.device
     path_metrics = {
@@ -283,7 +299,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in ctx.edges:
-                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -305,8 +321,8 @@ def evaluate_generation_dataset(
                 )
                 prefix_input_ids = prepared_generation_inputs["prefix_input_ids"]
 
-                source_model = ctx.mm.get_model(edge.src_id)
-                target_model = ctx.mm.get_model(edge.tgt_id)
+                source_model = ctx.tp.get_model(edge.src_id)
+                target_model = ctx.tp.get_model(edge.tgt_id)
 
                 pred_direct = _predict_direct_context_generation(
                     model=target_model,
@@ -319,6 +335,7 @@ def evaluate_generation_dataset(
                     context_budget=context_budget,
                 )
                 pred_kvcomm = _predict_kvcomm_generation(
+                    ctx=ctx,
                     pool=translator_pool,
                     edge_id=edge.id,
                     source_model=source_model,
@@ -333,12 +350,15 @@ def evaluate_generation_dataset(
                 )
 
                 kvcomm_source_past = extract_past_key_values(source_model, prefix_input_ids)
-                kvcomm_replayed_past = translator_pool.build_replayed_target_past(
+                kvcomm_replayed_past = build_replayed_target_past(
+                    ctx,
+                    translator_pool,
                     edge_id=edge.id,
                     source_past_key_values=kvcomm_source_past,
                 )
                 native_target_past = extract_past_key_values(target_model, prefix_input_ids)
                 kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
+                    ctx=ctx,
                     edge=edge,
                     translator_pool=translator_pool,
                     replayed_past=kvcomm_replayed_past,
@@ -366,7 +386,7 @@ def evaluate_generation_dataset(
 def run_eval(
     ctx: Context,
     eval_config: EvalConfig,
-    translator_pool: KVCommSelectionPool,
+    translator_pool: TranslatorPool,
 ) -> Path:
     train_config = ctx.config
     nodes = ctx.nodes
@@ -385,7 +405,7 @@ def run_eval(
 
     translator_pool.eval()
     for node in nodes:
-        ctx.mm.get_model(node.id).eval()
+        ctx.tp.get_model(node.id).eval()
 
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
@@ -400,29 +420,33 @@ def run_eval(
         logging.info(
             "%s | selected_target_layers=%s | selected_source_layers=%s",
             edge.id,
-            translator_pool.get_selected_target_layers(edge.id),
-            translator_pool.get_selected_source_layers(edge.id),
+            get_selected_target_layers(ctx, translator_pool, edge.id),
+            get_selected_source_layers(ctx, translator_pool, edge.id),
         )
 
     calibration_eval_name = _build_calibration_eval_name(train_config)
     logging.info("Preparing validation dataloader for %s", calibration_eval_name)
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        return translator_pool.build_replayed_target_past(
+        return build_replayed_target_past(
+            ctx,
+            translator_pool,
             edge_id=edge.id,
             source_past_key_values=past_by_node_id[edge.src_id],
         )
 
     def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
         native_past = past_by_node_id[edge.tgt_id]
-        translated_past = translator_pool.build_replayed_target_past(
+        translated_past = build_replayed_target_past(
+            ctx,
+            translator_pool,
             edge_id=edge.id,
             source_past_key_values=past_by_node_id[edge.src_id],
         )
         return build_openwebtext_tsne_named_pasts(
             source_top_past_key_values=select_past_layers_by_indices(
                 past_by_node_id[edge.src_id],
-                translator_pool.get_selected_source_layers(edge.id),
+                get_selected_source_layers(ctx, translator_pool, edge.id),
             ),
             translated_past_key_values=translated_past,
             target_top_past_key_values=native_past,
@@ -504,12 +528,13 @@ def run_eval(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    selected_layer_lines: List[str] = ["## KVComm selected replay layers", ""]
+
+    selected_layer_lines = ["## KVComm selected layers", ""]
     for edge in edges:
         pretty_name = build_edge_pretty_name(edge.id, nodes, edges)
         selected_layer_lines.append(
-            f"- {pretty_name}: target={translator_pool.get_selected_target_layers(edge.id)}, "
-            f"source={translator_pool.get_selected_source_layers(edge.id)}"
+            f"- {pretty_name}: target={get_selected_target_layers(ctx, translator_pool, edge.id)}, "
+            f"source={get_selected_source_layers(ctx, translator_pool, edge.id)}"
         )
     selected_layer_lines.append("")
 

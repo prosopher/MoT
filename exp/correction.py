@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from core.common import *
 from core.channel_manager import ChannelManager
 from core.context import Context
-from core.model_manager import ModelManager
+from core.translator_pool import TranslatorPool
 from core.eval_util import *
 from exp.exp_util import (
     AI_PAPER_PALETTE,
@@ -535,7 +535,7 @@ def maybe_append_input_ids(model: PreTrainedModel, past_key_values: PastKeyValue
 def evaluate_correction(
     ctx: Context,
     run_dir: Path,
-    translator_pool: lp.LayerWindowTranslatorPool,
+    translator_pool: TranslatorPool,
 ) -> Dict[str, Any]:
     config = ctx.config
     nodes = ctx.nodes
@@ -546,7 +546,7 @@ def evaluate_correction(
 
     translator_pool.eval()
     for node in nodes:
-        ctx.mm.get_model(node.id).eval()
+        ctx.tp.get_model(node.id).eval()
 
     eval_config = SimpleNamespace(
         batch_size=config.eval_batch_size,
@@ -560,7 +560,7 @@ def evaluate_correction(
 
     dataset_specs = get_eval_spec_group(config.benchmark_mode)
     dataloader_builder = build_eval_dataloader if config.benchmark_mode == "logit_qa" else build_generation_eval_dataloader
-    num_layers = ctx.mm.get_model_spec(edges[0].tgt_id).num_layers
+    num_layers = ctx.tp.get_model_spec(edges[0].tgt_id).num_layers
     source_idx = ctx.cm.get_tgt_layer_end_idx(edges[0].id) + 1
     num_points = num_layers + 1 - source_idx
     fullmix_collector = MetricCollector()
@@ -574,7 +574,7 @@ def evaluate_correction(
         for batch in dataloader:
             for example in batch:
                 for edge in edges:
-                    tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                    tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                     try:
                         prepared_inputs = build_prepared_inputs(
                             ctx=ctx,
@@ -594,11 +594,12 @@ def evaluate_correction(
                     suffix_cache_ids = prepared_inputs.get("suffix_cache_ids", None)
                     seed_token = prepared_inputs["seed_token"]
                     try:
-                        past_by_node_id = {node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids) for node in nodes}
+                        past_by_node_id = {node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids) for node in nodes}
                     except Exception as exc:
                         logging.warning("Skipping example due to cache extraction error: %s", exc)
                         continue
-                    translated_key, translated_value = translator_pool.translate_layer_window(
+                    translated_key, translated_value = lp.translate_layer_window(
+                        ctx,
                         past_key_values=past_by_node_id[edge.src_id],
                         src_node_id=edge.src_id,
                         tgt_node_id=edge.tgt_id,
@@ -610,12 +611,12 @@ def evaluate_correction(
                         num_layers=config.injection_window_size,
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
-                        target_model=ctx.mm.get_model(edge.tgt_id),
+                        target_model=ctx.tp.get_model(edge.tgt_id),
                         prefix_input_ids=prefix_input_ids,
                         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
-                        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                        tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                         target_model_id=node_map[edge.tgt_id].model_id,
                     )
                     random_key_block, random_value_block = build_random_matched_window(
@@ -625,16 +626,16 @@ def evaluate_correction(
                         translated_value_block=translated_value,
                     )
                     random_past = lp.replay_target_prefill_with_injected_window(
-                        target_model=ctx.mm.get_model(edge.tgt_id),
+                        target_model=ctx.tp.get_model(edge.tgt_id),
                         prefix_input_ids=prefix_input_ids,
                         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
-                        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                        tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                         target_model_id=node_map[edge.tgt_id].model_id,
                     )
 
-                    target_model = ctx.mm.get_model(edge.tgt_id)
+                    target_model = ctx.tp.get_model(edge.tgt_id)
                     native_past = maybe_append_input_ids(target_model, native_target_past, suffix_cache_ids)
                     fullmix_past = maybe_append_input_ids(target_model, full_mix_past, suffix_cache_ids)
                     random_past = maybe_append_input_ids(target_model, random_past, suffix_cache_ids)
@@ -808,7 +809,7 @@ def update_summary(ctx: Context, run_dir: Path, metrics: Dict[str, Any]) -> Path
     reference_edge_id = reference_edge.id
     post_window_boundary_idx = ctx.cm.get_tgt_layer_end_idx(reference_edge_id) + 1
     tgt_id = reference_edge.tgt_id
-    num_upper_layers = max(0, ctx.mm.get_model_spec(tgt_id).num_layers - post_window_boundary_idx)
+    num_upper_layers = max(0, ctx.tp.get_model_spec(tgt_id).num_layers - post_window_boundary_idx)
     row = CorrectionSummaryRow(
         study_id=study_dir.name,
         benchmark_mode=config.benchmark_mode,
@@ -1246,7 +1247,7 @@ def main() -> None:
         config,
         nodes,
         edges,
-        ModelManager(models, tokenizers),
+        TranslatorPool(models, tokenizers),
         ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)

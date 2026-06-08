@@ -32,7 +32,7 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
 
     output_path = outputs_path / f"{alg}_{timestamp}"
     checkpoint_dir_path = output_path
-    checkpoint_path = checkpoint_dir_path / "checkpoint.pt"
+    checkpoint_path = checkpoint_dir_path / "translators"
     train_log_path = output_path / "train.log"
 
     train_argv = [
@@ -63,7 +63,7 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
     train_entry.main()
     train_stdout = capsys.readouterr().out
 
-    assert checkpoint_path.exists(), f"missing checkpoint for {alg}: {checkpoint_path}"
+    assert checkpoint_path.is_dir(), f"missing checkpoint for {alg}: {checkpoint_path}"
     assert train_log_path.exists(), f"missing train.log for {alg}: {train_log_path}"
     assert "Final checkpoint:" in train_stdout
 

@@ -965,7 +965,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
     for target_node_id in target_node_ids:
         dataloader = build_openwebtext_eval_dataloader(
-            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+            tokenizer=ctx.tp.get_tokenizer(target_node_id),
             config=ctx.config,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -988,7 +988,7 @@ def evaluate_openwebtext_validation_loss_metrics(
                 prefix_tokens=ctx.config.prefix_tokens,
             )
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
                 for node in ctx.nodes
             }
 
@@ -1111,7 +1111,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         )
         translated_loss = float(
             compute_suffix_lm_loss(
-                target_model=ctx.mm.get_model(edge.tgt_id),
+                target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
@@ -1119,7 +1119,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
         )
         native_loss = float(
             compute_suffix_lm_loss(
-                target_model=ctx.mm.get_model(edge.tgt_id),
+                target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
@@ -1128,7 +1128,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
 
         def run_translated_inference() -> int:
             return run_openwebtext_greedy_inference(
-                model=ctx.mm.get_model(edge.tgt_id),
+                model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
                 seed_token=seed_token,
                 max_new_tokens=generation_steps,
@@ -1136,7 +1136,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
 
         def run_native_inference() -> int:
             return run_openwebtext_greedy_inference(
-                model=ctx.mm.get_model(edge.tgt_id),
+                model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
                 seed_token=seed_token,
                 max_new_tokens=generation_steps,
@@ -1209,7 +1209,7 @@ def evaluate_openwebtext_validation_loss_replay(
         )
         translated_loss = float(
             compute_prefix_correction_and_suffix_lm_loss(
-                target_model=ctx.mm.get_model(edge.tgt_id),
+                target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=mixed_target_past_for_loss,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
@@ -1219,7 +1219,7 @@ def evaluate_openwebtext_validation_loss_replay(
         )
         native_loss = float(
             compute_prefix_correction_and_suffix_lm_loss(
-                target_model=ctx.mm.get_model(edge.tgt_id),
+                target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
@@ -1235,7 +1235,7 @@ def evaluate_openwebtext_validation_loss_replay(
                 past_by_node_id=past_by_node_id,
             )
             return run_openwebtext_greedy_inference(
-                model=ctx.mm.get_model(edge.tgt_id),
+                model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=mixed_target_past,
                 seed_token=seed_token,
                 max_new_tokens=generation_steps,
@@ -1243,7 +1243,7 @@ def evaluate_openwebtext_validation_loss_replay(
 
         def run_native_inference() -> int:
             return run_openwebtext_greedy_inference(
-                model=ctx.mm.get_model(edge.tgt_id),
+                model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
                 seed_token=seed_token,
                 max_new_tokens=generation_steps,
@@ -1740,17 +1740,17 @@ def build_eval_context(
 def resolve_latest_checkpoint_dir_for_alg(
     alg: str,
     outputs_path: str = "outputs",
-    checkpoint_name: str = "checkpoint.pt",
+    checkpoint_name: str = "translators",
 ) -> Path:
     outputs_path_obj = Path(outputs_path)
     candidates = sorted(
         path
         for path in outputs_path_obj.glob(f"{alg}_*")
-        if path.is_dir() and (path / checkpoint_name).exists()
+        if path.is_dir() and (path / checkpoint_name).is_dir()
     )
     if not candidates:
         raise FileNotFoundError(
-            f"No checkpoint directories found for alg={alg!r} under {outputs_path_obj}"
+            f"No translator checkpoint directories found for alg={alg!r} under {outputs_path_obj}"
         )
     return candidates[-1]
 
@@ -2413,7 +2413,7 @@ def compute_benchmark_context_budget(
     target_node_id: str,
 ) -> int:
     shared_limit = get_model_context_limit(
-        ctx.mm.get_model(target_node_id),
+        ctx.tp.get_model(target_node_id),
         tokenizer,
     )
     suffix = prepare_generation_task_suffix(
@@ -2449,7 +2449,7 @@ def compute_logit_task_token_budgets(
     subject: Optional[str] = None,
 ) -> Dict[str, Optional[int]]:
     shared_limit = get_model_context_limit(
-        ctx.mm.get_model(target_node_id),
+        ctx.tp.get_model(target_node_id),
         tokenizer,
     )
     answer_budget = get_answer_token_budget(eval_config)
@@ -3040,7 +3040,7 @@ def evaluate_dataset(
             choice_texts = example.get("choice_texts")
 
             for edge in edges:
-                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                 token_budgets = compute_logit_task_token_budgets(
                     ctx=ctx,
                     spec=spec,
@@ -3100,7 +3100,7 @@ def evaluate_dataset(
                     translator_pool=translator_pool,
                 )
 
-                target_model = ctx.mm.get_model(edge.tgt_id)
+                target_model = ctx.tp.get_model(edge.tgt_id)
                 translated_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.translated_past_key_values,

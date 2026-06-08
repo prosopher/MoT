@@ -1,7 +1,6 @@
 from dataclasses import asdict, dataclass
 import math
 from pathlib import Path
-from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -1432,9 +1431,6 @@ def replay_target_prefill_with_injected_window(
     return tuple(rebuilt_past)
 
 
-TRANSLATOR_CHECKPOINT_DIR_NAME = "translators"
-
-
 def build_translator_pool(
     ctx: Context,
 ) -> TranslatorPool:
@@ -1454,57 +1450,6 @@ def build_translator_pool(
     return translator_pool
 
 
-def get_translator_checkpoint_dir(checkpoint_dir_path: Path) -> Path:
-    return checkpoint_dir_path / TRANSLATOR_CHECKPOINT_DIR_NAME
-
-
-def get_translator_checkpoint_filename(translator_id: str) -> str:
-    return f"{quote(translator_id, safe='')}.pt"
-
-
-def save_translator_checkpoints(output_path: Path, translator_pool: TranslatorPool) -> Path:
-    checkpoint_path = get_train_checkpoint_path(output_path)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    translator_checkpoint_dir = get_translator_checkpoint_dir(checkpoint_path.parent)
-    translator_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    files: Dict[str, str] = {}
-    for translator_id, translator in translator_pool.translators.items():
-        filename = get_translator_checkpoint_filename(translator_id)
-        torch.save(translator.state_dict(), translator_checkpoint_dir / filename)
-        files[translator_id] = f"{TRANSLATOR_CHECKPOINT_DIR_NAME}/{filename}"
-
-    write_json(
-        str(checkpoint_path),
-        {
-            "format": "mot-translator-pool-v1",
-            "translator_ids": list(translator_pool.translators.keys()),
-            "files": files,
-        },
-    )
-    return checkpoint_path
-
-
-def load_translator_checkpoints(checkpoint_dir_path: Path, translator_pool: TranslatorPool) -> None:
-    manifest_path = get_train_checkpoint_path(checkpoint_dir_path)
-    manifest = read_json(manifest_path)
-    files = manifest.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError(f"Invalid MOT checkpoint manifest: {manifest_path}")
-
-    for translator_id, relative_path in files.items():
-        if translator_id not in translator_pool.translators:
-            raise ValueError(
-                f"Translator {translator_id} exists in checkpoint but not in the current topology. "
-                f"Active translators: {list(translator_pool.translators.keys())}"
-            )
-        checkpoint_path = checkpoint_dir_path / relative_path
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Translator checkpoint not found: {checkpoint_path}")
-        state_dict = torch.load(str(checkpoint_path), map_location="cpu")
-        translator_pool.translators[translator_id].load_state_dict(state_dict)
-
-
 def load_translator_pool_from_checkpoint(
     checkpoint_dir_path: str,
     nodes: List[Node],
@@ -1517,9 +1462,6 @@ def load_translator_pool_from_checkpoint(
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
-    checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
-    if not checkpoint_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint manifest not found: {checkpoint_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
@@ -1538,7 +1480,6 @@ def load_translator_pool_from_checkpoint(
     if uses_channel_alignment(config.layer_alignment):
         profile_config_path = Path(checkpoint_dir_path_obj) / "channel_profile.json"
         ctx.cp = ChannelProfiler(ctx, load_channel_profile_config(profile_config_path))
-
     resolved_channels_path = build_resolved_channels_path(checkpoint_dir_path_obj)
     if resolved_channels_path.exists():
         load_resolved_channels(resolved_channels_path, ctx.cm, ctx.edges)
@@ -1547,13 +1488,11 @@ def load_translator_pool_from_checkpoint(
             "Resolved channel map not found under checkpoint directory: "
             f"{resolved_channels_path}. Re-run training with channel persistence enabled."
         )
-
     translator_pool = build_translator_pool(ctx)
     load_translator_checkpoints(checkpoint_dir_path_obj, translator_pool)
     move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
-
 
 def run_train(
     ctx: Context,
@@ -1704,7 +1643,8 @@ def run_train(
             running_gate_load_cv2 = 0.0
             running_gate_importance_entropy = 0.0
 
-    final_path = save_translator_checkpoints(output_path, translator_pool)
+    final_path = get_train_checkpoint_path(output_path)
+    save_translator_checkpoints(output_path, translator_pool)
     final_gpu_memory = gpu_memory_tracker.summary()
     logging.info(
         "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
@@ -1712,6 +1652,6 @@ def run_train(
         final_gpu_memory["peak_allocated_pretty"],
         final_gpu_memory["num_samples"],
     )
-    logging.info("[Done] final checkpoint saved to %s", final_path)
+    logging.info("[Done] final translator checkpoints saved to %s", final_path)
     logging.info("Saved train log to %s", log_path)
     return final_path

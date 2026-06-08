@@ -89,7 +89,7 @@ class ChannelProfiler:
         self.ctx = ctx
         self.config = ctx.config
         self.profile_config = profile_config
-        self.mm = ctx.mm
+        self.tp = ctx.tp
         self.cm = ctx.cm
         self.node_map = build_node_map(ctx.nodes)
 
@@ -147,8 +147,8 @@ class ChannelProfiler:
         )
 
         min_model_layers = min(
-            self.mm.get_model_spec(edge.src_id).num_layers,
-            self.mm.get_model_spec(edge.tgt_id).num_layers,
+            self.tp.get_model_spec(edge.src_id).num_layers,
+            self.tp.get_model_spec(edge.tgt_id).num_layers,
         )
         min_probe_window_size = max(1, round(min_model_layers * self.config.min_window_size_ratio))
         probe_window_size = min(min_probe_window_size, len(candidate_channels))
@@ -268,8 +268,8 @@ class ChannelProfiler:
         )
 
     def _build_terminal_channels(self, edge: Edge) -> List[Channel]:
-        src_spec = self.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
+        src_spec = self.tp.get_model_spec(edge.src_id)
+        tgt_spec = self.tp.get_model_spec(edge.tgt_id)
         min_model_layers = min(src_spec.num_layers, tgt_spec.num_layers)
         window_size = max(1, round(min_model_layers * self.config.max_window_size_ratio))
         window_size = min(window_size, min_model_layers)
@@ -288,8 +288,8 @@ class ChannelProfiler:
         raise ValueError(f"Unsupported layer_alignment for profiling: {self.config.layer_alignment}")
 
     def _build_depth_ratio_channels(self, edge: Edge) -> List[Channel]:
-        src_spec = self.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
+        src_spec = self.tp.get_model_spec(edge.src_id)
+        tgt_spec = self.tp.get_model_spec(edge.tgt_id)
         num_pairs = min(src_spec.num_layers, tgt_spec.num_layers)
         src_layer_indices = self._build_depth_ratio_indices(src_spec.num_layers, num_pairs)
         tgt_layer_indices = self._build_depth_ratio_indices(tgt_spec.num_layers, num_pairs)
@@ -299,8 +299,8 @@ class ChannelProfiler:
         ]
 
     def _exclude_edge_probe_channels(self, edge: Edge, channels: List[Channel]) -> List[Channel]:
-        src_spec = self.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
+        src_spec = self.tp.get_model_spec(edge.src_id)
+        tgt_spec = self.tp.get_model_spec(edge.tgt_id)
         if len(channels) <= 2 or min(src_spec.num_layers, tgt_spec.num_layers) <= 2:
             return channels
 
@@ -508,7 +508,7 @@ class ChannelProfiler:
         from torch.utils.data import DataLoader
 
         dataset = OpenWebTextSequenceStream(
-            tokenizer=self.ctx.mm.get_tokenizer(edge.tgt_id),
+            tokenizer=self.ctx.tp.get_tokenizer(edge.tgt_id),
             sequence_length=self.config.total_tokens,
             split=split,
             shuffle=True,
@@ -516,8 +516,8 @@ class ChannelProfiler:
             seed=self.config.seed + seed_offset,
         )
         loader = InfiniteDataLoader(DataLoader(dataset, batch_size=1, num_workers=0))
-        source_model = self.mm.get_model(edge.src_id)
-        target_model = self.mm.get_model(edge.tgt_id)
+        source_model = self.tp.get_model(edge.src_id)
+        target_model = self.tp.get_model(edge.tgt_id)
 
         bank: List[Dict[str, Any]] = []
         for _ in range(num_examples):
@@ -582,8 +582,8 @@ class ChannelProfiler:
             self._format_channels(channels),
             self.profile_config.max_steps,
         )
-        src_spec = self.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
+        src_spec = self.tp.get_model_spec(edge.src_id)
+        tgt_spec = self.tp.get_model_spec(edge.tgt_id)
         proxy = LayerWindowDirectionalTranslator(
             src_hidden_size=src_spec.kv_hidden_size,
             tgt_hidden_size=tgt_spec.kv_hidden_size,
@@ -664,8 +664,8 @@ class ChannelProfiler:
         selected_past = tuple(sample["source_past_key_values"][layer_idx] for layer_idx in src_layer_indices)
         key_block, value_block = past_key_values_to_blocks(selected_past)
         translated_key, translated_value = proxy(key_block, value_block)
-        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-        target_model = self.mm.get_model(edge.tgt_id)
+        tgt_spec = self.tp.get_model_spec(edge.tgt_id)
+        target_model = self.tp.get_model(edge.tgt_id)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=sample["prefix_cache_ids"],
@@ -699,8 +699,8 @@ class ChannelProfiler:
         selected_past = tuple(sample["source_past_key_values"][layer_idx] for layer_idx in src_layer_indices)
         key_block, value_block = past_key_values_to_blocks(selected_past)
         translated_key, translated_value = proxy(key_block, value_block)
-        tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-        target_model = self.mm.get_model(edge.tgt_id)
+        tgt_spec = self.tp.get_model_spec(edge.tgt_id)
+        target_model = self.tp.get_model(edge.tgt_id)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             prefix_input_ids=sample["prefix_cache_ids"],
@@ -729,7 +729,7 @@ class ChannelProfiler:
 
         target_layer_indices = self._get_tgt_layer_indices(channels)
         return compute_prefix_correction_and_suffix_lm_loss(
-            target_model=self.mm.get_model(edge.tgt_id),
+            target_model=self.tp.get_model(edge.tgt_id),
             past_key_values=sample["native_target_past_key_values"],
             lm_input_ids=sample["lm_input_ids"],
             lm_labels=sample["lm_labels"],

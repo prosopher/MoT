@@ -251,8 +251,8 @@ class KVCacheTranslationAdapter:
         source_past_key_values: PastKeyValues,
         prefix_input_ids: torch.Tensor,
     ) -> PastKeyValues:
-        tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
-        target_model = self.ctx.mm.get_model(edge.tgt_id)
+        tgt_spec = self.ctx.tp.get_model_spec(edge.tgt_id)
+        target_model = self.ctx.tp.get_model(edge.tgt_id)
 
         if self.alg == "mot":
             from alg.mot.train import build_replayed_target_past
@@ -261,7 +261,7 @@ class KVCacheTranslationAdapter:
                 self.ctx,
                 source_past_key_values=source_past_key_values,
                 prefix_input_ids=prefix_input_ids,
-                source_model=self.ctx.mm.get_model(edge.src_id),
+                source_model=self.ctx.tp.get_model(edge.src_id),
                 target_model=target_model,
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
@@ -270,7 +270,10 @@ class KVCacheTranslationAdapter:
             return translated_past
 
         if self.alg == "lsc":
-            return self.translator_pool.translate_layers(
+            from alg.lsc.train import translate_layers
+
+            return translate_layers(
+                translator_pool=self.translator_pool,
                 past_key_values=source_past_key_values,
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
@@ -278,7 +281,7 @@ class KVCacheTranslationAdapter:
             )
 
         if self.alg == "interlat":
-            from alg.interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states
+            from alg.interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states, translate_hidden_states
 
             source_tokens = get_past_seq_len(source_past_key_values)
             if int(prefix_input_ids.shape[1]) != source_tokens:
@@ -287,14 +290,16 @@ class KVCacheTranslationAdapter:
                     f"prefix_tokens={int(prefix_input_ids.shape[1])} source_tokens={source_tokens}"
                 )
 
-            source_model = self.ctx.mm.get_model(edge.src_id)
+            source_model = self.ctx.tp.get_model(edge.src_id)
             source_input_ids = prefix_input_ids.to(source_model.device)
             source_hidden_states = extract_interlat_source_hidden_states(
                 source_model,
                 source_input_ids,
             )
-            translated_latents = self.translator_pool.translate_hidden_states(
-                edge_id=edge.id,
+            translated_latents = translate_hidden_states(
+                translator_pool=self.translator_pool,
+                src_node_id=edge.src_id,
+                tgt_node_id=edge.tgt_id,
                 source_hidden_states=source_hidden_states,
             )
             translated_past = build_latent_conditioned_past(
@@ -343,13 +348,17 @@ class KVCacheTranslationAdapter:
             return translated_past
 
         if self.alg == "kvcomm":
+            from alg.kvcomm.train import build_replayed_target_past
+
             source_tokens = get_past_seq_len(source_past_key_values)
             if int(prefix_input_ids.shape[1]) != source_tokens:
                 raise ValueError(
                     f"KVComm prefix/token length mismatch on {edge.id}: "
                     f"prefix_tokens={int(prefix_input_ids.shape[1])} source_tokens={source_tokens}"
                 )
-            translated_past = self.translator_pool.build_replayed_target_past(
+            translated_past = build_replayed_target_past(
+                self.ctx,
+                self.translator_pool,
                 source_past_key_values=source_past_key_values,
                 edge_id=edge.id,
                 src_node_id=edge.src_id,
@@ -577,8 +586,8 @@ class AgentRunner:
             self.agent_sequence.append(
                 agent_cls(
                     node_id=node.id,
-                    model=ctx.mm.get_model(physical_node_id),
-                    tokenizer=ctx.mm.get_tokenizer(physical_node_id),
+                    model=ctx.tp.get_model(physical_node_id),
+                    tokenizer=ctx.tp.get_tokenizer(physical_node_id),
                     device=self.device,
                     max_new_tokens=self.generation_max_new_tokens,
                     stop_sequences=stop_sequences,
@@ -808,7 +817,7 @@ class AgentRunner:
     def _iter_unique_gpu_modules_for_kv_measurement(self):
         seen = set()
         modules = [self.translator_pool] + [
-            self.ctx.mm.get_model(node.id)
+            self.ctx.tp.get_model(node.id)
             for node in self.ctx.nodes
         ]
         for module in modules:
@@ -1347,7 +1356,7 @@ class AgentRunner:
         self._pending_pretranslated_second_hops.clear()
         self.translator_pool.eval()
         for node in self.ctx.nodes:
-            self.ctx.mm.get_model(node.id).eval()
+            self.ctx.tp.get_model(node.id).eval()
 
         self._log_example_start(question=question, gold_answers=gold_answers, example_index=example_index)
         transcript = self.build_initial_prompt_for_agent(

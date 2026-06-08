@@ -23,7 +23,7 @@ def _build_logit_example_state(
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
             for node in ctx.nodes
         }
     }
@@ -47,7 +47,7 @@ def _build_logit_edge_artifacts(
         receiver_past_key_values=past_by_node_id[edge.tgt_id],
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
-        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
     )
 
     native_past = past_by_node_id[edge.tgt_id]
@@ -85,7 +85,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in edges:
-                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -121,7 +121,7 @@ def evaluate_generation_dataset(
                     )
 
                 past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
                     for node in nodes
                 }
 
@@ -132,7 +132,7 @@ def evaluate_generation_dataset(
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                 )
 
                 native_past = past_by_node_id[edge.tgt_id]
@@ -143,7 +143,7 @@ def evaluate_generation_dataset(
                 cosine_value = cosine_similarity_between_past(translated_target_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=translated_target_past,
                     seed_token=seed_token,
@@ -151,7 +151,7 @@ def evaluate_generation_dataset(
                     suffix_cache_ids=suffix_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
@@ -204,7 +204,7 @@ def run_eval(
 
     translator_pool.eval()
     for node in nodes:
-        ctx.mm.get_model(node.id).eval()
+        ctx.tp.get_model(node.id).eval()
 
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
@@ -232,7 +232,7 @@ def run_eval(
             receiver_past_key_values=past_by_node_id[edge.tgt_id],
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
-            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
         )
         return replace_top_layers(
             base_past_key_values=past_by_node_id[edge.tgt_id],
@@ -252,7 +252,7 @@ def run_eval(
                 receiver_past_key_values=past_by_node_id[edge.tgt_id],
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
             ),
             target_top_past_key_values=slice_top_layers(
                 past_key_values=past_by_node_id[edge.tgt_id],

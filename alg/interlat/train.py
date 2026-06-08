@@ -26,7 +26,7 @@ from core.common import (
 )
 from core.config import Config
 from core.context import Context
-from core.model_manager import ModelManager
+from core.translator_pool import TranslatorPool
 from core.train_util import (
     build_models_and_tokenizers,
     WarmupCosineScheduler,
@@ -80,10 +80,10 @@ class TrainConfig(Config):
 
 
 class InterLatEdgeTranslator(nn.Module):
-    """Interlat-style hidden-state translator.
+    """Interlat-style hidden-state adapter.
 
     The upstream Interlat path directly communicates last-layer hidden states and
-    lets a compact hidden-state processor translate their numerical range before
+    lets a compact hidden-state processor adapt their numerical range before
     insertion into the receiver.  This module intentionally avoids the previous
     benchmark-specific query-token cross-attention compressor and hidden-state
     regression target.
@@ -107,40 +107,44 @@ class InterLatEdgeTranslator(nn.Module):
         return self.hidden_processor(source_hidden_states)
 
 
-class InterLatTranslatorPool(nn.Module):
-    def __init__(self, ctx: Context) -> None:
-        super().__init__()
-        config = ctx.config
-        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
-        translators = {}
-        for edge in ctx.edges:
-            translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-            if translator_id in translators:
-                continue
-            src_spec = ctx.mm.get_model_spec(edge.src_id)
-            tgt_spec = ctx.mm.get_model_spec(edge.tgt_id)
-            translators[translator_id] = InterLatEdgeTranslator(
+def initialize_translators(ctx: Context) -> TranslatorPool:
+    config = ctx.config
+    translator_pool = ctx.tp
+    translator_pool.interlat_node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    for edge in ctx.edges:
+        translator_id = get_translator_id(
+            translator_pool.interlat_node_model_ids[edge.src_id],
+            translator_pool.interlat_node_model_ids[edge.tgt_id],
+        )
+        if translator_id in translator_pool.translators:
+            continue
+        src_spec = ctx.tp.get_model_spec(edge.src_id)
+        tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
+        translator_pool.add_translator(
+            translator_id,
+            InterLatEdgeTranslator(
                 source_hidden_size=src_spec.hidden_size,
                 target_hidden_size=tgt_spec.hidden_size,
                 prepended_num_heads=config.prepended_num_heads,
-            )
-        self.translators = nn.ModuleDict(translators)
-        self.translator_ids = tuple(self.translators.keys())
+            ),
+        )
+    return translator_pool
 
-    def translate_hidden_states(
-        self,
-        *,
-        source_hidden_states: torch.Tensor,
-        src_node_id: str,
-        tgt_node_id: str,
-    ) -> torch.Tensor:
-        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
-        if translator_id not in self.translators:
-            raise ValueError(
-                f"InterLat translator {translator_id} is not available. "
-                f"Active translators: {list(self.translator_ids)}"
-            )
-        return self.translators[translator_id](source_hidden_states)
+
+def translate_hidden_states(
+    *,
+    translator_pool: TranslatorPool,
+    source_hidden_states: torch.Tensor,
+    src_node_id: str,
+    tgt_node_id: str,
+) -> torch.Tensor:
+    node_model_ids = getattr(translator_pool, "interlat_node_model_ids", None)
+    if node_model_ids is None:
+        raise ValueError("InterLat translator metadata has not been initialized.")
+    translator_id = get_translator_id(node_model_ids[src_node_id], node_model_ids[tgt_node_id])
+    if translator_id not in translator_pool.translators:
+        raise ValueError(f"InterLat translator {translator_id} is not available. Active translators: {list(translator_pool.translators.keys())}")
+    return translator_pool.translators[translator_id](source_hidden_states)
 
 
 def get_model_context_limit(model) -> int:
@@ -360,7 +364,7 @@ def load_translator_pool_from_checkpoint(
         config,
         nodes,
         edges,
-        ModelManager(models, tokenizers),
+        TranslatorPool(models, tokenizers),
         ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)
@@ -393,8 +397,8 @@ def run_train(
     translator_pool = build_translator_pool(ctx)
     translator_pool.train()
     for edge in ctx.edges:
-        src_spec = ctx.mm.get_model_spec(edge.src_id)
-        tgt_spec = ctx.mm.get_model_spec(edge.tgt_id)
+        src_spec = ctx.tp.get_model_spec(edge.src_id)
+        tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
         logging.info(
             "edge=%s | src_hidden=%d | tgt_hidden=%d | prefix_cache_tokens=%d",
             edge.id,
@@ -445,7 +449,7 @@ def run_train(
                 )
                 with torch.no_grad():
                     past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
                         for node in ctx.nodes
                     }
                 target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
@@ -458,15 +462,16 @@ def run_train(
             for edge in ctx.edges:
                 tgt_prefix_ids, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
 
-                target_model = ctx.mm.get_model(edge.tgt_id)
+                target_model = ctx.tp.get_model(edge.tgt_id)
                 tgt_model_context_limit = get_model_context_limit(target_model)
 
                 source_hidden_states = extract_interlat_source_hidden_states(
-                    ctx.mm.get_model(edge.src_id),
+                    ctx.tp.get_model(edge.src_id),
                     tgt_prefix_ids,
                 )
 
-                translated_latents = translator_pool.translate_hidden_states(
+                translated_latents = translate_hidden_states(
+                    translator_pool=translator_pool,
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     source_hidden_states=source_hidden_states,
@@ -497,7 +502,8 @@ def run_train(
                         lm_input_ids=lm_input_ids,
                         lm_labels=lm_labels,
                     )
-                    random_latents = translator_pool.translate_hidden_states(
+                    random_latents = translate_hidden_states(
+                        translator_pool=translator_pool,
                         src_node_id=edge.src_id,
                         tgt_node_id=edge.tgt_id,
                         source_hidden_states=build_mismatched_source_hidden_states(source_hidden_states),
@@ -604,7 +610,7 @@ def run_train(
             running_random_weight = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
-    torch.save(translator_pool.state_dict(), final_path)
+    save_translator_checkpoints(output_path, translator_pool)
     final_gpu_memory = gpu_memory_tracker.summary()
     logging.info(
         "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
@@ -613,6 +619,6 @@ def run_train(
         final_gpu_memory["num_samples"],
     )
     logging.info("[Params] trainable_translator_params=%s", f"{count_trainable_parameters(translator_pool):,}")
-    logging.info("[Done] final checkpoint saved to %s", final_path)
+    logging.info("[Done] final translator checkpoints saved to %s", final_path)
     logging.info("Saved train log to %s", log_path)
     return final_path

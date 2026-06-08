@@ -7,13 +7,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from core.channel_manager import ChannelManager
 from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
-from core.model_manager import ModelManager
+from core.translator_pool import TranslatorPool
 from core.topology import Edge, Node, build_edge_map, get_translator_id
 from core.train_util import (
     build_models_and_tokenizers,
@@ -21,6 +22,8 @@ from core.train_util import (
     get_train_config_path,
     get_train_log_path,
     initialize_train_output_paths,
+    load_translator_checkpoints,
+    save_translator_checkpoints,
 )
 
 
@@ -50,8 +53,8 @@ def inspect_kvcomm_model_compatibility(ctx: Context) -> Dict[str, object]:
     inspected_models: List[Dict[str, object]] = []
 
     for node in ctx.nodes:
-        model = ctx.mm.get_model(node.id)
-        spec = ctx.mm.get_model_spec(node.id)
+        model = ctx.tp.get_model(node.id)
+        spec = ctx.tp.get_model_spec(node.id)
         model_class, config_class, model_type, architecture_name = _extract_architecture_signature_from_model(model)
         inspected_models.append(
             {
@@ -159,122 +162,210 @@ class EdgeCalibrationResult:
     attention_importance: Optional[List[float]]
 
 
-class KVCommSelectionPool:
+class KVCommSelectionTranslator(nn.Module):
     def __init__(
         self,
-        ctx: Context,
-        selected_target_layers_by_translator_id: Dict[str, List[int]],
-        selected_source_layers_by_translator_id: Optional[Dict[str, List[int]]] = None,
+        selected_target_layers: List[int],
+        selected_source_layers: Optional[List[int]] = None,
+        layer_ranking: Optional[List[int]] = None,
+        calibration_score: Optional[float] = None,
+        attention_importance: Optional[List[float]] = None,
     ) -> None:
-        self.ctx = ctx
-        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
-        self.selected_target_layers_by_translator_id = {
-            translator_id: [int(layer_idx) for layer_idx in layers]
-            for translator_id, layers in selected_target_layers_by_translator_id.items()
-        }
-        self.selected_source_layers_by_translator_id = {
-            translator_id: [int(layer_idx) for layer_idx in layers]
-            for translator_id, layers in (selected_source_layers_by_translator_id or {}).items()
-        }
-        self.edge_map = build_edge_map(ctx.edges)
-        self._validate_all_edges()
+        super().__init__()
+        self.register_buffer(
+            "selected_target_layers_tensor",
+            torch.tensor([int(layer_idx) for layer_idx in selected_target_layers], dtype=torch.long),
+        )
+        self.register_buffer(
+            "selected_source_layers_tensor",
+            torch.tensor([int(layer_idx) for layer_idx in (selected_source_layers or [])], dtype=torch.long),
+        )
+        self.register_buffer(
+            "layer_ranking_tensor",
+            torch.tensor([int(layer_idx) for layer_idx in (layer_ranking or [])], dtype=torch.long),
+        )
+        score = float("nan") if calibration_score is None else float(calibration_score)
+        self.register_buffer("calibration_score_tensor", torch.tensor(score, dtype=torch.float32))
+        self.register_buffer(
+            "attention_importance_tensor",
+            torch.tensor([float(value) for value in (attention_importance or [])], dtype=torch.float32),
+        )
 
-    def eval(self) -> "KVCommSelectionPool":
-        return self
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        for name in (
+            "selected_target_layers_tensor",
+            "selected_source_layers_tensor",
+            "layer_ranking_tensor",
+            "calibration_score_tensor",
+            "attention_importance_tensor",
+        ):
+            if name in state_dict:
+                setattr(self, name, state_dict[name].detach().clone())
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
-    def _validate_all_edges(self) -> None:
-        for edge in self.ctx.edges:
-            self._validate_edge(edge)
+    @property
+    def selected_target_layers(self) -> List[int]:
+        return [int(value) for value in self.selected_target_layers_tensor.detach().cpu().tolist()]
 
-    def _validate_edge(self, edge: Edge) -> None:
-        src_spec = self.ctx.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
-        mismatches = []
-        if src_spec.hidden_size != tgt_spec.hidden_size:
-            mismatches.append(f"hidden_size {src_spec.hidden_size} != {tgt_spec.hidden_size}")
-        if src_spec.num_heads != tgt_spec.num_heads:
-            mismatches.append(f"num_heads {src_spec.num_heads} != {tgt_spec.num_heads}")
-        if src_spec.head_dim != tgt_spec.head_dim:
-            mismatches.append(f"head_dim {src_spec.head_dim} != {tgt_spec.head_dim}")
-        if mismatches:
-            raise ValueError(
-                "KVComm requires source/target models with matching KV geometry. "
-                f"Edge {edge.id} is incompatible: {', '.join(mismatches)}"
-            )
+    @property
+    def selected_source_layers(self) -> List[int]:
+        return [int(value) for value in self.selected_source_layers_tensor.detach().cpu().tolist()]
 
-    @staticmethod
-    def source_to_target_layer_map(num_source_layers: int, num_target_layers: int) -> Dict[int, int]:
-        return {
-            src_idx: int(
-                min(
-                    num_target_layers - 1,
-                    max(0, round((src_idx + 0.5) * num_target_layers / num_source_layers - 0.5)),
-                )
-            )
-            for src_idx in range(num_source_layers)
-        }
+    @property
+    def layer_ranking(self) -> Optional[List[int]]:
+        values = [int(value) for value in self.layer_ranking_tensor.detach().cpu().tolist()]
+        return values if values else None
 
-    @staticmethod
-    def target_to_source_layer_map(num_source_layers: int, num_target_layers: int) -> Dict[int, int]:
-        return {
-            tgt_idx: int(
-                min(
-                    num_source_layers - 1,
-                    max(0, round((tgt_idx + 0.5) * num_source_layers / num_target_layers - 0.5)),
-                )
-            )
-            for tgt_idx in range(num_target_layers)
-        }
+    @property
+    def calibration_score(self) -> Optional[float]:
+        value = float(self.calibration_score_tensor.detach().cpu().item())
+        return None if math.isnan(value) else value
 
-    def get_selected_target_layers(self, edge_id: str) -> List[int]:
-        edge = self.edge_map[edge_id]
-        translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-        return list(self.selected_target_layers_by_translator_id[translator_id])
+    @property
+    def attention_importance(self) -> Optional[List[float]]:
+        values = [float(value) for value in self.attention_importance_tensor.detach().cpu().tolist()]
+        return values if values else None
 
-    def get_selected_source_layers(self, edge_id: str) -> List[int]:
-        edge = self.edge_map[edge_id]
-        translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-        if translator_id in self.selected_source_layers_by_translator_id:
-            return list(self.selected_source_layers_by_translator_id[translator_id])
-        src_spec = self.ctx.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
-        tgt_to_src = self.target_to_source_layer_map(src_spec.num_layers, tgt_spec.num_layers)
-        return sorted({tgt_to_src[idx] for idx in self.selected_target_layers_by_translator_id[translator_id]})
 
-    def build_replayed_target_past(
-        self,
-        *,
-        source_past_key_values,
-        edge_id: Optional[str] = None,
-        src_node_id: Optional[str] = None,
-        tgt_node_id: Optional[str] = None,
-        **_: object,
-    ):
-        if edge_id is None:
-            if src_node_id is None or tgt_node_id is None:
-                raise ValueError("Either edge_id or both src_node_id/tgt_node_id must be provided.")
-            edge_id = f"{src_node_id}_to_{tgt_node_id}"
-        edge = self.edge_map[edge_id]
-        translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-        src_spec = self.ctx.mm.get_model_spec(edge.src_id)
-        tgt_spec = self.ctx.mm.get_model_spec(edge.tgt_id)
-        tgt_to_src = self.target_to_source_layer_map(src_spec.num_layers, tgt_spec.num_layers)
-        selected_target_layers = set(self.selected_target_layers_by_translator_id[translator_id])
+def source_to_target_layer_map(num_source_layers: int, num_target_layers: int) -> Dict[int, int]:
+    return {
+        src_idx: int(min(num_target_layers - 1, max(0, round((src_idx + 0.5) * num_target_layers / num_source_layers - 0.5))))
+        for src_idx in range(num_source_layers)
+    }
 
-        replayed = []
-        for tgt_layer_idx in range(tgt_spec.num_layers):
-            src_layer_idx = tgt_to_src[tgt_layer_idx]
-            key_layer, value_layer = source_past_key_values[src_layer_idx]
-            if tgt_layer_idx in selected_target_layers or tgt_layer_idx == 0:
-                replayed.append((key_layer, value_layer))
-            else:
-                replayed.append(
-                    (
-                        key_layer[:, :, :1, :].contiguous(),
-                        value_layer[:, :, :1, :].contiguous(),
-                    )
-                )
-        return tuple(replayed)
+
+def target_to_source_layer_map(num_source_layers: int, num_target_layers: int) -> Dict[int, int]:
+    return {
+        tgt_idx: int(min(num_source_layers - 1, max(0, round((tgt_idx + 0.5) * num_source_layers / num_target_layers - 0.5))))
+        for tgt_idx in range(num_target_layers)
+    }
+
+
+def validate_edge_compatibility(ctx: Context, edge: Edge) -> None:
+    src_spec = ctx.tp.get_model_spec(edge.src_id)
+    tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
+    mismatches = []
+    if src_spec.hidden_size != tgt_spec.hidden_size:
+        mismatches.append(f"hidden_size {src_spec.hidden_size} != {tgt_spec.hidden_size}")
+    if src_spec.num_heads != tgt_spec.num_heads:
+        mismatches.append(f"num_heads {src_spec.num_heads} != {tgt_spec.num_heads}")
+    if src_spec.head_dim != tgt_spec.head_dim:
+        mismatches.append(f"head_dim {src_spec.head_dim} != {tgt_spec.head_dim}")
+    if mismatches:
+        raise ValueError(
+            "KVComm requires source/target models with matching KV geometry. "
+            f"Edge {edge.id} is incompatible: {', '.join(mismatches)}"
+        )
+
+
+def validate_all_edges(ctx: Context) -> None:
+    for edge in ctx.edges:
+        validate_edge_compatibility(ctx, edge)
+
+
+def initialize_translators(
+    ctx: Context,
+    *,
+    selected_target_layers_by_translator_id: Dict[str, List[int]],
+    selected_source_layers_by_translator_id: Optional[Dict[str, List[int]]] = None,
+    layer_ranking_by_translator_id: Optional[Dict[str, Optional[List[int]]]] = None,
+    calibration_score_by_translator_id: Optional[Dict[str, Optional[float]]] = None,
+    attention_importance_by_translator_id: Optional[Dict[str, Optional[List[float]]]] = None,
+) -> TranslatorPool:
+    translator_pool = ctx.tp
+    translator_pool.kvcomm_node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    translator_pool.kvcomm_edge_map = build_edge_map(ctx.edges)
+    validate_all_edges(ctx)
+    selected_source_layers_by_translator_id = selected_source_layers_by_translator_id or {}
+    layer_ranking_by_translator_id = layer_ranking_by_translator_id or {}
+    calibration_score_by_translator_id = calibration_score_by_translator_id or {}
+    attention_importance_by_translator_id = attention_importance_by_translator_id or {}
+    for translator_id, target_layers in selected_target_layers_by_translator_id.items():
+        translator_pool.add_translator(
+            translator_id,
+            KVCommSelectionTranslator(
+                selected_target_layers=target_layers,
+                selected_source_layers=selected_source_layers_by_translator_id.get(translator_id, []),
+                layer_ranking=layer_ranking_by_translator_id.get(translator_id),
+                calibration_score=calibration_score_by_translator_id.get(translator_id),
+                attention_importance=attention_importance_by_translator_id.get(translator_id),
+            ),
+        )
+    return translator_pool
+
+
+def _get_kvcomm_edge(ctx: Context, translator_pool: TranslatorPool, edge_id: Optional[str], src_node_id: Optional[str], tgt_node_id: Optional[str]) -> Edge:
+    edge_map = getattr(translator_pool, "kvcomm_edge_map", None) or build_edge_map(ctx.edges)
+    if edge_id is None:
+        if src_node_id is None or tgt_node_id is None:
+            raise ValueError("Either edge_id or both src_node_id/tgt_node_id must be provided.")
+        edge_id = f"{src_node_id}_to_{tgt_node_id}"
+    return edge_map[edge_id]
+
+
+def get_kvcomm_translator_id(translator_pool: TranslatorPool, edge: Edge) -> str:
+    node_model_ids = getattr(translator_pool, "kvcomm_node_model_ids", None)
+    if node_model_ids is None:
+        raise ValueError("KVComm translator metadata has not been initialized.")
+    return get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id])
+
+
+def get_selected_target_layers(ctx: Context, translator_pool: TranslatorPool, edge_id: str) -> List[int]:
+    edge = _get_kvcomm_edge(ctx, translator_pool, edge_id, None, None)
+    translator_id = get_kvcomm_translator_id(translator_pool, edge)
+    return list(translator_pool.translators[translator_id].selected_target_layers)
+
+
+def get_selected_source_layers(ctx: Context, translator_pool: TranslatorPool, edge_id: str) -> List[int]:
+    edge = _get_kvcomm_edge(ctx, translator_pool, edge_id, None, None)
+    translator_id = get_kvcomm_translator_id(translator_pool, edge)
+    translator = translator_pool.translators[translator_id]
+    if translator.selected_source_layers:
+        return list(translator.selected_source_layers)
+    src_spec = ctx.tp.get_model_spec(edge.src_id)
+    tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
+    tgt_to_src = target_to_source_layer_map(src_spec.num_layers, tgt_spec.num_layers)
+    return sorted({tgt_to_src[idx] for idx in translator.selected_target_layers})
+
+
+def build_replayed_target_past(
+    ctx: Context,
+    translator_pool: TranslatorPool,
+    *,
+    source_past_key_values,
+    edge_id: Optional[str] = None,
+    src_node_id: Optional[str] = None,
+    tgt_node_id: Optional[str] = None,
+    **_: object,
+):
+    edge = _get_kvcomm_edge(ctx, translator_pool, edge_id, src_node_id, tgt_node_id)
+    translator_id = get_kvcomm_translator_id(translator_pool, edge)
+    src_spec = ctx.tp.get_model_spec(edge.src_id)
+    tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
+    tgt_to_src = target_to_source_layer_map(src_spec.num_layers, tgt_spec.num_layers)
+    selected_target_layers = set(translator_pool.translators[translator_id].selected_target_layers)
+    replayed = []
+    for tgt_layer_idx in range(tgt_spec.num_layers):
+        src_layer_idx = tgt_to_src[tgt_layer_idx]
+        key_layer, value_layer = source_past_key_values[src_layer_idx]
+        if tgt_layer_idx in selected_target_layers or tgt_layer_idx == 0:
+            replayed.append((key_layer, value_layer))
+        else:
+            replayed.append((key_layer[:, :, :1, :].contiguous(), value_layer[:, :, :1, :].contiguous()))
+    return tuple(replayed)
+
+
+def load_kvcomm_translator_checkpoints(ctx: Context) -> TranslatorPool:
+    node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    selected_target_layers_by_translator_id = {}
+    for edge in ctx.edges:
+        translator_id = get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id])
+        if translator_id in selected_target_layers_by_translator_id:
+            continue
+        selected_target_layers_by_translator_id[translator_id] = [0]
+    translator_pool = initialize_translators(ctx, selected_target_layers_by_translator_id=selected_target_layers_by_translator_id)
+    load_translator_checkpoints(ctx.config.output_path, translator_pool)
+    return translator_pool
 
 
 def _is_openwebtext_dataset(dataset_name: str) -> bool:
@@ -413,18 +504,15 @@ def _select_layers_for_edge(
     config: TrainConfig,
     calibration_batches: List[torch.Tensor],
 ) -> EdgeCalibrationResult:
-    target_spec = ctx.mm.get_model_spec(edge.tgt_id)
-    source_spec = ctx.mm.get_model_spec(edge.src_id)
-    node_model_ids = {node.id: node.model_id for node in ctx.nodes}
-    translator_id = get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id])
-    pool_probe = KVCommSelectionPool(ctx, selected_target_layers_by_translator_id={translator_id: [0]})
-    del pool_probe
+    target_spec = ctx.tp.get_model_spec(edge.tgt_id)
+    source_spec = ctx.tp.get_model_spec(edge.src_id)
+    validate_edge_compatibility(ctx, edge)
 
     candidate_layers, manual_layers, num_layers_to_select = _resolve_candidate_target_layers(
         config=config,
         target_num_layers=target_spec.num_layers,
     )
-    tgt_to_src = KVCommSelectionPool.target_to_source_layer_map(source_spec.num_layers, target_spec.num_layers)
+    tgt_to_src = target_to_source_layer_map(source_spec.num_layers, target_spec.num_layers)
 
     if manual_layers is not None:
         selected_target_layers = candidate_layers
@@ -462,7 +550,7 @@ def _select_layers_for_edge(
             attention_importance=None,
         )
 
-    target_model = ctx.mm.get_model(edge.tgt_id)
+    target_model = ctx.tp.get_model(edge.tgt_id)
     target_model.eval()
 
     layer_score_samples: List[np.ndarray] = []
@@ -554,7 +642,7 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
         target_node_id: _build_openwebtext_calibration_batches(
             ctx=ctx,
             config=config,
-            tokenizer=ctx.mm.get_tokenizer(target_node_id),
+            tokenizer=ctx.tp.get_tokenizer(target_node_id),
         )
         for target_node_id in sorted({edge.tgt_id for edge in edges})
     }
@@ -587,40 +675,32 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
         if result.layer_ranking is not None:
             logging.info("%s | translator_id=%s | layer_ranking=%s", edge.id, translator_id, result.layer_ranking)
 
-    checkpoint_payload = {
-        "train_config": asdict(config),
-        "selection_source": f"{config.calibration_dataset}/train",
-        "selection_total_tokens": _openwebtext_total_tokens(config),
-        "selection_prefix_tokens": _openwebtext_prefix_tokens(config),
-        "selected_target_layers_by_translator_id": {
+    translator_pool = initialize_translators(
+        ctx,
+        selected_target_layers_by_translator_id={
             translator_id: result.selected_target_layers
             for translator_id, result in calibration_by_translator_id.items()
         },
-        "selected_source_layers_by_translator_id": {
+        selected_source_layers_by_translator_id={
             translator_id: result.selected_source_layers
             for translator_id, result in calibration_by_translator_id.items()
         },
-        "layer_ranking_by_translator_id": {
+        layer_ranking_by_translator_id={
             translator_id: result.layer_ranking
             for translator_id, result in calibration_by_translator_id.items()
         },
-        "calibration_score_by_translator_id": {
+        calibration_score_by_translator_id={
             translator_id: result.calibration_score
             for translator_id, result in calibration_by_translator_id.items()
         },
-        "attention_importance_by_translator_id": {
+        attention_importance_by_translator_id={
             translator_id: result.attention_importance
             for translator_id, result in calibration_by_translator_id.items()
         },
-        "note": (
-            "KVComm has no gradient-based training in this repository wrapper. "
-            f"The train stage selects per-edge replay layers from {config.calibration_dataset} and stores them for dataset-agnostic evaluation."
-        ),
-    }
-    checkpoint_path = get_train_checkpoint_path(output_path)
-    torch.save(checkpoint_payload, checkpoint_path)
-    logging.info("Saved KVComm layer-selection checkpoint to %s", checkpoint_path)
-    return checkpoint_path
+    )
+    checkpoint_dir = save_translator_checkpoints(output_path, translator_pool)
+    logging.info("Saved KVComm layer-selection translator checkpoints to %s", checkpoint_dir)
+    return checkpoint_dir
 
 
 def load_translator_pool_from_checkpoint(
@@ -628,52 +708,19 @@ def load_translator_pool_from_checkpoint(
     nodes: List[Node],
     edges: List[Edge],
     device_override: Optional[str] = None,
-) -> Tuple[Context, KVCommSelectionPool]:
+) -> Tuple[Context, TranslatorPool]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
-
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
-
-    checkpoint_path = get_train_checkpoint_path(checkpoint_dir_path_obj)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = resolve_device(device_override)
-
+    config.output_path = str(checkpoint_dir_path_obj)
     models, tokenizers = build_models_and_tokenizers(config, nodes)
-    ctx = Context(
-        config,
-        nodes,
-        edges,
-        ModelManager(models, tokenizers),
-        ChannelManager(edges),
-    )
-    payload = torch.load(str(checkpoint_path), map_location="cpu")
-    node_model_ids = {node.id: node.model_id for node in nodes}
-    selected_target_layers_by_translator_id = payload.get("selected_target_layers_by_translator_id")
-    selected_source_layers_by_translator_id = payload.get("selected_source_layers_by_translator_id")
-    if selected_target_layers_by_translator_id is None:
-        selected_target_layers_by_translator_id = {
-            get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id]): layers
-            for edge in edges
-            for edge_id, layers in payload["selected_target_layers_by_edge"].items()
-            if edge.id == edge_id
-        }
-    if selected_source_layers_by_translator_id is None:
-        selected_source_layers_by_translator_id = {
-            get_translator_id(node_model_ids[edge.src_id], node_model_ids[edge.tgt_id]): layers
-            for edge in edges
-            for edge_id, layers in payload["selected_source_layers_by_edge"].items()
-            if edge.id == edge_id
-        }
-    translator_pool = KVCommSelectionPool(
-        ctx=ctx,
-        selected_target_layers_by_translator_id=selected_target_layers_by_translator_id,
-        selected_source_layers_by_translator_id=selected_source_layers_by_translator_id,
-    )
+    ctx = Context(config, nodes, edges, TranslatorPool(models, tokenizers), ChannelManager(edges))
+    translator_pool = load_kvcomm_translator_checkpoints(ctx)
+    translator_pool.eval()
     return ctx, translator_pool

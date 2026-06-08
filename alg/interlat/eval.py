@@ -12,6 +12,7 @@ from core.eval_util import *
 from alg.interlat.train import (
     build_latent_conditioned_past,
     extract_interlat_source_hidden_states,
+    translate_hidden_states,
 )
 
 
@@ -57,12 +58,13 @@ def _build_interlat_target_past(
     prefix_input_ids: torch.Tensor,
     translator_pool,
 ) -> PastKeyValues:
-    target_model = ctx.mm.get_model(edge.tgt_id)
+    target_model = ctx.tp.get_model(edge.tgt_id)
     source_hidden_states = extract_interlat_source_hidden_states(
-        ctx.mm.get_model(edge.src_id),
+        ctx.tp.get_model(edge.src_id),
         prefix_input_ids,
     )
-    translated_latents = translator_pool.translate_hidden_states(
+    translated_latents = translate_hidden_states(
+        translator_pool=translator_pool,
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
         source_hidden_states=source_hidden_states,
@@ -81,7 +83,7 @@ def _build_logit_example_state(
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
             for node in ctx.nodes
         }
     }
@@ -152,7 +154,7 @@ def evaluate_openwebtext_validation_loss_interlat(
         )
         translated_loss = float(
             compute_suffix_lm_loss(
-                target_model=ctx.mm.get_model(edge.tgt_id),
+                target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
@@ -160,7 +162,7 @@ def evaluate_openwebtext_validation_loss_interlat(
         )
         native_loss = float(
             compute_suffix_lm_loss(
-                target_model=ctx.mm.get_model(edge.tgt_id),
+                target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
@@ -169,7 +171,7 @@ def evaluate_openwebtext_validation_loss_interlat(
 
         def run_translated_inference() -> int:
             return run_openwebtext_greedy_inference(
-                model=ctx.mm.get_model(edge.tgt_id),
+                model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
                 seed_token=seed_token,
                 max_new_tokens=generation_steps,
@@ -177,7 +179,7 @@ def evaluate_openwebtext_validation_loss_interlat(
 
         def run_native_inference() -> int:
             return run_openwebtext_greedy_inference(
-                model=ctx.mm.get_model(edge.tgt_id),
+                model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
                 seed_token=seed_token,
                 max_new_tokens=generation_steps,
@@ -227,7 +229,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in edges:
-                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -263,7 +265,7 @@ def evaluate_generation_dataset(
                     )
 
                 past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
                     for node in ctx.nodes
                 }
                 translated_past = _build_interlat_target_past(
@@ -276,7 +278,7 @@ def evaluate_generation_dataset(
                 cosine_value = _cosine_similarity_for_interlat_past(translated_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=translated_past,
                     seed_token=seed_token,
@@ -284,7 +286,7 @@ def evaluate_generation_dataset(
                     suffix_cache_ids=suffix_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=native_past,
                     seed_token=seed_token,
@@ -337,7 +339,7 @@ def run_eval(
 
     translator_pool.eval()
     for node in nodes:
-        ctx.mm.get_model(node.id).eval()
+        ctx.tp.get_model(node.id).eval()
 
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])

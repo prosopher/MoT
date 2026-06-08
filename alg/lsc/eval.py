@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from core.context import Context
 from core.eval_util import *
+from alg.lsc.train import translate_layers
 
 
 def _build_logit_example_state(
@@ -17,7 +18,7 @@ def _build_logit_example_state(
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
             for node in ctx.nodes
         }
     }
@@ -33,11 +34,12 @@ def _build_logit_edge_artifacts(
 ) -> LogitEvalEdgeArtifacts:
     past_by_node_id = example_state["past_by_node_id"]
 
-    translated_past = translator_pool.translate_layers(
+    translated_past = translate_layers(
+        translator_pool=translator_pool,
         past_key_values=past_by_node_id[edge.src_id],
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
-        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
     )
     native_past = past_by_node_id[edge.tgt_id]
     return LogitEvalEdgeArtifacts(
@@ -70,7 +72,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in edges:
-                tokenizer = ctx.mm.get_tokenizer(edge.tgt_id)
+                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -106,21 +108,22 @@ def evaluate_generation_dataset(
                     )
 
                 past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_input_ids)
+                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
                     for node in nodes
                 }
 
-                translated_past = translator_pool.translate_layers(
+                translated_past = translate_layers(
+                    translator_pool=translator_pool,
                     past_key_values=past_by_node_id[edge.src_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                 )
                 native_past = past_by_node_id[edge.tgt_id]
                 cosine_value = cosine_similarity_between_past(translated_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=translated_past,
                     seed_token=seed_token,
@@ -128,7 +131,7 @@ def evaluate_generation_dataset(
                     suffix_cache_ids=suffix_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=ctx.mm.get_model(edge.tgt_id),
+                    model=ctx.tp.get_model(edge.tgt_id),
                     tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
@@ -181,7 +184,7 @@ def run_eval(
 
     translator_pool.eval()
     for node in nodes:
-        ctx.mm.get_model(node.id).eval()
+        ctx.tp.get_model(node.id).eval()
 
     logging.info("restored_train_config=%s", asdict(train_config))
     logging.info("nodes=%s", [asdict(node) for node in nodes])
@@ -190,9 +193,9 @@ def run_eval(
         logging.info(
             "translation_spec: %s layers=%d hidden=%d heads=%d (%s)",
             node.id,
-            ctx.mm.get_model_spec(node.id).num_layers,
-            ctx.mm.get_model_spec(node.id).hidden_size,
-            ctx.mm.get_model_spec(node.id).num_heads,
+            ctx.tp.get_model_spec(node.id).num_layers,
+            ctx.tp.get_model_spec(node.id).hidden_size,
+            ctx.tp.get_model_spec(node.id).num_heads,
             node.model_id,
         )
     logging.info("translation_mode=translate_all_layers")
@@ -204,11 +207,12 @@ def run_eval(
     logging.info("Preparing validation dataloader for OpenWebText/validation")
 
     def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
-        return translator_pool.translate_layers(
+        return translate_layers(
+            translator_pool=translator_pool,
             past_key_values=past_by_node_id[edge.src_id],
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
-            tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+            tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
         )
 
     def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
@@ -216,11 +220,12 @@ def run_eval(
         target_past = past_by_node_id[edge.tgt_id]
         return build_openwebtext_tsne_named_pasts(
             source_top_past_key_values=source_past,
-            translated_past_key_values=translator_pool.translate_layers(
+            translated_past_key_values=translate_layers(
+                translator_pool=translator_pool,
                 past_key_values=source_past,
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
-                tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
             ),
             target_top_past_key_values=target_past,
         )

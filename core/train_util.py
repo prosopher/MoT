@@ -35,7 +35,7 @@ def build_training_dataloader(ctx: Context, tokenizer: PreTrainedTokenizerBase) 
 def build_training_dataloaders_by_target(ctx: Context) -> Dict[str, InfiniteDataLoader]:
     target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
     return {
-        node_id: build_training_dataloader(ctx, ctx.mm.get_tokenizer(node_id))
+        node_id: build_training_dataloader(ctx, ctx.tp.get_tokenizer(node_id))
         for node_id in target_node_ids
     }
 
@@ -138,14 +138,37 @@ def build_models_and_tokenizers(
     return models, tokenizers
 
 
-def save_checkpoint(
-    output_path: str,
-    translator_pool: nn.Module,
-) -> None:
-    output_path = str(output_path)
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(translator_pool.state_dict(), output_path)
+TRANSLATOR_CHECKPOINT_DIR_NAME = "translators"
 
+
+def get_translator_checkpoint_dir(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / TRANSLATOR_CHECKPOINT_DIR_NAME
+
+
+def get_translator_checkpoint_filename(translator_id: str) -> str:
+    from urllib.parse import quote
+
+    return f"{quote(translator_id, safe='')}.pt"
+
+
+def get_translator_checkpoint_path(output_path: Union[str, Path], translator_id: str) -> Path:
+    return get_translator_checkpoint_dir(output_path) / get_translator_checkpoint_filename(translator_id)
+
+
+def save_translator_checkpoints(output_path: Union[str, Path], translator_pool) -> Path:
+    checkpoint_dir = get_translator_checkpoint_dir(output_path)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    for translator_id, translator in translator_pool.translators.items():
+        torch.save(translator.state_dict(), get_translator_checkpoint_path(output_path, translator_id))
+    return checkpoint_dir
+
+
+def load_translator_checkpoints(checkpoint_dir_path: Union[str, Path], translator_pool) -> None:
+    for translator_id, translator in translator_pool.translators.items():
+        checkpoint_path = get_translator_checkpoint_path(checkpoint_dir_path, translator_id)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Translator checkpoint not found: {checkpoint_path}")
+        translator.load_state_dict(torch.load(str(checkpoint_path), map_location="cpu"))
 
 def get_train_config_path(output_path: Union[str, Path]) -> Path:
     return Path(output_path) / "train_config.json"
@@ -156,7 +179,7 @@ def get_train_log_path(output_path: Union[str, Path]) -> Path:
 
 
 def get_train_checkpoint_path(output_path: Union[str, Path]) -> Path:
-    return Path(output_path) / "checkpoint.pt"
+    return get_translator_checkpoint_dir(output_path)
 
 
 def initialize_train_output_paths(config) -> None:

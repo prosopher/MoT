@@ -19,11 +19,3 @@ class Context:
     tp: TranslatorPool
     cm: ChannelManager
     cp: Optional["ChannelProfiler"] = None
-
-    @property
-    def mm(self) -> TranslatorPool:
-        return self.tp
-
-    @mm.setter
-    def mm(self, value: TranslatorPool) -> None:
-        self.tp = value

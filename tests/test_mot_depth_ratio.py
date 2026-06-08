@@ -12,7 +12,7 @@ from alg.mot.train import replay_target_prefill_with_injected_window
 import alg.mot.train as mot_train_module
 
 
-class DummyModelManager:
+class DummyTranslatorPool:
     def __init__(self, layer_counts: dict[str, int]) -> None:
         self.layer_counts = layer_counts
 
@@ -61,7 +61,7 @@ def build_profiler(layer_alignment: str) -> tuple[DeterministicChannelProfiler, 
         ),
         nodes=[],
         edges=[edge],
-        mm=DummyModelManager({"A": 2, "B": 4}),
+        tp=DummyTranslatorPool({"A": 2, "B": 4}),
         cm=ChannelManager([edge]),
     )
     profiler = DeterministicChannelProfiler(
@@ -97,7 +97,7 @@ def build_scored_profiler(
         ),
         nodes=[],
         edges=[edge],
-        mm=DummyModelManager({"A": layer_counts[0], "B": layer_counts[1]}),
+        tp=DummyTranslatorPool({"A": layer_counts[0], "B": layer_counts[1]}),
         cm=ChannelManager([edge]),
     )
     profiler = ScoreMappedChannelProfiler(

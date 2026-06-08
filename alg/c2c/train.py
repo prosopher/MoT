@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 from core.config import Config
 from core.context import Context
 from core.channel_manager import ChannelManager
-from core.model_manager import ModelManager
+from core.translator_pool import TranslatorPool
 from core.model_spec import ModelSpec
 from core.train_util import *
 from core.topology import get_translator_id
@@ -135,8 +135,8 @@ def get_top_layers_to_translate(config: TrainConfig) -> TopLayersToTranslate:
 def get_top_layers_to_translate_for_edge(config: TrainConfig, ctx: Context, edge: Edge) -> int:
     return resolve_top_layers_to_translate(
         value=config.top_layers_to_translate,
-        src_spec=ctx.mm.get_model_spec(edge.src_id),
-        tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+        src_spec=ctx.tp.get_model_spec(edge.src_id),
+        tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
         edge_id=edge.id,
     )
 
@@ -158,7 +158,7 @@ def get_trainable_module_label(config: TrainConfig) -> str:
 
 
 def translate_top_layers(
-    translator_pool,
+    translator_pool: TranslatorPool,
     train_config: TrainConfig,
     sharer_past_key_values: PastKeyValues,
     receiver_past_key_values: PastKeyValues,
@@ -167,19 +167,22 @@ def translate_top_layers(
     tgt_spec: ModelSpec,
 ) -> PastKeyValues:
     if is_projection_only_variant(train_config):
-        return translator_pool.project_top_layers(
+        return project_top_layers(
+            translator_pool=translator_pool,
             sharer_past_key_values=sharer_past_key_values,
             src_node_id=src_node_id,
             tgt_node_id=tgt_node_id,
             tgt_spec=tgt_spec,
         )
-    return translator_pool.fuse_top_layers(
+    return fuse_top_layers(
+        translator_pool=translator_pool,
         sharer_past_key_values=sharer_past_key_values,
         receiver_past_key_values=receiver_past_key_values,
         src_node_id=src_node_id,
         tgt_node_id=tgt_node_id,
         tgt_spec=tgt_spec,
     )
+
 
 
 class ResidualCacheFuser(nn.Module):
@@ -387,128 +390,144 @@ class DirectionalCacheFuser(nn.Module):
         return fused_key, fused_value
 
 
-class C2CFuserPool(nn.Module):
-    def __init__(
-        self,
-        ctx: Context,
-        top_layers_to_translate: TopLayersToTranslate,
-        fuser_dim: int,
-        fuser_heads: int,
-        fuser_depth: int,
-        mlp_ratio: int,
-        gate_temperature_start: float,
-        hard_gate_eval: bool,
-            ) -> None:
-        super().__init__()
-        top_layers_to_translate = normalize_top_layers_to_translate(top_layers_to_translate)
+def _ensure_c2c_metadata(translator_pool: TranslatorPool) -> None:
+    if not hasattr(translator_pool, "c2c_node_model_ids"):
+        translator_pool.c2c_node_model_ids = {}
+    if not hasattr(translator_pool, "c2c_top_layers_by_edge_id"):
+        translator_pool.c2c_top_layers_by_edge_id = {}
 
-        self.mm = ctx.mm
-        self.top_layers_to_translate = top_layers_to_translate
-        self.edges = tuple(ctx.edges)
-        self.edge_ids = tuple(edge.id for edge in ctx.edges)
-        self.edges_by_id = build_edge_map(ctx.edges)
-        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
 
-        translators = {}
-        top_layers_by_edge_id = {}
-        for edge in self.edges:
-            src_spec = self.mm.get_model_spec(edge.src_id)
-            tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-            edge_top_layers_to_translate = resolve_top_layers_to_translate(
-                value=top_layers_to_translate,
-                src_spec=src_spec,
-                tgt_spec=tgt_spec,
-                edge_id=edge.id,
-            )
-            top_layers_by_edge_id[edge.id] = edge_top_layers_to_translate
-            translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-            if translator_id not in translators:
-                translators[translator_id] = DirectionalCacheFuser(
-                    src_hidden_size=src_spec.kv_hidden_size,
-                    tgt_hidden_size=tgt_spec.kv_hidden_size,
-                    top_layers_to_translate=edge_top_layers_to_translate,
-                    fuser_dim=fuser_dim,
-                    fuser_heads=fuser_heads,
-                    fuser_depth=fuser_depth,
-                    mlp_ratio=mlp_ratio,
-                    gate_temperature_start=gate_temperature_start,
-                    hard_gate_eval=hard_gate_eval,
-                )
+def _get_c2c_translator_id(translator_pool: TranslatorPool, src_node_id: str, tgt_node_id: str) -> str:
+    node_model_ids = getattr(translator_pool, "c2c_node_model_ids", None)
+    if node_model_ids is None:
+        raise ValueError("C2C translator metadata has not been initialized.")
+    return get_translator_id(node_model_ids[src_node_id], node_model_ids[tgt_node_id])
 
-        self.translators = nn.ModuleDict(translators)
-        self.translator_ids = tuple(self.translators.keys())
-        self.top_layers_by_edge_id = top_layers_by_edge_id
 
-    def set_temperature(self, temperature: float) -> None:
-        for module in self.translators.values():
-            module.set_temperature(temperature)
-
-    def set_hard_gate_eval(self, enabled: bool) -> None:
-        for module in self.translators.values():
-            module.set_hard_gate_eval(enabled)
-
-    def mean_gate_probability(self) -> float:
-        if not self.translators:
-            return float("nan")
-        return float(sum(module.mean_gate_probability() for module in self.translators.values()) / len(self.translators))
-
-    def fuse_top_layer_blocks(
-        self,
-        receiver_key_block: torch.Tensor,
-        receiver_value_block: torch.Tensor,
-        sharer_key_block: torch.Tensor,
-        sharer_value_block: torch.Tensor,
-        src_node_id: str,
-        tgt_node_id: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
-        if translator_id not in self.translators:
-            raise ValueError(
-                f"C2C translator {translator_id} is not available. Active translators: {list(self.translator_ids)}"
-            )
-        return self.translators[translator_id](
-            receiver_key_block=receiver_key_block,
-            receiver_value_block=receiver_value_block,
-            sharer_key_block=sharer_key_block,
-            sharer_value_block=sharer_value_block,
+def initialize_fuser_translators(
+    ctx: Context,
+    *,
+    top_layers_to_translate: TopLayersToTranslate,
+    fuser_dim: int,
+    fuser_heads: int,
+    fuser_depth: int,
+    mlp_ratio: int,
+    gate_temperature_start: float,
+    hard_gate_eval: bool,
+) -> TranslatorPool:
+    translator_pool = ctx.tp
+    _ensure_c2c_metadata(translator_pool)
+    translator_pool.c2c_node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    translator_pool.c2c_top_layers_by_edge_id = {}
+    top_layers_to_translate = normalize_top_layers_to_translate(top_layers_to_translate)
+    for edge in ctx.edges:
+        src_spec = ctx.tp.get_model_spec(edge.src_id)
+        tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
+        edge_top_layers_to_translate = resolve_top_layers_to_translate(
+            value=top_layers_to_translate,
+            src_spec=src_spec,
+            tgt_spec=tgt_spec,
+            edge_id=edge.id,
         )
+        translator_pool.c2c_top_layers_by_edge_id[edge.id] = edge_top_layers_to_translate
+        translator_id = get_translator_id(
+            translator_pool.c2c_node_model_ids[edge.src_id],
+            translator_pool.c2c_node_model_ids[edge.tgt_id],
+        )
+        if translator_id in translator_pool.translators:
+            continue
+        translator_pool.add_translator(
+            translator_id,
+            DirectionalCacheFuser(
+                src_hidden_size=src_spec.kv_hidden_size,
+                tgt_hidden_size=tgt_spec.kv_hidden_size,
+                top_layers_to_translate=edge_top_layers_to_translate,
+                fuser_dim=fuser_dim,
+                fuser_heads=fuser_heads,
+                fuser_depth=fuser_depth,
+                mlp_ratio=mlp_ratio,
+                gate_temperature_start=gate_temperature_start,
+                hard_gate_eval=hard_gate_eval,
+            ),
+        )
+    return translator_pool
 
-    def fuse_top_layers(
-        self,
-        sharer_past_key_values: PastKeyValues,
-        receiver_past_key_values: PastKeyValues,
-        src_node_id: str,
-        tgt_node_id: str,
-        tgt_spec: ModelSpec,
-    ) -> PastKeyValues:
-        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
-        if translator_id not in self.translators:
-            raise ValueError(
-                f"C2C translator {translator_id} is not available. Active translators: {list(self.translator_ids)}"
-            )
-        top_layers_to_translate = self.translators[translator_id].top_layers_to_translate
-        sharer_key_block, sharer_value_block = extract_top_layer_blocks(
-            past_key_values=sharer_past_key_values,
-            top_layers_to_translate=top_layers_to_translate,
-        )
-        receiver_key_block, receiver_value_block = extract_top_layer_blocks(
-            past_key_values=receiver_past_key_values,
-            top_layers_to_translate=top_layers_to_translate,
-        )
-        fused_key, fused_value = self.fuse_top_layer_blocks(
-            receiver_key_block=receiver_key_block,
-            receiver_value_block=receiver_value_block,
-            sharer_key_block=sharer_key_block,
-            sharer_value_block=sharer_value_block,
-            src_node_id=src_node_id,
-            tgt_node_id=tgt_node_id,
-        )
-        return blocks_to_partial_past_key_values(
-            key_block=fused_key,
-            value_block=fused_value,
-            num_heads=tgt_spec.num_key_value_heads,
-            head_dim=tgt_spec.head_dim,
-        )
+
+def set_temperature(translator_pool: TranslatorPool, temperature: float) -> None:
+    for translator in translator_pool.translators.values():
+        if hasattr(translator, "set_temperature"):
+            translator.set_temperature(temperature)
+
+
+def set_hard_gate_eval(translator_pool: TranslatorPool, enabled: bool) -> None:
+    for translator in translator_pool.translators.values():
+        if hasattr(translator, "set_hard_gate_eval"):
+            translator.set_hard_gate_eval(enabled)
+
+
+def mean_gate_probability(translator_pool: TranslatorPool) -> float:
+    if not translator_pool.translators:
+        return float("nan")
+    return float(sum(translator.mean_gate_probability() for translator in translator_pool.translators.values()) / len(translator_pool.translators))
+
+
+def fuse_top_layer_blocks(
+    *,
+    translator_pool: TranslatorPool,
+    receiver_key_block: torch.Tensor,
+    receiver_value_block: torch.Tensor,
+    sharer_key_block: torch.Tensor,
+    sharer_value_block: torch.Tensor,
+    src_node_id: str,
+    tgt_node_id: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    translator_id = _get_c2c_translator_id(translator_pool, src_node_id, tgt_node_id)
+    if translator_id not in translator_pool.translators:
+        raise ValueError(f"C2C translator {translator_id} is not available. Active translators: {list(translator_pool.translators.keys())}")
+    return translator_pool.translators[translator_id](
+        receiver_key_block=receiver_key_block,
+        receiver_value_block=receiver_value_block,
+        sharer_key_block=sharer_key_block,
+        sharer_value_block=sharer_value_block,
+    )
+
+
+def fuse_top_layers(
+    *,
+    translator_pool: TranslatorPool,
+    sharer_past_key_values: PastKeyValues,
+    receiver_past_key_values: PastKeyValues,
+    src_node_id: str,
+    tgt_node_id: str,
+    tgt_spec: ModelSpec,
+) -> PastKeyValues:
+    translator_id = _get_c2c_translator_id(translator_pool, src_node_id, tgt_node_id)
+    if translator_id not in translator_pool.translators:
+        raise ValueError(f"C2C translator {translator_id} is not available. Active translators: {list(translator_pool.translators.keys())}")
+    top_layers_to_translate = translator_pool.translators[translator_id].top_layers_to_translate
+    sharer_key_block, sharer_value_block = extract_top_layer_blocks(
+        past_key_values=sharer_past_key_values,
+        top_layers_to_translate=top_layers_to_translate,
+    )
+    receiver_key_block, receiver_value_block = extract_top_layer_blocks(
+        past_key_values=receiver_past_key_values,
+        top_layers_to_translate=top_layers_to_translate,
+    )
+    fused_key, fused_value = fuse_top_layer_blocks(
+        translator_pool=translator_pool,
+        receiver_key_block=receiver_key_block,
+        receiver_value_block=receiver_value_block,
+        sharer_key_block=sharer_key_block,
+        sharer_value_block=sharer_value_block,
+        src_node_id=src_node_id,
+        tgt_node_id=tgt_node_id,
+    )
+    return blocks_to_partial_past_key_values(
+        key_block=fused_key,
+        value_block=fused_value,
+        num_heads=tgt_spec.num_key_value_heads,
+        head_dim=tgt_spec.head_dim,
+    )
 
 
 def extract_top_layer_blocks(
@@ -530,7 +549,7 @@ def extract_top_layer_blocks(
 
 class ProjectionMLP(nn.Module):
     """
-    Projection-only cache translator for the C2C ablation in Table 8 ("Project").
+    Projection-only cache adapter for the C2C ablation in Table 8 ("Project").
     It directly maps the sharer's top-layer KV cache into the receiver hidden space
     and replaces the receiver top layers.
     """
@@ -601,92 +620,84 @@ class DirectionalCacheProjector(nn.Module):
         return self.key_projector(sharer_key_block), self.value_projector(sharer_value_block)
 
 
-class C2CProjectorPool(nn.Module):
-    def __init__(
-        self,
-        ctx: Context,
-        top_layers_to_translate: TopLayersToTranslate,
-        projector_dim: int,
-        projector_depth: int,
-        mlp_ratio: int,
-            ) -> None:
-        super().__init__()
-        top_layers_to_translate = normalize_top_layers_to_translate(top_layers_to_translate)
-
-        self.mm = ctx.mm
-        self.top_layers_to_translate = top_layers_to_translate
-        self.edges = tuple(ctx.edges)
-        self.edge_ids = tuple(edge.id for edge in ctx.edges)
-        self.edges_by_id = build_edge_map(ctx.edges)
-        self.node_model_ids = {node.id: node.model_id for node in ctx.nodes}
-
-        translators = {}
-        top_layers_by_edge_id = {}
-        for edge in self.edges:
-            src_spec = self.mm.get_model_spec(edge.src_id)
-            tgt_spec = self.mm.get_model_spec(edge.tgt_id)
-            edge_top_layers_to_translate = resolve_top_layers_to_translate(
-                value=top_layers_to_translate,
-                src_spec=src_spec,
-                tgt_spec=tgt_spec,
-                edge_id=edge.id,
-            )
-            top_layers_by_edge_id[edge.id] = edge_top_layers_to_translate
-            translator_id = get_translator_id(self.node_model_ids[edge.src_id], self.node_model_ids[edge.tgt_id])
-            if translator_id not in translators:
-                translators[translator_id] = DirectionalCacheProjector(
-                    src_hidden_size=src_spec.kv_hidden_size,
-                    tgt_hidden_size=tgt_spec.kv_hidden_size,
-                    top_layers_to_translate=edge_top_layers_to_translate,
-                    hidden_dim=projector_dim,
-                    depth=projector_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-        self.translators = nn.ModuleDict(translators)
-        self.translator_ids = tuple(self.translators.keys())
-        self.top_layers_by_edge_id = top_layers_by_edge_id
-    def mean_gate_probability(self) -> float:
-        if not self.translators:
-            return float("nan")
-        return float(sum(module.mean_gate_probability() for module in self.translators.values()) / len(self.translators))
-
-    def project_top_layers(
-        self,
-        sharer_past_key_values: PastKeyValues,
-        src_node_id: str,
-        tgt_node_id: str,
-        tgt_spec: ModelSpec,
-    ) -> PastKeyValues:
-        translator_id = get_translator_id(self.node_model_ids[src_node_id], self.node_model_ids[tgt_node_id])
-        if translator_id not in self.translators:
-            raise ValueError(
-                f"C2C-Project translator {translator_id} is not available. "
-                f"Active translators: {list(self.translator_ids)}"
-            )
-        translator = self.translators[translator_id]
-        sharer_key_block, sharer_value_block = extract_top_layer_blocks(
-            past_key_values=sharer_past_key_values,
-            top_layers_to_translate=translator.top_layers_to_translate,
+def initialize_projector_translators(
+    ctx: Context,
+    *,
+    top_layers_to_translate: TopLayersToTranslate,
+    projector_dim: int,
+    projector_depth: int,
+    mlp_ratio: int,
+) -> TranslatorPool:
+    translator_pool = ctx.tp
+    _ensure_c2c_metadata(translator_pool)
+    translator_pool.c2c_node_model_ids = {node.id: node.model_id for node in ctx.nodes}
+    translator_pool.c2c_top_layers_by_edge_id = {}
+    top_layers_to_translate = normalize_top_layers_to_translate(top_layers_to_translate)
+    for edge in ctx.edges:
+        src_spec = ctx.tp.get_model_spec(edge.src_id)
+        tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
+        edge_top_layers_to_translate = resolve_top_layers_to_translate(
+            value=top_layers_to_translate,
+            src_spec=src_spec,
+            tgt_spec=tgt_spec,
+            edge_id=edge.id,
         )
-        projected_key, projected_value = translator(
-            sharer_key_block=sharer_key_block,
-            sharer_value_block=sharer_value_block,
+        translator_pool.c2c_top_layers_by_edge_id[edge.id] = edge_top_layers_to_translate
+        translator_id = get_translator_id(
+            translator_pool.c2c_node_model_ids[edge.src_id],
+            translator_pool.c2c_node_model_ids[edge.tgt_id],
         )
-        return blocks_to_partial_past_key_values(
-            key_block=projected_key,
-            value_block=projected_value,
-            num_heads=tgt_spec.num_key_value_heads,
-            head_dim=tgt_spec.head_dim,
+        if translator_id in translator_pool.translators:
+            continue
+        translator_pool.add_translator(
+            translator_id,
+            DirectionalCacheProjector(
+                src_hidden_size=src_spec.kv_hidden_size,
+                tgt_hidden_size=tgt_spec.kv_hidden_size,
+                top_layers_to_translate=edge_top_layers_to_translate,
+                hidden_dim=projector_dim,
+                depth=projector_depth,
+                mlp_ratio=mlp_ratio,
+            ),
         )
+    return translator_pool
+
+
+def project_top_layers(
+    *,
+    translator_pool: TranslatorPool,
+    sharer_past_key_values: PastKeyValues,
+    src_node_id: str,
+    tgt_node_id: str,
+    tgt_spec: ModelSpec,
+) -> PastKeyValues:
+    translator_id = _get_c2c_translator_id(translator_pool, src_node_id, tgt_node_id)
+    if translator_id not in translator_pool.translators:
+        raise ValueError(f"C2C-Project translator {translator_id} is not available. Active translators: {list(translator_pool.translators.keys())}")
+    translator = translator_pool.translators[translator_id]
+    sharer_key_block, sharer_value_block = extract_top_layer_blocks(
+        past_key_values=sharer_past_key_values,
+        top_layers_to_translate=translator.top_layers_to_translate,
+    )
+    projected_key, projected_value = translator(
+        sharer_key_block=sharer_key_block,
+        sharer_value_block=sharer_value_block,
+    )
+    return blocks_to_partial_past_key_values(
+        key_block=projected_key,
+        value_block=projected_value,
+        num_heads=tgt_spec.num_key_value_heads,
+        head_dim=tgt_spec.head_dim,
+    )
 
 
 def build_translator_pool(
     ctx: Context,
-) -> Union[C2CFuserPool, C2CProjectorPool]:
+) -> TranslatorPool:
     config = ctx.config
     edges = ctx.edges
     if is_projection_only_variant(config):
-        translator_pool = C2CProjectorPool(
+        translator_pool = initialize_projector_translators(
             ctx=ctx,
             top_layers_to_translate=config.top_layers_to_translate,
             projector_dim=config.projector_dim,
@@ -694,7 +705,7 @@ def build_translator_pool(
             mlp_ratio=config.projector_mlp_ratio,
         )
     else:
-        translator_pool = C2CFuserPool(
+        translator_pool = initialize_fuser_translators(
             ctx=ctx,
             top_layers_to_translate=config.top_layers_to_translate,
             fuser_dim=config.fuser_dim,
@@ -716,14 +727,11 @@ def load_translator_pool_from_checkpoint(
     device_override: Optional[str] = None,
 ) -> Tuple[
     Context,
-    Union[C2CFuserPool, C2CProjectorPool],
+    TranslatorPool,
 ]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir_path_obj}")
-    checkpoint_path_obj = get_train_checkpoint_path(checkpoint_dir_path_obj)
-    if not checkpoint_path_obj.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path_obj}")
     train_config_path = get_train_config_path(checkpoint_dir_path_obj)
     if not train_config_path.exists():
         raise FileNotFoundError(f"Train config not found under checkpoint directory: {checkpoint_dir_path}")
@@ -731,17 +739,16 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
-    translator_pool_state_dict = torch.load(str(checkpoint_path_obj), map_location="cpu")
     models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        ModelManager(models, tokenizers),
+        TranslatorPool(models, tokenizers),
         ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)
-    translator_pool.load_state_dict(translator_pool_state_dict)
+    load_translator_checkpoints(checkpoint_dir_path_obj, translator_pool)
     move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
@@ -789,7 +796,7 @@ def run_train(
 
     logging.info("[Setup] full model specs")
     for node in nodes:
-        spec = ctx.mm.get_model_spec(node.id)
+        spec = ctx.tp.get_model_spec(node.id)
         logging.info(
             "  %s (%s): layers=%d, hidden=%d, heads=%d",
             node.id,
@@ -829,7 +836,7 @@ def run_train(
         gate_temperature = None
         if not is_projection_only_variant(config):
             gate_temperature = compute_gate_temperature(config, step)
-            translator_pool.set_temperature(gate_temperature)
+            set_temperature(translator_pool, gate_temperature)
 
         optimizer.zero_grad(set_to_none=True)
         step_loss_value = 0.0
@@ -844,7 +851,7 @@ def run_train(
                 )
                 with torch.no_grad():
                     past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.mm.get_model(node.id), prefix_cache_ids)
+                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
                         for node in nodes
                     }
                 target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
@@ -859,14 +866,14 @@ def run_train(
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
-                    tgt_spec=ctx.mm.get_model_spec(edge.tgt_id),
+                    tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
                 )
                 translated_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.tgt_id],
                     translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
-                    target_model=ctx.mm.get_model(edge.tgt_id),
+                    target_model=ctx.tp.get_model(edge.tgt_id),
                     past_key_values=translated_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -892,7 +899,7 @@ def run_train(
             if is_projection_only_variant(config):
                 postfix["proj"] = "1.000"
             else:
-                postfix["gate"] = f"{translator_pool.mean_gate_probability():.3f}"
+                postfix["gate"] = f"{mean_gate_probability(translator_pool):.3f}"
             progress_bar.set_postfix(**postfix)
 
             gpu_memory = gpu_memory_tracker.summary()
@@ -912,17 +919,14 @@ def run_train(
                     avg_loss,
                     scheduler.lr,
                     gate_temperature,
-                    translator_pool.mean_gate_probability(),
+                    mean_gate_probability(translator_pool),
                     gpu_memory["avg_allocated_pretty"],
                     gpu_memory["peak_allocated_pretty"],
                 )
             running_loss = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
-    save_checkpoint(
-        output_path=final_path,
-        translator_pool=translator_pool,
-    )
+    save_translator_checkpoints(output_path, translator_pool)
     final_gpu_memory = gpu_memory_tracker.summary()
     logging.info(
         "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
@@ -930,6 +934,6 @@ def run_train(
         final_gpu_memory["peak_allocated_pretty"],
         final_gpu_memory["num_samples"],
     )
-    logging.info("[Done] final checkpoint saved to %s", final_path)
+    logging.info("[Done] final translator checkpoints saved to %s", final_path)
     logging.info("Saved train log to %s", log_path)
     return final_path
