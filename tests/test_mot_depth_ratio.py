@@ -215,8 +215,8 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
     transformer = SimpleNamespace(h=[SimpleNamespace(layer_idx=idx) for idx in range(12)])
     target_model = SimpleNamespace(transformer=transformer)
 
-    def fake_build_gpt2_input_hidden_states(model, input_ids):
-        del model, input_ids
+    def fake_build_gpt2_input_hidden_states(model, token_ids):
+        del model, token_ids
         return torch.zeros(1, 1, 8)
 
     def fake_run_gpt2_block(block, hidden_states, *, sparse_attention_indices=None, injected_key=None, injected_value=None):
@@ -234,7 +234,7 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
     with torch.no_grad():
         replayed_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
-            prefix_input_ids=torch.tensor([[1]]),
+            context_token_ids=torch.tensor([[1]]),
             target_layer_indices=[1, 3, 5, 7, 9, 11],
             injected_key_block=torch.zeros(1, 1, 6, 8),
             injected_value_block=torch.zeros(1, 1, 6, 8),

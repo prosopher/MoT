@@ -211,14 +211,14 @@ def _fraction(values: List[bool]) -> float:
     return float(sum(1 for v in values if v) / len(values)) if values else float("nan")
 
 
-def build_input_hidden_states_with_past(model: PreTrainedModel, input_ids: torch.Tensor, past_length: int) -> torch.Tensor:
+def build_input_hidden_states_with_past(model: PreTrainedModel, token_ids: TokenIDs, past_length: int) -> torch.Tensor:
     transformer = lp.require_gpt2_transformer(model)
-    if input_ids.ndim != 2:
-        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(past_length, past_length + seq_len, device=input_ids.device, dtype=torch.long)
+    if token_ids.ndim != 2:
+        raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
+    batch_size, seq_len = token_ids.shape
+    position_ids = torch.arange(past_length, past_length + seq_len, device=token_ids.device, dtype=torch.long)
     position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-    hidden_states = transformer.wte(input_ids) + transformer.wpe(position_ids)
+    hidden_states = transformer.wte(token_ids) + transformer.wpe(position_ids)
     drop = getattr(transformer, "drop", None)
     if drop is not None:
         hidden_states = drop(hidden_states)
@@ -259,11 +259,11 @@ def run_gpt2_block_with_past_and_trace(
 def trace_single_token_with_past(
     model: PreTrainedModel,
     past_key_values: PastKeyValues,
-    input_ids: torch.Tensor,
+    token_ids: TokenIDs,
 ) -> Dict[str, Any]:
     transformer = lp.require_gpt2_transformer(model)
     past_length = 0 if len(past_key_values) == 0 else past_key_values[0][0].shape[2]
-    hidden_states = build_input_hidden_states_with_past(model, input_ids, past_length)
+    hidden_states = build_input_hidden_states_with_past(model, token_ids, past_length)
     token_hidden_states = [hidden_states[:, -1, :].detach()]
     token_attn_additions: List[torch.Tensor] = []
     token_mlp_additions: List[torch.Tensor] = []
@@ -524,12 +524,12 @@ def compute_correction_metrics_from_traces(
     }
 
 
-def maybe_append_input_ids(model: PreTrainedModel, past_key_values: PastKeyValues, input_ids: Optional[torch.Tensor]) -> PastKeyValues:
-    if input_ids is None:
+def maybe_append_token_ids(model: PreTrainedModel, past_key_values: PastKeyValues, token_ids: Optional[torch.Tensor]) -> PastKeyValues:
+    if token_ids is None:
         return past_key_values
-    if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+    if token_ids.ndim != 2 or token_ids.shape[1] == 0:
         return past_key_values
-    return append_input_ids_to_past(model=model, past_key_values=past_key_values, input_ids=input_ids)
+    return append_token_ids_to_past(model=model, past_key_values=past_key_values, token_ids=token_ids)
 
 
 def evaluate_correction(
@@ -590,11 +590,11 @@ def evaluate_correction(
                     if answer_token_ids is None or answer_token_ids.shape[0] < 1:
                         continue
                     answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
-                    prefix_input_ids = prepared_inputs["prefix_input_ids"]
-                    suffix_cache_ids = prepared_inputs.get("suffix_cache_ids", None)
+                    context_token_ids = prepared_inputs["context_token_ids"]
+                    prompt_token_ids = prepared_inputs.get("prompt_token_ids", None)
                     seed_token = prepared_inputs["seed_token"]
                     try:
-                        past_by_node_id = {node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids) for node in nodes}
+                        past_by_node_id = {node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids) for node in nodes}
                     except Exception as exc:
                         logging.warning("Skipping example due to cache extraction error: %s", exc)
                         continue
@@ -612,7 +612,7 @@ def evaluate_correction(
                     )
                     full_mix_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.tp.get_model(edge.tgt_id),
-                        prefix_input_ids=prefix_input_ids,
+                        context_token_ids=context_token_ids,
                         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=translated_key,
                         injected_value_block=translated_value,
@@ -627,7 +627,7 @@ def evaluate_correction(
                     )
                     random_past = lp.replay_target_prefill_with_injected_window(
                         target_model=ctx.tp.get_model(edge.tgt_id),
-                        prefix_input_ids=prefix_input_ids,
+                        context_token_ids=context_token_ids,
                         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                         injected_key_block=random_key_block,
                         injected_value_block=random_value_block,
@@ -636,17 +636,17 @@ def evaluate_correction(
                     )
 
                     target_model = ctx.tp.get_model(edge.tgt_id)
-                    native_past = maybe_append_input_ids(target_model, native_target_past, suffix_cache_ids)
-                    fullmix_past = maybe_append_input_ids(target_model, full_mix_past, suffix_cache_ids)
-                    random_past = maybe_append_input_ids(target_model, random_past, suffix_cache_ids)
-                    native_past = maybe_append_input_ids(target_model, native_past, seed_token)
-                    fullmix_past = maybe_append_input_ids(target_model, fullmix_past, seed_token)
-                    random_past = maybe_append_input_ids(target_model, random_past, seed_token)
+                    native_past = maybe_append_token_ids(target_model, native_target_past, prompt_token_ids)
+                    fullmix_past = maybe_append_token_ids(target_model, full_mix_past, prompt_token_ids)
+                    random_past = maybe_append_token_ids(target_model, random_past, prompt_token_ids)
+                    native_past = maybe_append_token_ids(target_model, native_past, seed_token)
+                    fullmix_past = maybe_append_token_ids(target_model, fullmix_past, seed_token)
+                    random_past = maybe_append_token_ids(target_model, random_past, seed_token)
 
                     for token_idx in range(answer_token_ids.shape[0]):
-                        current_input_ids = answer_token_ids[token_idx : token_idx + 1].view(1, 1)
-                        native_trace = trace_single_token_with_past(target_model, native_past, current_input_ids)
-                        fullmix_trace = trace_single_token_with_past(target_model, fullmix_past, current_input_ids)
+                        current_token_ids = answer_token_ids[token_idx : token_idx + 1].view(1, 1)
+                        native_trace = trace_single_token_with_past(target_model, native_past, current_token_ids)
+                        fullmix_trace = trace_single_token_with_past(target_model, fullmix_past, current_token_ids)
                         correction_metrics = compute_correction_metrics_from_traces(
                             native_trace,
                             fullmix_trace,
@@ -674,7 +674,7 @@ def evaluate_correction(
                                 beta_L_T_over_initial=correction_metrics["trajectory"]["beta_L_T_over_initial"],
                                 correction_cosine=correction_metrics["trajectory"]["correction_cosine"],
                             )
-                        random_trace = trace_single_token_with_past(target_model, random_past, current_input_ids)
+                        random_trace = trace_single_token_with_past(target_model, random_past, current_token_ids)
                         random_metrics = compute_correction_metrics_from_traces(
                             native_trace,
                             random_trace,

@@ -52,11 +52,11 @@ def _predict_direct_context_logit(model, spec, tokenizer, context: str, question
         subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
-    context_past = extract_past_key_values(model, prepared["prefix_input_ids"])
+    context_past = extract_past_key_values(model, prepared["context_token_ids"])
     scoring_past = prepare_answer_scoring_past(
         model=model,
         past_key_values=context_past,
-        suffix_cache_ids=prepared["suffix_cache_ids"],
+        prompt_token_ids=prepared["prompt_token_ids"],
     )
     scores = score_answer_choices(
         model=model,
@@ -87,14 +87,14 @@ def _predict_direct_context_generation(
         device=device,
         max_input_tokens=context_budget,
     )
-    context_past = extract_past_key_values(model, prepared["prefix_input_ids"])
+    context_past = extract_past_key_values(model, prepared["context_token_ids"])
     return predict_generation_task_answer(
         model=model,
         tokenizer=tokenizer,
         past_key_values=context_past,
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
-        suffix_cache_ids=prepared["suffix_cache_ids"],
+        prompt_token_ids=prepared["prompt_token_ids"],
     )
 
 
@@ -126,7 +126,7 @@ def _predict_kvcomm_logit(
         subject=subject,
     )
     choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
-    source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
+    source_past = extract_past_key_values(source_model, prepared["context_token_ids"])
     kvcomm_past = build_replayed_target_past(
         ctx,
         pool,
@@ -136,7 +136,7 @@ def _predict_kvcomm_logit(
     scoring_past = prepare_answer_scoring_past(
         model=target_model,
         past_key_values=kvcomm_past,
-        suffix_cache_ids=prepared["suffix_cache_ids"],
+        prompt_token_ids=prepared["prompt_token_ids"],
     )
     scores = score_answer_choices(
         model=target_model,
@@ -172,7 +172,7 @@ def _predict_kvcomm_generation(
         device=device,
         max_input_tokens=context_budget,
     )
-    source_past = extract_past_key_values(source_model, prepared["prefix_input_ids"])
+    source_past = extract_past_key_values(source_model, prepared["context_token_ids"])
     kvcomm_past = build_replayed_target_past(
         ctx,
         pool,
@@ -185,19 +185,19 @@ def _predict_kvcomm_generation(
         past_key_values=kvcomm_past,
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
-        suffix_cache_ids=prepared["suffix_cache_ids"],
+        prompt_token_ids=prepared["prompt_token_ids"],
     )
 
 
 def _build_logit_example_state(
     *,
     ctx: Context,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     **_,
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
             for node in ctx.nodes
         }
     }
@@ -233,11 +233,11 @@ def _build_logit_edge_artifacts(
     )
 
 
-def _prepare_kvcomm_scoring_past(*, model, past_key_values, suffix_cache_ids):
+def _prepare_kvcomm_scoring_past(*, model, past_key_values, prompt_token_ids):
     return prepare_answer_scoring_past(
         model=model,
         past_key_values=past_key_values,
-        suffix_cache_ids=suffix_cache_ids,
+        prompt_token_ids=prompt_token_ids,
     )
 
 
@@ -319,7 +319,7 @@ def evaluate_generation_dataset(
                     device=device,
                     max_input_tokens=context_budget,
                 )
-                prefix_input_ids = prepared_generation_inputs["prefix_input_ids"]
+                context_token_ids = prepared_generation_inputs["context_token_ids"]
 
                 source_model = ctx.tp.get_model(edge.src_id)
                 target_model = ctx.tp.get_model(edge.tgt_id)
@@ -349,14 +349,14 @@ def evaluate_generation_dataset(
                     context_budget=context_budget,
                 )
 
-                kvcomm_source_past = extract_past_key_values(source_model, prefix_input_ids)
+                kvcomm_source_past = extract_past_key_values(source_model, context_token_ids)
                 kvcomm_replayed_past = build_replayed_target_past(
                     ctx,
                     translator_pool,
                     edge_id=edge.id,
                     source_past_key_values=kvcomm_source_past,
                 )
-                native_target_past = extract_past_key_values(target_model, prefix_input_ids)
+                native_target_past = extract_past_key_values(target_model, context_token_ids)
                 kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
                     ctx=ctx,
                     edge=edge,

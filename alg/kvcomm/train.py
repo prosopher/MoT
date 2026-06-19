@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from core.channel_manager import ChannelManager
-from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, read_json, set_seed, write_json
+from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, TokenIDs, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
 from core.translator_pool import TranslatorPool
@@ -450,15 +450,15 @@ def _build_openwebtext_calibration_batches(
 def _compute_attention_importance_for_batch(
     *,
     model,
-    input_ids: torch.Tensor,
+    token_ids: TokenIDs,
     context_length: int,
 ) -> Optional[np.ndarray]:
-    query_length = int(input_ids.shape[1]) - context_length
+    query_length = int(token_ids.shape[1]) - context_length
     if context_length < 1 or query_length < 1:
         return None
 
     outputs = model(
-        input_ids=input_ids,
+        input_ids=token_ids,
         use_cache=False,
         output_attentions=True,
     )
@@ -559,15 +559,15 @@ def _select_layers_for_edge(
     log_interval = 1 if str(config.log_level).upper() == "DEBUG" else max(1, min(25, config.calib_size))
 
     for batch_idx, batch in enumerate(calibration_batches, start=1):
-        input_ids = batch.to(config.device)
+        token_ids = batch.to(config.device)
         scores = _compute_attention_importance_for_batch(
             model=target_model,
-            input_ids=input_ids,
+            token_ids=token_ids,
             context_length=context_length,
         )
         if scores is not None:
             layer_score_samples.append(scores)
-        processed += int(input_ids.shape[0])
+        processed += int(token_ids.shape[0])
         if batch_idx % log_interval == 0 or processed >= config.calib_size:
             logging.info("%s | %s selection progress: %d/%d sequences", edge.id, config.calibration_dataset, processed, config.calib_size)
         if processed >= config.calib_size:

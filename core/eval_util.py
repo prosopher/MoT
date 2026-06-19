@@ -905,25 +905,25 @@ def run_openwebtext_greedy_inference(
     *,
     model,
     past_key_values: PastKeyValues,
-    seed_token: torch.Tensor,
+    seed_token: TokenIDs,
     max_new_tokens: int,
 ) -> int:
     if max_new_tokens <= 0:
         return 0
 
-    current_input_ids = seed_token
+    current_token_ids = seed_token
     current_past = past_key_values
     total_generated_tokens = 0
 
     for _ in range(max_new_tokens):
         outputs = model(
-            input_ids=current_input_ids,
+            input_ids=current_token_ids,
             past_key_values=current_past,
             use_cache=True,
         )
         next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         total_generated_tokens += int(next_token.numel())
-        current_input_ids = next_token
+        current_token_ids = next_token
         current_past = outputs.past_key_values
 
     return total_generated_tokens
@@ -974,32 +974,32 @@ def evaluate_openwebtext_validation_loss_metrics(
             shuffle_buffer=shuffle_buffer,
         )
         processed_examples = 0
-        for batch_idx, input_ids in enumerate(dataloader, start=1):
+        for batch_idx, token_ids in enumerate(dataloader, start=1):
             if processed_examples >= max_examples:
                 break
 
             remaining_examples = max_examples - processed_examples
-            if input_ids.shape[0] > remaining_examples:
-                input_ids = input_ids[:remaining_examples]
-            input_ids = input_ids.to(device)
+            if token_ids.shape[0] > remaining_examples:
+                token_ids = token_ids[:remaining_examples]
+            token_ids = token_ids.to(device)
 
-            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                input_ids=input_ids,
-                prefix_tokens=ctx.config.prefix_tokens,
+            context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+                token_ids=token_ids,
+                context_tokens=ctx.config.prefix_tokens,
             )
             past_by_node_id = {
-                node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
+                node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
                 for node in ctx.nodes
             }
 
-            batch_examples = input_ids.shape[0]
+            batch_examples = token_ids.shape[0]
             for edge in edges_by_target[target_node_id]:
                 edge_losses, edge_profiles = evaluate_edge_losses_fn(
                     edge_id=edge.id,
                     edge=edge,
-                    prefix_cache_ids=prefix_cache_ids,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
+                    context_token_ids=context_token_ids,
+                    prompt_token_ids=prompt_token_ids,
+                    label_token_ids=label_token_ids,
                     past_by_node_id=past_by_node_id,
                 )
                 if not edge_losses:
@@ -1025,9 +1025,9 @@ def evaluate_openwebtext_validation_loss_metrics(
                     named_pasts = build_visualization_pasts_fn(
                         edge_id=edge.id,
                         edge=edge,
-                        prefix_cache_ids=prefix_cache_ids,
-                        lm_input_ids=lm_input_ids,
-                        lm_labels=lm_labels,
+                        context_token_ids=context_token_ids,
+                        prompt_token_ids=prompt_token_ids,
+                        label_token_ids=label_token_ids,
                         past_by_node_id=past_by_node_id,
                     )
                     if named_pasts:
@@ -1095,15 +1095,15 @@ def evaluate_openwebtext_validation_loss_top_layers(
         *,
         edge_id: str,
         edge: Edge,
-        prefix_cache_ids: torch.Tensor,
-        lm_input_ids: torch.Tensor,
-        lm_labels: torch.Tensor,
+        context_token_ids: TokenIDs,
+        prompt_token_ids: TokenIDs,
+        label_token_ids: TokenIDs,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        del edge_id, prefix_cache_ids
-        profile_tokens = int(lm_labels.numel())
-        seed_token = lm_input_ids[:, :1]
-        generation_steps = int(lm_labels.shape[1])
+        del edge_id, context_token_ids
+        profile_tokens = int(label_token_ids.numel())
+        seed_token = prompt_token_ids[:, :1]
+        generation_steps = int(label_token_ids.shape[1])
 
         translated_target_past = build_translated_target_past_fn(
             edge=edge,
@@ -1113,16 +1113,16 @@ def evaluate_openwebtext_validation_loss_top_layers(
             compute_suffix_lm_loss(
                 target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
             ).item()
         )
         native_loss = float(
             compute_suffix_lm_loss(
                 target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
             ).item()
         )
 
@@ -1193,26 +1193,26 @@ def evaluate_openwebtext_validation_loss_replay(
         *,
         edge_id: str,
         edge: Edge,
-        prefix_cache_ids: torch.Tensor,
-        lm_input_ids: torch.Tensor,
-        lm_labels: torch.Tensor,
+        context_token_ids: TokenIDs,
+        prompt_token_ids: TokenIDs,
+        label_token_ids: TokenIDs,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        profile_tokens = int(lm_labels.numel())
-        seed_token = lm_input_ids[:, :1]
-        generation_steps = int(lm_labels.shape[1])
+        profile_tokens = int(label_token_ids.numel())
+        seed_token = prompt_token_ids[:, :1]
+        generation_steps = int(label_token_ids.shape[1])
 
         mixed_target_past_for_loss = build_translated_target_past_fn(
             edge=edge,
-            prefix_cache_ids=prefix_cache_ids,
+            context_token_ids=context_token_ids,
             past_by_node_id=past_by_node_id,
         )
         translated_loss = float(
             compute_prefix_correction_and_suffix_lm_loss(
                 target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=mixed_target_past_for_loss,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
                 native_target_past_key_values=past_by_node_id[edge.tgt_id],
                 target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
             ).item()
@@ -1221,8 +1221,8 @@ def evaluate_openwebtext_validation_loss_replay(
             compute_prefix_correction_and_suffix_lm_loss(
                 target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
                 native_target_past_key_values=past_by_node_id[edge.tgt_id],
                 target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
             ).item()
@@ -1231,7 +1231,7 @@ def evaluate_openwebtext_validation_loss_replay(
         def run_translated_inference() -> int:
             mixed_target_past = build_translated_target_past_fn(
                 edge=edge,
-                prefix_cache_ids=prefix_cache_ids,
+                context_token_ids=context_token_ids,
                 past_by_node_id=past_by_node_id,
             )
             return run_openwebtext_greedy_inference(
@@ -2283,30 +2283,30 @@ def prepare_cache_text_inputs(
     truncation_side: str = "left",
 ) -> Dict[str, torch.Tensor]:
     tokenized = tokenizer(text, return_tensors="pt")
-    input_ids = tokenized.input_ids
+    token_ids = tokenized.input_ids
     was_truncated = False
 
     if max_input_tokens is not None:
         if max_input_tokens < 2:
             raise ValueError("max_input_tokens must be >= 2")
-        if input_ids.shape[1] > max_input_tokens:
+        if token_ids.shape[1] > max_input_tokens:
             was_truncated = True
             if truncation_side == "left":
-                input_ids = input_ids[:, -max_input_tokens:]
+                token_ids = token_ids[:, -max_input_tokens:]
             elif truncation_side == "right":
-                input_ids = input_ids[:, :max_input_tokens]
+                token_ids = token_ids[:, :max_input_tokens]
             else:
                 raise ValueError(f"Unsupported truncation_side: {truncation_side}")
 
-    input_ids = input_ids.to(device)
-    if input_ids.shape[1] < 2:
+    token_ids = token_ids.to(device)
+    if token_ids.shape[1] < 2:
         raise ValueError("Cache text must tokenize to at least 2 tokens.")
-    cache_ids = input_ids[:, :-1]
-    seed_token = input_ids[:, -1:]
+    prompt_token_ids = token_ids[:, :-1]
+    seed_token = token_ids[:, -1:]
     return {
         "text": text,
-        "input_ids": input_ids,
-        "cache_ids": cache_ids,
+        "token_ids": token_ids,
+        "prompt_token_ids": prompt_token_ids,
         "seed_token": seed_token,
         "was_truncated": was_truncated,
     }
@@ -2366,13 +2366,13 @@ def prepare_full_text_inputs(
         tokenizer_kwargs["truncation"] = True
         tokenizer_kwargs["max_length"] = max_input_tokens
     tokenized = tokenizer(text, **tokenizer_kwargs)
-    input_ids = tokenized.input_ids.to(device)
-    if input_ids.shape[1] < 1:
+    token_ids = tokenized.input_ids.to(device)
+    if token_ids.shape[1] < 1:
         raise ValueError("Text must tokenize to at least 1 token.")
     return {
         "text": text,
-        "input_ids": input_ids,
-        "was_truncated": max_input_tokens is not None and input_ids.shape[1] >= max_input_tokens,
+        "token_ids": token_ids,
+        "was_truncated": max_input_tokens is not None and token_ids.shape[1] >= max_input_tokens,
     }
 
 
@@ -2423,7 +2423,7 @@ def compute_benchmark_context_budget(
         device="cpu",
     )
     reserved_tokens = (
-        suffix["cache_ids"].shape[1]
+        suffix["prompt_token_ids"].shape[1]
         + suffix["seed_token"].shape[1]
         + get_answer_token_budget(eval_config)
     )
@@ -2461,7 +2461,7 @@ def compute_logit_task_token_budgets(
             device="cpu",
         )
         reserved_tokens = (
-            suffix["cache_ids"].shape[1]
+            suffix["prompt_token_ids"].shape[1]
             + suffix["seed_token"].shape[1]
             + answer_budget
         )
@@ -2480,7 +2480,7 @@ def compute_logit_task_token_budgets(
             device="cpu",
         )
         reserved_tokens = (
-            suffix["cache_ids"].shape[1]
+            suffix["prompt_token_ids"].shape[1]
             + suffix["seed_token"].shape[1]
             + answer_budget
         )
@@ -2504,7 +2504,7 @@ def compute_logit_task_token_budgets(
             device="cpu",
         )
         reserved_tokens = (
-            suffix["cache_ids"].shape[1]
+            suffix["prompt_token_ids"].shape[1]
             + suffix["seed_token"].shape[1]
             + answer_budget
         )
@@ -2579,8 +2579,8 @@ def prepare_logit_task_inputs(
         return {
             "prefix": context_prefix,
             "suffix": suffix,
-            "prefix_input_ids": context_prefix["input_ids"],
-            "suffix_cache_ids": suffix["cache_ids"],
+            "context_token_ids": context_prefix["token_ids"],
+            "prompt_token_ids": suffix["prompt_token_ids"],
             "seed_token": suffix["seed_token"],
             "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
@@ -2602,8 +2602,8 @@ def prepare_logit_task_inputs(
         return {
             "prefix": context_prefix,
             "suffix": suffix,
-            "prefix_input_ids": context_prefix["input_ids"],
-            "suffix_cache_ids": suffix["cache_ids"],
+            "context_token_ids": context_prefix["token_ids"],
+            "prompt_token_ids": suffix["prompt_token_ids"],
             "seed_token": suffix["seed_token"],
             "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
@@ -2629,8 +2629,8 @@ def prepare_logit_task_inputs(
         return {
             "prefix": question_prefix,
             "suffix": suffix,
-            "prefix_input_ids": question_prefix["input_ids"],
-            "suffix_cache_ids": suffix["cache_ids"],
+            "context_token_ids": question_prefix["token_ids"],
+            "prompt_token_ids": suffix["prompt_token_ids"],
             "seed_token": suffix["seed_token"],
             "was_truncated": bool(question_prefix.get("was_truncated", False)),
         }
@@ -2648,8 +2648,8 @@ def prepare_logit_task_inputs(
         truncation_side="left",
     )
     return {
-        "prefix_input_ids": prompt["cache_ids"],
-        "suffix_cache_ids": None,
+        "context_token_ids": prompt["prompt_token_ids"],
+        "prompt_token_ids": None,
         "seed_token": prompt["seed_token"],
         "was_truncated": bool(prompt.get("was_truncated", False)),
     }
@@ -2678,8 +2678,8 @@ def prepare_generation_task_inputs(
         return {
             "prefix": context_prefix,
             "suffix": suffix,
-            "prefix_input_ids": context_prefix["input_ids"],
-            "suffix_cache_ids": suffix["cache_ids"],
+            "context_token_ids": context_prefix["token_ids"],
+            "prompt_token_ids": suffix["prompt_token_ids"],
             "seed_token": suffix["seed_token"],
             "was_truncated": context_prefix.get("was_truncated", False),
         }
@@ -2699,8 +2699,8 @@ def prepare_generation_task_inputs(
     #     return {
     #         "prefix": context_prefix,
     #         "suffix": suffix,
-    #         "prefix_input_ids": context_prefix["input_ids"],
-    #         "suffix_cache_ids": suffix["cache_ids"],
+    #         "context_token_ids": context_prefix["token_ids"],
+    #         "prompt_token_ids": suffix["prompt_token_ids"],
     #         "seed_token": suffix["seed_token"],
     #         "was_truncated": bool(context_prefix.get("was_truncated", False)),
     #     }
@@ -2712,8 +2712,8 @@ def prepare_generation_task_inputs(
         device=device,
     )
     return {
-        "prefix_input_ids": prompt["cache_ids"],
-        "suffix_cache_ids": None,
+        "context_token_ids": prompt["prompt_token_ids"],
+        "prompt_token_ids": None,
         "seed_token": prompt["seed_token"],
         "was_truncated": False,
     }
@@ -2723,16 +2723,16 @@ def predict_generation_task_answer(
     model,
     tokenizer,
     past_key_values: PastKeyValues,
-    seed_token: torch.Tensor,
+    seed_token: TokenIDs,
     eval_config,
-    suffix_cache_ids: Optional[torch.Tensor] = None,
+    prompt_token_ids: Optional[TokenIDs] = None,
 ) -> str:
     generation_past = past_key_values
-    if suffix_cache_ids is not None:
-        generation_past = append_input_ids_to_past(
+    if prompt_token_ids is not None:
+        generation_past = append_token_ids_to_past(
             model=model,
             past_key_values=past_key_values,
-            input_ids=suffix_cache_ids,
+            token_ids=prompt_token_ids,
         )
 
     return generate_greedy_answer(
@@ -2746,16 +2746,16 @@ def predict_generation_task_answer(
 
 
 @torch.inference_mode()
-def append_input_ids_to_past(
+def append_token_ids_to_past(
     model,
     past_key_values: PastKeyValues,
-    input_ids: torch.Tensor,
+    token_ids: TokenIDs,
 ) -> PastKeyValues:
-    if input_ids.shape[1] == 0:
+    if token_ids.shape[1] == 0:
         return past_key_values
 
     outputs = model(
-        input_ids=input_ids,
+        input_ids=token_ids,
         past_key_values=past_key_values,
         use_cache=True,
     )
@@ -2765,8 +2765,8 @@ def append_input_ids_to_past(
 def build_text_candidate_token_ids(
     tokenizer,
     candidates: Dict[str, str],
-) -> Dict[str, torch.Tensor]:
-    token_ids_by_label: Dict[str, torch.Tensor] = {}
+) -> Dict[str, TokenIDs]:
+    token_ids_by_label: Dict[str, TokenIDs] = {}
 
     for label, text in candidates.items():
         normalized_text = text.strip()
@@ -2784,7 +2784,7 @@ def build_text_candidate_token_ids(
 def build_logit_answer_candidates(
     tokenizer,
     spec: HFDatasetSpec,
-) -> Dict[str, torch.Tensor]:
+) -> Dict[str, TokenIDs]:
     if spec.answer_mode == "boolq":
         return build_text_candidate_token_ids(
             tokenizer,
@@ -2809,20 +2809,20 @@ def build_logit_answer_candidates(
 def score_candidate_logprob(
     model,
     past_key_values,
-    seed_token: torch.Tensor,
-    candidate_token_ids: torch.Tensor,
+    seed_token: TokenIDs,
+    candidate_token_ids: TokenIDs,
     normalize_by_length: bool = True,
 ) -> float:
     device = seed_token.device
     candidate_ids = candidate_token_ids.to(device).unsqueeze(0)
 
     if candidate_ids.shape[1] == 1:
-        scoring_input_ids = seed_token
+        scoring_token_ids = seed_token
     else:
-        scoring_input_ids = torch.cat([seed_token, candidate_ids[:, :-1]], dim=1)
+        scoring_token_ids = torch.cat([seed_token, candidate_ids[:, :-1]], dim=1)
 
     outputs = model(
-        input_ids=scoring_input_ids,
+        input_ids=scoring_token_ids,
         past_key_values=past_key_values,
         use_cache=False,
     )
@@ -2838,8 +2838,8 @@ def score_candidate_logprob(
 def score_answer_choices(
     model,
     past_key_values,
-    seed_token: torch.Tensor,
-    choice_token_ids: Dict[str, torch.Tensor],
+    seed_token: TokenIDs,
+    choice_token_ids: Dict[str, TokenIDs],
     normalize_by_length: bool = True,
 ) -> Dict[str, float]:
     return {
@@ -2857,14 +2857,14 @@ def score_answer_choices(
 def prepare_answer_scoring_past(
     model,
     past_key_values: PastKeyValues,
-    suffix_cache_ids: Optional[torch.Tensor] = None,
+    prompt_token_ids: Optional[TokenIDs] = None,
 ) -> PastKeyValues:
-    if suffix_cache_ids is None:
+    if prompt_token_ids is None:
         return past_key_values
-    return append_input_ids_to_past(
+    return append_token_ids_to_past(
         model=model,
         past_key_values=past_key_values,
-        input_ids=suffix_cache_ids,
+        token_ids=prompt_token_ids,
     )
 
 
@@ -2903,17 +2903,17 @@ def generate_greedy_answer(
     model,
     tokenizer,
     past_key_values: PastKeyValues,
-    seed_token: torch.Tensor,
+    seed_token: TokenIDs,
     max_new_tokens: int,
 ) -> str:
     generated_token_ids: List[int] = []
-    current_input_ids = seed_token
+    current_token_ids = seed_token
     current_past = past_key_values
     eos_token_id = tokenizer.eos_token_id
 
     for _ in range(max_new_tokens):
         outputs = model(
-            input_ids=current_input_ids,
+            input_ids=current_token_ids,
             past_key_values=current_past,
             use_cache=True,
         )
@@ -2924,7 +2924,7 @@ def generate_greedy_answer(
             break
 
         generated_token_ids.append(next_token_id)
-        current_input_ids = next_token
+        current_token_ids = next_token
         current_past = outputs.past_key_values
 
     decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
@@ -3064,18 +3064,18 @@ def evaluate_dataset(
                     max_context_tokens=token_budgets["max_context_tokens"],
                     max_prefix_tokens=token_budgets["max_prefix_tokens"],
                 )
-                prefix_input_ids = prepared_inputs["prefix_input_ids"]
-                suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
+                context_token_ids = prepared_inputs["context_token_ids"]
+                prompt_token_ids = prepared_inputs["prompt_token_ids"]
                 seed_token = prepared_inputs["seed_token"]
 
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                    suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                    prompt_tokens = 0 if prompt_token_ids is None else prompt_token_ids.shape[1]
                     logging.info(
-                        "[%s][%s] truncated prefix to fit model context window (prefix_tokens=%d, suffix_cache_tokens=%d, answer_token_budget=%d)",
+                        "[%s][%s] truncated context to fit model context window (context_tokens=%d, prompt_tokens=%d, answer_token_budget=%d)",
                         spec.name_for_log,
                         edge.id,
-                        prefix_input_ids.shape[1],
-                        suffix_cache_tokens,
+                        context_token_ids.shape[1],
+                        prompt_tokens,
                         get_answer_token_budget(eval_config),
                     )
 
@@ -3084,7 +3084,7 @@ def evaluate_dataset(
                     spec=spec,
                     edge=edge,
                     example=example,
-                    prefix_input_ids=prefix_input_ids,
+                    context_token_ids=context_token_ids,
                     prepared_inputs=prepared_inputs,
                     translator_pool=translator_pool,
                 )
@@ -3094,7 +3094,7 @@ def evaluate_dataset(
                     spec=spec,
                     edge=edge,
                     example=example,
-                    prefix_input_ids=prefix_input_ids,
+                    context_token_ids=context_token_ids,
                     prepared_inputs=prepared_inputs,
                     example_state=example_state,
                     translator_pool=translator_pool,
@@ -3104,12 +3104,12 @@ def evaluate_dataset(
                 translated_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.translated_past_key_values,
-                    suffix_cache_ids=suffix_cache_ids,
+                    prompt_token_ids=prompt_token_ids,
                 )
                 native_generation_past = prepare_scoring_past_fn(
                     model=target_model,
                     past_key_values=edge_artifacts.native_past_key_values,
-                    suffix_cache_ids=suffix_cache_ids,
+                    prompt_token_ids=prompt_token_ids,
                 )
 
                 translated_answer = generate_greedy_answer(

@@ -426,21 +426,21 @@ def run_train(
         for _ in range(config.grad_accum_steps):
             batches_by_node = {}
             for node_id, dataloader in training_dataloaders.items():
-                input_ids = next(dataloader).to(config.device)
-                prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                    input_ids=input_ids,
-                    prefix_tokens=config.prefix_tokens,
+                token_ids = next(dataloader).to(config.device)
+                context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+                    token_ids=token_ids,
+                    context_tokens=config.prefix_tokens,
                 )
                 with torch.no_grad():
                     past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
+                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
                         for node in nodes
                     }
-                batches_by_node[node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
+                batches_by_node[node_id] = (context_token_ids, prompt_token_ids, label_token_ids, past_by_node_id)
 
             total_direction_loss = 0.0
             for edge in edges:
-                _, lm_input_ids, lm_labels, past_by_node_id = batches_by_node[edge.tgt_id]
+                _, prompt_token_ids, label_token_ids, past_by_node_id = batches_by_node[edge.tgt_id]
                 translated_past = translate_layers(
                     translator_pool=translator_pool,
                     past_key_values=past_by_node_id[edge.src_id],
@@ -451,8 +451,8 @@ def run_train(
                 direction_loss = compute_suffix_lm_loss(
                     target_model=ctx.tp.get_model(edge.tgt_id),
                     past_key_values=translated_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
+                    prompt_token_ids=prompt_token_ids,
+                    label_token_ids=label_token_ids,
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 

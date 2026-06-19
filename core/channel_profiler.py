@@ -8,9 +8,10 @@ import torch
 
 from .channel_manager import Channel
 from .common import (
+    TokenIDs,
     extract_past_key_values,
     read_json,
-    split_prefix_and_suffix_for_exact_next_token_loss,
+    split_context_and_prompt_token_ids,
     write_json,
 )
 from .context import Context
@@ -521,19 +522,19 @@ class ChannelProfiler:
 
         bank: List[Dict[str, Any]] = []
         for _ in range(num_examples):
-            input_ids = next(loader).to(self.config.device)
-            prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                input_ids=input_ids,
-                prefix_tokens=self.config.prefix_tokens,
+            token_ids = next(loader).to(self.config.device)
+            context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+                token_ids=token_ids,
+                context_tokens=self.config.prefix_tokens,
             )
             with torch.no_grad():
-                native_target_past_key_values = extract_past_key_values(target_model, prefix_cache_ids)
+                native_target_past_key_values = extract_past_key_values(target_model, context_token_ids)
                 bank.append(
                     {
-                        "prefix_cache_ids": prefix_cache_ids,
-                        "lm_input_ids": lm_input_ids,
-                        "lm_labels": lm_labels,
-                        "source_past_key_values": extract_past_key_values(source_model, prefix_cache_ids),
+                        "context_token_ids": context_token_ids,
+                        "prompt_token_ids": prompt_token_ids,
+                        "label_token_ids": label_token_ids,
+                        "source_past_key_values": extract_past_key_values(source_model, context_token_ids),
                         "native_target_past_key_values": native_target_past_key_values,
                     }
                 )
@@ -668,7 +669,7 @@ class ChannelProfiler:
         target_model = self.tp.get_model(edge.tgt_id)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
-            prefix_input_ids=sample["prefix_cache_ids"],
+            context_token_ids=sample["context_token_ids"],
             target_layer_indices=target_layer_indices,
             injected_key_block=translated_key,
             injected_value_block=translated_value,
@@ -678,8 +679,8 @@ class ChannelProfiler:
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=target_model,
             past_key_values=mixed_target_past,
-            lm_input_ids=sample["lm_input_ids"],
-            lm_labels=sample["lm_labels"],
+            prompt_token_ids=sample["prompt_token_ids"],
+            label_token_ids=sample["label_token_ids"],
             native_target_past_key_values=sample["native_target_past_key_values"],
             target_layer_indices=target_layer_indices,
         )
@@ -703,7 +704,7 @@ class ChannelProfiler:
         target_model = self.tp.get_model(edge.tgt_id)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
-            prefix_input_ids=sample["prefix_cache_ids"],
+            context_token_ids=sample["context_token_ids"],
             target_layer_indices=target_layer_indices,
             injected_key_block=translated_key,
             injected_value_block=translated_value,
@@ -713,8 +714,8 @@ class ChannelProfiler:
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=target_model,
             past_key_values=mixed_target_past,
-            lm_input_ids=sample["lm_input_ids"],
-            lm_labels=sample["lm_labels"],
+            prompt_token_ids=sample["prompt_token_ids"],
+            label_token_ids=sample["label_token_ids"],
             native_target_past_key_values=sample["native_target_past_key_values"],
             target_layer_indices=target_layer_indices,
         )
@@ -731,8 +732,8 @@ class ChannelProfiler:
         return compute_prefix_correction_and_suffix_lm_loss(
             target_model=self.tp.get_model(edge.tgt_id),
             past_key_values=sample["native_target_past_key_values"],
-            lm_input_ids=sample["lm_input_ids"],
-            lm_labels=sample["lm_labels"],
+            prompt_token_ids=sample["prompt_token_ids"],
+            label_token_ids=sample["label_token_ids"],
             native_target_past_key_values=sample["native_target_past_key_values"],
             target_layer_indices=target_layer_indices,
         )

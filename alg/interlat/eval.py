@@ -55,13 +55,13 @@ def _build_interlat_target_past(
     *,
     ctx: Context,
     edge: Edge,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     translator_pool,
 ) -> PastKeyValues:
     target_model = ctx.tp.get_model(edge.tgt_id)
     source_hidden_states = extract_interlat_source_hidden_states(
         ctx.tp.get_model(edge.src_id),
-        prefix_input_ids,
+        context_token_ids,
     )
     translated_latents = translate_hidden_states(
         translator_pool=translator_pool,
@@ -78,12 +78,12 @@ def _build_interlat_target_past(
 def _build_logit_example_state(
     *,
     ctx: Context,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     **_,
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
+            node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
             for node in ctx.nodes
         }
     }
@@ -93,7 +93,7 @@ def _build_logit_edge_artifacts(
     *,
     ctx: Context,
     edge: Edge,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     prepared_inputs,
     example_state,
     translator_pool,
@@ -103,7 +103,7 @@ def _build_logit_edge_artifacts(
     translated_past = _build_interlat_target_past(
         ctx=ctx,
         edge=edge,
-        prefix_input_ids=prefix_input_ids,
+        context_token_ids=context_token_ids,
         translator_pool=translator_pool,
     )
     native_past = example_state["past_by_node_id"][edge.tgt_id]
@@ -136,36 +136,36 @@ def evaluate_openwebtext_validation_loss_interlat(
         *,
         edge_id: str,
         edge: Edge,
-        prefix_cache_ids: torch.Tensor,
-        lm_input_ids: torch.Tensor,
-        lm_labels: torch.Tensor,
+        context_token_ids: TokenIDs,
+        prompt_token_ids: TokenIDs,
+        label_token_ids: TokenIDs,
         past_by_node_id,
     ):
         del edge_id
-        profile_tokens = int(lm_labels.numel())
-        seed_token = lm_input_ids[:, :1]
-        generation_steps = int(lm_labels.shape[1])
+        profile_tokens = int(label_token_ids.numel())
+        seed_token = prompt_token_ids[:, :1]
+        generation_steps = int(label_token_ids.shape[1])
 
         translated_target_past = _build_interlat_target_past(
             ctx=ctx,
             edge=edge,
-            prefix_input_ids=prefix_cache_ids,
+            context_token_ids=context_token_ids,
             translator_pool=translator_pool,
         )
         translated_loss = float(
             compute_suffix_lm_loss(
                 target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
             ).item()
         )
         native_loss = float(
             compute_suffix_lm_loss(
                 target_model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
             ).item()
         )
 
@@ -249,29 +249,29 @@ def evaluate_generation_dataset(
                     device=device,
                     max_input_tokens=context_budget,
                 )
-                prefix_input_ids = prepared_inputs["prefix_input_ids"]
-                suffix_cache_ids = prepared_inputs["suffix_cache_ids"]
+                context_token_ids = prepared_inputs["context_token_ids"]
+                prompt_token_ids = prepared_inputs["prompt_token_ids"]
                 seed_token = prepared_inputs["seed_token"]
 
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
-                    suffix_cache_tokens = 0 if suffix_cache_ids is None else suffix_cache_ids.shape[1]
+                    prompt_tokens = 0 if prompt_token_ids is None else prompt_token_ids.shape[1]
                     logging.info(
-                        "[%s][%s] truncated prefix to %d tokens to fit model context window (suffix_cache_tokens=%d, answer_token_budget=%d)",
+                        "[%s][%s] truncated context to %d tokens to fit model context window (prompt_tokens=%d, answer_token_budget=%d)",
                         spec.name_for_log,
                         edge.id,
-                        prefix_input_ids.shape[1],
-                        suffix_cache_tokens,
+                        context_token_ids.shape[1],
+                        prompt_tokens,
                         get_answer_token_budget(eval_config),
                     )
 
                 past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_input_ids)
+                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
                     for node in ctx.nodes
                 }
                 translated_past = _build_interlat_target_past(
                     ctx=ctx,
                     edge=edge,
-                    prefix_input_ids=prefix_input_ids,
+                    context_token_ids=context_token_ids,
                     translator_pool=translator_pool,
                 )
                 native_past = past_by_node_id[edge.tgt_id]
@@ -283,7 +283,7 @@ def evaluate_generation_dataset(
                     past_key_values=translated_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    suffix_cache_ids=suffix_cache_ids,
+                    prompt_token_ids=prompt_token_ids,
                 )
                 native_answer = predict_generation_task_answer(
                     model=ctx.tp.get_model(edge.tgt_id),
@@ -291,7 +291,7 @@ def evaluate_generation_dataset(
                     past_key_values=native_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    suffix_cache_ids=suffix_cache_ids,
+                    prompt_token_ids=prompt_token_ids,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -357,14 +357,14 @@ def run_eval(
     def build_visualization_pasts_fn(
         *,
         edge: Edge,
-        prefix_cache_ids: torch.Tensor,
+        context_token_ids: TokenIDs,
         past_by_node_id,
         **_,
     ) -> Dict[str, PastKeyValues]:
         translated_past = _build_interlat_target_past(
             ctx=ctx,
             edge=edge,
-            prefix_input_ids=prefix_cache_ids,
+            context_token_ids=context_token_ids,
             translator_pool=translator_pool,
         )
         return build_openwebtext_tsne_named_pasts(

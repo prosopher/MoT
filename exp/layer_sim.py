@@ -454,24 +454,24 @@ def collect_layer_features(config: LayerSimConfig) -> Tuple[Dict[str, object], D
         if valid_count == 0:
             continue
 
-        input_ids_a = encoded_a["input_ids"][valid_mask]
-        input_ids_b = encoded_b["input_ids"][valid_mask]
+        token_ids_a = encoded_a["input_ids"][valid_mask]
+        token_ids_b = encoded_b["input_ids"][valid_mask]
         remaining = config.num_samples - processed
-        if input_ids_a.shape[0] > remaining:
-            input_ids_a = input_ids_a[:remaining]
-            input_ids_b = input_ids_b[:remaining]
+        if token_ids_a.shape[0] > remaining:
+            token_ids_a = token_ids_a[:remaining]
+            token_ids_b = token_ids_b[:remaining]
 
-        input_ids_a = input_ids_a.to(config.device)
-        input_ids_b = input_ids_b.to(config.device)
+        token_ids_a = token_ids_a.to(config.device)
+        token_ids_b = token_ids_b.to(config.device)
 
-        past_a = extract_past_key_values(model_a, input_ids_a)
-        past_b = extract_past_key_values(model_b, input_ids_b)
+        past_a = extract_past_key_values(model_a, token_ids_a)
+        past_b = extract_past_key_values(model_b, token_ids_b)
         key_a, value_a = past_key_values_to_blocks(past_a)
         key_b, value_b = past_key_values_to_blocks(past_b)
 
         store_a.update(key_a, value_a, pool_mode=config.pool_mode)
         store_b.update(key_b, value_b, pool_mode=config.pool_mode)
-        processed += input_ids_a.shape[0]
+        processed += token_ids_a.shape[0]
 
         if batch_idx == 1:
             logging.info(

@@ -7,8 +7,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from core.common import PastKeyValues, extract_past_key_values
-from core.eval_util import append_input_ids_to_past
+from core.common import PastKeyValues, TokenIDs, extract_past_key_values
+from core.eval_util import append_token_ids_to_past
 
 
 @dataclass
@@ -126,18 +126,18 @@ class Agent:
         truncation_side: str = "left",
     ) -> torch.Tensor:
         encoded = self.tokenizer(text, return_tensors="pt")
-        input_ids = encoded.input_ids
+        token_ids = encoded.input_ids
         token_limit = self.max_prompt_tokens if max_input_tokens is None else max_input_tokens
-        if token_limit is not None and input_ids.shape[1] > token_limit:
+        if token_limit is not None and token_ids.shape[1] > token_limit:
             if truncation_side == "left":
-                input_ids = input_ids[:, -token_limit:]
+                token_ids = token_ids[:, -token_limit:]
             elif truncation_side == "right":
-                input_ids = input_ids[:, :token_limit]
+                token_ids = token_ids[:, :token_limit]
             else:
                 raise ValueError(f"Unsupported truncation_side={truncation_side!r}")
-        if input_ids.shape[1] < 1:
+        if token_ids.shape[1] < 1:
             raise ValueError("Agent text must tokenize to at least one token.")
-        return input_ids.to(self.device)
+        return token_ids.to(self.device)
     def set_replayed_cache(
         self,
         past_key_values: PastKeyValues,
@@ -161,15 +161,15 @@ class Agent:
         if prompt_ids.shape[1] == 1:
             return self.past_key_values, prompt_ids, prompt_tokens
 
-        cache_ids = prompt_ids[:, :-1]
+        prompt_token_ids = prompt_ids[:, :-1]
         seed_token = prompt_ids[:, -1:]
         if self.past_key_values is None:
-            prompt_past = extract_past_key_values(self.model, cache_ids)
+            prompt_past = extract_past_key_values(self.model, prompt_token_ids)
         else:
-            prompt_past = append_input_ids_to_past(
+            prompt_past = append_token_ids_to_past(
                 model=self.model,
                 past_key_values=self.past_key_values,
-                input_ids=cache_ids,
+                token_ids=prompt_token_ids,
             )
         return prompt_past, seed_token, prompt_tokens
 
@@ -191,7 +191,7 @@ class Agent:
     @torch.inference_mode()
     def generate_response(self, prompt_text: str) -> AgentGeneration:
         tokens_before = self.cache_seq_len
-        current_past, current_input_ids, tokens_prompt = self._prefill_prompt(prompt_text)
+        current_past, current_token_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
         eos_token_id = self.tokenizer.eos_token_id
         # A generated token is not added to past_key_values at prediction time;
@@ -201,7 +201,7 @@ class Agent:
 
         for _ in range(max(0, self.max_new_tokens)):
             outputs = self.model(
-                input_ids=current_input_ids,
+                input_ids=current_token_ids,
                 past_key_values=current_past,
                 use_cache=True,
             )
@@ -221,7 +221,7 @@ class Agent:
             uncached_generated_token = next_token
             decoded_so_far = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
             _, matched_stop = self._trim_at_stop_sequence(decoded_so_far, self.stop_sequences)
-            current_input_ids = next_token
+            current_token_ids = next_token
             if matched_stop is not None:
                 break
 

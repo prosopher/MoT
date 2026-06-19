@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, TypeAlias, TypeVar, Union, get_args, get_origin
 
 import torch
 import torch.nn as nn
@@ -66,19 +66,20 @@ def setup_logging(log_path: Union[str, Path]) -> logging.Logger:
 
 
 
-PastKeyValues = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
+PastKeyValues: TypeAlias = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
+TokenIDs: TypeAlias = torch.Tensor
 
 
-def split_prefix_and_suffix_for_exact_next_token_loss(
-    input_ids: torch.Tensor,
-    prefix_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if prefix_tokens < 2:
-        raise ValueError("prefix_tokens must be >= 2")
-    prefix_cache_ids = input_ids[:, : prefix_tokens - 1]
-    lm_input_ids = input_ids[:, prefix_tokens - 1 : -1]
-    lm_labels = input_ids[:, prefix_tokens:]
-    return prefix_cache_ids, lm_input_ids, lm_labels
+def split_context_and_prompt_token_ids(
+    token_ids: TokenIDs,
+    context_tokens: int,
+) -> Tuple[TokenIDs, TokenIDs, TokenIDs]:
+    if context_tokens < 2:
+        raise ValueError("context_tokens must be >= 2")
+    context_token_ids = token_ids[:, : context_tokens - 1]
+    prompt_token_ids = token_ids[:, context_tokens - 1 : -1]
+    label_token_ids = token_ids[:, context_tokens:]
+    return context_token_ids, prompt_token_ids, label_token_ids
 
 
 class OpenWebTextSequenceStream(IterableDataset):
@@ -130,11 +131,11 @@ class OpenWebTextSequenceStream(IterableDataset):
 def compute_suffix_lm_loss(
     target_model: PreTrainedModel,
     past_key_values: PastKeyValues,
-    lm_input_ids: torch.Tensor,
-    lm_labels: torch.Tensor,
+    prompt_token_ids: TokenIDs,
+    label_token_ids: TokenIDs,
 ) -> torch.Tensor:
     outputs = target_model(
-        input_ids=lm_input_ids,
+        input_ids=prompt_token_ids,
         past_key_values=past_key_values,
         use_cache=False,
     )
@@ -142,7 +143,7 @@ def compute_suffix_lm_loss(
     vocab_size = logits.shape[-1]
     return F.cross_entropy(
         logits.reshape(-1, vocab_size),
-        lm_labels.reshape(-1),
+        label_token_ids.reshape(-1),
         reduction="mean",
     )
 
@@ -150,8 +151,8 @@ def compute_suffix_lm_loss(
 def compute_prefix_correction_and_suffix_lm_loss(
     target_model: PreTrainedModel,
     past_key_values: PastKeyValues,
-    lm_input_ids: torch.Tensor,
-    lm_labels: torch.Tensor,
+    prompt_token_ids: TokenIDs,
+    label_token_ids: TokenIDs,
     native_target_past_key_values: PastKeyValues,
     target_layer_indices: Sequence[int],
     prefix_correction_weight: float = 1.0,
@@ -161,8 +162,8 @@ def compute_prefix_correction_and_suffix_lm_loss(
     suffix_lm_loss = compute_suffix_lm_loss(
         target_model=target_model,
         past_key_values=past_key_values,
-        lm_input_ids=lm_input_ids,
-        lm_labels=lm_labels,
+        prompt_token_ids=prompt_token_ids,
+        label_token_ids=label_token_ids,
     )
 
     mixed_key_block, mixed_value_block = past_key_values_to_blocks(past_key_values[correction_start_layer_idx:])
@@ -291,8 +292,8 @@ def cast_past_key_values_dtype(
 
 
 @torch.no_grad()
-def extract_past_key_values(model: PreTrainedModel, input_ids: torch.Tensor) -> PastKeyValues:
-    outputs = model(input_ids=input_ids, use_cache=True)
+def extract_past_key_values(model: PreTrainedModel, token_ids: TokenIDs) -> PastKeyValues:
+    outputs = model(input_ids=token_ids, use_cache=True)
     return cast_past_key_values_dtype(
         outputs.past_key_values,
         get_model_parameter_dtype(model),

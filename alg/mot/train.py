@@ -468,7 +468,7 @@ def build_replayed_target_past(
     ctx: Context,
     *,
     source_past_key_values: PastKeyValues,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     source_model: PreTrainedModel,
     target_model: PreTrainedModel,
     src_node_id: str,
@@ -492,7 +492,7 @@ def build_replayed_target_past(
     src_spec = ctx.tp.get_model_spec(src_node_id)
     sparse_attention_indices = build_extrapolated_sparse_attention_indices(
         source_model,
-        prefix_input_ids,
+        context_token_ids,
         source_layer_indices=ctx.cm.get_src_layer_indices(edge_id),
         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
         num_source_layers=src_spec.num_layers,
@@ -503,7 +503,7 @@ def build_replayed_target_past(
     mixed_target_past = replay_target_prefill_with_injected_window(
         target_model=target_model,
         target_model_id=node_model_ids.get(tgt_node_id),
-        prefix_input_ids=prefix_input_ids,
+        context_token_ids=context_token_ids,
         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
         injected_key_block=translated_key,
         injected_value_block=translated_value,
@@ -670,13 +670,13 @@ def require_qwen2_model(model: PreTrainedModel):
     return model_wrapper
 
 
-def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
+def build_gpt2_input_hidden_states(model: PreTrainedModel, token_ids: TokenIDs) -> torch.Tensor:
     transformer = require_gpt2_transformer(model)
-    if input_ids.ndim != 2:
-        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    hidden_states = transformer.wte(input_ids) + transformer.wpe(position_ids)
+    if token_ids.ndim != 2:
+        raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
+    batch_size, seq_len = token_ids.shape
+    position_ids = torch.arange(seq_len, device=token_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    hidden_states = transformer.wte(token_ids) + transformer.wpe(position_ids)
     drop = getattr(transformer, "drop", None)
     if drop is not None:
         hidden_states = drop(hidden_states)
@@ -685,16 +685,16 @@ def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tens
 
 def build_opt_input_hidden_states(
     model: PreTrainedModel,
-    input_ids: torch.Tensor,
+    token_ids: TokenIDs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     decoder = require_opt_decoder(model)
-    if input_ids.ndim != 2:
-        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
-    batch_size, seq_len = input_ids.shape
-    flat_input_ids = input_ids.view(batch_size, seq_len)
-    token_attention_mask = torch.ones(batch_size, seq_len, device=input_ids.device, dtype=torch.long)
+    if token_ids.ndim != 2:
+        raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
+    batch_size, seq_len = token_ids.shape
+    flat_token_ids = token_ids.view(batch_size, seq_len)
+    token_attention_mask = torch.ones(batch_size, seq_len, device=token_ids.device, dtype=torch.long)
 
-    hidden_states = decoder.embed_tokens(flat_input_ids)
+    hidden_states = decoder.embed_tokens(flat_token_ids)
     project_in = getattr(decoder, "project_in", None)
     if project_in is not None:
         hidden_states = project_in(hidden_states)
@@ -724,14 +724,14 @@ def build_opt_input_hidden_states(
 
 def build_qwen2_input_hidden_states(
     model: PreTrainedModel,
-    input_ids: torch.Tensor,
+    token_ids: TokenIDs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
     qwen_model = require_qwen2_model(model)
-    if input_ids.ndim != 2:
-        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
-    batch_size, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    hidden_states = qwen_model.embed_tokens(input_ids)
+    if token_ids.ndim != 2:
+        raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
+    batch_size, seq_len = token_ids.shape
+    position_ids = torch.arange(seq_len, device=token_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    hidden_states = qwen_model.embed_tokens(token_ids)
     attention_mask = build_causal_attention_mask(hidden_states)
 
     position_embeddings = None
@@ -746,7 +746,7 @@ def build_qwen2_input_hidden_states(
 
 def extract_source_attention_topk_indices(
     source_model: PreTrainedModel,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     layer_indices: List[int],
     *,
     source_model_id: Optional[str] = None,
@@ -756,13 +756,13 @@ def extract_source_attention_topk_indices(
         return []
     model_family = resolve_target_model_family(source_model, target_model_id=source_model_id)
     model_kwargs: Dict[str, Any] = {
-        "input_ids": prefix_input_ids,
+        "input_ids": context_token_ids,
         "use_cache": False,
         "output_attentions": True,
         "return_dict": True,
     }
     if model_family in {"opt", "qwen2"}:
-        model_kwargs["attention_mask"] = torch.ones_like(prefix_input_ids)
+        model_kwargs["attention_mask"] = torch.ones_like(context_token_ids)
     with torch.no_grad():
         outputs = source_model(**model_kwargs)
     attentions = getattr(outputs, "attentions", None)
@@ -833,7 +833,7 @@ def extrapolate_source_layer_alignment(
 
 def build_extrapolated_sparse_attention_indices(
     source_model: PreTrainedModel,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     *,
     source_layer_indices: List[int],
     target_layer_indices: List[int],
@@ -851,7 +851,7 @@ def build_extrapolated_sparse_attention_indices(
     unique_source_layers = sorted(set(aligned_source_by_target))
     unique_sparse_indices = extract_source_attention_topk_indices(
         source_model,
-        prefix_input_ids,
+        context_token_ids,
         unique_source_layers,
         source_model_id=source_model_id,
         top_k=top_k,
@@ -1237,7 +1237,7 @@ def build_causal_attention_mask(hidden_states: torch.Tensor) -> torch.Tensor:
 
 def replay_target_prefill_with_injected_window(
     target_model: PreTrainedModel,
-    prefix_input_ids: torch.Tensor,
+    context_token_ids: TokenIDs,
     target_layer_indices: List[int],
     injected_key_block: torch.Tensor,
     injected_value_block: torch.Tensor,
@@ -1274,7 +1274,7 @@ def replay_target_prefill_with_injected_window(
         target_blocks = transformer.h
 
         def build_initial_hidden_states() -> Tuple[torch.Tensor, None, None, None]:
-            return build_gpt2_input_hidden_states(target_model, prefix_input_ids), None, None, None
+            return build_gpt2_input_hidden_states(target_model, context_token_ids), None, None, None
 
         def run_block(
             block: nn.Module,
@@ -1299,7 +1299,7 @@ def replay_target_prefill_with_injected_window(
         target_blocks = decoder.layers
 
         def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-            hidden_states, token_attention_mask, attention_mask = build_opt_input_hidden_states(target_model, prefix_input_ids)
+            hidden_states, token_attention_mask, attention_mask = build_opt_input_hidden_states(target_model, context_token_ids)
             return hidden_states, token_attention_mask, attention_mask, None
 
         def run_block(
@@ -1327,7 +1327,7 @@ def replay_target_prefill_with_injected_window(
         target_blocks = qwen_model.layers
 
         def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-            return build_qwen2_input_hidden_states(target_model, prefix_input_ids)
+            return build_qwen2_input_hidden_states(target_model, context_token_ids)
 
         def run_block(
             block: nn.Module,
@@ -1567,25 +1567,25 @@ def run_train(
         for _ in range(config.grad_accum_steps):
             batches_by_node = {}
             for node_id, dataloader in training_dataloaders.items():
-                input_ids = next(dataloader).to(config.device)
-                prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                    input_ids=input_ids,
-                    prefix_tokens=config.prefix_tokens,
+                token_ids = next(dataloader).to(config.device)
+                context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+                    token_ids=token_ids,
+                    context_tokens=config.prefix_tokens,
                 )
                 with torch.no_grad():
                     past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
+                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
                         for node in nodes
                     }
-                batches_by_node[node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
+                batches_by_node[node_id] = (context_token_ids, prompt_token_ids, label_token_ids, past_by_node_id)
 
             total_direction_loss = 0.0
             for edge in edges:
-                prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id = batches_by_node[edge.tgt_id]
+                context_token_ids, prompt_token_ids, label_token_ids, past_by_node_id = batches_by_node[edge.tgt_id]
                 mixed_target_past, _ = build_replayed_target_past(
                     ctx,
                     source_past_key_values=past_by_node_id[edge.src_id],
-                    prefix_input_ids=prefix_cache_ids,
+                    context_token_ids=context_token_ids,
                     source_model=ctx.tp.get_model(edge.src_id),
                     target_model=ctx.tp.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
@@ -1595,8 +1595,8 @@ def run_train(
                 direction_loss = compute_prefix_correction_and_suffix_lm_loss(
                     target_model=ctx.tp.get_model(edge.tgt_id),
                     past_key_values=mixed_target_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
+                    prompt_token_ids=prompt_token_ids,
+                    label_token_ids=label_token_ids,
                     native_target_past_key_values=past_by_node_id[edge.tgt_id],
                     target_layer_indices=ctx.cm.get_tgt_layer_indices(edge.id),
                 )

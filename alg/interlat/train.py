@@ -14,6 +14,7 @@ from core.channel_manager import ChannelManager
 from core.common import (
     GPUMemoryTracker,
     PastKeyValues,
+    TokenIDs,
     count_trainable_parameters,
     extract_past_key_values,
     get_model_parameter_dtype,
@@ -21,7 +22,7 @@ from core.common import (
     load_tokenizer,
     read_json,
     set_seed,
-    split_prefix_and_suffix_for_exact_next_token_loss,
+    split_context_and_prompt_token_ids,
     write_json,
 )
 from core.config import Config
@@ -161,16 +162,16 @@ def get_model_context_limit(model) -> int:
 
 
 @torch.no_grad()
-def extract_interlat_source_hidden_states(model, input_ids: torch.Tensor) -> torch.Tensor:
+def extract_interlat_source_hidden_states(model, token_ids: TokenIDs) -> torch.Tensor:
     """Extract the last-layer hidden states that InterLat communicates.
 
-    The input ids are the same prefix ids used to build the common prefix cache
+    The token ids are the same context token ids used to build the common context cache
     for the other algorithms.  This preserves the benchmark data split while
     keeping InterLat's algorithmic input faithful to hidden-state communication.
     """
 
     outputs = model(
-        input_ids=input_ids,
+        input_ids=token_ids,
         use_cache=False,
         output_hidden_states=True,
         return_dict=True,
@@ -195,7 +196,7 @@ def build_latent_conditioned_past(
 
     The communicated sequence length is the common benchmark prefix length
     (``prefix_tokens - 1``).  This avoids giving InterLat an extra
-    target-prefix cache on top of the communicated source latent.
+    target context cache on top of the communicated source latent.
     """
 
     model_context_limit = get_model_context_limit(model)
@@ -223,18 +224,18 @@ def compute_suffix_logits_and_loss(
     *,
     target_model,
     past_key_values: PastKeyValues,
-    lm_input_ids: torch.Tensor,
-    lm_labels: torch.Tensor,
+    prompt_token_ids: TokenIDs,
+    label_token_ids: TokenIDs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     outputs = target_model(
-        input_ids=lm_input_ids,
+        input_ids=prompt_token_ids,
         past_key_values=past_key_values,
         use_cache=False,
     )
     logits = outputs.logits
     loss = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
-        lm_labels.reshape(-1),
+        label_token_ids.reshape(-1),
         reduction="mean",
     )
     return logits, loss
@@ -390,7 +391,7 @@ def run_train(
     logging.info("train_config=%s", asdict(config))
     logging.info("upstream_vendor_defaults.prepended_length=%d", _VENDOR_MODEL_ARGUMENTS.prepended_length)
     logging.info(
-        "InterLat source communication is derived from the same common prefix cache used by the other algorithms; "
+        "InterLat source communication is derived from the same common context cache used by the other algorithms; "
         "the target past is built from the communicated latent sequence only."
     )
 
@@ -400,7 +401,7 @@ def run_train(
         src_spec = ctx.tp.get_model_spec(edge.src_id)
         tgt_spec = ctx.tp.get_model_spec(edge.tgt_id)
         logging.info(
-            "edge=%s | src_hidden=%d | tgt_hidden=%d | prefix_cache_tokens=%d",
+            "edge=%s | src_hidden=%d | tgt_hidden=%d | context_tokens=%d",
             edge.id,
             src_spec.hidden_size,
             tgt_spec.hidden_size,
@@ -442,17 +443,17 @@ def run_train(
         while used_micro_batches < config.grad_accum_steps:
             batches_by_node = {}
             for node_id, dataloader in training_dataloaders.items():
-                input_ids = next(dataloader).to(config.device)
-                prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
-                    input_ids=input_ids,
-                    prefix_tokens=config.prefix_tokens,
+                token_ids = next(dataloader).to(config.device)
+                context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+                    token_ids=token_ids,
+                    context_tokens=config.prefix_tokens,
                 )
                 with torch.no_grad():
                     past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
+                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
                         for node in ctx.nodes
                     }
-                batches_by_node[node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
+                batches_by_node[node_id] = (context_token_ids, prompt_token_ids, label_token_ids, past_by_node_id)
 
             total_edge_loss = 0.0
             total_edge_ce = 0.0
@@ -460,7 +461,7 @@ def run_train(
             total_edge_random = 0.0
             total_edge_cosine = 0.0
             for edge in ctx.edges:
-                tgt_prefix_ids, lm_input_ids, lm_labels, past_by_node_id = batches_by_node[edge.tgt_id]
+                tgt_prefix_ids, prompt_token_ids, label_token_ids, past_by_node_id = batches_by_node[edge.tgt_id]
 
                 target_model = ctx.tp.get_model(edge.tgt_id)
                 tgt_model_context_limit = get_model_context_limit(target_model)
@@ -476,11 +477,11 @@ def run_train(
                     tgt_node_id=edge.tgt_id,
                     source_hidden_states=source_hidden_states,
                 )
-                if translated_latents.shape[1] + lm_input_ids.shape[1] > tgt_model_context_limit:
+                if translated_latents.shape[1] + prompt_token_ids.shape[1] > tgt_model_context_limit:
                     raise ValueError(
                         "InterLat training sequence does not fit target model context window: "
                         f"target={edge.tgt_id}, model_context_limit={tgt_model_context_limit}, "
-                        f"latent_tokens={translated_latents.shape[1]}, lm_input_tokens={lm_input_ids.shape[1]}"
+                        f"latent_tokens={translated_latents.shape[1]}, prompt_tokens={prompt_token_ids.shape[1]}"
                     )
 
                 conditioned_past = build_latent_conditioned_past(
@@ -490,8 +491,8 @@ def run_train(
                 normal_logits, ce_loss = compute_suffix_logits_and_loss(
                     target_model=target_model,
                     past_key_values=conditioned_past,
-                    lm_input_ids=lm_input_ids,
-                    lm_labels=lm_labels,
+                    prompt_token_ids=prompt_token_ids,
+                    label_token_ids=label_token_ids,
                 )
 
                 with torch.no_grad():
@@ -499,8 +500,8 @@ def run_train(
                     plan_logits, _ = compute_suffix_logits_and_loss(
                         target_model=target_model,
                         past_key_values=plan_past,
-                        lm_input_ids=lm_input_ids,
-                        lm_labels=lm_labels,
+                        prompt_token_ids=prompt_token_ids,
+                        label_token_ids=label_token_ids,
                     )
                     random_latents = translate_hidden_states(
                         translator_pool=translator_pool,
@@ -515,23 +516,23 @@ def run_train(
                     random_logits, _ = compute_suffix_logits_and_loss(
                         target_model=target_model,
                         past_key_values=random_past,
-                        lm_input_ids=lm_input_ids,
-                        lm_labels=lm_labels,
+                        prompt_token_ids=prompt_token_ids,
+                        label_token_ids=label_token_ids,
                     )
 
                 plan_loss = compute_plan_similarity_loss(
                     normal_logits=normal_logits,
                     plan_logits=plan_logits,
-                    labels=lm_labels,
+                    labels=label_token_ids,
                 )
                 random_loss = compute_random_contrast_loss(
                     normal_logits=normal_logits,
                     random_logits=random_logits,
-                    labels=lm_labels,
+                    labels=label_token_ids,
                 )
                 positive_cosine = F.cosine_similarity(
-                    F.softmax(_flatten_logits_for_valid_labels(normal_logits, lm_labels), dim=-1).reshape(-1),
-                    F.softmax(_flatten_logits_for_valid_labels(plan_logits, lm_labels), dim=-1).reshape(-1),
+                    F.softmax(_flatten_logits_for_valid_labels(normal_logits, label_token_ids), dim=-1).reshape(-1),
+                    F.softmax(_flatten_logits_for_valid_labels(plan_logits, label_token_ids), dim=-1).reshape(-1),
                     dim=0,
                 )
                 plan_weight, random_weight = adjust_interlat_loss_weights(
