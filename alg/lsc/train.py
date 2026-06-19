@@ -402,7 +402,7 @@ def run_train(
         )
     logging.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloaders_by_target = build_training_dataloaders_by_target(ctx)
+    training_dataloaders = build_training_dataloaders(ctx)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
@@ -424,8 +424,8 @@ def run_train(
         step_loss_value = 0.0
 
         for _ in range(config.grad_accum_steps):
-            target_batches = {}
-            for target_node_id, dataloader in dataloaders_by_target.items():
+            batches_by_node = {}
+            for node_id, dataloader in training_dataloaders.items():
                 input_ids = next(dataloader).to(config.device)
                 prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
                     input_ids=input_ids,
@@ -436,11 +436,11 @@ def run_train(
                         node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
                         for node in nodes
                     }
-                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
+                batches_by_node[node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
 
             total_direction_loss = 0.0
             for edge in edges:
-                _, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
+                _, lm_input_ids, lm_labels, past_by_node_id = batches_by_node[edge.tgt_id]
                 translated_past = translate_layers(
                     translator_pool=translator_pool,
                     past_key_values=past_by_node_id[edge.src_id],

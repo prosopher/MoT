@@ -30,7 +30,7 @@ from core.translator_pool import TranslatorPool
 from core.train_util import (
     build_models_and_tokenizers,
     WarmupCosineScheduler,
-    build_training_dataloaders_by_target,
+    build_training_dataloaders,
     get_train_checkpoint_path,
     get_train_config_path,
     get_train_log_path,
@@ -417,7 +417,7 @@ def run_train(
         warmup_steps=config.warmup_steps,
         total_steps=config.max_steps,
     )
-    dataloaders_by_target = build_training_dataloaders_by_target(ctx)
+    training_dataloaders = build_training_dataloaders(ctx)
 
     running_total_loss = 0.0
     running_ce_loss = 0.0
@@ -440,8 +440,8 @@ def run_train(
         used_micro_batches = 0
 
         while used_micro_batches < config.grad_accum_steps:
-            target_batches = {}
-            for target_node_id, dataloader in dataloaders_by_target.items():
+            batches_by_node = {}
+            for node_id, dataloader in training_dataloaders.items():
                 input_ids = next(dataloader).to(config.device)
                 prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
                     input_ids=input_ids,
@@ -452,7 +452,7 @@ def run_train(
                         node.id: extract_past_key_values(ctx.tp.get_model(node.id), prefix_cache_ids)
                         for node in ctx.nodes
                     }
-                target_batches[target_node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
+                batches_by_node[node_id] = (prefix_cache_ids, lm_input_ids, lm_labels, past_by_node_id)
 
             total_edge_loss = 0.0
             total_edge_ce = 0.0
@@ -460,7 +460,7 @@ def run_train(
             total_edge_random = 0.0
             total_edge_cosine = 0.0
             for edge in ctx.edges:
-                tgt_prefix_ids, lm_input_ids, lm_labels, past_by_node_id = target_batches[edge.tgt_id]
+                tgt_prefix_ids, lm_input_ids, lm_labels, past_by_node_id = batches_by_node[edge.tgt_id]
 
                 target_model = ctx.tp.get_model(edge.tgt_id)
                 tgt_model_context_limit = get_model_context_limit(target_model)

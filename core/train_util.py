@@ -32,11 +32,10 @@ def build_training_dataloader(ctx: Context, tokenizer: PreTrainedTokenizerBase) 
     return InfiniteDataLoader(dataloader)
 
 
-def build_training_dataloaders_by_target(ctx: Context) -> Dict[str, InfiniteDataLoader]:
-    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
+def build_training_dataloaders(ctx: Context) -> Dict[str, InfiniteDataLoader]:
     return {
-        node_id: build_training_dataloader(ctx, ctx.tp.get_tokenizer(node_id))
-        for node_id in target_node_ids
+        node.id: build_training_dataloader(ctx, ctx.tp.get_tokenizer(node.id))
+        for node in ctx.nodes
     }
 
 
