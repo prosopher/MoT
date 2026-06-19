@@ -117,25 +117,6 @@ def move_trainable_module_to_config_dtype(module: nn.Module, config) -> nn.Modul
     return module.to(device=config.device, dtype=get_training_dtype(config))
 
 
-def build_models_and_tokenizers(
-    config,
-    nodes: List[Node],
-) -> Tuple[Dict[str, PreTrainedModel], Dict[str, PreTrainedTokenizerBase]]:
-    unique_tokenizers: Dict[str, PreTrainedTokenizerBase] = {}
-    unique_models: Dict[str, PreTrainedModel] = {}
-
-    tokenizers: Dict[str, PreTrainedTokenizerBase] = {}
-    models: Dict[str, PreTrainedModel] = {}
-    for node in nodes:
-        if node.model_id not in unique_tokenizers:
-            unique_tokenizers[node.model_id] = load_tokenizer(node.model_id)
-        if node.model_id not in unique_models:
-            unique_models[node.model_id] = load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
-        tokenizers[node.id] = unique_tokenizers[node.model_id]
-        models[node.id] = unique_models[node.model_id]
-
-    return models, tokenizers
-
 
 TRANSLATOR_CHECKPOINT_DIR_NAME = "translators"
 

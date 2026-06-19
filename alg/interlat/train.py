@@ -18,8 +18,6 @@ from core.common import (
     count_trainable_parameters,
     extract_past_key_values,
     get_model_parameter_dtype,
-    load_frozen_model,
-    load_tokenizer,
     read_json,
     set_seed,
     split_context_and_prompt_token_ids,
@@ -29,7 +27,6 @@ from core.config import Config
 from core.context import Context
 from core.translator_pool import TranslatorPool
 from core.train_util import (
-    build_models_and_tokenizers,
     WarmupCosineScheduler,
     build_training_dataloaders,
     get_train_checkpoint_path,
@@ -360,12 +357,11 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
-    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        TranslatorPool(models, tokenizers),
+        TranslatorPool(config, nodes),
         ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)

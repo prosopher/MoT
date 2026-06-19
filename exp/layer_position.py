@@ -2137,12 +2137,11 @@ def main() -> None:
 
     set_seed(config.seed)
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        TranslatorPool(models, tokenizers),
+        TranslatorPool(config, nodes),
         ChannelManager(edges),
     )
     run_dir = build_run_output_dir(config)

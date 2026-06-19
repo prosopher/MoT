@@ -1,54 +1,41 @@
-from typing import Dict, Hashable, Iterator
+from typing import Any, Dict, Iterable, Iterator
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
+from .common import load_frozen_model, load_tokenizer
+from .model import Model
 from .model_spec import ModelSpec, infer_model_spec_from_config
+from .topology import Node
 
 
 class TranslatorPool:
-    def __init__(
-        self,
-        models: Dict[str, PreTrainedModel],
-        tokenizers: Dict[str, PreTrainedTokenizerBase],
-    ) -> None:
-        self._models: Dict[str, PreTrainedModel] = {}
-        self._tokenizers: Dict[str, PreTrainedTokenizerBase] = {}
+    def __init__(self, config: Any, nodes: Iterable[Node]) -> None:
+        self.models: Dict[str, Model] = {}
         self.translators: Dict[str, nn.Module] = {}
 
-        unique_models: Dict[Hashable, PreTrainedModel] = {}
-        for node_id, model in models.items():
-            config = getattr(model, "config", None)
-            model_key = getattr(config, "_name_or_path", None) or getattr(model, "name_or_path", None) or id(model)
-            if model_key not in unique_models:
-                unique_models[model_key] = model
-            self._models[node_id] = unique_models[model_key]
-
-        unique_tokenizers: Dict[Hashable, PreTrainedTokenizerBase] = {}
-        for node_id, tokenizer in tokenizers.items():
-            tokenizer_key = (
-                getattr(tokenizer, "name_or_path", None)
-                or getattr(tokenizer, "model_id", None)
-                or id(tokenizer)
-            )
-            if tokenizer_key not in unique_tokenizers:
-                unique_tokenizers[tokenizer_key] = tokenizer
-            self._tokenizers[node_id] = unique_tokenizers[tokenizer_key]
+        unique_models: Dict[str, Model] = {}
+        for node in nodes:
+            if node.model_id not in unique_models:
+                model = load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
+                tokenizer = load_tokenizer(node.model_id)
+                unique_models[node.model_id] = Model(node.model_id, model, tokenizer)
+            self.models[node.id] = unique_models[node.model_id]
 
         self._model_specs = {
-            node_id: infer_model_spec_from_config(model.config)
-            for node_id, model in self._models.items()
+            node_id: infer_model_spec_from_config(model.model.config, default_model_id=model.id)
+            for node_id, model in self.models.items()
         }
 
     def get_model(self, node_id: str) -> PreTrainedModel:
-        return self._models[node_id]
+        return self.models[node_id].model
 
     def get_model_spec(self, node_id: str) -> ModelSpec:
         return self._model_specs[node_id]
 
     def get_tokenizer(self, node_id: str) -> PreTrainedTokenizerBase:
-        return self._tokenizers[node_id]
+        return self.models[node_id].tokenizer
 
     def add_translator(self, translator_id: str, translator: nn.Module) -> nn.Module:
         self.translators[translator_id] = translator

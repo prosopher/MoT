@@ -17,7 +17,6 @@ from core.context import Context
 from core.translator_pool import TranslatorPool
 from core.topology import Edge, Node, build_edge_map, get_translator_id
 from core.train_util import (
-    build_models_and_tokenizers,
     get_train_checkpoint_path,
     get_train_config_path,
     get_train_log_path,
@@ -719,8 +718,7 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = resolve_device(device_override)
     config.output_path = str(checkpoint_dir_path_obj)
-    models, tokenizers = build_models_and_tokenizers(config, nodes)
-    ctx = Context(config, nodes, edges, TranslatorPool(models, tokenizers), ChannelManager(edges))
+    ctx = Context(config, nodes, edges, TranslatorPool(config, nodes), ChannelManager(edges))
     translator_pool = load_kvcomm_translator_checkpoints(ctx)
     translator_pool.eval()
     return ctx, translator_pool

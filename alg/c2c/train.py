@@ -739,12 +739,11 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
-    models, tokenizers = build_models_and_tokenizers(config, nodes)
     ctx = Context(
         config,
         nodes,
         edges,
-        TranslatorPool(models, tokenizers),
+        TranslatorPool(config, nodes),
         ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)
