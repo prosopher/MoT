@@ -33,7 +33,9 @@ from core.train_util import (
     get_train_config_path,
     get_train_log_path,
     initialize_train_output_paths,
-    move_trainable_module_to_config_dtype
+    load_translator_checkpoints,
+    move_trainable_module_to_config_dtype,
+    save_translator_checkpoints,
 )
 from core.topology import Edge, Node, get_translator_id
 from alg.interlat.vender import ModelArguments as VendorModelArguments
@@ -334,10 +336,10 @@ def _candidate_num_heads(hidden_size: int, requested_heads: int) -> int:
     return 1
 
 
-def build_translator_pool(ctx: Context) -> InterLatTranslatorPool:
-    pool = InterLatTranslatorPool(ctx)
-    move_trainable_module_to_config_dtype(pool, ctx.config)
-    return pool
+def build_translator_pool(ctx: Context) -> TranslatorPool:
+    translator_pool = initialize_translators(ctx)
+    move_trainable_module_to_config_dtype(translator_pool, ctx.config)
+    return translator_pool
 
 
 def load_translator_pool_from_checkpoint(
@@ -365,7 +367,7 @@ def load_translator_pool_from_checkpoint(
         ChannelManager(edges),
     )
     translator_pool = build_translator_pool(ctx)
-    translator_pool.load_state_dict(torch.load(str(checkpoint_path_obj), map_location="cpu"))
+    load_translator_checkpoints(checkpoint_dir_path_obj, translator_pool)
     move_trainable_module_to_config_dtype(translator_pool, config)
     translator_pool.eval()
     return ctx, translator_pool
