@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from core.channel_manager import ChannelManager
 from core.channel_profiler import ChannelProfileConfig, ChannelProfiler, ProxyValidationScore
 from core.context import Context
 from core.model_spec import ModelSpec
@@ -51,19 +50,20 @@ class ScoreMappedChannelProfiler(ChannelProfiler):
 
 
 def build_profiler(layer_alignment: str) -> tuple[DeterministicChannelProfiler, Edge]:
-    edge = Edge(id="A_to_B", src_id="A", tgt_id="B")
     ctx = Context(
         config=SimpleNamespace(
             alg="mot",
+            model_ids="src-model,tgt-model",
+            model_directions="A_to_B",
+            device="cpu",
+            dtype="float32",
             layer_alignment=layer_alignment,
             min_window_size_ratio=0.33,
             max_window_size_ratio=0.5,
         ),
-        nodes=[],
-        edges=[edge],
-        tp=DummyTranslatorPool({"A": 2, "B": 4}),
-        cm=ChannelManager([edge]),
     )
+    ctx.tp = DummyTranslatorPool({"A": 2, "B": 4})
+    edge = ctx.edges[0]
     profiler = DeterministicChannelProfiler(
         ctx,
         ChannelProfileConfig(
@@ -87,19 +87,20 @@ def build_scored_profiler(
     layer_counts: tuple[int, int],
     score_map: dict[tuple[int, ...], float],
 ) -> tuple[ScoreMappedChannelProfiler, Edge]:
-    edge = Edge(id="A_to_B", src_id="A", tgt_id="B")
     ctx = Context(
         config=SimpleNamespace(
             alg="mot",
+            model_ids="src-model,tgt-model",
+            model_directions="A_to_B",
+            device="cpu",
+            dtype="float32",
             layer_alignment=layer_alignment,
             min_window_size_ratio=0.33,
             max_window_size_ratio=0.5,
         ),
-        nodes=[],
-        edges=[edge],
-        tp=DummyTranslatorPool({"A": layer_counts[0], "B": layer_counts[1]}),
-        cm=ChannelManager([edge]),
     )
+    ctx.tp = DummyTranslatorPool({"A": layer_counts[0], "B": layer_counts[1]})
+    edge = ctx.edges[0]
     profiler = ScoreMappedChannelProfiler(
         ctx,
         ChannelProfileConfig(

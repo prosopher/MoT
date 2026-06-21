@@ -11,7 +11,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.common import *
-from core.channel_manager import ChannelManager
 from core.context import Context
 from core.translator_pool import TranslatorPool
 from core.model_spec import ModelSpec, infer_model_spec_from_config
@@ -2130,14 +2129,7 @@ def main() -> None:
     )
 
     set_seed(config.seed)
-    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    ctx = Context(
-        config,
-        nodes,
-        edges,
-        TranslatorPool(config, nodes),
-        ChannelManager(edges),
-    )
+    ctx = Context(config)
     run_dir = build_run_output_dir(config)
     run_dir.mkdir(parents=True, exist_ok=True)
 

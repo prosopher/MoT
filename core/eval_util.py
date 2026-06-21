@@ -1712,8 +1712,6 @@ def load_train_config_from_checkpoint(
 def build_eval_context(
     alg: str,
     eval_config: EvalConfig,
-    nodes: List[Node],
-    edges: List[Edge],
 ):
     if eval_config.checkpoint_dir_path is None:
         raise ValueError("EvalConfig.checkpoint_dir_path must be set before build_eval_context.")
@@ -1737,8 +1735,6 @@ def build_eval_context(
 
     return load_from_checkpoint(
         checkpoint_dir_path=checkpoint_dir_path,
-        nodes=nodes,
-        edges=edges,
         device_override=eval_config.device,
     )
 

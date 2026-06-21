@@ -1452,8 +1452,6 @@ def build_translator_pool(
 
 def load_translator_pool_from_checkpoint(
     checkpoint_dir_path: str,
-    nodes: List[Node],
-    edges: List[Edge],
     device_override: Optional[str] = None,
 ) -> Tuple[
     Context,
@@ -1469,13 +1467,7 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
-    ctx = Context(
-        config,
-        nodes,
-        edges,
-        TranslatorPool(config, nodes),
-        ChannelManager(edges),
-    )
+    ctx = Context(config)
     if uses_channel_alignment(config.layer_alignment):
         profile_config_path = Path(checkpoint_dir_path_obj) / "channel_profile.json"
         ctx.cp = ChannelProfiler(ctx, load_channel_profile_config(profile_config_path))

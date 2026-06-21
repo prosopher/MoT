@@ -2,11 +2,8 @@ import argparse
 import importlib
 from pathlib import Path
 
-from core.channel_manager import ChannelManager
 from core.common import GPUMemoryTracker, add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace, setup_logging
 from core.context import Context
-from core.translator_pool import TranslatorPool
-from core.topology import build_nodes_and_edges
 from core.train_util import get_train_log_path
 
 
@@ -65,14 +62,7 @@ def main() -> None:
 
     setup_logging(get_train_log_path(config.output_path))
 
-    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    ctx = Context(
-        config,
-        nodes,
-        edges,
-        TranslatorPool(config, nodes),
-        ChannelManager(edges),
-    )
+    ctx = Context(config)
     if hasattr(train_module, "ChannelProfiler") and train_module.uses_channel_alignment(getattr(config, "layer_alignment", "")):
         profile_config = train_module.load_channel_profile_config(Path(args.channel_profile_config_path))
         ctx.cp = train_module.ChannelProfiler(ctx, profile_config)

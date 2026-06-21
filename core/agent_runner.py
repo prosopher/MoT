@@ -632,8 +632,6 @@ class AgentRunner:
         train_mod = importlib.import_module(TRAIN_MODULE_BY_ALG[resolved_alg])
         loaded = train_mod.load_translator_pool_from_checkpoint(
             checkpoint_dir_path=config.checkpoint_dir_path,
-            nodes=all_nodes,
-            edges=all_edges,
             device_override=resolve_device(config.device),
         )
         ctx, translator_pool, *_ = loaded

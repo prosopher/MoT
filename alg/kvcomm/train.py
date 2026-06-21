@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from core.channel_manager import ChannelManager
 from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, TokenIDs, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
@@ -704,8 +703,6 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
 
 def load_translator_pool_from_checkpoint(
     checkpoint_dir_path: str,
-    nodes: List[Node],
-    edges: List[Edge],
     device_override: Optional[str] = None,
 ) -> Tuple[Context, TranslatorPool]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
@@ -718,7 +715,7 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = resolve_device(device_override)
     config.output_path = str(checkpoint_dir_path_obj)
-    ctx = Context(config, nodes, edges, TranslatorPool(config, nodes), ChannelManager(edges))
+    ctx = Context(config)
     translator_pool = load_kvcomm_translator_checkpoints(ctx)
     translator_pool.eval()
     return ctx, translator_pool
