@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import asdict, dataclass
 import logging
 from pathlib import Path
@@ -385,7 +383,7 @@ def run_train(
     config_path = get_train_config_path(output_path)
     write_json(str(config_path), asdict(config))
     log_path = get_train_log_path(output_path)
-    logging.info("Starting Interlat training")
+    logging.info("Starting training")
     logging.info("train_config=%s", asdict(config))
     logging.info("upstream_vendor_defaults.prepended_length=%d", _VENDOR_MODEL_ARGUMENTS.prepended_length)
     logging.info(

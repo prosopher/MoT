@@ -255,28 +255,42 @@ class TinyCausalLM(PreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         past_key_values=None,
         use_cache: bool = True,
         output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask=None,
+        return_dict: bool = True,
         **_: object,
     ):
-        batch_size, seq_len = input_ids.shape
+        del attention_mask, return_dict
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("input_ids or inputs_embeds must be provided")
+        if input_ids is not None:
+            batch_size, seq_len = input_ids.shape
+        else:
+            batch_size, seq_len = inputs_embeds.shape[:2]
         past_length = 0
         if past_key_values is not None and len(past_key_values) > 0:
             past_length = past_key_values[0][0].shape[2]
 
+        input_device = input_ids.device if input_ids is not None else inputs_embeds.device
         position_ids = torch.arange(
             past_length,
             past_length + seq_len,
-            device=input_ids.device,
+            device=input_device,
             dtype=torch.long,
         ).unsqueeze(0).expand(batch_size, -1)
-        hidden_states = self.transformer.wte(input_ids) + self.transformer.wpe(position_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.transformer.wte(input_ids)
+        hidden_states = inputs_embeds + self.transformer.wpe(position_ids)
         hidden_states = self.transformer.drop(hidden_states)
 
         presents = []
         attentions = []
+        all_hidden_states = [hidden_states] if output_hidden_states else None
         for layer_idx, block in enumerate(self.transformer.h):
             layer_past = None if past_key_values is None else past_key_values[layer_idx]
             block_outputs = block(
@@ -296,13 +310,18 @@ class TinyCausalLM(PreTrainedModel):
                 next_index += 1
             if output_attentions:
                 attentions.append(block_outputs[next_index])
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
 
         hidden_states = self.transformer.ln_f(hidden_states)
+        if output_hidden_states:
+            all_hidden_states[-1] = hidden_states
         logits = self.lm_head(hidden_states)
         return SimpleNamespace(
             logits=logits,
             past_key_values=tuple(presents) if use_cache else None,
             last_hidden_state=hidden_states,
+            hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
             attentions=tuple(attentions) if output_attentions else None,
         )
 

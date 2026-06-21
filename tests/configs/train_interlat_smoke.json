@@ -1,0 +1,23 @@
+{
+  "timestamp": null,
+  "output_path": null,
+  "model_ids": "tiny-a,tiny-b",
+  "model_directions": "A_to_B",
+  "max_steps": 1,
+  "batch_size": 1,
+  "grad_accum_steps": 1,
+  "total_tokens": 4,
+  "prefix_tokens": 2,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0,
+  "warmup_steps": 1,
+  "grad_clip_norm": 1.0,
+  "log_every": 1,
+  "seed": 123,
+  "shuffle_buffer": 8,
+  "prepended_num_heads": 1,
+  "plan_similarity_weight": 1.0,
+  "random_contrast_weight": 2.0,
+  "device": "cpu",
+  "dtype": "float32"
+}

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict
@@ -330,7 +328,7 @@ def run_eval(
     write_json(str(config_path), asdict(eval_config))
 
     log_path = get_eval_log_path(eval_config.output_path)
-    logging.info("Starting InterLat evaluation")
+    logging.info("Starting evaluation")
     logging.info("checkpoint_dir_path=%s", checkpoint_dir_path)
     logging.info("eval_config=%s", asdict(eval_config))
 

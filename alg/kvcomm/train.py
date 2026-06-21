@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 from dataclasses import asdict, dataclass
 import logging
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import asdict
 import logging
 from pathlib import Path

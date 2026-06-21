@@ -18,6 +18,7 @@ CONFIGS_PATH = REPO_ROOT / "tests" / "configs"
         ("lsc", "train_lsc_smoke.json"),
         ("mot", "train_mot_smoke.json"),
         ("c2c", "train_c2c_smoke.json"),
+        ("interlat", "train_interlat_smoke.json"),
         ("kvcomm", "train_kvcomm_smoke.json"),
     ],
 )
