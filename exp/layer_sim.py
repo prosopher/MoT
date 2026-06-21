@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.common import (  # noqa: E402
+    TokenIDs,
     extract_past_key_values,
     load_frozen_model,
     load_tokenizer,
@@ -461,8 +462,8 @@ def collect_layer_features(config: LayerSimConfig) -> Tuple[Dict[str, object], D
             token_ids_a = token_ids_a[:remaining]
             token_ids_b = token_ids_b[:remaining]
 
-        token_ids_a = token_ids_a.to(config.device)
-        token_ids_b = token_ids_b.to(config.device)
+        token_ids_a = TokenIDs(token_ids_a.to(config.device), model_id=model_a.id)
+        token_ids_b = TokenIDs(token_ids_b.to(config.device), model_id=model_b.id)
 
         past_a = extract_past_key_values(model_a, token_ids_a)
         past_b = extract_past_key_values(model_b, token_ids_b)

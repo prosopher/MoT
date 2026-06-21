@@ -40,10 +40,10 @@ def _openwebtext_prefix_tokens(config) -> int:
 
 
 @torch.inference_mode()
-def _predict_direct_context_logit(model, spec, tokenizer, context: str, question: str, device: str, *, choices=None, choice_texts=None, subject=None):
+def _predict_direct_context_logit(model, spec, context: str, question: str, device: str, *, choices=None, choice_texts=None, subject=None):
     prepared = prepare_logit_task_inputs(
         spec=spec,
-        tokenizer=tokenizer,
+        model=model,
         context=context,
         question=question,
         device=device,
@@ -51,7 +51,7 @@ def _predict_direct_context_logit(model, spec, tokenizer, context: str, question
         choice_texts=choice_texts,
         subject=subject,
     )
-    choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
+    choice_token_ids = build_logit_answer_candidates(model=model, spec=spec)
     context_past = extract_past_key_values(model, prepared["context_token_ids"])
     scoring_past = prepare_answer_scoring_past(
         model=model,
@@ -72,7 +72,6 @@ def _predict_direct_context_logit(model, spec, tokenizer, context: str, question
 def _predict_direct_context_generation(
     model,
     spec,
-    tokenizer,
     context: str,
     question: str,
     eval_config: EvalConfig,
@@ -81,7 +80,7 @@ def _predict_direct_context_generation(
 ) -> str:
     prepared = prepare_generation_task_inputs(
         spec=spec,
-        tokenizer=tokenizer,
+        model=model,
         context=context,
         question=question,
         device=device,
@@ -90,7 +89,6 @@ def _predict_direct_context_generation(
     context_past = extract_past_key_values(model, prepared["context_token_ids"])
     return predict_generation_task_answer(
         model=model,
-        tokenizer=tokenizer,
         past_key_values=context_past,
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
@@ -107,7 +105,6 @@ def _predict_kvcomm_logit(
     source_model,
     target_model,
     spec,
-    tokenizer,
     context: str,
     question: str,
     device: str,
@@ -117,7 +114,7 @@ def _predict_kvcomm_logit(
 ):
     prepared = prepare_logit_task_inputs(
         spec=spec,
-        tokenizer=tokenizer,
+        model=target_model,
         context=context,
         question=question,
         device=device,
@@ -125,7 +122,7 @@ def _predict_kvcomm_logit(
         choice_texts=choice_texts,
         subject=subject,
     )
-    choice_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
+    choice_token_ids = build_logit_answer_candidates(model=target_model, spec=spec)
     source_past = extract_past_key_values(source_model, prepared["context_token_ids"])
     kvcomm_past = build_replayed_target_past(
         ctx,
@@ -157,7 +154,6 @@ def _predict_kvcomm_generation(
     source_model,
     target_model,
     spec,
-    tokenizer,
     context: str,
     question: str,
     eval_config: EvalConfig,
@@ -166,7 +162,7 @@ def _predict_kvcomm_generation(
 ) -> str:
     prepared = prepare_generation_task_inputs(
         spec=spec,
-        tokenizer=tokenizer,
+        model=target_model,
         context=context,
         question=question,
         device=device,
@@ -181,7 +177,6 @@ def _predict_kvcomm_generation(
     )
     return predict_generation_task_answer(
         model=target_model,
-        tokenizer=tokenizer,
         past_key_values=kvcomm_past,
         seed_token=prepared["seed_token"],
         eval_config=eval_config,
@@ -299,7 +294,8 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in ctx.edges:
-                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
+                source_model = ctx.tp.get_model(edge.src_id)
+                target_model = ctx.tp.get_model(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -307,13 +303,12 @@ def evaluate_generation_dataset(
                         spec=spec,
                         question=question,
                         eval_config=eval_config,
-                        tokenizer=tokenizer,
-                        target_node_id=edge.tgt_id,
+                        model=target_model,
                     )
 
                 prepared_generation_inputs = prepare_generation_task_inputs(
                     spec=spec,
-                    tokenizer=tokenizer,
+                    model=target_model,
                     context=context,
                     question=question,
                     device=device,
@@ -321,13 +316,9 @@ def evaluate_generation_dataset(
                 )
                 context_token_ids = prepared_generation_inputs["context_token_ids"]
 
-                source_model = ctx.tp.get_model(edge.src_id)
-                target_model = ctx.tp.get_model(edge.tgt_id)
-
                 pred_direct = _predict_direct_context_generation(
                     model=target_model,
                     spec=spec,
-                    tokenizer=tokenizer,
                     context=context,
                     question=question,
                     eval_config=eval_config,
@@ -341,7 +332,6 @@ def evaluate_generation_dataset(
                     source_model=source_model,
                     target_model=target_model,
                     spec=spec,
-                    tokenizer=tokenizer,
                     context=context,
                     question=question,
                     eval_config=eval_config,

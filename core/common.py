@@ -26,6 +26,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from .model import Model
 from .topology import *
 
 
@@ -67,7 +68,53 @@ def setup_logging(log_path: Union[str, Path]) -> logging.Logger:
 
 
 PastKeyValues: TypeAlias = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
-TokenIDs: TypeAlias = torch.Tensor
+
+
+class TokenIDs(torch.Tensor):
+    model_id: str
+
+    def __new__(
+        cls,
+        data: Any,
+        model_id: str,
+    ) -> "TokenIDs":
+        tensor = data if isinstance(data, torch.Tensor) else torch.tensor(data)
+        token_ids = tensor.as_subclass(cls)
+        token_ids.model_id = str(model_id)
+        return token_ids
+
+    def as_tensor(self) -> torch.Tensor:
+        return self.as_subclass(torch.Tensor)
+
+    def _with_model_id(self, tensor: torch.Tensor) -> "TokenIDs":
+        return TokenIDs(tensor, model_id=self.model_id)
+
+    def __getitem__(self, key) -> "TokenIDs":
+        return self._with_model_id(super().__getitem__(key))
+
+    def clone(self, *args, **kwargs) -> "TokenIDs":
+        return self._with_model_id(super().clone(*args, **kwargs))
+
+    def to(self, *args, **kwargs) -> "TokenIDs":
+        return self._with_model_id(super().to(*args, **kwargs))
+
+    def view(self, *shape) -> "TokenIDs":
+        return self._with_model_id(super().view(*shape))
+
+    def reshape(self, *shape) -> "TokenIDs":
+        return self._with_model_id(super().reshape(*shape))
+
+    def unsqueeze(self, dim: int) -> "TokenIDs":
+        return self._with_model_id(super().unsqueeze(dim))
+
+    def squeeze(self, *args) -> "TokenIDs":
+        return self._with_model_id(super().squeeze(*args))
+
+    def detach(self) -> "TokenIDs":
+        return self._with_model_id(super().detach())
+
+    def cpu(self) -> "TokenIDs":
+        return self._with_model_id(super().cpu())
 
 
 def split_context_and_prompt_token_ids(
@@ -129,13 +176,13 @@ class OpenWebTextSequenceStream(IterableDataset):
 
 
 def compute_suffix_lm_loss(
-    target_model: PreTrainedModel,
+    target_model: Model,
     past_key_values: PastKeyValues,
     prompt_token_ids: TokenIDs,
     label_token_ids: TokenIDs,
 ) -> torch.Tensor:
     outputs = target_model(
-        input_ids=prompt_token_ids,
+        input_ids=prompt_token_ids.as_tensor(),
         past_key_values=past_key_values,
         use_cache=False,
     )
@@ -143,13 +190,13 @@ def compute_suffix_lm_loss(
     vocab_size = logits.shape[-1]
     return F.cross_entropy(
         logits.reshape(-1, vocab_size),
-        label_token_ids.reshape(-1),
+        label_token_ids.as_tensor().reshape(-1),
         reduction="mean",
     )
 
 
 def compute_prefix_correction_and_suffix_lm_loss(
-    target_model: PreTrainedModel,
+    target_model: Model,
     past_key_values: PastKeyValues,
     prompt_token_ids: TokenIDs,
     label_token_ids: TokenIDs,
@@ -269,7 +316,7 @@ def load_frozen_model(model_id: str, device: str, dtype: str) -> PreTrainedModel
 
 
 
-def get_model_parameter_dtype(model: PreTrainedModel) -> Optional[torch.dtype]:
+def get_model_parameter_dtype(model: Model) -> Optional[torch.dtype]:
     try:
         return next(model.parameters()).dtype
     except StopIteration:
@@ -292,8 +339,8 @@ def cast_past_key_values_dtype(
 
 
 @torch.no_grad()
-def extract_past_key_values(model: PreTrainedModel, token_ids: TokenIDs) -> PastKeyValues:
-    outputs = model(input_ids=token_ids, use_cache=True)
+def extract_past_key_values(model: Model, token_ids: TokenIDs) -> PastKeyValues:
+    outputs = model(input_ids=token_ids.as_tensor(), use_cache=True)
     return cast_past_key_values_dtype(
         outputs.past_key_values,
         get_model_parameter_dtype(model),

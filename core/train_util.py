@@ -18,23 +18,26 @@ class InfiniteDataLoader:
             return next(self.iterator)
 
 
-def build_training_dataloader(ctx: Context, tokenizer: PreTrainedTokenizerBase) -> InfiniteDataLoader:
+def build_training_dataloader(ctx: Context, model: Model) -> InfiniteDataLoader:
     config = ctx.config
     dataset = OpenWebTextSequenceStream(
-        tokenizer=tokenizer,
+        tokenizer=model.tokenizer,
         sequence_length=config.total_tokens,
         split="train",
         shuffle=True,
         shuffle_buffer=config.shuffle_buffer,
         seed=config.seed,
     )
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, num_workers=0)
+    def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
+        return TokenIDs(torch.stack([torch.as_tensor(example) for example in examples], dim=0), model_id=model.id)
+
+    dataloader = DataLoader(dataset, batch_size=config.batch_size, num_workers=0, collate_fn=collate_token_ids)
     return InfiniteDataLoader(dataloader)
 
 
 def build_training_dataloaders(ctx: Context) -> Dict[str, InfiniteDataLoader]:
     return {
-        node.id: build_training_dataloader(ctx, ctx.tp.get_tokenizer(node.id))
+        node.id: build_training_dataloader(ctx, ctx.tp.get_model(node.id))
         for node in ctx.nodes
     }
 

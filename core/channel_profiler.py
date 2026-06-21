@@ -508,17 +508,20 @@ class ChannelProfiler:
         from .common import OpenWebTextSequenceStream, compute_suffix_lm_loss
         from torch.utils.data import DataLoader
 
+        target_model = self.tp.get_model(edge.tgt_id)
         dataset = OpenWebTextSequenceStream(
-            tokenizer=self.ctx.tp.get_tokenizer(edge.tgt_id),
+            tokenizer=target_model.tokenizer,
             sequence_length=self.config.total_tokens,
             split=split,
             shuffle=True,
             shuffle_buffer=self.config.shuffle_buffer,
             seed=self.config.seed + seed_offset,
         )
-        loader = InfiniteDataLoader(DataLoader(dataset, batch_size=1, num_workers=0))
+        def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
+            return TokenIDs(torch.stack([torch.as_tensor(example) for example in examples], dim=0), model_id=target_model.id)
+
+        loader = InfiniteDataLoader(DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_token_ids))
         source_model = self.tp.get_model(edge.src_id)
-        target_model = self.tp.get_model(edge.tgt_id)
 
         bank: List[Dict[str, Any]] = []
         for _ in range(num_examples):

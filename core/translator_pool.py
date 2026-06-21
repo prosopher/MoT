@@ -2,8 +2,6 @@ from typing import Any, Dict, Iterable, Iterator
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
-
 from .common import load_frozen_model, load_tokenizer
 from .model import Model
 from .model_spec import ModelSpec, infer_model_spec_from_config
@@ -24,18 +22,15 @@ class TranslatorPool:
             self.models[node.id] = unique_models[node.model_id]
 
         self._model_specs = {
-            node_id: infer_model_spec_from_config(model.model.config, default_model_id=model.id)
+            node_id: infer_model_spec_from_config(model.config, default_model_id=model.id)
             for node_id, model in self.models.items()
         }
 
-    def get_model(self, node_id: str) -> PreTrainedModel:
-        return self.models[node_id].model
+    def get_model(self, node_id: str) -> Model:
+        return self.models[node_id]
 
     def get_model_spec(self, node_id: str) -> ModelSpec:
         return self._model_specs[node_id]
-
-    def get_tokenizer(self, node_id: str) -> PreTrainedTokenizerBase:
-        return self.models[node_id].tokenizer
 
     def add_translator(self, translator_id: str, translator: nn.Module) -> nn.Module:
         self.translators[translator_id] = translator

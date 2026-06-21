@@ -272,12 +272,12 @@ def build_magnitude_only_window(
 
 
 def compute_next_token_log_probs(
-    model: PreTrainedModel,
+    model: Model,
     past_key_values: PastKeyValues,
     seed_token: TokenIDs,
 ) -> torch.Tensor:
     outputs = model(
-        input_ids=seed_token,
+        input_ids=seed_token.as_tensor(),
         past_key_values=past_key_values,
         use_cache=False,
     )
@@ -415,7 +415,8 @@ def run_train(
         for _ in range(config.grad_accum_steps):
             batches_by_node = {}
             for node_id, dataloader in training_dataloaders.items():
-                token_ids = next(dataloader).to(config.device)
+                token_ids = next(dataloader)
+                token_ids = token_ids.to(config.device)
                 context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
                     token_ids=token_ids,
                     context_tokens=config.prefix_tokens,
@@ -499,9 +500,10 @@ def evaluate_logit_dataset(
 
     for batch_idx, batch in enumerate(dataloader, start=1):
         for example in batch:
+            target_model = ctx.tp.get_model(edges[0].tgt_id)
             prepared_inputs = prepare_logit_task_inputs(
                 spec=spec,
-                tokenizer=ctx.tp.get_tokenizer(edges[0].tgt_id),
+                model=target_model,
                 context=example.get("context"),
                 question=example["question"],
                 device=config.device,
@@ -509,7 +511,7 @@ def evaluate_logit_dataset(
                 choice_texts=example.get("choice_texts"),
                 subject=example.get("subject"),
             )
-            candidate_token_ids = build_logit_answer_candidates(tokenizer=ctx.tp.get_tokenizer(edges[0].tgt_id), spec=spec)
+            candidate_token_ids = build_logit_answer_candidates(model=target_model, spec=spec)
             gold_answer = example["answer"]
             context_token_ids = prepared_inputs["context_token_ids"]
             prompt_token_ids = prepared_inputs["prompt_token_ids"]
@@ -693,17 +695,17 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
+            target_model = ctx.tp.get_model(edges[0].tgt_id)
             context_budget = compute_benchmark_context_budget(
                 ctx=ctx,
                 spec=spec,
                 question=question,
                 eval_config=config,
-                tokenizer=ctx.tp.get_tokenizer(edges[0].tgt_id),
-                target_node_id=edges[0].tgt_id,
+                model=target_model,
             )
             prepared_inputs = prepare_generation_task_inputs(
                 spec=spec,
-                tokenizer=ctx.tp.get_tokenizer(edges[0].tgt_id),
+                model=target_model,
                 context=context_text,
                 question=question,
                 device=config.device,
@@ -777,7 +779,6 @@ def evaluate_generation_dataset(
 
                 native_answer = predict_generation_task_answer(
                     model=ctx.tp.get_model(edge.tgt_id),
-                    tokenizer=ctx.tp.get_tokenizer(edge.tgt_id),
                     past_key_values=native_target_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -785,7 +786,6 @@ def evaluate_generation_dataset(
                 )
                 dir_only_answer = predict_generation_task_answer(
                     model=ctx.tp.get_model(edge.tgt_id),
-                    tokenizer=ctx.tp.get_tokenizer(edge.tgt_id),
                     past_key_values=dir_only_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -793,7 +793,6 @@ def evaluate_generation_dataset(
                 )
                 mag_only_answer = predict_generation_task_answer(
                     model=ctx.tp.get_model(edge.tgt_id),
-                    tokenizer=ctx.tp.get_tokenizer(edge.tgt_id),
                     past_key_values=mag_only_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -801,7 +800,6 @@ def evaluate_generation_dataset(
                 )
                 full_mix_answer = predict_generation_task_answer(
                     model=ctx.tp.get_model(edge.tgt_id),
-                    tokenizer=ctx.tp.get_tokenizer(edge.tgt_id),
                     past_key_values=full_mix_past,
                     seed_token=seed_token,
                     eval_config=config,
@@ -1114,8 +1112,7 @@ def compute_full_mix_vs_native_kv_similarity_matrix(
 @torch.inference_mode()
 def generate_greedy_with_final_past(
     *,
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
+    model: Model,
     past_key_values: PastKeyValues,
     seed_token: TokenIDs,
     max_new_tokens: int,
@@ -1128,11 +1125,11 @@ def generate_greedy_with_final_past(
     current_input_in_past = False
     generated_token_ids: List[int] = []
     past_after_seed: Optional[PastKeyValues] = None
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = model.tokenizer.eos_token_id
 
     for _ in range(max_new_tokens):
         outputs = model(
-            input_ids=current_token_ids,
+            input_ids=current_token_ids.as_tensor(),
             past_key_values=current_past,
             use_cache=True,
         )
@@ -1141,7 +1138,7 @@ def generate_greedy_with_final_past(
         if past_after_seed is None:
             past_after_seed = current_past
 
-        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
         next_token_id = int(next_token.item())
         if eos_token_id is not None and next_token_id == eos_token_id:
             break
@@ -1166,7 +1163,7 @@ def generate_greedy_with_final_past(
             token_ids=current_token_ids,
         )
 
-    generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    generated_text = model.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
     return {
         "past_after_seed": past_after_seed,
         "final_past": current_past,
@@ -1534,7 +1531,7 @@ def evaluate_openwebtext_losses_and_kv_similarity(
 
     for target_node_id in target_node_ids:
         dataloader = build_openwebtext_eval_dataloader(
-            tokenizer=ctx.tp.get_tokenizer(target_node_id),
+            model=ctx.tp.get_model(target_node_id),
             config=config,
             batch_size=config.eval_batch_size,
             num_workers=config.eval_num_workers,
@@ -1595,7 +1592,6 @@ def evaluate_openwebtext_losses_and_kv_similarity(
                 )
                 native_prefix_past = past_by_node_id[edge.tgt_id]
                 target_model = ctx.tp.get_model(edge.tgt_id)
-                target_tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
 
                 for example_idx in range(batch_examples):
                     native_prefix_example = slice_past_key_values_batch(native_prefix_past, example_idx)
@@ -1616,14 +1612,12 @@ def evaluate_openwebtext_losses_and_kv_similarity(
 
                     native_generation = generate_greedy_with_final_past(
                         model=target_model,
-                        tokenizer=target_tokenizer,
                         past_key_values=native_past_before_seed,
                         seed_token=example_seed_token,
                         max_new_tokens=config.generation_max_new_tokens,
                     )
                     full_mix_generation = generate_greedy_with_final_past(
                         model=target_model,
-                        tokenizer=target_tokenizer,
                         past_key_values=full_mix_past_before_seed,
                         seed_token=example_seed_token,
                         max_new_tokens=config.generation_max_new_tokens,

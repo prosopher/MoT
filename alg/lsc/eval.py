@@ -72,7 +72,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             for edge in edges:
-                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
+                target_model = ctx.tp.get_model(edge.tgt_id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -80,13 +80,12 @@ def evaluate_generation_dataset(
                         spec=spec,
                         question=question,
                         eval_config=eval_config,
-                        tokenizer=tokenizer,
-                        target_node_id=edge.tgt_id,
+                        model=target_model,
                     )
 
                 prepared_inputs = prepare_generation_task_inputs(
                     spec=spec,
-                    tokenizer=tokenizer,
+                    model=target_model,
                     context=context_text,
                     question=question,
                     device=device,
@@ -123,16 +122,14 @@ def evaluate_generation_dataset(
                 cosine_value = cosine_similarity_between_past(translated_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
-                    model=ctx.tp.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    model=target_model,
                     past_key_values=translated_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
                     prompt_token_ids=prompt_token_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    model=ctx.tp.get_model(edge.tgt_id),
-                    tokenizer=tokenizer,
+                    model=target_model,
                     past_key_values=past_by_node_id[edge.tgt_id],
                     seed_token=seed_token,
                     eval_config=eval_config,

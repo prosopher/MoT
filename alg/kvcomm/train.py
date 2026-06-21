@@ -14,6 +14,7 @@ from core.channel_manager import ChannelManager
 from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, TokenIDs, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
+from core.model import Model
 from core.translator_pool import TranslatorPool
 from core.topology import Edge, Node, build_edge_map, get_translator_id
 from core.train_util import (
@@ -416,7 +417,7 @@ def _build_openwebtext_calibration_batches(
     *,
     ctx: Context,
     config: TrainConfig,
-    tokenizer,
+    model: Model,
 ) -> List[torch.Tensor]:
     if not _is_openwebtext_dataset(config.calibration_dataset):
         raise ValueError(
@@ -424,7 +425,7 @@ def _build_openwebtext_calibration_batches(
         )
 
     dataset = OpenWebTextSequenceStream(
-        tokenizer=tokenizer,
+        tokenizer=model.tokenizer,
         sequence_length=_openwebtext_total_tokens(config),
         split="train",
         shuffle=True,
@@ -457,7 +458,7 @@ def _compute_attention_importance_for_batch(
         return None
 
     outputs = model(
-        input_ids=token_ids,
+        input_ids=token_ids.as_tensor(),
         use_cache=False,
         output_attentions=True,
     )
@@ -558,7 +559,7 @@ def _select_layers_for_edge(
     log_interval = 1 if str(config.log_level).upper() == "DEBUG" else max(1, min(25, config.calib_size))
 
     for batch_idx, batch in enumerate(calibration_batches, start=1):
-        token_ids = batch.to(config.device)
+        token_ids = TokenIDs(batch.to(config.device), model_id=target_model.id)
         scores = _compute_attention_importance_for_batch(
             model=target_model,
             token_ids=token_ids,
@@ -641,7 +642,7 @@ def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
         target_node_id: _build_openwebtext_calibration_batches(
             ctx=ctx,
             config=config,
-            tokenizer=ctx.tp.get_tokenizer(target_node_id),
+            model=ctx.tp.get_model(target_node_id),
         )
         for target_node_id in sorted({edge.tgt_id for edge in edges})
     }

@@ -170,7 +170,7 @@ def extract_interlat_source_hidden_states(model, token_ids: TokenIDs) -> torch.T
     """
 
     outputs = model(
-        input_ids=token_ids,
+        input_ids=token_ids.as_tensor(),
         use_cache=False,
         output_hidden_states=True,
         return_dict=True,
@@ -227,21 +227,21 @@ def compute_suffix_logits_and_loss(
     label_token_ids: TokenIDs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     outputs = target_model(
-        input_ids=prompt_token_ids,
+        input_ids=prompt_token_ids.as_tensor(),
         past_key_values=past_key_values,
         use_cache=False,
     )
     logits = outputs.logits
     loss = F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
-        label_token_ids.reshape(-1),
+        label_token_ids.as_tensor().reshape(-1),
         reduction="mean",
     )
     return logits, loss
 
 
-def _flatten_logits_for_valid_labels(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    valid = labels.reshape(-1).ne(-100)
+def _flatten_logits_for_valid_labels(logits: torch.Tensor, label_token_ids: TokenIDs) -> torch.Tensor:
+    valid = label_token_ids.as_tensor().reshape(-1).ne(-100)
     flat = logits.reshape(-1, logits.shape[-1])
     if not bool(valid.any()):
         return flat[:0]
@@ -252,14 +252,14 @@ def compute_plan_similarity_loss(
     *,
     normal_logits: torch.Tensor,
     plan_logits: torch.Tensor,
-    labels: torch.Tensor,
+    label_token_ids: TokenIDs,
     margin_kl: float = 0.7,
     margin_cos: float = 0.3,
 ) -> torch.Tensor:
     """Interlat-style plan-aligned regularization on receiver logits."""
 
-    normal = _flatten_logits_for_valid_labels(normal_logits, labels)
-    plan = _flatten_logits_for_valid_labels(plan_logits, labels).detach()
+    normal = _flatten_logits_for_valid_labels(normal_logits, label_token_ids)
+    plan = _flatten_logits_for_valid_labels(plan_logits, label_token_ids).detach()
     if normal.numel() == 0 or plan.numel() == 0:
         return normal_logits.new_zeros(())
     kl_loss = F.kl_div(
@@ -277,13 +277,13 @@ def compute_random_contrast_loss(
     *,
     normal_logits: torch.Tensor,
     random_logits: torch.Tensor,
-    labels: torch.Tensor,
+    label_token_ids: TokenIDs,
     margin: float = 0.69,
 ) -> torch.Tensor:
     """Interlat-style separation from mismatched latent communication."""
 
-    normal = _flatten_logits_for_valid_labels(normal_logits, labels)
-    random = _flatten_logits_for_valid_labels(random_logits, labels).detach()
+    normal = _flatten_logits_for_valid_labels(normal_logits, label_token_ids)
+    random = _flatten_logits_for_valid_labels(random_logits, label_token_ids).detach()
     if normal.numel() == 0 or random.numel() == 0:
         return normal_logits.new_zeros(())
     normal_prob = F.softmax(normal, dim=-1).clamp_min(1e-8)
@@ -521,12 +521,12 @@ def run_train(
                 plan_loss = compute_plan_similarity_loss(
                     normal_logits=normal_logits,
                     plan_logits=plan_logits,
-                    labels=label_token_ids,
+                    label_token_ids=label_token_ids,
                 )
                 random_loss = compute_random_contrast_loss(
                     normal_logits=normal_logits,
                     random_logits=random_logits,
-                    labels=label_token_ids,
+                    label_token_ids=label_token_ids,
                 )
                 positive_cosine = F.cosine_similarity(
                     F.softmax(_flatten_logits_for_valid_labels(normal_logits, label_token_ids), dim=-1).reshape(-1),

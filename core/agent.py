@@ -5,8 +5,7 @@ import logging
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
-
+from core.model import Model
 from core.common import PastKeyValues, TokenIDs, extract_past_key_values
 from core.eval_util import append_token_ids_to_past
 
@@ -53,8 +52,7 @@ class Agent:
         self,
         *,
         node_id: str,
-        model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizerBase,
+        model: Model,
         device: str,
         max_new_tokens: int = 64,
         stop_sequences: Optional[Sequence[str]] = None,
@@ -62,7 +60,6 @@ class Agent:
     ) -> None:
         self.node_id = node_id
         self.model = model
-        self.tokenizer = tokenizer
         self.device = device
         self.max_new_tokens = int(max_new_tokens)
         self.stop_sequences = tuple(stop_sequences or ())
@@ -124,9 +121,9 @@ class Agent:
         *,
         max_input_tokens: Optional[int] = None,
         truncation_side: str = "left",
-    ) -> torch.Tensor:
-        encoded = self.tokenizer(text, return_tensors="pt")
-        token_ids = encoded.input_ids
+    ) -> TokenIDs:
+        encoded = self.model.tokenizer(text, return_tensors="pt")
+        token_ids = TokenIDs(encoded.input_ids, model_id=self.model.id)
         token_limit = self.max_prompt_tokens if max_input_tokens is None else max_input_tokens
         if token_limit is not None and token_ids.shape[1] > token_limit:
             if truncation_side == "left":
@@ -193,7 +190,7 @@ class Agent:
         tokens_before = self.cache_seq_len
         current_past, current_token_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
-        eos_token_id = self.tokenizer.eos_token_id
+        eos_token_id = self.model.tokenizer.eos_token_id
         # A generated token is not added to past_key_values at prediction time;
         # it is added only when it is fed back as input in the next decoding step.
         # Track only the generated token that is still visible but not yet cached.
@@ -201,7 +198,7 @@ class Agent:
 
         for _ in range(max(0, self.max_new_tokens)):
             outputs = self.model(
-                input_ids=current_token_ids,
+                input_ids=current_token_ids.as_tensor(),
                 past_key_values=current_past,
                 use_cache=True,
             )
@@ -211,7 +208,7 @@ class Agent:
             # the final one-token cache append below.
             uncached_generated_token = None
 
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
             next_token_id = int(next_token.item())
 
             if eos_token_id is not None and next_token_id == int(eos_token_id):
@@ -219,7 +216,7 @@ class Agent:
 
             generated_token_ids.append(next_token_id)
             uncached_generated_token = next_token
-            decoded_so_far = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+            decoded_so_far = self.model.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
             _, matched_stop = self._trim_at_stop_sequence(decoded_so_far, self.stop_sequences)
             current_token_ids = next_token
             if matched_stop is not None:
@@ -232,13 +229,13 @@ class Agent:
         # this block is correctly skipped and the token ledger stays aligned.
         if uncached_generated_token is not None:
             outputs = self.model(
-                input_ids=uncached_generated_token,
+                input_ids=uncached_generated_token.as_tensor(),
                 past_key_values=current_past,
                 use_cache=True,
             )
             current_past = outputs.past_key_values
 
-        raw_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        raw_text = self.model.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
         text, _ = self._trim_at_stop_sequence(raw_text, self.stop_sequences)
         text = text.strip()
 

@@ -566,7 +566,7 @@ EVAL_SPEC_GROUP_FACTORIES = {
 
 
 def build_openwebtext_eval_dataloader(
-    tokenizer: PreTrainedTokenizerBase,
+    model: Model,
     config,
     *,
     batch_size: int,
@@ -577,14 +577,18 @@ def build_openwebtext_eval_dataloader(
     seed_offset: int = 10_000,
 ) -> DataLoader:
     dataset = OpenWebTextSequenceStream(
-        tokenizer=tokenizer,
+        tokenizer=model.tokenizer,
         sequence_length=config.total_tokens,
         split="train",
         shuffle=shuffle,
         shuffle_buffer=config.shuffle_buffer if shuffle_buffer is None else shuffle_buffer,
         seed=(config.seed if seed is None else seed) + seed_offset,
     )
-    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
+
+    def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
+        return TokenIDs(torch.stack([torch.as_tensor(example) for example in examples], dim=0), model_id=model.id)
+
+    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=collate_token_ids)
 
 
 def select_past_layers_by_indices(
@@ -917,11 +921,11 @@ def run_openwebtext_greedy_inference(
 
     for _ in range(max_new_tokens):
         outputs = model(
-            input_ids=current_token_ids,
+            input_ids=current_token_ids.as_tensor(),
             past_key_values=current_past,
             use_cache=True,
         )
-        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
         total_generated_tokens += int(next_token.numel())
         current_token_ids = next_token
         current_past = outputs.past_key_values
@@ -964,8 +968,9 @@ def evaluate_openwebtext_validation_loss_metrics(
     }
 
     for target_node_id in target_node_ids:
+        target_model = ctx.tp.get_model(target_node_id)
         dataloader = build_openwebtext_eval_dataloader(
-            tokenizer=ctx.tp.get_tokenizer(target_node_id),
+            model=target_model,
             config=ctx.config,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -2046,23 +2051,23 @@ def format_boolq_question_suffix(question: str) -> str:
 
 
 def prepare_boolq_context_inputs(
-    tokenizer,
+    model: Model,
     context: str,
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     prefix_text = format_boolq_context_prefix(context=context)
     return prepare_full_text_inputs(
-        tokenizer=tokenizer,
+        model=model,
         text=prefix_text,
         device=device,
         max_input_tokens=max_input_tokens,
     )
 
 
-def prepare_boolq_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_boolq_question_suffix(model: Model, question: str, device: str) -> Dict[str, torch.Tensor]:
     suffix_text = format_boolq_question_suffix(question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix_text, device=device)
+    return prepare_cache_text_inputs(model=model, text=suffix_text, device=device)
 
 
 def format_pubmed_qa_context_prefix(context: str) -> str:
@@ -2103,27 +2108,27 @@ def format_mmlu_redux_choices_suffix(
 
 
 def prepare_pubmed_qa_context_inputs(
-    tokenizer,
+    model: Model,
     context: str,
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     prefix_text = format_pubmed_qa_context_prefix(context=context)
     return prepare_full_text_inputs(
-        tokenizer=tokenizer,
+        model=model,
         text=prefix_text,
         device=device,
         max_input_tokens=max_input_tokens,
     )
 
 
-def prepare_pubmed_qa_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_pubmed_qa_question_suffix(model: Model, question: str, device: str) -> Dict[str, torch.Tensor]:
     suffix = format_pubmed_qa_question_suffix(question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
+    return prepare_cache_text_inputs(model=model, text=suffix, device=device)
 
 
 def prepare_mmlu_redux_question_inputs(
-    tokenizer,
+    model: Model,
     question: str,
     device: str,
     max_input_tokens: Optional[int] = None,
@@ -2131,7 +2136,7 @@ def prepare_mmlu_redux_question_inputs(
 ) -> Dict[str, Any]:
     prefix_text = format_mmlu_redux_question_prefix(question=question, subject=subject)
     return prepare_full_text_inputs(
-        tokenizer=tokenizer,
+        model=model,
         text=prefix_text,
         device=device,
         max_input_tokens=max_input_tokens,
@@ -2139,7 +2144,7 @@ def prepare_mmlu_redux_question_inputs(
 
 
 def prepare_mmlu_redux_choices_suffix(
-    tokenizer,
+    model: Model,
     choices: List[str],
     choice_texts: List[str],
     device: str,
@@ -2148,7 +2153,7 @@ def prepare_mmlu_redux_choices_suffix(
         choices=choices,
         choice_texts=choice_texts,
     )
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
+    return prepare_cache_text_inputs(model=model, text=suffix, device=device)
 
 
 def format_logit_task_prompt(
@@ -2213,23 +2218,23 @@ def format_squad_v11_question_suffix(question: str) -> str:
 
 
 def prepare_squad_v11_context_inputs(
-    tokenizer,
+    model: Model,
     context: str,
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     prefix_text = format_squad_v11_context_prefix(context=context)
     return prepare_full_text_inputs(
-        tokenizer=tokenizer,
+        model=model,
         text=prefix_text,
         device=device,
         max_input_tokens=max_input_tokens,
     )
 
 
-def prepare_squad_v11_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_squad_v11_question_suffix(model: Model, question: str, device: str) -> Dict[str, torch.Tensor]:
     suffix = format_squad_v11_question_suffix(question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
+    return prepare_cache_text_inputs(model=model, text=suffix, device=device)
 
 
 def format_multinews_context_prefix(context: str) -> str:
@@ -2247,23 +2252,23 @@ def format_multinews_question_suffix(question: str) -> str:
 
 
 def prepare_multinews_context_inputs(
-    tokenizer,
+    model: Model,
     context: str,
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     prefix_text = format_multinews_context_prefix(context=context)
     return prepare_full_text_inputs(
-        tokenizer=tokenizer,
+        model=model,
         text=prefix_text,
         device=device,
         max_input_tokens=max_input_tokens,
     )
 
 
-def prepare_multinews_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_multinews_question_suffix(model: Model, question: str, device: str) -> Dict[str, torch.Tensor]:
     suffix = format_multinews_question_suffix(question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
+    return prepare_cache_text_inputs(model=model, text=suffix, device=device)
 
 
 def format_generation_task_prompt(context: str, question: str) -> str:
@@ -2276,14 +2281,14 @@ def format_generation_task_prompt(context: str, question: str) -> str:
 
 
 def prepare_cache_text_inputs(
-    tokenizer,
+    model: Model,
     text: str,
     device: str,
     max_input_tokens: Optional[int] = None,
     truncation_side: str = "left",
-) -> Dict[str, torch.Tensor]:
-    tokenized = tokenizer(text, return_tensors="pt")
-    token_ids = tokenized.input_ids
+) -> Dict[str, TokenIDs]:
+    tokenized = model.tokenizer(text, return_tensors="pt")
+    token_ids = TokenIDs(tokenized.input_ids, model_id=model.id)
     was_truncated = False
 
     if max_input_tokens is not None:
@@ -2313,7 +2318,7 @@ def prepare_cache_text_inputs(
 
 
 def prepare_logit_task_prompt(
-    tokenizer,
+    model: Model,
     question: str,
     device: str,
     choices: Optional[List[str]] = None,
@@ -2333,7 +2338,7 @@ def prepare_logit_task_prompt(
         answer_mode=answer_mode,
     )
     return prepare_cache_text_inputs(
-        tokenizer=tokenizer,
+        model=model,
         text=prompt_text,
         device=device,
         max_input_tokens=max_input_tokens,
@@ -2341,9 +2346,9 @@ def prepare_logit_task_prompt(
     )
 
 
-def prepare_generation_task_prompt(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_generation_task_prompt(model: Model, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
     prompt_text = format_generation_task_prompt(context=context, question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=prompt_text, device=device)
+    return prepare_cache_text_inputs(model=model, text=prompt_text, device=device)
 
 
 def format_generation_question_suffix(question: str) -> str:
@@ -2354,7 +2359,7 @@ def format_generation_question_suffix(question: str) -> str:
 
 
 def prepare_full_text_inputs(
-    tokenizer,
+    model: Model,
     text: str,
     device: str,
     max_input_tokens: Optional[int] = None,
@@ -2365,8 +2370,8 @@ def prepare_full_text_inputs(
             raise ValueError("max_input_tokens must be >= 1")
         tokenizer_kwargs["truncation"] = True
         tokenizer_kwargs["max_length"] = max_input_tokens
-    tokenized = tokenizer(text, **tokenizer_kwargs)
-    token_ids = tokenized.input_ids.to(device)
+    tokenized = model.tokenizer(text, **tokenizer_kwargs)
+    token_ids = TokenIDs(tokenized.input_ids.to(device), model_id=model.id)
     if token_ids.shape[1] < 1:
         raise ValueError("Text must tokenize to at least 1 token.")
     return {
@@ -2376,22 +2381,21 @@ def prepare_full_text_inputs(
     }
 
 
-def prepare_generation_question_suffix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+def prepare_generation_question_suffix(model: Model, question: str, device: str) -> Dict[str, torch.Tensor]:
     suffix = format_generation_question_suffix(question=question)
-    return prepare_cache_text_inputs(tokenizer=tokenizer, text=suffix, device=device)
+    return prepare_cache_text_inputs(model=model, text=suffix, device=device)
 
 
-def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> int:
+def get_model_context_limit(model: Model) -> int:
     config = getattr(model, "config", None)
     candidates = [
         getattr(config, "n_positions", None),
         getattr(config, "max_position_embeddings", None),
         getattr(config, "n_ctx", None),
     ]
-    if tokenizer is not None:
-        tokenizer_limit = getattr(tokenizer, "model_max_length", None)
-        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
-            candidates.append(tokenizer_limit)
+    tokenizer_limit = getattr(model.tokenizer, "model_max_length", None)
+    if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
+        candidates.append(tokenizer_limit)
 
     limits = [value for value in candidates if isinstance(value, int) and value > 0]
     if not limits:
@@ -2409,16 +2413,12 @@ def compute_benchmark_context_budget(
     question: str,
     eval_config,
     *,
-    tokenizer,
-    target_node_id: str,
+    model: Model,
 ) -> int:
-    shared_limit = get_model_context_limit(
-        ctx.tp.get_model(target_node_id),
-        tokenizer,
-    )
+    shared_limit = get_model_context_limit(model)
     suffix = prepare_generation_task_suffix(
         spec=spec,
-        tokenizer=tokenizer,
+        model=model,
         question=question,
         device="cpu",
     )
@@ -2442,21 +2442,17 @@ def compute_logit_task_token_budgets(
     question: str,
     eval_config,
     *,
-    tokenizer,
-    target_node_id: str,
+    model: Model,
     choices: Optional[List[str]] = None,
     choice_texts: Optional[List[str]] = None,
     subject: Optional[str] = None,
 ) -> Dict[str, Optional[int]]:
-    shared_limit = get_model_context_limit(
-        ctx.tp.get_model(target_node_id),
-        tokenizer,
-    )
+    shared_limit = get_model_context_limit(model)
     answer_budget = get_answer_token_budget(eval_config)
 
     if spec.answer_mode == "boolq":
         suffix = prepare_boolq_question_suffix(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device="cpu",
         )
@@ -2475,7 +2471,7 @@ def compute_logit_task_token_budgets(
 
     if spec.answer_mode == "pubmed_qa":
         suffix = prepare_pubmed_qa_question_suffix(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device="cpu",
         )
@@ -2498,7 +2494,7 @@ def compute_logit_task_token_budgets(
         if not choice_texts:
             raise ValueError("MMLU-Redux requires choice_texts for prompt budgeting.")
         suffix = prepare_mmlu_redux_choices_suffix(
-            tokenizer=tokenizer,
+            model=model,
             choices=choices,
             choice_texts=choice_texts,
             device="cpu",
@@ -2527,24 +2523,23 @@ def compute_logit_task_token_budgets(
 
 def prepare_generation_task_suffix(
     spec: HFDatasetSpec,
-    tokenizer,
+    model: Model,
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
     if spec.answer_mode in {"squad", "newsqa"}:
         return prepare_squad_v11_question_suffix(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device=device,
         )
     # if spec.answer_mode == "multinews":
     #     return prepare_multinews_question_suffix(
-    #         tokenizer=tokenizer,
     #         question=question,
     #         device=device,
     #     )
     return prepare_generation_question_suffix(
-        tokenizer=tokenizer,
+        model=model,
         question=question,
         device=device,
     )
@@ -2552,7 +2547,7 @@ def prepare_generation_task_suffix(
 
 def prepare_logit_task_inputs(
     spec: HFDatasetSpec,
-    tokenizer,
+    model: Model,
     context: Optional[str],
     question: str,
     device: str,
@@ -2566,13 +2561,13 @@ def prepare_logit_task_inputs(
         if not isinstance(context, str) or not context.strip():
             raise ValueError("BoolQ requires passage context.")
         context_prefix = prepare_boolq_context_inputs(
-            tokenizer=tokenizer,
+            model=model,
             context=context,
             device=device,
             max_input_tokens=max_context_tokens,
         )
         suffix = prepare_boolq_question_suffix(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device=device,
         )
@@ -2589,13 +2584,13 @@ def prepare_logit_task_inputs(
         if not isinstance(context, str) or not context.strip():
             raise ValueError("PubMedQA requires abstract context.")
         context_prefix = prepare_pubmed_qa_context_inputs(
-            tokenizer=tokenizer,
+            model=model,
             context=context,
             device=device,
             max_input_tokens=max_context_tokens,
         )
         suffix = prepare_pubmed_qa_question_suffix(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device=device,
         )
@@ -2614,14 +2609,14 @@ def prepare_logit_task_inputs(
         if not choice_texts:
             raise ValueError("MMLU-Redux requires choice_texts.")
         question_prefix = prepare_mmlu_redux_question_inputs(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device=device,
             max_input_tokens=max_context_tokens,
             subject=subject,
         )
         suffix = prepare_mmlu_redux_choices_suffix(
-            tokenizer=tokenizer,
+            model=model,
             choices=choices,
             choice_texts=choice_texts,
             device=device,
@@ -2636,7 +2631,7 @@ def prepare_logit_task_inputs(
         }
 
     prompt = prepare_logit_task_prompt(
-        tokenizer=tokenizer,
+        model=model,
         question=question,
         device=device,
         choices=choices,
@@ -2657,7 +2652,7 @@ def prepare_logit_task_inputs(
 
 def prepare_generation_task_inputs(
     spec: HFDatasetSpec,
-    tokenizer,
+    model: Model,
     context: str,
     question: str,
     device: str,
@@ -2665,13 +2660,13 @@ def prepare_generation_task_inputs(
 ) -> Dict[str, Any]:
     if spec.answer_mode in {"squad", "newsqa"}:
         context_prefix = prepare_squad_v11_context_inputs(
-            tokenizer=tokenizer,
+            model=model,
             context=context,
             device=device,
             max_input_tokens=max_input_tokens,
         )
         suffix = prepare_squad_v11_question_suffix(
-            tokenizer=tokenizer,
+            model=model,
             question=question,
             device=device,
         )
@@ -2686,13 +2681,11 @@ def prepare_generation_task_inputs(
 
     # if spec.answer_mode == "multinews":
     #     context_prefix = prepare_multinews_context_inputs(
-    #         tokenizer=tokenizer,
     #         context=context,
     #         device=device,
     #         max_input_tokens=max_input_tokens,
     #     )
     #     suffix = prepare_multinews_question_suffix(
-    #         tokenizer=tokenizer,
     #         question=question,
     #         device=device,
     #     )
@@ -2706,7 +2699,7 @@ def prepare_generation_task_inputs(
     #     }
 
     prompt = prepare_generation_task_prompt(
-        tokenizer=tokenizer,
+        model=model,
         context=context,
         question=question,
         device=device,
@@ -2720,8 +2713,7 @@ def prepare_generation_task_inputs(
 
 
 def predict_generation_task_answer(
-    model,
-    tokenizer,
+    model: Model,
     past_key_values: PastKeyValues,
     seed_token: TokenIDs,
     eval_config,
@@ -2737,7 +2729,6 @@ def predict_generation_task_answer(
 
     return generate_greedy_answer(
         model=model,
-        tokenizer=tokenizer,
         past_key_values=generation_past,
         seed_token=seed_token,
         max_new_tokens=eval_config.generation_max_new_tokens,
@@ -2755,7 +2746,7 @@ def append_token_ids_to_past(
         return past_key_values
 
     outputs = model(
-        input_ids=token_ids,
+        input_ids=token_ids.as_tensor(),
         past_key_values=past_key_values,
         use_cache=True,
     )
@@ -2763,43 +2754,43 @@ def append_token_ids_to_past(
 
 
 def build_text_candidate_token_ids(
-    tokenizer,
+    model: Model,
     candidates: Dict[str, str],
 ) -> Dict[str, TokenIDs]:
     token_ids_by_label: Dict[str, TokenIDs] = {}
 
     for label, text in candidates.items():
         normalized_text = text.strip()
-        token_ids = tokenizer(
+        token_ids = model.tokenizer(
             f" {normalized_text}",
             add_special_tokens=False,
         ).input_ids
         if len(token_ids) < 1:
             raise ValueError(f"Failed to tokenize candidate text for label={label}: {text!r}")
-        token_ids_by_label[label] = torch.tensor(token_ids, dtype=torch.long)
+        token_ids_by_label[label] = TokenIDs(torch.tensor(token_ids, dtype=torch.long), model_id=model.id)
 
     return token_ids_by_label
 
 
 def build_logit_answer_candidates(
-    tokenizer,
+    model: Model,
     spec: HFDatasetSpec,
 ) -> Dict[str, TokenIDs]:
     if spec.answer_mode == "boolq":
         return build_text_candidate_token_ids(
-            tokenizer,
+            model,
             {"yes": "yes", "no": "no"},
         )
 
     if spec.answer_mode == "pubmed_qa":
         return build_text_candidate_token_ids(
-            tokenizer,
+            model,
             {"yes": "yes", "no": "no", "maybe": "maybe"},
         )
 
     if spec.answer_mode == "mmlu_redux":
         return build_text_candidate_token_ids(
-            tokenizer,
+            model,
             {label: label for label in MMLU_REDUX_LABELS},
         )
 
@@ -2814,15 +2805,15 @@ def score_candidate_logprob(
     normalize_by_length: bool = True,
 ) -> float:
     device = seed_token.device
-    candidate_ids = candidate_token_ids.to(device).unsqueeze(0)
+    candidate_ids = candidate_token_ids.as_tensor().to(device).unsqueeze(0)
 
     if candidate_ids.shape[1] == 1:
         scoring_token_ids = seed_token
     else:
-        scoring_token_ids = torch.cat([seed_token, candidate_ids[:, :-1]], dim=1)
+        scoring_token_ids = TokenIDs(torch.cat([seed_token, candidate_ids[:, :-1]], dim=1), model_id=seed_token.model_id)
 
     outputs = model(
-        input_ids=scoring_token_ids,
+        input_ids=scoring_token_ids.as_tensor(),
         past_key_values=past_key_values,
         use_cache=False,
     )
@@ -2900,8 +2891,7 @@ def parse_generated_logit_answer(
 
 @torch.inference_mode()
 def generate_greedy_answer(
-    model,
-    tokenizer,
+    model: Model,
     past_key_values: PastKeyValues,
     seed_token: TokenIDs,
     max_new_tokens: int,
@@ -2909,15 +2899,15 @@ def generate_greedy_answer(
     generated_token_ids: List[int] = []
     current_token_ids = seed_token
     current_past = past_key_values
-    eos_token_id = tokenizer.eos_token_id
+    eos_token_id = model.tokenizer.eos_token_id
 
     for _ in range(max_new_tokens):
         outputs = model(
-            input_ids=current_token_ids,
+            input_ids=current_token_ids.as_tensor(),
             past_key_values=current_past,
             use_cache=True,
         )
-        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
         next_token_id = next_token.item()
 
         if eos_token_id is not None and next_token_id == eos_token_id:
@@ -2927,7 +2917,7 @@ def generate_greedy_answer(
         current_token_ids = next_token
         current_past = outputs.past_key_values
 
-    decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    decoded = model.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
     return postprocess_generated_answer(decoded)
 
 
@@ -3040,21 +3030,20 @@ def evaluate_dataset(
             choice_texts = example.get("choice_texts")
 
             for edge in edges:
-                tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
+                target_model = ctx.tp.get_model(edge.tgt_id)
                 token_budgets = compute_logit_task_token_budgets(
                     ctx=ctx,
                     spec=spec,
                     question=question,
                     eval_config=eval_config,
-                    tokenizer=tokenizer,
-                    target_node_id=edge.tgt_id,
+                    model=target_model,
                     choices=choices,
                     choice_texts=choice_texts,
                     subject=example.get("subject"),
                 )
                 prepared_inputs = prepare_logit_task_inputs(
                     spec=spec,
-                    tokenizer=tokenizer,
+                    model=target_model,
                     context=context_text,
                     question=question,
                     device=device,
@@ -3114,14 +3103,12 @@ def evaluate_dataset(
 
                 translated_answer = generate_greedy_answer(
                     model=target_model,
-                    tokenizer=tokenizer,
                     past_key_values=translated_generation_past,
                     seed_token=seed_token,
                     max_new_tokens=eval_config.generation_max_new_tokens,
                 )
                 native_answer = generate_greedy_answer(
                     model=target_model,
-                    tokenizer=tokenizer,
                     past_key_values=native_generation_past,
                     seed_token=seed_token,
                     max_new_tokens=eval_config.generation_max_new_tokens,

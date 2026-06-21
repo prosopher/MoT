@@ -587,7 +587,6 @@ class AgentRunner:
                 agent_cls(
                     node_id=node.id,
                     model=ctx.tp.get_model(physical_node_id),
-                    tokenizer=ctx.tp.get_tokenizer(physical_node_id),
                     device=self.device,
                     max_new_tokens=self.generation_max_new_tokens,
                     stop_sequences=stop_sequences,
@@ -675,10 +674,8 @@ class AgentRunner:
 
     @staticmethod
     def _is_qwen_agent(agent: Agent) -> bool:
-        model_id = str(getattr(getattr(agent.model, "config", None), "_name_or_path", ""))
-        tokenizer_id = str(getattr(agent.tokenizer, "name_or_path", ""))
-        model_type = str(getattr(getattr(agent.model, "config", None), "model_type", ""))
-        haystack = " ".join([model_id, tokenizer_id, model_type]).lower()
+        model_type = str(getattr(agent.model.config, "model_type", ""))
+        haystack = " ".join([agent.model.id, model_type]).lower()
         return "qwen" in haystack
 
     @staticmethod
@@ -716,7 +713,7 @@ class AgentRunner:
             {"role": "user", "content": user_content.strip()},
         ]
         try:
-            rendered = agent.tokenizer.apply_chat_template(
+            rendered = agent.model.tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,

@@ -211,14 +211,14 @@ def _fraction(values: List[bool]) -> float:
     return float(sum(1 for v in values if v) / len(values)) if values else float("nan")
 
 
-def build_input_hidden_states_with_past(model: PreTrainedModel, token_ids: TokenIDs, past_length: int) -> torch.Tensor:
+def build_input_hidden_states_with_past(model: Model, token_ids: TokenIDs, past_length: int) -> torch.Tensor:
     transformer = lp.require_gpt2_transformer(model)
     if token_ids.ndim != 2:
         raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
     batch_size, seq_len = token_ids.shape
     position_ids = torch.arange(past_length, past_length + seq_len, device=token_ids.device, dtype=torch.long)
     position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-    hidden_states = transformer.wte(token_ids) + transformer.wpe(position_ids)
+    hidden_states = transformer.wte(token_ids.as_tensor()) + transformer.wpe(position_ids)
     drop = getattr(transformer, "drop", None)
     if drop is not None:
         hidden_states = drop(hidden_states)
@@ -257,7 +257,7 @@ def run_gpt2_block_with_past_and_trace(
 
 @torch.inference_mode()
 def trace_single_token_with_past(
-    model: PreTrainedModel,
+    model: Model,
     past_key_values: PastKeyValues,
     token_ids: TokenIDs,
 ) -> Dict[str, Any]:
@@ -306,13 +306,13 @@ def build_random_matched_window(
 def build_teacher_forcing_answer_token_ids(
     spec: HFDatasetSpec,
     example: Dict[str, Any],
-    tokenizer: PreTrainedTokenizerBase,
-) -> Optional[torch.Tensor]:
+    model: Model,
+) -> Optional[TokenIDs]:
     if spec.answer_mode in {"boolq", "pubmed_qa"}:
         answer_value = example.get("answer", None)
         if not isinstance(answer_value, str) or not answer_value.strip():
             return None
-        choice_ids = build_logit_answer_candidates(tokenizer, spec)
+        choice_ids = build_logit_answer_candidates(model, spec)
         token_ids = choice_ids.get(answer_value.strip().lower())
         return None if token_ids is None else token_ids.clone()
 
@@ -323,10 +323,10 @@ def build_teacher_forcing_answer_token_ids(
         gold_answer = next((text.strip() for text in answers if isinstance(text, str) and text.strip()), None)
         if not gold_answer:
             return None
-        token_ids = tokenizer(f" {gold_answer}", add_special_tokens=False).input_ids
+        token_ids = model.tokenizer(f" {gold_answer}", add_special_tokens=False).input_ids
         if len(token_ids) < 1:
             return None
-        return torch.tensor(token_ids, dtype=torch.long)
+        return TokenIDs(torch.tensor(token_ids, dtype=torch.long), model_id=model.id)
 
     raise ValueError(f"Unsupported answer_mode for correction analysis: {spec.answer_mode}")
 
@@ -336,14 +336,13 @@ def build_prepared_inputs(
     spec: HFDatasetSpec,
     example: Dict[str, Any],
     *,
-    tokenizer,
-    target_node_id: str,
+    target_model: Model,
 ) -> Dict[str, Any]:
     config = ctx.config
     if config.benchmark_mode == "logit_qa":
         return prepare_logit_task_inputs(
             spec=spec,
-            tokenizer=tokenizer,
+            model=target_model,
             context=example.get("context", None),
             question=example["question"],
             device=config.device,
@@ -357,12 +356,11 @@ def build_prepared_inputs(
             spec=spec,
             question=example["question"],
             eval_config=SimpleNamespace(generation_max_new_tokens=config.generation_max_new_tokens),
-            tokenizer=tokenizer,
-            target_node_id=target_node_id,
+            model=target_model,
         )
         return prepare_generation_task_inputs(
             spec=spec,
-            tokenizer=tokenizer,
+            model=target_model,
             context=example["context"],
             question=example["question"],
             device=config.device,
@@ -524,7 +522,7 @@ def compute_correction_metrics_from_traces(
     }
 
 
-def maybe_append_token_ids(model: PreTrainedModel, past_key_values: PastKeyValues, token_ids: Optional[torch.Tensor]) -> PastKeyValues:
+def maybe_append_token_ids(model: Model, past_key_values: PastKeyValues, token_ids: Optional[TokenIDs]) -> PastKeyValues:
     if token_ids is None:
         return past_key_values
     if token_ids.ndim != 2 or token_ids.shape[1] == 0:
@@ -574,19 +572,18 @@ def evaluate_correction(
         for batch in dataloader:
             for example in batch:
                 for edge in edges:
-                    tokenizer = ctx.tp.get_tokenizer(edge.tgt_id)
+                    target_model = ctx.tp.get_model(edge.tgt_id)
                     try:
                         prepared_inputs = build_prepared_inputs(
                             ctx=ctx,
                             spec=spec,
                             example=example,
-                            tokenizer=tokenizer,
-                            target_node_id=edge.tgt_id,
+                            target_model=target_model,
                         )
                     except Exception as exc:
                         logging.warning("Skipping example due to input preparation error: %s", exc)
                         continue
-                    answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, tokenizer=tokenizer)
+                    answer_token_ids = build_teacher_forcing_answer_token_ids(spec=spec, example=example, model=target_model)
                     if answer_token_ids is None or answer_token_ids.shape[0] < 1:
                         continue
                     answer_token_ids = answer_token_ids[: config.correction_max_analysis_tokens].to(config.device)
