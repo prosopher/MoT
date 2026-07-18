@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -11,7 +13,7 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, TypeAlias, TypeVar, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, TypeAlias, TypeVar, Union, get_args, get_origin
 
 import torch
 import torch.nn as nn
@@ -28,6 +30,11 @@ from transformers import (
 
 from .model import Model
 from .topology import *
+
+
+if TYPE_CHECKING:
+    from .context import Context
+    from .train_util import InfiniteDataLoader
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -127,6 +134,29 @@ def split_context_and_prompt_token_ids(
     prompt_token_ids = token_ids[:, context_tokens - 1 : -1]
     label_token_ids = token_ids[:, context_tokens:]
     return context_token_ids, prompt_token_ids, label_token_ids
+
+
+def build_step_pasts_and_batches(
+    ctx: Context,
+    dataloaders: Dict[str, InfiniteDataLoader],
+) -> Tuple[Dict[str, PastKeyValues], Dict[str, Tuple[TokenIDs, TokenIDs, TokenIDs]]]:
+    past_by_node_id: Dict[str, PastKeyValues] = {}
+    batches_by_node_id: Dict[str, Tuple[TokenIDs, TokenIDs, TokenIDs]] = {}
+
+    for node in ctx.nodes:
+        token_ids = next(dataloaders[node.id]).to(ctx.config.device)
+        context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+            token_ids=token_ids,
+            context_tokens=ctx.config.prefix_tokens,
+        )
+        with torch.no_grad():
+            past_by_node_id[node.id] = extract_past_key_values(
+                ctx.tp.get_model(node.id),
+                context_token_ids,
+            )
+        batches_by_node_id[node.id] = (context_token_ids, prompt_token_ids, label_token_ids)
+
+    return past_by_node_id, batches_by_node_id
 
 
 class OpenWebTextSequenceStream(IterableDataset):

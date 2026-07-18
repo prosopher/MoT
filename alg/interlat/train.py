@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 
 from core.common import (
     GPUMemoryTracker,
+    build_step_pasts_and_batches,
     PastKeyValues,
     TokenIDs,
     count_trainable_parameters,
@@ -428,19 +429,10 @@ def run_train(
         used_micro_batches = 0
 
         while used_micro_batches < config.grad_accum_steps:
-            batches_by_node = {}
-            for node_id, dataloader in training_dataloaders.items():
-                token_ids = next(dataloader).to(config.device)
-                context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
-                    token_ids=token_ids,
-                    context_tokens=config.prefix_tokens,
-                )
-                with torch.no_grad():
-                    past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-                        for node in ctx.nodes
-                    }
-                batches_by_node[node_id] = (context_token_ids, prompt_token_ids, label_token_ids, past_by_node_id)
+            past_by_node_id, batches_by_node_id = build_step_pasts_and_batches(
+                ctx,
+                training_dataloaders,
+            )
 
             total_edge_loss = 0.0
             total_edge_ce = 0.0
@@ -448,7 +440,7 @@ def run_train(
             total_edge_random = 0.0
             total_edge_cosine = 0.0
             for edge in ctx.edges:
-                tgt_prefix_ids, prompt_token_ids, label_token_ids, past_by_node_id = batches_by_node[edge.tgt_id]
+                tgt_prefix_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
 
                 target_model = ctx.tp.get_model(edge.tgt_id)
                 tgt_model_context_limit = get_model_context_limit(target_model)

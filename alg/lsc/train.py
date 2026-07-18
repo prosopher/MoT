@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
+from core.common import build_step_pasts_and_batches
 from core.config import Config
 from core.context import Context
 from core.translator_pool import TranslatorPool
@@ -414,23 +415,14 @@ def run_train(
         step_loss_value = 0.0
 
         for _ in range(config.grad_accum_steps):
-            batches_by_node = {}
-            for node_id, dataloader in training_dataloaders.items():
-                token_ids = next(dataloader).to(config.device)
-                context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
-                    token_ids=token_ids,
-                    context_tokens=config.prefix_tokens,
-                )
-                with torch.no_grad():
-                    past_by_node_id = {
-                        node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-                        for node in nodes
-                    }
-                batches_by_node[node_id] = (context_token_ids, prompt_token_ids, label_token_ids, past_by_node_id)
+            past_by_node_id, batches_by_node_id = build_step_pasts_and_batches(
+                ctx,
+                training_dataloaders,
+            )
 
             total_direction_loss = 0.0
             for edge in edges:
-                _, prompt_token_ids, label_token_ids, past_by_node_id = batches_by_node[edge.tgt_id]
+                _, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
                 translated_past = translate_layers(
                     translator_pool=translator_pool,
                     past_key_values=past_by_node_id[edge.src_id],
