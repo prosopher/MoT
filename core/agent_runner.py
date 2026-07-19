@@ -197,11 +197,19 @@ class KVCacheTranslationAdapter:
         )
 
     @staticmethod
-    def _ids_to_tensor(token_ids: Sequence[int], *, device: str) -> torch.Tensor:
+    def _build_token_ids(
+        token_ids: Sequence[int],
+        *,
+        model_id: str,
+        device: str,
+    ) -> TokenIDs:
         ids = list(token_ids)
         if not ids:
             raise ValueError("Cannot prepare or offload an empty KV cache.")
-        return torch.tensor([ids], dtype=torch.long, device=device)
+        return TokenIDs(
+            torch.tensor([ids], dtype=torch.long, device=device),
+            model_id=model_id,
+        )
 
     @torch.inference_mode()
     def build_pretranslated_past_for_edge(
@@ -229,7 +237,11 @@ class KVCacheTranslationAdapter:
 
         edge = self._get_edge(source_agent.node_id, target_agent.node_id)
         edge_id = edge.id
-        context_token_ids = self._ids_to_tensor(token_ids, device=target_agent.device)
+        context_token_ids = self._build_token_ids(
+            token_ids,
+            model_id=source_agent.model.id,
+            device=target_agent.device,
+        )
         translated_past = self._build_algorithm_translated_past(
             edge=edge,
             source_past_key_values=source_past_key_values,

@@ -5,6 +5,7 @@ import torch
 
 from core.channel_profiler import ChannelProfileConfig, ChannelProfiler, ProxyValidationScore
 from core.context import Context
+from core.common import TokenIDs
 from core.model_spec import ModelSpec
 from core.topology import Edge
 from alg.mot.train import replay_target_prefill_with_injected_window
@@ -235,7 +236,7 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
     with torch.no_grad():
         replayed_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
-            context_token_ids=torch.tensor([[1]]),
+            context_token_ids=TokenIDs(torch.tensor([[1]]), model_id="dummy-target"),
             target_layer_indices=[1, 3, 5, 7, 9, 11],
             injected_key_block=torch.zeros(1, 1, 6, 8),
             injected_value_block=torch.zeros(1, 1, 6, 8),
