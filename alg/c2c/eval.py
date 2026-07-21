@@ -18,12 +18,15 @@ from alg.c2c.train import (
 def _build_logit_example_state(
     *,
     ctx: Context,
-    context_token_ids: TokenIDs,
+    prepared_inputs_by_node_id,
     **_,
 ):
     return {
         "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
+            node.id: extract_past_key_values(
+                ctx.tp.get_model(node.id),
+                prepared_inputs_by_node_id[node.id]["context_token_ids"],
+            )
             for node in ctx.nodes
         }
     }
@@ -84,8 +87,9 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            for edge in edges:
-                target_model = ctx.tp.get_model(edge.tgt_id)
+            prepared_inputs_by_node_id = {}
+            for node in nodes:
+                model = ctx.tp.get_model(node.id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -93,37 +97,42 @@ def evaluate_generation_dataset(
                         spec=spec,
                         question=question,
                         eval_config=eval_config,
-                        model=target_model,
+                        model=model,
                     )
-
                 prepared_inputs = prepare_generation_task_inputs(
                     spec=spec,
-                    model=target_model,
+                    model=model,
                     context=context_text,
                     question=question,
                     device=device,
                     max_input_tokens=context_budget,
                 )
-                context_token_ids = prepared_inputs["context_token_ids"]
-                prompt_token_ids = prepared_inputs["prompt_token_ids"]
-                seed_token = prepared_inputs["seed_token"]
-
+                prepared_inputs_by_node_id[node.id] = prepared_inputs
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    prompt_token_ids = prepared_inputs["prompt_token_ids"]
                     prompt_tokens = 0 if prompt_token_ids is None else prompt_token_ids.shape[1]
                     logging.info(
                         "[%s][%s] truncated context to %d tokens to fit model context window (prompt_tokens=%d, answer_token_budget=%d)",
                         spec.name_for_log,
-                        edge.id,
-                        context_token_ids.shape[1],
+                        node.id,
+                        prepared_inputs["context_token_ids"].shape[1],
                         prompt_tokens,
                         get_answer_token_budget(eval_config),
                     )
 
-                past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-                    for node in nodes
-                }
+            past_by_node_id = {
+                node.id: extract_past_key_values(
+                    ctx.tp.get_model(node.id),
+                    prepared_inputs_by_node_id[node.id]["context_token_ids"],
+                )
+                for node in nodes
+            }
 
+            for edge in edges:
+                target_model = ctx.tp.get_model(edge.tgt_id)
+                target_inputs = prepared_inputs_by_node_id[edge.tgt_id]
+                prompt_token_ids = target_inputs["prompt_token_ids"]
+                seed_token = target_inputs["seed_token"]
                 translated_top_past = translate_top_layers(
                     translator_pool=translator_pool,
                     train_config=train_config,
