@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from core.model import Model
-from core.common import PastKeyValues, TokenIDs, extract_past_key_values
+from core.common import PastKeyValues, TokenIDs, ensure_token_ids_model, extract_past_key_values
 from core.eval_util import append_token_ids_to_past
 
 
@@ -197,6 +197,7 @@ class Agent:
         uncached_generated_token: Optional[torch.Tensor] = None
 
         for _ in range(max(0, self.max_new_tokens)):
+            ensure_token_ids_model(self.model, current_token_ids)
             outputs = self.model(
                 input_ids=current_token_ids.as_tensor(),
                 past_key_values=current_past,
@@ -228,6 +229,7 @@ class Agent:
         # last visible token was already consumed in the EOS-prediction step, so
         # this block is correctly skipped and the token ledger stays aligned.
         if uncached_generated_token is not None:
+            ensure_token_ids_model(self.model, uncached_generated_token)
             outputs = self.model(
                 input_ids=uncached_generated_token.as_tensor(),
                 past_key_values=current_past,

@@ -920,6 +920,7 @@ def run_openwebtext_greedy_inference(
     total_generated_tokens = 0
 
     for _ in range(max_new_tokens):
+        ensure_token_ids_model(model, current_token_ids)
         outputs = model(
             input_ids=current_token_ids.as_tensor(),
             past_key_values=current_past,
@@ -2738,6 +2739,7 @@ def append_token_ids_to_past(
     past_key_values: PastKeyValues,
     token_ids: TokenIDs,
 ) -> PastKeyValues:
+    ensure_token_ids_model(model, token_ids)
     if token_ids.shape[1] == 0:
         return past_key_values
 
@@ -2800,6 +2802,8 @@ def score_candidate_logprob(
     candidate_token_ids: TokenIDs,
     normalize_by_length: bool = True,
 ) -> float:
+    ensure_token_ids_model(model, seed_token)
+    ensure_token_ids_model(model, candidate_token_ids)
     device = seed_token.device
     candidate_ids = candidate_token_ids.as_tensor().to(device).unsqueeze(0)
 
@@ -2898,6 +2902,7 @@ def generate_greedy_answer(
     eos_token_id = model.tokenizer.eos_token_id
 
     for _ in range(max_new_tokens):
+        ensure_token_ids_model(model, current_token_ids)
         outputs = model(
             input_ids=current_token_ids.as_tensor(),
             past_key_values=current_past,

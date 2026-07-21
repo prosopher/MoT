@@ -124,6 +124,14 @@ class TokenIDs(torch.Tensor):
         return self._with_model_id(super().cpu())
 
 
+def ensure_token_ids_model(model: Model, token_ids: TokenIDs) -> None:
+    if token_ids.model_id != model.id:
+        raise ValueError(
+            f"TokenIDs model mismatch: model.id={model.id!r}, "
+            f"token_ids.model_id={token_ids.model_id!r}"
+        )
+
+
 def split_context_and_prompt_token_ids(
     token_ids: TokenIDs,
     context_tokens: int,
@@ -211,6 +219,8 @@ def compute_suffix_lm_loss(
     prompt_token_ids: TokenIDs,
     label_token_ids: TokenIDs,
 ) -> torch.Tensor:
+    ensure_token_ids_model(target_model, prompt_token_ids)
+    ensure_token_ids_model(target_model, label_token_ids)
     outputs = target_model(
         input_ids=prompt_token_ids.as_tensor(),
         past_key_values=past_key_values,
@@ -370,6 +380,7 @@ def cast_past_key_values_dtype(
 
 @torch.no_grad()
 def extract_past_key_values(model: Model, token_ids: TokenIDs) -> PastKeyValues:
+    ensure_token_ids_model(model, token_ids)
     outputs = model(input_ids=token_ids.as_tensor(), use_cache=True)
     return cast_past_key_values_dtype(
         outputs.past_key_values,

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, TokenIDs, read_json, set_seed, write_json
+from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, TokenIDs, ensure_token_ids_model, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
 from core.model import Model
@@ -455,6 +455,7 @@ def _compute_attention_importance_for_batch(
     if context_length < 1 or query_length < 1:
         return None
 
+    ensure_token_ids_model(model, token_ids)
     outputs = model(
         input_ids=token_ids.as_tensor(),
         use_cache=False,

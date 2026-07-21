@@ -14,6 +14,7 @@ from core.common import (
     PastKeyValues,
     TokenIDs,
     count_trainable_parameters,
+    ensure_token_ids_model,
     extract_past_key_values,
     get_model_parameter_dtype,
     read_json,
@@ -167,6 +168,7 @@ def extract_interlat_source_hidden_states(model, token_ids: TokenIDs) -> torch.T
     keeping InterLat's algorithmic input faithful to hidden-state communication.
     """
 
+    ensure_token_ids_model(model, token_ids)
     outputs = model(
         input_ids=token_ids.as_tensor(),
         use_cache=False,
@@ -224,6 +226,8 @@ def compute_suffix_logits_and_loss(
     prompt_token_ids: TokenIDs,
     label_token_ids: TokenIDs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ensure_token_ids_model(target_model, prompt_token_ids)
+    ensure_token_ids_model(target_model, label_token_ids)
     outputs = target_model(
         input_ids=prompt_token_ids.as_tensor(),
         past_key_values=past_key_values,
@@ -440,14 +444,15 @@ def run_train(
             total_edge_random = 0.0
             total_edge_cosine = 0.0
             for edge in ctx.edges:
-                tgt_prefix_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                src_prefix_ids, _, _ = batches_by_node_id[edge.src_id]
+                _, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
 
                 target_model = ctx.tp.get_model(edge.tgt_id)
                 tgt_model_context_limit = get_model_context_limit(target_model)
 
                 source_hidden_states = extract_interlat_source_hidden_states(
                     ctx.tp.get_model(edge.src_id),
-                    tgt_prefix_ids,
+                    src_prefix_ids,
                 )
 
                 translated_latents = translate_hidden_states(
