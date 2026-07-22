@@ -508,36 +508,58 @@ class ChannelProfiler:
         from .common import OpenWebTextSequenceStream, compute_suffix_lm_loss
         from torch.utils.data import DataLoader
 
-        target_model = self.tp.get_model(edge.tgt_id)
-        dataset = OpenWebTextSequenceStream(
-            tokenizer=target_model.tokenizer,
-            sequence_length=self.config.total_tokens,
-            split=split,
-            shuffle=True,
-            shuffle_buffer=self.config.shuffle_buffer,
-            seed=self.config.seed + seed_offset,
-        )
-        def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
-            return TokenIDs(torch.stack([torch.as_tensor(example) for example in examples], dim=0), model_id=target_model.id)
-
-        loader = InfiniteDataLoader(DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_token_ids))
         source_model = self.tp.get_model(edge.src_id)
+        target_model = self.tp.get_model(edge.tgt_id)
+
+        def build_loader(model: Model) -> InfiniteDataLoader:
+            dataset = OpenWebTextSequenceStream(
+                tokenizer=model.tokenizer,
+                sequence_length=self.config.total_tokens,
+                split=split,
+                shuffle=True,
+                shuffle_buffer=self.config.shuffle_buffer,
+                seed=self.config.seed + seed_offset,
+            )
+
+            def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
+                return TokenIDs(
+                    torch.stack([torch.as_tensor(example) for example in examples], dim=0),
+                    model_id=model.id,
+                )
+
+            return InfiniteDataLoader(
+                DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_token_ids)
+            )
+
+        source_loader = build_loader(source_model)
+        target_loader = build_loader(target_model)
 
         bank: List[Dict[str, Any]] = []
         for _ in range(num_examples):
-            token_ids = next(loader).to(self.config.device)
-            context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
-                token_ids=token_ids,
+            source_token_ids = next(source_loader).to(self.config.device)
+            target_token_ids = next(target_loader).to(self.config.device)
+            source_context_token_ids = split_context_and_prompt_token_ids(
+                token_ids=source_token_ids,
+                context_tokens=self.config.prefix_tokens,
+            )[0]
+            target_context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
+                token_ids=target_token_ids,
                 context_tokens=self.config.prefix_tokens,
             )
             with torch.no_grad():
-                native_target_past_key_values = extract_past_key_values(target_model, context_token_ids)
+                native_target_past_key_values = extract_past_key_values(
+                    target_model,
+                    target_context_token_ids,
+                )
                 bank.append(
                     {
-                        "context_token_ids": context_token_ids,
+                        "target_context_token_ids": target_context_token_ids,
                         "prompt_token_ids": prompt_token_ids,
                         "label_token_ids": label_token_ids,
-                        "source_past_key_values": extract_past_key_values(source_model, context_token_ids),
+                        "source_past_key_values": extract_past_key_values(
+                            source_model,
+                            source_context_token_ids,
+                        ),
                         "native_target_past_key_values": native_target_past_key_values,
                     }
                 )
@@ -672,7 +694,7 @@ class ChannelProfiler:
         target_model = self.tp.get_model(edge.tgt_id)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
-            context_token_ids=sample["context_token_ids"],
+            context_token_ids=sample["target_context_token_ids"],
             target_layer_indices=target_layer_indices,
             injected_key_block=translated_key,
             injected_value_block=translated_value,
@@ -707,7 +729,7 @@ class ChannelProfiler:
         target_model = self.tp.get_model(edge.tgt_id)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
-            context_token_ids=sample["context_token_ids"],
+            context_token_ids=sample["target_context_token_ids"],
             target_layer_indices=target_layer_indices,
             injected_key_block=translated_key,
             injected_value_block=translated_value,

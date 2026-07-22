@@ -84,7 +84,7 @@ def _build_logit_edge_artifacts(
     translated_past = _build_interlat_target_past(
         ctx=ctx,
         edge=edge,
-        context_token_ids=target_context_token_ids,
+        context_token_ids=source_context_token_ids,
         translator_pool=translator_pool,
     )
     native_past = past_by_node_id[edge.tgt_id]
@@ -130,7 +130,7 @@ def evaluate_openwebtext_validation_loss_interlat(
         translated_target_past = _build_interlat_target_past(
             ctx=ctx,
             edge=edge,
-            context_token_ids=target_context_token_ids,
+            context_token_ids=source_context_token_ids,
             translator_pool=translator_pool,
         )
         translated_loss = float(
@@ -256,7 +256,7 @@ def evaluate_generation_dataset(
                 translated_past = _build_interlat_target_past(
                     ctx=ctx,
                     edge=edge,
-                    context_token_ids=target_inputs["context_token_ids"],
+                    context_token_ids=prepared_inputs_by_node_id[edge.src_id]["context_token_ids"],
                     translator_pool=translator_pool,
                 )
                 native_past = past_by_node_id[edge.tgt_id]
@@ -346,7 +346,7 @@ def run_eval(
         translated_past = _build_interlat_target_past(
             ctx=ctx,
             edge=edge,
-            context_token_ids=target_context_token_ids,
+            context_token_ids=source_context_token_ids,
             translator_pool=translator_pool,
         )
         return build_openwebtext_tsne_named_pasts(
