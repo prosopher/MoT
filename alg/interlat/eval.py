@@ -74,16 +74,12 @@ def _build_interlat_target_past(
 
 
 def _build_logit_edge_artifacts(
-    *,
     ctx: Context,
     edge: Edge,
     context_token_ids: TokenIDs,
-    prepared_inputs,
     past_by_node_id,
     translator_pool,
-    **_,
 ) -> LogitEvalEdgeArtifacts:
-    del prepared_inputs
     translated_past = _build_interlat_target_past(
         ctx=ctx,
         edge=edge,

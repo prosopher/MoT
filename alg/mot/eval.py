@@ -40,13 +40,11 @@ def build_partial_past_from_layer_indices(
 
 
 def _build_logit_edge_artifacts(
-    *,
     ctx: Context,
     edge: Edge,
     context_token_ids: TokenIDs,
     past_by_node_id,
     translator_pool,
-    **_,
 ) -> LogitEvalEdgeArtifacts:
     mixed_target_past, _ = build_replayed_target_past(
         ctx,

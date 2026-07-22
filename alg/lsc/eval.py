@@ -11,12 +11,11 @@ from alg.lsc.train import translate_layers
 
 
 def _build_logit_edge_artifacts(
-    *,
     ctx: Context,
     edge: Edge,
+    context_token_ids: TokenIDs,
     past_by_node_id,
     translator_pool,
-    **_,
 ) -> LogitEvalEdgeArtifacts:
 
     translated_past = translate_layers(

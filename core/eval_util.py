@@ -3085,12 +3085,8 @@ def evaluate_dataset(
 
                 edge_artifacts = build_edge_artifacts_fn(
                     ctx=ctx,
-                    spec=spec,
                     edge=edge,
-                    example=example,
                     context_token_ids=context_token_ids,
-                    prepared_inputs=prepared_inputs,
-                    prepared_inputs_by_node_id=prepared_inputs_by_node_id,
                     past_by_node_id=past_by_node_id,
                     translator_pool=translator_pool,
                 )

@@ -183,12 +183,11 @@ def _predict_kvcomm_generation(
 
 
 def _build_logit_edge_artifacts(
-    *,
     ctx: Context,
     edge: Edge,
+    context_token_ids: TokenIDs,
     past_by_node_id,
-    translator_pool: TranslatorPool,
-    **_,
+    translator_pool,
 ) -> LogitEvalEdgeArtifacts:
     kvcomm_past = build_replayed_target_past(
         ctx,
