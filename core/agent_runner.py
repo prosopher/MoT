@@ -237,15 +237,28 @@ class KVCacheTranslationAdapter:
 
         edge = self._get_edge(source_agent.node_id, target_agent.node_id)
         edge_id = edge.id
-        context_token_ids = self._build_token_ids(
+        source_context_token_ids = self._build_token_ids(
             token_ids,
             model_id=source_agent.model.id,
-            device=target_agent.device,
+            device=source_agent.device,
+        )
+        context_text = source_agent.model.tokenizer.decode(
+            token_ids,
+            skip_special_tokens=False,
+        )
+        target_tokenized = target_agent.model.tokenizer(
+            context_text,
+            return_tensors="pt",
+        )
+        target_context_token_ids = TokenIDs(
+            target_tokenized.input_ids.to(target_agent.device),
+            model_id=target_agent.model.id,
         )
         translated_past = self._build_algorithm_translated_past(
             edge=edge,
             source_past_key_values=source_past_key_values,
-            context_token_ids=context_token_ids,
+            source_context_token_ids=source_context_token_ids,
+            target_context_token_ids=target_context_token_ids,
         )
         translated_tokens = get_past_seq_len(translated_past)
         if translated_tokens != source_tokens:
@@ -261,7 +274,8 @@ class KVCacheTranslationAdapter:
         *,
         edge: Edge,
         source_past_key_values: PastKeyValues,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
     ) -> PastKeyValues:
         tgt_spec = self.ctx.tp.get_model_spec(edge.tgt_id)
         target_model = self.ctx.tp.get_model(edge.tgt_id)
@@ -272,7 +286,8 @@ class KVCacheTranslationAdapter:
             translated_past, _ = build_replayed_target_past(
                 self.ctx,
                 source_past_key_values=source_past_key_values,
-                context_token_ids=context_token_ids,
+                source_context_token_ids=source_context_token_ids,
+                target_context_token_ids=target_context_token_ids,
                 source_model=self.ctx.tp.get_model(edge.src_id),
                 target_model=target_model,
                 src_node_id=edge.src_id,
@@ -296,14 +311,14 @@ class KVCacheTranslationAdapter:
             from alg.interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states, translate_hidden_states
 
             source_tokens = get_past_seq_len(source_past_key_values)
-            if int(context_token_ids.shape[1]) != source_tokens:
+            if int(source_context_token_ids.shape[1]) != source_tokens:
                 raise ValueError(
                     f"InterLat prefix/token length mismatch on {edge.id}: "
-                    f"prefix_tokens={int(context_token_ids.shape[1])} source_tokens={source_tokens}"
+                    f"prefix_tokens={int(source_context_token_ids.shape[1])} source_tokens={source_tokens}"
                 )
 
             source_model = self.ctx.tp.get_model(edge.src_id)
-            source_token_ids = context_token_ids.to(source_model.device)
+            source_token_ids = source_context_token_ids.to(source_model.device)
             source_hidden_states = extract_interlat_source_hidden_states(
                 source_model,
                 source_token_ids,
@@ -332,12 +347,12 @@ class KVCacheTranslationAdapter:
             from alg.c2c.train import translate_top_layers
 
             source_tokens = get_past_seq_len(source_past_key_values)
-            if int(context_token_ids.shape[1]) != source_tokens:
+            if int(source_context_token_ids.shape[1]) != source_tokens:
                 raise ValueError(
                     f"C2C-PR prefix/token length mismatch on {edge.id}: "
-                    f"prefix_tokens={int(context_token_ids.shape[1])} source_tokens={source_tokens}"
+                    f"prefix_tokens={int(source_context_token_ids.shape[1])} source_tokens={source_tokens}"
                 )
-            native_target_past = extract_past_key_values(target_model, context_token_ids)
+            native_target_past = extract_past_key_values(target_model, target_context_token_ids)
             translated_top_past = translate_top_layers(
                 translator_pool=self.translator_pool,
                 train_config=self.ctx.config,
@@ -363,10 +378,10 @@ class KVCacheTranslationAdapter:
             from alg.kvcomm.train import build_replayed_target_past
 
             source_tokens = get_past_seq_len(source_past_key_values)
-            if int(context_token_ids.shape[1]) != source_tokens:
+            if int(source_context_token_ids.shape[1]) != source_tokens:
                 raise ValueError(
                     f"KVComm prefix/token length mismatch on {edge.id}: "
-                    f"prefix_tokens={int(context_token_ids.shape[1])} source_tokens={source_tokens}"
+                    f"prefix_tokens={int(source_context_token_ids.shape[1])} source_tokens={source_tokens}"
                 )
             translated_past = build_replayed_target_past(
                 self.ctx,

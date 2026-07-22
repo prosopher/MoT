@@ -158,7 +158,7 @@ def _predict_kvcomm_generation(
     device: str,
     context_budget: Optional[int],
 ) -> str:
-    prepared = prepare_generation_task_inputs(
+    target_prepared = prepare_generation_task_inputs(
         spec=spec,
         model=target_model,
         context=context,
@@ -166,7 +166,27 @@ def _predict_kvcomm_generation(
         device=device,
         max_input_tokens=context_budget,
     )
-    source_past = extract_past_key_values(source_model, prepared["context_token_ids"])
+    source_context_budget = None
+    if spec.answer_mode in {"squad", "newsqa"}:
+        source_context_budget = compute_benchmark_context_budget(
+            ctx=ctx,
+            spec=spec,
+            question=question,
+            eval_config=eval_config,
+            model=source_model,
+        )
+    source_prepared = prepare_generation_task_inputs(
+        spec=spec,
+        model=source_model,
+        context=context,
+        question=question,
+        device=device,
+        max_input_tokens=source_context_budget,
+    )
+    source_past = extract_past_key_values(
+        source_model,
+        source_prepared["context_token_ids"],
+    )
     kvcomm_past = build_replayed_target_past(
         ctx,
         pool,
@@ -176,16 +196,17 @@ def _predict_kvcomm_generation(
     return predict_generation_task_answer(
         model=target_model,
         past_key_values=kvcomm_past,
-        seed_token=prepared["seed_token"],
+        seed_token=target_prepared["seed_token"],
         eval_config=eval_config,
-        prompt_token_ids=prepared["prompt_token_ids"],
+        prompt_token_ids=target_prepared["prompt_token_ids"],
     )
 
 
 def _build_logit_edge_artifacts(
     ctx: Context,
     edge: Edge,
-    context_token_ids: TokenIDs,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
     past_by_node_id,
     translator_pool,
 ) -> LogitEvalEdgeArtifacts:
@@ -288,7 +309,7 @@ def evaluate_generation_dataset(
                         model=target_model,
                     )
 
-                prepared_generation_inputs = prepare_generation_task_inputs(
+                target_prepared_inputs = prepare_generation_task_inputs(
                     spec=spec,
                     model=target_model,
                     context=context,
@@ -296,7 +317,23 @@ def evaluate_generation_dataset(
                     device=device,
                     max_input_tokens=context_budget,
                 )
-                context_token_ids = prepared_generation_inputs["context_token_ids"]
+                source_context_budget = None
+                if spec.answer_mode in {"squad", "newsqa"}:
+                    source_context_budget = compute_benchmark_context_budget(
+                        ctx=ctx,
+                        spec=spec,
+                        question=question,
+                        eval_config=eval_config,
+                        model=source_model,
+                    )
+                source_prepared_inputs = prepare_generation_task_inputs(
+                    spec=spec,
+                    model=source_model,
+                    context=context,
+                    question=question,
+                    device=device,
+                    max_input_tokens=source_context_budget,
+                )
 
                 pred_direct = _predict_direct_context_generation(
                     model=target_model,
@@ -321,14 +358,20 @@ def evaluate_generation_dataset(
                     context_budget=context_budget,
                 )
 
-                kvcomm_source_past = extract_past_key_values(source_model, context_token_ids)
+                kvcomm_source_past = extract_past_key_values(
+                    source_model,
+                    source_prepared_inputs["context_token_ids"],
+                )
                 kvcomm_replayed_past = build_replayed_target_past(
                     ctx,
                     translator_pool,
                     edge_id=edge.id,
                     source_past_key_values=kvcomm_source_past,
                 )
-                native_target_past = extract_past_key_values(target_model, context_token_ids)
+                native_target_past = extract_past_key_values(
+                    target_model,
+                    target_prepared_inputs["context_token_ids"],
+                )
                 kvcomm_past_for_cosine = _build_full_length_kvcomm_past_for_cosine(
                     ctx=ctx,
                     edge=edge,

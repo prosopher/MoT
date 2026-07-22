@@ -18,7 +18,8 @@ from alg.c2c.train import (
 def _build_logit_edge_artifacts(
     ctx: Context,
     edge: Edge,
-    context_token_ids: TokenIDs,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
     past_by_node_id,
     translator_pool,
 ) -> LogitEvalEdgeArtifacts:

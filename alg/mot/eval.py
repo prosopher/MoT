@@ -42,14 +42,16 @@ def build_partial_past_from_layer_indices(
 def _build_logit_edge_artifacts(
     ctx: Context,
     edge: Edge,
-    context_token_ids: TokenIDs,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
     past_by_node_id,
     translator_pool,
 ) -> LogitEvalEdgeArtifacts:
     mixed_target_past, _ = build_replayed_target_past(
         ctx,
         source_past_key_values=past_by_node_id[edge.src_id],
-        context_token_ids=context_token_ids,
+        source_context_token_ids=source_context_token_ids,
+        target_context_token_ids=target_context_token_ids,
         source_model=ctx.tp.get_model(edge.src_id),
         target_model=ctx.tp.get_model(edge.tgt_id),
         src_node_id=edge.src_id,
@@ -98,15 +100,29 @@ def evaluate_generation_dataset(
                         model=target_model,
                     )
 
-                prepared_inputs = prepare_generation_task_inputs(
-                    spec=spec,
-                    model=target_model,
-                    context=context_text,
-                    question=question,
-                    device=device,
-                    max_input_tokens=context_budget,
-                )
-                context_token_ids = prepared_inputs["context_token_ids"]
+                prepared_inputs_by_node_id = {}
+                for node_id in {edge.src_id, edge.tgt_id}:
+                    model = ctx.tp.get_model(node_id)
+                    node_context_budget = None
+                    if spec.answer_mode in {"squad", "newsqa"}:
+                        node_context_budget = compute_benchmark_context_budget(
+                            ctx=ctx,
+                            spec=spec,
+                            question=question,
+                            eval_config=eval_config,
+                            model=model,
+                        )
+                    prepared_inputs_by_node_id[node_id] = prepare_generation_task_inputs(
+                        spec=spec,
+                        model=model,
+                        context=context_text,
+                        question=question,
+                        device=device,
+                        max_input_tokens=node_context_budget,
+                    )
+                prepared_inputs = prepared_inputs_by_node_id[edge.tgt_id]
+                source_context_token_ids = prepared_inputs_by_node_id[edge.src_id]["context_token_ids"]
+                target_context_token_ids = prepared_inputs["context_token_ids"]
                 prompt_token_ids = prepared_inputs["prompt_token_ids"]
                 seed_token = prepared_inputs["seed_token"]
 
@@ -116,20 +132,24 @@ def evaluate_generation_dataset(
                         "[%s][%s] truncated context to %d tokens to fit model context window (prompt_tokens=%d, answer_token_budget=%d)",
                         spec.name_for_log,
                         edge.id,
-                        context_token_ids.shape[1],
+                        target_context_token_ids.shape[1],
                         prompt_tokens,
                         get_answer_token_budget(eval_config),
                     )
 
                 past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-                    for node in nodes
+                    node_id: extract_past_key_values(
+                        ctx.tp.get_model(node_id),
+                        prepared_inputs_by_node_id[node_id]["context_token_ids"],
+                    )
+                    for node_id in {edge.src_id, edge.tgt_id}
                 }
 
                 mixed_target_past, _ = build_replayed_target_past(
                     ctx,
                     source_past_key_values=past_by_node_id[edge.src_id],
-                    context_token_ids=context_token_ids,
+                    source_context_token_ids=source_context_token_ids,
+                    target_context_token_ids=target_context_token_ids,
                     source_model=ctx.tp.get_model(edge.src_id),
                     target_model=ctx.tp.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,
@@ -244,13 +264,15 @@ def run_eval(
     def build_translated_target_past_fn(
         *,
         edge: Edge,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
         past_by_node_id,
     ) -> PastKeyValues:
         mixed_target_past, _ = build_replayed_target_past(
             ctx,
             source_past_key_values=past_by_node_id[edge.src_id],
-            context_token_ids=context_token_ids,
+            source_context_token_ids=source_context_token_ids,
+            target_context_token_ids=target_context_token_ids,
             source_model=ctx.tp.get_model(edge.src_id),
             target_model=ctx.tp.get_model(edge.tgt_id),
             src_node_id=edge.src_id,
@@ -262,14 +284,16 @@ def run_eval(
     def build_visualization_pasts_fn(
         *,
         edge: Edge,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
         past_by_node_id,
         **_,
     ) -> Dict[str, PastKeyValues]:
         _, translated_window_past = build_replayed_target_past(
             ctx,
             source_past_key_values=past_by_node_id[edge.src_id],
-            context_token_ids=context_token_ids,
+            source_context_token_ids=source_context_token_ids,
+            target_context_token_ids=target_context_token_ids,
             source_model=ctx.tp.get_model(edge.src_id),
             target_model=ctx.tp.get_model(edge.tgt_id),
             src_node_id=edge.src_id,

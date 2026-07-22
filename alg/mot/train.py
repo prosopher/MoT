@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from core.common import build_step_pasts_and_batches
+from core.common import build_step_pasts_and_batches, ensure_token_ids_model
 from core.config import Config
 from core.channel_manager import (
     Channel,
@@ -469,7 +469,8 @@ def build_replayed_target_past(
     ctx: Context,
     *,
     source_past_key_values: PastKeyValues,
-    context_token_ids: TokenIDs,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
     source_model: Model,
     target_model: Model,
     src_node_id: str,
@@ -493,7 +494,7 @@ def build_replayed_target_past(
     src_spec = ctx.tp.get_model_spec(src_node_id)
     sparse_attention_indices = build_extrapolated_sparse_attention_indices(
         source_model,
-        context_token_ids,
+        source_context_token_ids,
         source_layer_indices=ctx.cm.get_src_layer_indices(edge_id),
         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
         num_source_layers=src_spec.num_layers,
@@ -504,7 +505,7 @@ def build_replayed_target_past(
     mixed_target_past = replay_target_prefill_with_injected_window(
         target_model=target_model,
         target_model_id=node_model_ids.get(tgt_node_id),
-        context_token_ids=context_token_ids,
+        context_token_ids=target_context_token_ids,
         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
         injected_key_block=translated_key,
         injected_value_block=translated_value,
@@ -843,6 +844,7 @@ def build_extrapolated_sparse_attention_indices(
     source_model_id: Optional[str] = None,
     top_k: int,
 ) -> List[torch.Tensor]:
+    ensure_token_ids_model(source_model, context_token_ids)
     aligned_source_by_target = extrapolate_source_layer_alignment(
         source_layer_indices=source_layer_indices,
         target_layer_indices=target_layer_indices,
@@ -1248,6 +1250,7 @@ def replay_target_prefill_with_injected_window(
     num_bottom_full_attn: int = 3,
     cache_injected_window: bool = False,
 ) -> PastKeyValues:
+    ensure_token_ids_model(target_model, context_token_ids)
     injected_window = blocks_to_partial_past_key_values(
         key_block=injected_key_block,
         value_block=injected_value_block,
@@ -1564,11 +1567,13 @@ def run_train(
 
             total_direction_loss = 0.0
             for edge in edges:
-                context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                target_context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                source_context_token_ids = batches_by_node_id[edge.src_id][0]
                 mixed_target_past, _ = build_replayed_target_past(
                     ctx,
                     source_past_key_values=past_by_node_id[edge.src_id],
-                    context_token_ids=context_token_ids,
+                    source_context_token_ids=source_context_token_ids,
+                    target_context_token_ids=target_context_token_ids,
                     source_model=ctx.tp.get_model(edge.src_id),
                     target_model=ctx.tp.get_model(edge.tgt_id),
                     src_node_id=edge.src_id,

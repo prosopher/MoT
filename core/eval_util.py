@@ -8,7 +8,7 @@ import numpy as np
 from core.common import *
 from core.config import Config
 from core.context import Context
-from core.train_util import get_train_config_path
+from core.train_util import InfiniteDataLoader, get_train_config_path
 
 
 @dataclass
@@ -575,7 +575,7 @@ def build_openwebtext_eval_dataloader(
     seed: Optional[int] = None,
     shuffle_buffer: Optional[int] = None,
     seed_offset: int = 10_000,
-) -> DataLoader:
+) -> InfiniteDataLoader:
     dataset = OpenWebTextSequenceStream(
         tokenizer=model.tokenizer,
         sequence_length=config.total_tokens,
@@ -588,7 +588,8 @@ def build_openwebtext_eval_dataloader(
     def collate_token_ids(examples: List[torch.Tensor]) -> TokenIDs:
         return TokenIDs(torch.stack([torch.as_tensor(example) for example in examples], dim=0), model_id=model.id)
 
-    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=collate_token_ids)
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=collate_token_ids)
+    return InfiniteDataLoader(dataloader)
 
 
 def select_past_layers_by_indices(
@@ -949,7 +950,6 @@ def evaluate_openwebtext_validation_loss_metrics(
     evaluate_edge_losses_fn: Callable[..., Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]],
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
-    device = ctx.config.device
     max_examples = max(1, max_examples)
 
     loss_sums = {edge.id: {} for edge in ctx.edges}
@@ -962,16 +962,9 @@ def evaluate_openwebtext_validation_loss_metrics(
             for edge in ctx.edges
         }
 
-    target_node_ids = sorted({edge.tgt_id for edge in ctx.edges})
-    edges_by_target = {
-        target_node_id: [edge for edge in ctx.edges if edge.tgt_id == target_node_id]
-        for target_node_id in target_node_ids
-    }
-
-    for target_node_id in target_node_ids:
-        target_model = ctx.tp.get_model(target_node_id)
-        dataloader = build_openwebtext_eval_dataloader(
-            model=target_model,
+    eval_dataloaders = {
+        node.id: build_openwebtext_eval_dataloader(
+            model=ctx.tp.get_model(node.id),
             config=ctx.config,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -979,78 +972,75 @@ def evaluate_openwebtext_validation_loss_metrics(
             seed=seed,
             shuffle_buffer=shuffle_buffer,
         )
-        processed_examples = 0
-        for batch_idx, token_ids in enumerate(dataloader, start=1):
-            if processed_examples >= max_examples:
-                break
+        for node in ctx.nodes
+    }
 
-            remaining_examples = max_examples - processed_examples
-            if token_ids.shape[0] > remaining_examples:
-                token_ids = token_ids[:remaining_examples]
-            token_ids = token_ids.to(device)
+    processed_examples = 0
+    batch_idx = 0
+    while processed_examples < max_examples:
+        batch_idx += 1
+        past_by_node_id, batches_by_node_id = build_step_pasts_and_batches(ctx, eval_dataloaders)
 
-            context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
-                token_ids=token_ids,
-                context_tokens=ctx.config.prefix_tokens,
+        batch_examples = min(
+            batches_by_node_id[edge.tgt_id][0].shape[0]
+            for edge in ctx.edges
+        )
+        for edge in ctx.edges:
+            target_context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+            source_context_token_ids = batches_by_node_id[edge.src_id][0]
+
+            edge_losses, edge_profiles = evaluate_edge_losses_fn(
+                edge_id=edge.id,
+                edge=edge,
+                source_context_token_ids=source_context_token_ids,
+                target_context_token_ids=target_context_token_ids,
+                prompt_token_ids=prompt_token_ids,
+                label_token_ids=label_token_ids,
+                past_by_node_id=past_by_node_id,
             )
-            past_by_node_id = {
-                node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-                for node in ctx.nodes
-            }
+            if not edge_losses:
+                continue
+            for metric_name, loss_value in edge_losses.items():
+                loss_sums[edge.id][metric_name] = (
+                    float(loss_sums[edge.id].get(metric_name, 0.0))
+                    + float(loss_value) * batch_examples
+                )
+            for metric_name, profile_values in edge_profiles.items():
+                accumulator = profile_accumulators[edge.id].setdefault(
+                    metric_name,
+                    InferenceProfileAccumulator(),
+                )
+                accumulator.update(
+                    latency_sec=float(profile_values.get("latency_sec", 0.0)),
+                    tokens=profile_values.get("tokens", 0),
+                    peak_memory_bytes=profile_values.get("peak_memory_bytes"),
+                )
+            counts[edge.id] += batch_examples
 
-            batch_examples = token_ids.shape[0]
-            for edge in edges_by_target[target_node_id]:
-                edge_losses, edge_profiles = evaluate_edge_losses_fn(
+            if tsne_features is not None:
+                named_pasts = build_visualization_pasts_fn(
                     edge_id=edge.id,
                     edge=edge,
-                    context_token_ids=context_token_ids,
+                    source_context_token_ids=source_context_token_ids,
+                    target_context_token_ids=target_context_token_ids,
                     prompt_token_ids=prompt_token_ids,
                     label_token_ids=label_token_ids,
                     past_by_node_id=past_by_node_id,
                 )
-                if not edge_losses:
-                    continue
-                for metric_name, loss_value in edge_losses.items():
-                    loss_sums[edge.id][metric_name] = (
-                        float(loss_sums[edge.id].get(metric_name, 0.0))
-                        + float(loss_value) * batch_examples
-                    )
-                for metric_name, profile_values in edge_profiles.items():
-                    accumulator = profile_accumulators[edge.id].setdefault(
-                        metric_name,
-                        InferenceProfileAccumulator(),
-                    )
-                    accumulator.update(
-                        latency_sec=float(profile_values.get("latency_sec", 0.0)),
-                        tokens=profile_values.get("tokens", 0),
-                        peak_memory_bytes=profile_values.get("peak_memory_bytes"),
-                    )
-                counts[edge.id] += batch_examples
-
-                if tsne_features is not None:
-                    named_pasts = build_visualization_pasts_fn(
+                if named_pasts:
+                    _accumulate_openwebtext_tsne_samples(
+                        tsne_features,
                         edge_id=edge.id,
-                        edge=edge,
-                        context_token_ids=context_token_ids,
-                        prompt_token_ids=prompt_token_ids,
-                        label_token_ids=label_token_ids,
-                        past_by_node_id=past_by_node_id,
+                        named_pasts=named_pasts,
                     )
-                    if named_pasts:
-                        _accumulate_openwebtext_tsne_samples(
-                            tsne_features,
-                            edge_id=edge.id,
-                            named_pasts=named_pasts,
-                        )
 
-            processed_examples += batch_examples
-            if batch_idx % 25 == 0:
-                logging.info(
-                    "[OpenWebText/validation][target=%s] progress: %d/%d sequences",
-                    target_node_id,
-                    processed_examples,
-                    max_examples,
-                )
+        processed_examples += batch_examples
+        if batch_idx % 25 == 0:
+            logging.info(
+                "[OpenWebText/validation] progress: %d/%d sequences",
+                processed_examples,
+                max_examples,
+            )
 
     summaries = {}
     for edge in ctx.edges:
@@ -1101,12 +1091,12 @@ def evaluate_openwebtext_validation_loss_top_layers(
         *,
         edge_id: str,
         edge: Edge,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
         prompt_token_ids: TokenIDs,
         label_token_ids: TokenIDs,
         past_by_node_id,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Optional[float]]]]:
-        del edge_id, context_token_ids
         profile_tokens = int(label_token_ids.numel())
         seed_token = prompt_token_ids[:, :1]
         generation_steps = int(label_token_ids.shape[1])
@@ -1199,7 +1189,8 @@ def evaluate_openwebtext_validation_loss_replay(
         *,
         edge_id: str,
         edge: Edge,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
         prompt_token_ids: TokenIDs,
         label_token_ids: TokenIDs,
         past_by_node_id,
@@ -1210,7 +1201,8 @@ def evaluate_openwebtext_validation_loss_replay(
 
         mixed_target_past_for_loss = build_translated_target_past_fn(
             edge=edge,
-            context_token_ids=context_token_ids,
+            source_context_token_ids=source_context_token_ids,
+            target_context_token_ids=target_context_token_ids,
             past_by_node_id=past_by_node_id,
         )
         translated_loss = float(
@@ -1237,7 +1229,8 @@ def evaluate_openwebtext_validation_loss_replay(
         def run_translated_inference() -> int:
             mixed_target_past = build_translated_target_past_fn(
                 edge=edge,
-                context_token_ids=context_token_ids,
+                source_context_token_ids=source_context_token_ids,
+                target_context_token_ids=target_context_token_ids,
                 past_by_node_id=past_by_node_id,
             )
             return run_openwebtext_greedy_inference(
@@ -3079,14 +3072,16 @@ def evaluate_dataset(
             for edge in edges:
                 target_model = ctx.tp.get_model(edge.tgt_id)
                 prepared_inputs = prepared_inputs_by_node_id[edge.tgt_id]
-                context_token_ids = prepared_inputs["context_token_ids"]
+                target_context_token_ids = prepared_inputs["context_token_ids"]
+                source_context_token_ids = prepared_inputs_by_node_id[edge.src_id]["context_token_ids"]
                 prompt_token_ids = prepared_inputs["prompt_token_ids"]
                 seed_token = prepared_inputs["seed_token"]
 
                 edge_artifacts = build_edge_artifacts_fn(
                     ctx=ctx,
                     edge=edge,
-                    context_token_ids=context_token_ids,
+                    source_context_token_ids=source_context_token_ids,
+                    target_context_token_ids=target_context_token_ids,
                     past_by_node_id=past_by_node_id,
                     translator_pool=translator_pool,
                 )

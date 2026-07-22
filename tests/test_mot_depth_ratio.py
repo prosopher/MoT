@@ -215,7 +215,7 @@ def test_replay_interleaves_native_layers_between_translated_target_layers(monke
     call_order: list[tuple[str, int]] = []
 
     transformer = SimpleNamespace(h=[SimpleNamespace(layer_idx=idx) for idx in range(12)])
-    target_model = SimpleNamespace(transformer=transformer)
+    target_model = SimpleNamespace(id="dummy-target", transformer=transformer)
 
     def fake_build_gpt2_input_hidden_states(model, token_ids):
         del model, token_ids

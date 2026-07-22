@@ -76,14 +76,15 @@ def _build_interlat_target_past(
 def _build_logit_edge_artifacts(
     ctx: Context,
     edge: Edge,
-    context_token_ids: TokenIDs,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
     past_by_node_id,
     translator_pool,
 ) -> LogitEvalEdgeArtifacts:
     translated_past = _build_interlat_target_past(
         ctx=ctx,
         edge=edge,
-        context_token_ids=context_token_ids,
+        context_token_ids=target_context_token_ids,
         translator_pool=translator_pool,
     )
     native_past = past_by_node_id[edge.tgt_id]
@@ -116,12 +117,12 @@ def evaluate_openwebtext_validation_loss_interlat(
         *,
         edge_id: str,
         edge: Edge,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
         prompt_token_ids: TokenIDs,
         label_token_ids: TokenIDs,
         past_by_node_id,
     ):
-        del edge_id
         profile_tokens = int(label_token_ids.numel())
         seed_token = prompt_token_ids[:, :1]
         generation_steps = int(label_token_ids.shape[1])
@@ -129,7 +130,7 @@ def evaluate_openwebtext_validation_loss_interlat(
         translated_target_past = _build_interlat_target_past(
             ctx=ctx,
             edge=edge,
-            context_token_ids=context_token_ids,
+            context_token_ids=target_context_token_ids,
             translator_pool=translator_pool,
         )
         translated_loss = float(
@@ -195,9 +196,9 @@ def evaluate_generation_dataset(
     eval_config: EvalConfig,
     translator_pool,
 ) -> Dict[str, Dict[str, float]]:
-    train_config = ctx.config
+    nodes = ctx.nodes
     edges = ctx.edges
-    device = train_config.device
+    device = ctx.config.device
     path_metrics = {edge.id: GenerationRunningAverage() for edge in edges}
 
     processed_examples = 0
@@ -208,8 +209,9 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            for edge in edges:
-                target_model = ctx.tp.get_model(edge.tgt_id)
+            prepared_inputs_by_node_id = {}
+            for node in nodes:
+                model = ctx.tp.get_model(node.id)
                 context_budget = None
                 if spec.answer_mode in {"squad", "newsqa"}:
                     context_budget = compute_benchmark_context_budget(
@@ -217,67 +219,67 @@ def evaluate_generation_dataset(
                         spec=spec,
                         question=question,
                         eval_config=eval_config,
-                        model=target_model,
+                        model=model,
                     )
-
                 prepared_inputs = prepare_generation_task_inputs(
                     spec=spec,
-                    model=target_model,
+                    model=model,
                     context=context_text,
                     question=question,
                     device=device,
                     max_input_tokens=context_budget,
                 )
-                context_token_ids = prepared_inputs["context_token_ids"]
-                prompt_token_ids = prepared_inputs["prompt_token_ids"]
-                seed_token = prepared_inputs["seed_token"]
-
+                prepared_inputs_by_node_id[node.id] = prepared_inputs
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    prompt_token_ids = prepared_inputs["prompt_token_ids"]
                     prompt_tokens = 0 if prompt_token_ids is None else prompt_token_ids.shape[1]
                     logging.info(
                         "[%s][%s] truncated context to %d tokens to fit model context window (prompt_tokens=%d, answer_token_budget=%d)",
                         spec.name_for_log,
-                        edge.id,
-                        context_token_ids.shape[1],
+                        node.id,
+                        prepared_inputs["context_token_ids"].shape[1],
                         prompt_tokens,
                         get_answer_token_budget(eval_config),
                     )
 
-                past_by_node_id = {
-                    node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-                    for node in ctx.nodes
-                }
+            past_by_node_id = {
+                node.id: extract_past_key_values(
+                    ctx.tp.get_model(node.id),
+                    prepared_inputs_by_node_id[node.id]["context_token_ids"],
+                )
+                for node in nodes
+            }
+
+            for edge in edges:
+                target_model = ctx.tp.get_model(edge.tgt_id)
+                target_inputs = prepared_inputs_by_node_id[edge.tgt_id]
                 translated_past = _build_interlat_target_past(
                     ctx=ctx,
                     edge=edge,
-                    context_token_ids=context_token_ids,
+                    context_token_ids=target_inputs["context_token_ids"],
                     translator_pool=translator_pool,
                 )
                 native_past = past_by_node_id[edge.tgt_id]
-                cosine_value = _cosine_similarity_for_interlat_past(translated_past, native_past)
 
                 translated_answer = predict_generation_task_answer(
                     model=target_model,
                     past_key_values=translated_past,
-                    seed_token=seed_token,
+                    seed_token=target_inputs["seed_token"],
                     eval_config=eval_config,
-                    prompt_token_ids=prompt_token_ids,
+                    prompt_token_ids=target_inputs["prompt_token_ids"],
                 )
                 native_answer = predict_generation_task_answer(
                     model=target_model,
                     past_key_values=native_past,
-                    seed_token=seed_token,
+                    seed_token=target_inputs["seed_token"],
                     eval_config=eval_config,
-                    prompt_token_ids=prompt_token_ids,
+                    prompt_token_ids=target_inputs["prompt_token_ids"],
                 )
 
-                f1 = compute_generation_f1(translated_answer, gold_answers)
-                native_f1 = compute_generation_f1(native_answer, gold_answers)
-
                 path_metrics[edge.id].update(
-                    cosine_value=cosine_value,
-                    f1_value=f1,
-                    native_f1_value=native_f1,
+                    cosine_value=_cosine_similarity_for_interlat_past(translated_past, native_past),
+                    f1_value=compute_generation_f1(translated_answer, gold_answers),
+                    native_f1_value=compute_generation_f1(native_answer, gold_answers),
                     n=1,
                 )
 
@@ -333,15 +335,18 @@ def run_eval(
 
     def build_visualization_pasts_fn(
         *,
+        edge_id: str,
         edge: Edge,
-        context_token_ids: TokenIDs,
+        source_context_token_ids: TokenIDs,
+        target_context_token_ids: TokenIDs,
+        prompt_token_ids: TokenIDs,
+        label_token_ids: TokenIDs,
         past_by_node_id,
-        **_,
     ) -> Dict[str, PastKeyValues]:
         translated_past = _build_interlat_target_past(
             ctx=ctx,
             edge=edge,
-            context_token_ids=context_token_ids,
+            context_token_ids=target_context_token_ids,
             translator_pool=translator_pool,
         )
         return build_openwebtext_tsne_named_pasts(
