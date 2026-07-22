@@ -3003,7 +3003,6 @@ def evaluate_dataset(
     dataloader: DataLoader,
     eval_config: EvalConfig,
     translator_pool,
-    build_example_state_fn: Callable[..., Any],
     build_edge_artifacts_fn: Callable[..., LogitEvalEdgeArtifacts],
     prepare_scoring_past_fn: Callable[..., PastKeyValues] = prepare_answer_scoring_past,
     finalize_results_fn: Optional[Callable[..., None]] = None,
@@ -3030,21 +3029,22 @@ def evaluate_dataset(
             choices = example.get("choices")
             choice_texts = example.get("choice_texts")
 
-            for edge in edges:
-                target_model = ctx.tp.get_model(edge.tgt_id)
+            prepared_inputs_by_node_id = {}
+            for node in ctx.nodes:
+                model = ctx.tp.get_model(node.id)
                 token_budgets = compute_logit_task_token_budgets(
                     ctx=ctx,
                     spec=spec,
                     question=question,
                     eval_config=eval_config,
-                    model=target_model,
+                    model=model,
                     choices=choices,
                     choice_texts=choice_texts,
                     subject=example.get("subject"),
                 )
                 prepared_inputs = prepare_logit_task_inputs(
                     spec=spec,
-                    model=target_model,
+                    model=model,
                     context=context_text,
                     question=question,
                     device=device,
@@ -3054,30 +3054,34 @@ def evaluate_dataset(
                     max_context_tokens=token_budgets["max_context_tokens"],
                     max_prefix_tokens=token_budgets["max_prefix_tokens"],
                 )
-                context_token_ids = prepared_inputs["context_token_ids"]
-                prompt_token_ids = prepared_inputs["prompt_token_ids"]
-                seed_token = prepared_inputs["seed_token"]
+                prepared_inputs_by_node_id[node.id] = prepared_inputs
 
                 if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                    prompt_token_ids = prepared_inputs["prompt_token_ids"]
                     prompt_tokens = 0 if prompt_token_ids is None else prompt_token_ids.shape[1]
                     logging.info(
                         "[%s][%s] truncated context to fit model context window (context_tokens=%d, prompt_tokens=%d, answer_token_budget=%d)",
                         spec.name_for_log,
-                        edge.id,
-                        context_token_ids.shape[1],
+                        node.id,
+                        prepared_inputs["context_token_ids"].shape[1],
                         prompt_tokens,
                         get_answer_token_budget(eval_config),
                     )
 
-                example_state = build_example_state_fn(
-                    ctx=ctx,
-                    spec=spec,
-                    edge=edge,
-                    example=example,
-                    context_token_ids=context_token_ids,
-                    prepared_inputs=prepared_inputs,
-                    translator_pool=translator_pool,
+            past_by_node_id = {
+                node.id: extract_past_key_values(
+                    ctx.tp.get_model(node.id),
+                    prepared_inputs_by_node_id[node.id]["context_token_ids"],
                 )
+                for node in ctx.nodes
+            }
+
+            for edge in edges:
+                target_model = ctx.tp.get_model(edge.tgt_id)
+                prepared_inputs = prepared_inputs_by_node_id[edge.tgt_id]
+                context_token_ids = prepared_inputs["context_token_ids"]
+                prompt_token_ids = prepared_inputs["prompt_token_ids"]
+                seed_token = prepared_inputs["seed_token"]
 
                 edge_artifacts = build_edge_artifacts_fn(
                     ctx=ctx,
@@ -3086,7 +3090,8 @@ def evaluate_dataset(
                     example=example,
                     context_token_ids=context_token_ids,
                     prepared_inputs=prepared_inputs,
-                    example_state=example_state,
+                    prepared_inputs_by_node_id=prepared_inputs_by_node_id,
+                    past_by_node_id=past_by_node_id,
                     translator_pool=translator_pool,
                 )
 

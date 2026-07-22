@@ -182,29 +182,14 @@ def _predict_kvcomm_generation(
     )
 
 
-def _build_logit_example_state(
-    *,
-    ctx: Context,
-    context_token_ids: TokenIDs,
-    **_,
-):
-    return {
-        "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-            for node in ctx.nodes
-        }
-    }
-
-
 def _build_logit_edge_artifacts(
     *,
     ctx: Context,
     edge: Edge,
-    example_state,
+    past_by_node_id,
     translator_pool: TranslatorPool,
     **_,
 ) -> LogitEvalEdgeArtifacts:
-    past_by_node_id = example_state["past_by_node_id"]
     kvcomm_past = build_replayed_target_past(
         ctx,
         translator_pool,
@@ -477,7 +462,6 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            build_example_state_fn=_build_logit_example_state,
             build_edge_artifacts_fn=_build_logit_edge_artifacts,
             prepare_scoring_past_fn=_prepare_kvcomm_scoring_past,
             finalize_results_fn=_finalize_logit_results,

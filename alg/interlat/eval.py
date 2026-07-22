@@ -73,27 +73,13 @@ def _build_interlat_target_past(
     )
 
 
-def _build_logit_example_state(
-    *,
-    ctx: Context,
-    context_token_ids: TokenIDs,
-    **_,
-):
-    return {
-        "past_by_node_id": {
-            node.id: extract_past_key_values(ctx.tp.get_model(node.id), context_token_ids)
-            for node in ctx.nodes
-        }
-    }
-
-
 def _build_logit_edge_artifacts(
     *,
     ctx: Context,
     edge: Edge,
     context_token_ids: TokenIDs,
     prepared_inputs,
-    example_state,
+    past_by_node_id,
     translator_pool,
     **_,
 ) -> LogitEvalEdgeArtifacts:
@@ -104,7 +90,7 @@ def _build_logit_edge_artifacts(
         context_token_ids=context_token_ids,
         translator_pool=translator_pool,
     )
-    native_past = example_state["past_by_node_id"][edge.tgt_id]
+    native_past = past_by_node_id[edge.tgt_id]
     return LogitEvalEdgeArtifacts(
         translated_past_key_values=translated_past,
         native_past_key_values=native_past,
@@ -403,7 +389,6 @@ def run_eval(
             dataloader=dataloader,
             eval_config=eval_config,
             translator_pool=translator_pool,
-            build_example_state_fn=_build_logit_example_state,
             build_edge_artifacts_fn=_build_logit_edge_artifacts,
         )
         all_logit_results[spec.name_for_log] = results
