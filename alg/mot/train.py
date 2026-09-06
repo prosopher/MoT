@@ -598,6 +598,8 @@ def normalize_model_family(model_id: str) -> Optional[str]:
         or "qwen/qwen3" in normalized
     ):
         return "qwen2"
+    if "llama-3.2" in normalized or "llama3.2" in normalized:
+        return "llama"
     if "facebook/opt" in normalized or "/opt-" in normalized or normalized.startswith("opt-"):
         return "opt"
     if "gpt2" in normalized:
@@ -617,6 +619,8 @@ def resolve_target_model_family(
     config_model_type = str(getattr(getattr(target_model, "config", None), "model_type", "")).lower()
     if config_model_type in {"qwen2", "qwen2_5", "qwen3"}:
         return "qwen2"
+    if config_model_type == "llama":
+        return "llama"
 
     if getattr(target_model, "transformer", None) is not None and hasattr(target_model.transformer, "h"):
         return "gpt2"
@@ -636,7 +640,7 @@ def resolve_target_model_family(
         return "opt"
 
     raise ValueError(
-        "mot target-model replay supports GPT-2, OPT, Qwen2/Qwen2.5, and Qwen3 decoder stacks only "
+        "mot target-model replay supports GPT-2, OPT, Qwen2/Qwen2.5, Qwen3, and Llama 3.2 decoder stacks only "
         f"(target_model_id={target_model_id!r})."
     )
 
@@ -666,15 +670,9 @@ def require_opt_decoder(model: Model):
 
 
 
-def require_qwen2_model(model: Model):
-    # `core.model.Model` adds one wrapper level around the Hugging Face causal LM:
-    #
-    #   Model -> Qwen2ForCausalLM -> Qwen2Model -> {embed_tokens, layers}
-    #
-    # The previous implementation inspected only the first `.model`, so it stopped
-    # at Qwen2ForCausalLM and incorrectly rejected Qwen2/Qwen2.5.  Walk common
-    # wrapper attributes until the actual decoder stack is found instead of assuming
-    # a fixed wrapper depth.
+def _require_rotary_decoder_model(model: Model, *, family_name: str):
+    # core.model.Model adds one wrapper around the Hugging Face causal LM.
+    # Walk common wrapper attributes instead of assuming a fixed nesting depth.
     pending = [model]
     seen: set[int] = set()
     while pending:
@@ -695,9 +693,17 @@ def require_qwen2_model(model: Model):
                 pending.append(wrapped)
 
     raise ValueError(
-        "mot currently supports Qwen2/Qwen2.5/Qwen3 style decoder stacks only "
+        f"mot could not locate the {family_name} decoder stack "
         "(expected a wrapped decoder with layers/embed_tokens to exist)."
     )
+
+
+def require_qwen2_model(model: Model):
+    return _require_rotary_decoder_model(model, family_name="Qwen2/Qwen2.5/Qwen3")
+
+
+def require_llama_model(model: Model):
+    return _require_rotary_decoder_model(model, family_name="Llama")
 
 
 def build_gpt2_input_hidden_states(model: Model, token_ids: TokenIDs) -> torch.Tensor:
@@ -752,26 +758,41 @@ def build_opt_input_hidden_states(
 
 
 
-def build_qwen2_input_hidden_states(
-    model: Model,
+def _build_rotary_input_hidden_states(
+    decoder_model: nn.Module,
     token_ids: TokenIDs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-    qwen_model = require_qwen2_model(model)
     if token_ids.ndim != 2:
         raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
     batch_size, seq_len = token_ids.shape
     position_ids = torch.arange(seq_len, device=token_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    hidden_states = qwen_model.embed_tokens(token_ids.as_tensor())
+    hidden_states = decoder_model.embed_tokens(token_ids.as_tensor())
     attention_mask = build_causal_attention_mask(hidden_states)
 
     position_embeddings = None
-    rotary_emb = getattr(qwen_model, "rotary_emb", None)
+    rotary_emb = getattr(decoder_model, "rotary_emb", None)
     if rotary_emb is not None:
         try:
             position_embeddings = rotary_emb(hidden_states, position_ids)
         except TypeError:
             position_embeddings = None
     return hidden_states, position_ids, attention_mask, position_embeddings
+
+
+def build_qwen2_input_hidden_states(
+    model: Model,
+    token_ids: TokenIDs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    return _build_rotary_input_hidden_states(require_qwen2_model(model), token_ids)
+
+
+def build_llama_input_hidden_states(
+    model: Model,
+    token_ids: TokenIDs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    # Llama 3.2 uses the same embedding/position inputs as the Qwen rotary
+    # decoder path, but keep family validation explicit.
+    return _build_rotary_input_hidden_states(require_llama_model(model), token_ids)
 
 
 def extract_source_attention_topk_indices(
@@ -791,7 +812,7 @@ def extract_source_attention_topk_indices(
         "output_attentions": True,
         "return_dict": True,
     }
-    if model_family in {"opt", "qwen2"}:
+    if model_family in {"opt", "qwen2", "llama"}:
         model_kwargs["attention_mask"] = torch.ones_like(context_token_ids.as_tensor())
     with torch.no_grad():
         outputs = source_model(**model_kwargs)
@@ -1189,7 +1210,7 @@ def run_qwen2_block(
     attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
-            "Attention cache shape mismatch for Qwen2/Qwen2.5/Qwen3 layer replay: "
+            "Attention cache shape mismatch for rotary GQA layer replay: "
             f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
         )
 
@@ -1234,6 +1255,32 @@ def run_qwen2_block(
     hidden_states = block.mlp(hidden_states)
     hidden_states = residual + hidden_states
     return hidden_states, (native_like_key, native_like_value)
+
+
+def run_llama_block(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
+    injected_key: Optional[torch.Tensor] = None,
+    injected_value: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    # Llama 3.2's attention/MLP block is structurally identical for the fields
+    # consumed by the Qwen2-family replay helper. Llama-specific RoPE lives on
+    # the attention module itself, so the shared replay applies it correctly.
+    return run_qwen2_block(
+        block,
+        hidden_states,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        position_embeddings=position_embeddings,
+        sparse_attention_indices=sparse_attention_indices,
+        injected_key=injected_key,
+        injected_value=injected_value,
+    )
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -1385,6 +1432,34 @@ def replay_target_prefill_with_injected_window(
             injected_value: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
             return run_qwen2_block(
+                block,
+                hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                sparse_attention_indices=sparse_attention_indices,
+                injected_key=injected_key,
+                injected_value=injected_value,
+            )
+
+    elif model_family == "llama":
+        llama_model = require_llama_model(target_model)
+        target_blocks = llama_model.layers
+
+        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+            return build_llama_input_hidden_states(target_model, context_token_ids)
+
+        def run_block(
+            block: nn.Module,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+            sparse_attention_indices: Optional[torch.Tensor],
+            injected_key: Optional[torch.Tensor] = None,
+            injected_value: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_llama_block(
                 block,
                 hidden_states,
                 position_ids=position_ids,
