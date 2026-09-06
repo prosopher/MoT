@@ -661,15 +661,37 @@ def require_opt_decoder(model: Model):
 
 
 def require_qwen2_model(model: Model):
-    model_wrapper = getattr(model, "model", None)
-    if model_wrapper is None and hasattr(model, "layers") and hasattr(model, "embed_tokens"):
-        model_wrapper = model
-    if model_wrapper is None or not hasattr(model_wrapper, "layers") or not hasattr(model_wrapper, "embed_tokens"):
-        raise ValueError(
-            "mot currently supports Qwen2/Qwen2.5 style decoder stacks only "
-            "(expected model.model.layers/model.model.embed_tokens to exist)."
-        )
-    return model_wrapper
+    # `core.model.Model` adds one wrapper level around the Hugging Face causal LM:
+    #
+    #   Model -> Qwen2ForCausalLM -> Qwen2Model -> {embed_tokens, layers}
+    #
+    # The previous implementation inspected only the first `.model`, so it stopped
+    # at Qwen2ForCausalLM and incorrectly rejected Qwen2/Qwen2.5.  Walk common
+    # wrapper attributes until the actual decoder stack is found instead of assuming
+    # a fixed wrapper depth.
+    pending = [model]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+
+        if hasattr(candidate, "layers") and hasattr(candidate, "embed_tokens"):
+            return candidate
+
+        for attr_name in ("model", "base_model", "module"):
+            try:
+                wrapped = getattr(candidate, attr_name, None)
+            except Exception:
+                continue
+            if wrapped is not None and wrapped is not candidate and id(wrapped) not in seen:
+                pending.append(wrapped)
+
+    raise ValueError(
+        "mot currently supports Qwen2/Qwen2.5 style decoder stacks only "
+        "(expected a wrapped decoder with layers/embed_tokens to exist)."
+    )
 
 
 def build_gpt2_input_hidden_states(model: Model, token_ids: TokenIDs) -> torch.Tensor:
