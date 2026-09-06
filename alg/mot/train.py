@@ -598,6 +598,8 @@ def normalize_model_family(model_id: str) -> Optional[str]:
         or "qwen/qwen3" in normalized
     ):
         return "qwen2"
+    if "gemma-3" in normalized or "gemma3" in normalized:
+        return "gemma3"
     if "llama-3.2" in normalized or "llama3.2" in normalized:
         return "llama"
     if "facebook/opt" in normalized or "/opt-" in normalized or normalized.startswith("opt-"):
@@ -619,6 +621,8 @@ def resolve_target_model_family(
     config_model_type = str(getattr(getattr(target_model, "config", None), "model_type", "")).lower()
     if config_model_type in {"qwen2", "qwen2_5", "qwen3"}:
         return "qwen2"
+    if config_model_type == "gemma3_text":
+        return "gemma3"
     if config_model_type == "llama":
         return "llama"
 
@@ -640,7 +644,7 @@ def resolve_target_model_family(
         return "opt"
 
     raise ValueError(
-        "mot target-model replay supports GPT-2, OPT, Qwen2/Qwen2.5, Qwen3, and Llama 3.2 decoder stacks only "
+        "mot target-model replay supports GPT-2, OPT, Qwen2/Qwen2.5, Qwen3, Llama 3.2, and Gemma 3 text decoder stacks only "
         f"(target_model_id={target_model_id!r})."
     )
 
@@ -704,6 +708,10 @@ def require_qwen2_model(model: Model):
 
 def require_llama_model(model: Model):
     return _require_rotary_decoder_model(model, family_name="Llama")
+
+
+def require_gemma3_model(model: Model):
+    return _require_rotary_decoder_model(model, family_name="Gemma 3")
 
 
 def build_gpt2_input_hidden_states(model: Model, token_ids: TokenIDs) -> torch.Tensor:
@@ -795,6 +803,23 @@ def build_llama_input_hidden_states(
     return _build_rotary_input_hidden_states(require_llama_model(model), token_ids)
 
 
+def build_gemma3_input_hidden_states(
+    model: Model,
+    token_ids: TokenIDs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+    decoder = require_gemma3_model(model)
+    if token_ids.ndim != 2:
+        raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
+    batch_size, seq_len = token_ids.shape
+    position_ids = torch.arange(seq_len, device=token_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    # Gemma3ScaledWordEmbedding applies the model-required sqrt(hidden_size)
+    # scaling internally. RoPE is layer-specific (local vs global), so unlike
+    # Llama/Qwen it must be computed by each attention module during replay.
+    hidden_states = decoder.embed_tokens(token_ids.as_tensor())
+    attention_mask = build_causal_attention_mask(hidden_states)
+    return hidden_states, position_ids, attention_mask, None
+
+
 def extract_source_attention_topk_indices(
     source_model: Model,
     context_token_ids: TokenIDs,
@@ -812,7 +837,7 @@ def extract_source_attention_topk_indices(
         "output_attentions": True,
         "return_dict": True,
     }
-    if model_family in {"opt", "qwen2", "llama"}:
+    if model_family in {"opt", "qwen2", "llama", "gemma3"}:
         model_kwargs["attention_mask"] = torch.ones_like(context_token_ids.as_tensor())
     with torch.no_grad():
         outputs = source_model(**model_kwargs)
@@ -1283,6 +1308,131 @@ def run_llama_block(
     )
 
 
+def run_gemma3_block(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    sparse_attention_indices: Optional[torch.Tensor] = None,
+    injected_key: Optional[torch.Tensor] = None,
+    injected_value: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Replay one Gemma 3 text block with an optional translated KV cache.
+
+    Gemma 3 shares the rotary GQA projection layout with Qwen3, but its block
+    normalization order is different: attention and MLP outputs are each
+    post-normalized before the residual addition. Local layers also use a
+    different RoPE base and a sliding attention window. Keep those semantics
+    isolated here so the existing Qwen/Llama paths are unchanged.
+    """
+    if (injected_key is None) != (injected_value is None):
+        raise ValueError("injected_key and injected_value must be provided together.")
+    if injected_key is not None and injected_key.shape != injected_value.shape:
+        raise ValueError(
+            "Injected key/value must have identical shapes, "
+            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
+        )
+
+    attn = block.self_attn
+    batch_size, seq_len, hidden_size = hidden_states.shape
+    num_query_heads, num_key_value_heads, num_key_value_groups, head_dim = get_qwen2_attention_shape(attn, hidden_size)
+    expected_cache_shape = (batch_size, num_key_value_heads, seq_len, head_dim)
+
+    residual = hidden_states
+    attn_input = block.input_layernorm(hidden_states)
+
+    query_states = attn.q_proj(attn_input).view(batch_size, seq_len, num_query_heads, head_dim)
+    native_like_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim)
+    native_like_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim)
+
+    query_states = attn.q_norm(query_states).transpose(1, 2).contiguous()
+    native_like_key = attn.k_norm(native_like_key).transpose(1, 2).contiguous()
+    native_like_value = native_like_value.transpose(1, 2).contiguous()
+
+    rotary_emb = getattr(attn, "rotary_emb", None)
+    if rotary_emb is None:
+        raise ValueError("Gemma3 replay requires a layer-local rotary embedding module.")
+    try:
+        cos, sin = rotary_emb(native_like_value, position_ids=position_ids)
+    except TypeError:
+        cos, sin = rotary_emb(native_like_value, position_ids)
+    query_states, native_like_key = apply_rotary_pos_emb(
+        query_states, native_like_key, cos, sin, position_ids
+    )
+
+    attention_key = native_like_key if injected_key is None else injected_key
+    attention_value = native_like_value if injected_value is None else injected_value
+    if tuple(attention_key.shape) != expected_cache_shape:
+        raise ValueError(
+            "Attention cache shape mismatch for Gemma3 replay: "
+            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
+        )
+
+    expanded_attention_key = repeat_key_value_heads(attention_key, num_key_value_groups)
+    expanded_attention_value = repeat_key_value_heads(attention_value, num_key_value_groups)
+    scaling = float(getattr(attn, "scaling", head_dim ** -0.5))
+    sliding_window = getattr(attn, "sliding_window", None)
+
+    if sparse_attention_indices is not None:
+        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
+        selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
+        attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
+        invalid_mask = build_sparse_query_mask(
+            sparse_attention_indices, seq_len=seq_len, num_heads=num_query_heads
+        )
+        if sliding_window is not None and int(sliding_window) > 0:
+            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
+            outside_window = sparse_attention_indices <= (query_positions - int(sliding_window))
+            invalid_mask = invalid_mask | outside_window
+        attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
+    else:
+        attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
+        effective_attention_mask = attention_mask
+        if sliding_window is not None and int(sliding_window) > 0:
+            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            outside_window = key_positions <= (query_positions - int(sliding_window))
+            sliding_bias = torch.zeros_like(attn_weights).masked_fill(
+                outside_window, torch.finfo(attn_weights.dtype).min
+            )
+            effective_attention_mask = (
+                effective_attention_mask + sliding_bias
+                if effective_attention_mask is not None
+                else sliding_bias
+            )
+        if effective_attention_mask is not None:
+            attn_weights = attn_weights + effective_attention_mask
+
+    softcap = getattr(attn, "attn_logit_softcapping", None)
+    if softcap is not None:
+        softcap = float(softcap)
+        attn_weights = torch.tanh(attn_weights / softcap) * softcap
+    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
+    attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
+
+    if sparse_attention_indices is not None:
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    else:
+        attn_output = torch.matmul(attn_weights, expanded_attention_value)
+
+    attn_output = attn_output.transpose(1, 2).contiguous().reshape(
+        batch_size, seq_len, num_query_heads * head_dim
+    )
+    attn_output = attn.o_proj(attn_output)
+    hidden_states = block.post_attention_layernorm(attn_output)
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = block.pre_feedforward_layernorm(hidden_states)
+    hidden_states = block.mlp(hidden_states)
+    hidden_states = block.post_feedforward_layernorm(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states, (native_like_key, native_like_value)
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -1465,6 +1615,33 @@ def replay_target_prefill_with_injected_window(
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 position_embeddings=position_embeddings,
+                sparse_attention_indices=sparse_attention_indices,
+                injected_key=injected_key,
+                injected_value=injected_value,
+            )
+
+    elif model_family == "gemma3":
+        gemma_model = require_gemma3_model(target_model)
+        target_blocks = gemma_model.layers
+
+        def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+            return build_gemma3_input_hidden_states(target_model, context_token_ids)
+
+        def run_block(
+            block: nn.Module,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            _: Any,
+            sparse_attention_indices: Optional[torch.Tensor],
+            injected_key: Optional[torch.Tensor] = None,
+            injected_value: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            return run_gemma3_block(
+                block,
+                hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,

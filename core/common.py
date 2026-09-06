@@ -346,6 +346,11 @@ def _looks_like_llama32_model_id(model_id: str) -> bool:
     return "llama-3.2" in normalized or "llama3.2" in normalized
 
 
+def _looks_like_gemma3_model_id(model_id: str) -> bool:
+    normalized = model_id.lower()
+    return "gemma-3" in normalized or "gemma3" in normalized
+
+
 def _is_legacy_tokenizers_model_error(error: Exception) -> bool:
     message = str(error)
     return "ModelWrapper" in message or "tokenizer.json" in message and "did not match" in message
@@ -427,10 +432,30 @@ def _load_llama32_tokenizer_with_legacy_tokenizers(model_id: str) -> PreTrainedT
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
     is_qwen3 = _looks_like_qwen3_model_id(model_id)
     is_llama32 = _looks_like_llama32_model_id(model_id)
+    is_gemma3 = _looks_like_gemma3_model_id(model_id)
     if _looks_like_qwen2_model_id(model_id):
         _ensure_qwen2_compat_for_old_transformers()
     elif is_qwen3:
         _ensure_qwen3_compat_for_old_transformers()
+
+    if is_gemma3:
+        # transformers==4.35.2 predates GemmaTokenizer, but the checkpoint
+        # ships a complete tokenizer.json. Loading the generic fast tokenizer
+        # directly avoids AutoTokenizer trying to resolve an unavailable
+        # Gemma tokenizer class while preserving the checkpoint chat template
+        # and special-token metadata. Some current Gemma3 tokenizer.json files
+        # use the newer BPE merge-pair serialization, so reuse the same narrow
+        # legacy-BPE rewrite as Qwen3 only when old tokenizers rejects it.
+        try:
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, trust_remote_code=True)
+        except Exception as error:
+            if not _is_legacy_tokenizers_model_error(error):
+                raise
+            tokenizer = _load_tokenizer_with_legacy_bpe(model_id, prefix="gemma3")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        return tokenizer
 
     if is_llama32:
         # The official Llama 3.2 tokenizer is already a generic fast tokenizer.
@@ -488,7 +513,13 @@ def load_frozen_model(model_id: str, device: str, dtype: str) -> PreTrainedModel
     elif _looks_like_qwen3_model_id(model_id):
         _ensure_qwen3_compat_for_old_transformers()
     torch_dtype = get_torch_dtype(dtype)
-    if _looks_like_llama32_model_id(model_id):
+    if _looks_like_gemma3_model_id(model_id):
+        # transformers==4.35.2 predates Gemma 3. Load the text-only decoder
+        # through the local compatibility implementation.
+        from .gemma3_compat import load_gemma3_compat_model
+
+        model = load_gemma3_compat_model(model_id, torch_dtype=torch_dtype)
+    elif _looks_like_llama32_model_id(model_id):
         # 4.35.2's built-in LlamaConfig rejects Llama 3.2's llama3 RoPE
         # schema, so load through the local compatibility decoder instead.
         from .llama32_compat import load_llama32_compat_model
