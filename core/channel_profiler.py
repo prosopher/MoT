@@ -15,6 +15,7 @@ from .common import (
     write_json,
 )
 from .context import Context
+from .model import Model
 from .topology import Edge, build_node_map
 from .train_util import InfiniteDataLoader, get_training_dtype
 
