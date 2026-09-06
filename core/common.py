@@ -322,17 +322,126 @@ def _looks_like_qwen2_model_id(model_id: str) -> bool:
     normalized = model_id.lower()
     return "qwen2" in normalized or "qwen2.5" in normalized or "qwen/qwen2" in normalized
 
+
+def _ensure_qwen3_compat_for_old_transformers() -> None:
+    try:
+        import transformers
+
+        if hasattr(transformers, "Qwen3ForCausalLM"):
+            return
+    except Exception:
+        pass
+    from .qwen3_compat import register_qwen3_compat
+
+    register_qwen3_compat()
+
+
+def _looks_like_qwen3_model_id(model_id: str) -> bool:
+    normalized = model_id.lower()
+    return "qwen3" in normalized or "qwen/qwen3" in normalized
+
+
+def _is_legacy_tokenizers_model_error(error: Exception) -> bool:
+    message = str(error)
+    return "ModelWrapper" in message or "tokenizer.json" in message and "did not match" in message
+
+
+def _rewrite_qwen3_tokenizer_json_for_legacy_tokenizers(source_path: str) -> str:
+    """Create a tokenizers<0.19-compatible copy of a Qwen3 tokenizer.json.
+
+    New tokenizers releases serialize BPE models with fields/merge-pair shapes
+    that tokenizers 0.14-0.15 (the range used with transformers==4.35.2) cannot
+    deserialize.  The underlying vocabulary, merge order, pre-tokenizer, decoder,
+    and added-token definitions are unchanged, so rewriting only the BPE
+    serialization preserves Qwen3 tokenization exactly.
+    """
+    import os
+    import tempfile
+
+    with open(source_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    model = data.get("model")
+    if not isinstance(model, dict) or model.get("type") != "BPE":
+        raise ValueError(f"Expected a BPE tokenizer in {source_path}")
+
+    # Added to BPE serialization after the tokenizers versions accepted by
+    # transformers 4.35.2.  For Qwen3 this is false, matching the old default.
+    model.pop("ignore_merges", None)
+
+    # New tokenizers writes merge pairs as [token_a, token_b].  Older releases
+    # expect the legacy `token_a token_b` string representation.
+    merges = model.get("merges")
+    if isinstance(merges, list) and merges and isinstance(merges[0], (list, tuple)):
+        legacy_merges = []
+        for pair in merges:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError("Unexpected Qwen3 BPE merge entry in tokenizer.json")
+            legacy_merges.append(f"{pair[0]} {pair[1]}")
+        model["merges"] = legacy_merges
+
+    fd, compat_path = tempfile.mkstemp(prefix="mot-qwen3-tokenizer-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        try:
+            os.unlink(compat_path)
+        except OSError:
+            pass
+        raise
+    return compat_path
+
+
+def _load_qwen3_tokenizer_with_legacy_tokenizers(model_id: str) -> PreTrainedTokenizerBase:
+    import os
+
+    # Import lazily so the project's light-weight transformer stubs remain usable.
+    from transformers.utils import cached_file
+
+    tokenizer_json = cached_file(model_id, "tokenizer.json")
+    if tokenizer_json is None:
+        raise FileNotFoundError(f"tokenizer.json was not found for {model_id}")
+
+    compat_path = _rewrite_qwen3_tokenizer_json_for_legacy_tokenizers(tokenizer_json)
+    try:
+        # from_pretrained still reads tokenizer_config.json from the Qwen3 repo,
+        # so chat_template, EOS/PAD tokens, model_max_length and fixed added-token
+        # ids are retained.  Only the backend tokenizer_file is replaced.
+        return PreTrainedTokenizerFast.from_pretrained(
+            model_id, tokenizer_file=compat_path, trust_remote_code=True
+        )
+    finally:
+        try:
+            os.unlink(compat_path)
+        except OSError:
+            pass
+
+
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
+    is_qwen3 = _looks_like_qwen3_model_id(model_id)
     if _looks_like_qwen2_model_id(model_id):
         _ensure_qwen2_compat_for_old_transformers()
+    elif is_qwen3:
+        _ensure_qwen3_compat_for_old_transformers()
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     except ValueError as error:
         if not _is_qwen2_tokenizer_error(error):
             raise
-        # transformers==4.35.x does not ship Qwen2Tokenizer, but Qwen2/Qwen2.5
-        # repos include tokenizer.json, which the generic fast tokenizer can load.
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, trust_remote_code=True)
+        # transformers==4.35.x does not ship Qwen2Tokenizer.
+        try:
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, trust_remote_code=True)
+        except Exception as fast_error:
+            if not is_qwen3 or not _is_legacy_tokenizers_model_error(fast_error):
+                raise
+            tokenizer = _load_qwen3_tokenizer_with_legacy_tokenizers(model_id)
+    except Exception as error:
+        # Some 4.35.x/tokenizers combinations reach the fast tokenizer directly
+        # and fail before AutoTokenizer can report the missing Qwen2Tokenizer.
+        if not is_qwen3 or not _is_legacy_tokenizers_model_error(error):
+            raise
+        tokenizer = _load_qwen3_tokenizer_with_legacy_tokenizers(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -348,6 +457,8 @@ def freeze_model(model: PreTrainedModel) -> None:
 def load_frozen_model(model_id: str, device: str, dtype: str) -> PreTrainedModel:
     if _looks_like_qwen2_model_id(model_id):
         _ensure_qwen2_compat_for_old_transformers()
+    elif _looks_like_qwen3_model_id(model_id):
+        _ensure_qwen3_compat_for_old_transformers()
     torch_dtype = get_torch_dtype(dtype)
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch_dtype, trust_remote_code=True)
     model.to(device)

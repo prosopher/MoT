@@ -166,8 +166,9 @@ class Qwen2Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        if self.head_dim * self.num_heads != self.hidden_size:
+        configured_head_dim = getattr(config, "head_dim", None)
+        self.head_dim = self.hidden_size // self.num_heads if configured_head_dim is None else int(configured_head_dim)
+        if configured_head_dim is None and self.head_dim * self.num_heads != self.hidden_size:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.num_heads % self.num_key_value_heads != 0:
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
@@ -207,9 +208,22 @@ class Qwen2Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        # Qwen3 reuses this compatibility attention and adds per-head q/k RMSNorm.
+        # Qwen2/Qwen2.5 do not define these modules, so their behavior is unchanged.
+        q_norm = getattr(self, "q_norm", None)
+        k_norm = getattr(self, "k_norm", None)
+        if q_norm is not None:
+            query_states = q_norm(query_states)
+        if k_norm is not None:
+            key_states = k_norm(key_states)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)

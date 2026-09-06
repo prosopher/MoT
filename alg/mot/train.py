@@ -590,7 +590,13 @@ def extract_layer_window_blocks(
 
 def normalize_model_family(model_id: str) -> Optional[str]:
     normalized = str(model_id).strip().lower()
-    if "qwen2" in normalized or "qwen2.5" in normalized or "qwen/qwen2" in normalized:
+    if (
+        "qwen2" in normalized
+        or "qwen2.5" in normalized
+        or "qwen/qwen2" in normalized
+        or "qwen3" in normalized
+        or "qwen/qwen3" in normalized
+    ):
         return "qwen2"
     if "facebook/opt" in normalized or "/opt-" in normalized or normalized.startswith("opt-"):
         return "opt"
@@ -609,7 +615,7 @@ def resolve_target_model_family(
         return model_family
 
     config_model_type = str(getattr(getattr(target_model, "config", None), "model_type", "")).lower()
-    if config_model_type in {"qwen2", "qwen2_5"}:
+    if config_model_type in {"qwen2", "qwen2_5", "qwen3"}:
         return "qwen2"
 
     if getattr(target_model, "transformer", None) is not None and hasattr(target_model.transformer, "h"):
@@ -630,7 +636,7 @@ def resolve_target_model_family(
         return "opt"
 
     raise ValueError(
-        "mot target-model replay supports GPT-2, OPT, and Qwen2/Qwen2.5 decoder stacks only "
+        "mot target-model replay supports GPT-2, OPT, Qwen2/Qwen2.5, and Qwen3 decoder stacks only "
         f"(target_model_id={target_model_id!r})."
     )
 
@@ -689,7 +695,7 @@ def require_qwen2_model(model: Model):
                 pending.append(wrapped)
 
     raise ValueError(
-        "mot currently supports Qwen2/Qwen2.5 style decoder stacks only "
+        "mot currently supports Qwen2/Qwen2.5/Qwen3 style decoder stacks only "
         "(expected a wrapped decoder with layers/embed_tokens to exist)."
     )
 
@@ -1149,9 +1155,22 @@ def run_qwen2_block(
     residual = hidden_states
     attn_input = block.input_layernorm(hidden_states)
 
-    query_states = attn.q_proj(attn_input).view(batch_size, seq_len, num_query_heads, head_dim).transpose(1, 2).contiguous()
-    native_like_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
-    native_like_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2).contiguous()
+    query_states = attn.q_proj(attn_input).view(batch_size, seq_len, num_query_heads, head_dim)
+    native_like_key = attn.k_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim)
+    native_like_value = attn.v_proj(attn_input).view(batch_size, seq_len, num_key_value_heads, head_dim)
+
+    # Qwen3 adds RMSNorm on each projected q/k head before RoPE.  Keeping the
+    # check structural lets the Qwen2/Qwen2.5 replay path remain unchanged.
+    q_norm = getattr(attn, "q_norm", None)
+    k_norm = getattr(attn, "k_norm", None)
+    if q_norm is not None:
+        query_states = q_norm(query_states)
+    if k_norm is not None:
+        native_like_key = k_norm(native_like_key)
+
+    query_states = query_states.transpose(1, 2).contiguous()
+    native_like_key = native_like_key.transpose(1, 2).contiguous()
+    native_like_value = native_like_value.transpose(1, 2).contiguous()
 
     if position_embeddings is not None:
         cos, sin = position_embeddings
@@ -1159,7 +1178,7 @@ def run_qwen2_block(
     else:
         rotary_emb = getattr(attn, "rotary_emb", None)
         if rotary_emb is None:
-            raise ValueError("Qwen2 replay requires rotary embeddings from model.model.rotary_emb or layer.self_attn.rotary_emb.")
+            raise ValueError("Qwen replay requires rotary embeddings from the decoder or layer self-attention.")
         try:
             cos, sin = rotary_emb(native_like_value, seq_len=seq_len)
         except TypeError:
@@ -1170,7 +1189,7 @@ def run_qwen2_block(
     attention_value = native_like_value if injected_value is None else injected_value
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
-            "Attention cache shape mismatch for Qwen2/Qwen2.5 layer replay: "
+            "Attention cache shape mismatch for Qwen2/Qwen2.5/Qwen3 layer replay: "
             f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
         )
 
