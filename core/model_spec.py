@@ -42,13 +42,21 @@ def infer_model_spec_from_config(config: Any, *, default_model_id: str = "unknow
     configured_num_key_value_heads = getattr(config, "num_key_value_heads", None)
     num_key_value_heads = num_heads if configured_num_key_value_heads is None else int(configured_num_key_value_heads)
     configured_head_dim = getattr(config, "head_dim", None)
-    head_dim = hidden_size // num_heads if configured_head_dim is None else int(configured_head_dim)
-
-    if hidden_size != num_heads * head_dim:
-        raise ValueError(
-            "hidden_size must equal num_heads * head_dim, "
-            f"got hidden_size={hidden_size}, num_heads={num_heads}, head_dim={head_dim}"
-        )
+    if configured_head_dim is None:
+        if hidden_size % num_heads != 0:
+            raise ValueError(
+                "hidden_size must be divisible by num_heads when head_dim is not explicitly configured, "
+                f"got hidden_size={hidden_size}, num_heads={num_heads}"
+            )
+        head_dim = hidden_size // num_heads
+    else:
+        # Some architectures (notably Qwen3) use an attention projection width
+        # num_heads * head_dim that is different from the residual hidden_size.
+        # When head_dim is explicit in the model config, it is the authoritative
+        # cache/head width and must not be reconstructed from hidden_size.
+        head_dim = int(configured_head_dim)
+        if head_dim < 1:
+            raise ValueError(f"head_dim must be >= 1, got {head_dim}")
     if num_key_value_heads < 1:
         raise ValueError(f"num_key_value_heads must be >= 1, got {num_key_value_heads}")
     if num_heads % num_key_value_heads != 0:

@@ -251,7 +251,13 @@ class Qwen2Attention(nn.Module):
                 f"attn_output should be {(bsz, self.num_heads, q_len, self.head_dim)}, got {attn_output.size()}"
             )
 
-        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+        # The concatenated attention heads live in the attention projection
+        # width, which may differ from the residual hidden size (Qwen3-4B is
+        # 32 * 128 = 4096 here while hidden_size is 2560).  For Qwen2/Qwen2.5
+        # these values are equal, so this keeps their behavior unchanged.
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(
+            bsz, q_len, self.num_heads * self.head_dim
+        )
         attn_output = self.o_proj(attn_output)
         if not output_attentions:
             attn_weights = None
