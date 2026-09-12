@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 from core.model import Model
@@ -122,7 +122,7 @@ class Agent:
         max_input_tokens: Optional[int] = None,
         truncation_side: str = "left",
     ) -> TokenIDs:
-        encoded = self.model.tokenizer(text, return_tensors="pt")
+        encoded = self.model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         token_ids = TokenIDs(encoded.input_ids, model_id=self.model.id)
         token_limit = self.max_prompt_tokens if max_input_tokens is None else max_input_tokens
         if token_limit is not None and token_ids.shape[1] > token_limit:
@@ -185,12 +185,43 @@ class Agent:
             return text, None
         return text[:earliest_idx], matched_stop
 
+    def _eos_token_ids(self) -> Set[int]:
+        """Return every EOS id advertised by the tokenizer/model.
+
+        Some recent model families, including Qwen3, use more than one valid
+        end-of-sequence token in ``generation_config``.  The hand-written
+        decoding loop cannot rely only on ``tokenizer.eos_token_id`` or it may
+        continue generating after another configured EOS token is produced.
+        """
+
+        eos_token_ids: Set[int] = set()
+
+        def add_ids(value) -> None:
+            if value is None:
+                return
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().reshape(-1).tolist()
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_ids(item)
+                return
+            try:
+                eos_token_ids.add(int(value))
+            except (TypeError, ValueError):
+                return
+
+        add_ids(getattr(self.model.tokenizer, "eos_token_id", None))
+        add_ids(getattr(getattr(self.model, "config", None), "eos_token_id", None))
+        add_ids(getattr(getattr(self.model, "generation_config", None), "eos_token_id", None))
+        return eos_token_ids
+
     @torch.inference_mode()
     def generate_response(self, prompt_text: str) -> AgentGeneration:
         tokens_before = self.cache_seq_len
         current_past, current_token_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
-        eos_token_id = self.model.tokenizer.eos_token_id
+        terminal_token_id: Optional[int] = None
+        eos_token_ids = self._eos_token_ids()
         # A generated token is not added to past_key_values at prediction time;
         # it is added only when it is fed back as input in the next decoding step.
         # Track only the generated token that is still visible but not yet cached.
@@ -212,7 +243,15 @@ class Agent:
             next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
             next_token_id = int(next_token.item())
 
-            if eos_token_id is not None and next_token_id == int(eos_token_id):
+            if next_token_id in eos_token_ids:
+                # Keep the model's turn terminator in the resident cache.  For chat
+                # models (Qwen/Gemma/Llama and others), EOS is commonly also the
+                # assistant end-of-turn token.  The next logical Agent appends a new
+                # user turn to this cache, so dropping the terminator would leave the
+                # cached conversation structurally incomplete.  It remains excluded
+                # from visible/generated_token_ids.
+                terminal_token_id = next_token_id
+                uncached_generated_token = next_token
                 break
 
             generated_token_ids.append(next_token_id)
@@ -224,10 +263,9 @@ class Agent:
                 break
 
         # The final predicted visible token has not entered the KV cache if the
-        # loop ended before another decoding step consumed it. Append only that
-        # still-uncached token. When decoding stops because EOS is predicted, the
-        # last visible token was already consumed in the EOS-prediction step, so
-        # this block is correctly skipped and the token ledger stays aligned.
+        # loop ended before another decoding step consumed it. This includes an
+        # EOS/end-of-turn token predicted by a chat model; it is cached but not
+        # exposed as visible completion text.
         if uncached_generated_token is not None:
             ensure_token_ids_model(self.model, uncached_generated_token)
             outputs = self.model(
@@ -243,6 +281,8 @@ class Agent:
 
         prompt_token_ids = self.encode_text(prompt_text).squeeze(0).detach().cpu().tolist()
         expected_cache_token_ids = list(self.cache_token_ids) + prompt_token_ids + list(generated_token_ids)
+        if terminal_token_id is not None:
+            expected_cache_token_ids.append(terminal_token_id)
 
         self.past_key_values = current_past
         actual_cache_tokens = self.cache_seq_len

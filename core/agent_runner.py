@@ -53,8 +53,6 @@ def normalize_agent_runner_alg(alg: str) -> str:
 def resolve_agent_count(
     agent_count: Optional[int],
     total_nodes: int,
-    *,
-    allow_unbounded_homogeneous_agents: bool = False,
 ) -> int:
     total_nodes = int(total_nodes)
     if total_nodes < 2:
@@ -64,11 +62,6 @@ def resolve_agent_count(
     resolved = int(agent_count)
     if resolved < 1:
         raise ValueError(f"agent_count must be at least 1, got {resolved}")
-    if not allow_unbounded_homogeneous_agents and resolved > total_nodes:
-        raise ValueError(
-            f"agent_count={resolved} exceeds checkpoint nodes={total_nodes}. "
-            "Use a homogeneous checkpoint model pool to run more logical agents than trained nodes."
-        )
     return resolved
 
 
@@ -175,7 +168,6 @@ class KVCacheTranslationAdapter:
         self.translator_pool = translator_pool
         self.alg = normalize_agent_runner_alg(alg)
         self.edge_map = build_edge_map(ctx.edges)
-        self._homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
         self._canonical_edge = next(iter(ctx.edges), None)
 
     def _get_edge(self, src_node_id: str, tgt_node_id: str) -> Edge:
@@ -183,11 +175,9 @@ class KVCacheTranslationAdapter:
         edge = self.edge_map.get(edge_id)
         if edge is not None:
             return edge
-        if self._homogeneous_model_pool and self._canonical_edge is not None:
-            # When every logical Agent is backed by the same model family/checkpoint, a single
-            # trained direction such as A_to_B can be reused as a universal logical edge.
-            # The canonical physical edge supplies the learned adapter weights and target
-            # model space; logical source/target ids are still used by AgentRunner records.
+        if self._canonical_edge is not None:
+            # AgentRunner only accepts homogeneous checkpoints, so a single trained direction
+            # such as A_to_B is the universal physical translator for every logical handoff.
             return self._canonical_edge
         raise ValueError(
             f"Missing translator edge {edge_id!r}. AgentRunner requires every KV offload edge used by the "
@@ -242,17 +232,13 @@ class KVCacheTranslationAdapter:
             model_id=source_agent.model.id,
             device=source_agent.device,
         )
-        context_text = source_agent.model.tokenizer.decode(
+        # AgentRunner is a homogeneous-model control experiment. All logical
+        # Agents share one physical model/tokenizer, so the target token ledger
+        # is exactly the source token ledger; no cross-tokenization is performed.
+        target_context_token_ids = self._build_token_ids(
             token_ids,
-            skip_special_tokens=False,
-        )
-        target_tokenized = target_agent.model.tokenizer(
-            context_text,
-            return_tensors="pt",
-        )
-        target_context_token_ids = TokenIDs(
-            target_tokenized.input_ids.to(target_agent.device),
             model_id=target_agent.model.id,
+            device=target_agent.device,
         )
         translated_past = self._build_algorithm_translated_past(
             edge=edge,
@@ -550,17 +536,22 @@ class AgentRunner:
         agent_count: Optional[int] = None,
     ) -> None:
         total_nodes = len(ctx.nodes)
-        homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
+        if not _is_homogeneous_model_pool(ctx.nodes):
+            raise ValueError(
+                "AgentRunner is a homogeneous-model control experiment and does not support "
+                "heterogeneous model pools. Use the same model_id for every checkpoint node."
+            )
+        physical_models = {id(ctx.tp.get_model(node.id)) for node in ctx.nodes}
+        if len(physical_models) != 1:
+            raise RuntimeError(
+                "AgentRunner requires all logical checkpoint nodes to share one physical Model instance."
+            )
         resolved_alg = normalize_agent_runner_alg(alg)
         if cache_mode not in SUPPORTED_CACHE_MODES:
             raise ValueError(f"Unsupported cache_mode={cache_mode!r}; expected one of {SUPPORTED_CACHE_MODES}")
         if resolved_alg in RETAIN_ONLY_ALGS and cache_mode != CACHE_MODE_RETAIN:
             raise ValueError(f"alg={resolved_alg!r} supports only cache_mode='retain'.")
-        resolved_agent_count = resolve_agent_count(
-            agent_count,
-            total_nodes,
-            allow_unbounded_homogeneous_agents=homogeneous_model_pool,
-        )
+        resolved_agent_count = resolve_agent_count(agent_count, total_nodes)
 
         self.ctx = ctx
         self.translator_pool = translator_pool
@@ -576,12 +567,7 @@ class AgentRunner:
         self.device = ctx.config.device
         self.profiler = InferenceProfiler(self.device)
         self.cache_translator = KVCacheTranslationAdapter(ctx=ctx, translator_pool=translator_pool, alg=alg)
-        self._homogeneous_model_pool = homogeneous_model_pool
-        self._canonical_model_node_id = (
-            self.cache_translator._canonical_edge.tgt_id
-            if self._homogeneous_model_pool and self.cache_translator._canonical_edge is not None
-            else ctx.nodes[0].id
-        )
+        self._canonical_model_node_id = ctx.nodes[0].id
 
         if self.agent_count <= total_nodes:
             self.active_nodes = list(ctx.nodes[: self.agent_count])
@@ -593,9 +579,6 @@ class AgentRunner:
             ]
         self.node_ids = [node.id for node in self.active_nodes]
         stop_sequences = tuple(f"\nAgent {node.id}:" for node in self.active_nodes) + (
-            "<|im_end|>",
-            "\n<|im_start|>",
-            "<|endoftext|>",
             "\n### Instruction:",
             "\n### Passage:",
             "\n### Question:",
@@ -606,9 +589,7 @@ class AgentRunner:
         self.logical_to_physical_node_id: Dict[str, str] = {}
         for index, node in enumerate(self.active_nodes):
             agent_cls = HubAgent if index == 0 else Agent
-            physical_node_id = node.id if node.id in {ctx_node.id for ctx_node in ctx.nodes} else self._canonical_model_node_id
-            if self._homogeneous_model_pool:
-                physical_node_id = self._canonical_model_node_id
+            physical_node_id = self._canonical_model_node_id
             self.logical_to_physical_node_id[node.id] = physical_node_id
             self.agent_sequence.append(
                 agent_cls(
@@ -649,12 +630,12 @@ class AgentRunner:
             raise FileNotFoundError(f"Train config not found: {train_config_path}")
         train_payload = read_json(train_config_path)
         all_nodes, all_edges = build_nodes_and_edges(train_payload["model_ids"], train_payload["model_directions"])
-        allow_unbounded = _is_homogeneous_model_pool(all_nodes)
-        resolve_agent_count(
-            config.agent_count,
-            len(all_nodes),
-            allow_unbounded_homogeneous_agents=allow_unbounded,
-        )
+        if not _is_homogeneous_model_pool(all_nodes):
+            raise ValueError(
+                "AgentRunner is a homogeneous-model control experiment and does not support "
+                "heterogeneous checkpoints. All model_ids in the training config must be identical."
+            )
+        resolve_agent_count(config.agent_count, len(all_nodes))
 
         train_mod = importlib.import_module(TRAIN_MODULE_BY_ALG[resolved_alg])
         loaded = train_mod.load_translator_pool_from_checkpoint(
@@ -698,20 +679,24 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _is_qwen_agent(agent: Agent) -> bool:
-        model_type = str(getattr(agent.model.config, "model_type", ""))
-        haystack = " ".join([agent.model.id, model_type]).lower()
-        return "qwen" in haystack
+    def _explicit_chat_template(agent: Agent):
+        """Return a tokenizer-provided chat template, never a library default."""
+        template = getattr(agent.model.tokenizer, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default") or next(iter(template.values()), None)
+        if isinstance(template, str) and template.strip():
+            return template
+        return None
 
     @staticmethod
-    def _qwen_system_prompt() -> str:
+    def _system_prompt() -> str:
         return (
             "You are a helpful QA assistant. "
             "Answer the given question accurately, using only the provided passage and prior agent response when available."
         )
 
     @staticmethod
-    def _build_qwen_initial_user_content(context: str, question: str) -> str:
+    def _build_initial_user_content(context: str, question: str) -> str:
         return (
             "### Instruction:\n"
             "Use the passage to answer the Question accurately.\n"
@@ -722,7 +707,7 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_qwen_followup_user_content(question: str) -> str:
+    def _build_followup_user_content(question: str) -> str:
         return (
             "### Instruction:\n"
             "Using the passage and previous Agent's response, improve the answer to the Question.\n"
@@ -731,34 +716,73 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _render_qwen_chat_prompt(agent: Agent, user_content: str) -> str:
-        system_content = AgentRunner._qwen_system_prompt()
-        messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content.strip()},
-        ]
-        try:
-            rendered = agent.model.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            if rendered:
-                return str(rendered)
-        except Exception:
-            pass
-        return (
-            "<|im_start|>system\n"
-            f"{system_content}<|im_end|>\n"
-            "<|im_start|>user\n"
-            f"{user_content.strip()}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
+    def _strip_leading_bos_for_continuation(tokenizer, rendered: str) -> str:
+        bos_token = getattr(tokenizer, "bos_token", None)
+        if isinstance(bos_token, str) and bos_token and rendered.startswith(bos_token):
+            return rendered[len(bos_token) :]
+        return rendered
 
-    def _format_agent_prompt(self, agent: Agent, user_content: str, fallback_prompt: str) -> str:
-        if self._is_qwen_agent(agent):
-            return self._render_qwen_chat_prompt(agent, user_content)
-        return fallback_prompt
+    @staticmethod
+    def _render_chat_prompt(
+        agent: Agent,
+        user_content: str,
+        *,
+        continuation: bool,
+    ) -> Optional[str]:
+        tokenizer = agent.model.tokenizer
+        chat_template = AgentRunner._explicit_chat_template(agent)
+        if chat_template is None:
+            return None
+
+        if continuation:
+            # The existing KV cache already contains the prior conversation and
+            # its generated EOS/end-of-turn token. Append only a new user turn.
+            message_sets = [[{"role": "user", "content": user_content.strip()}]]
+        else:
+            # Some checkpoints (for example Gemma-family templates) do not accept
+            # a system role. Try the canonical system+user form first, then fold
+            # the system instruction into the user message without model-specific
+            # branching.
+            message_sets = [
+                [
+                    {"role": "system", "content": AgentRunner._system_prompt()},
+                    {"role": "user", "content": user_content.strip()},
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": f"{AgentRunner._system_prompt()}\n\n{user_content.strip()}",
+                    }
+                ],
+            ]
+
+        for messages in message_sets:
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    chat_template=chat_template,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if rendered:
+                    rendered = str(rendered)
+                    if continuation:
+                        rendered = AgentRunner._strip_leading_bos_for_continuation(tokenizer, rendered)
+                    return rendered
+            except Exception as error:
+                logging.debug("Chat-template rendering failed; trying fallback/plain prompt: %s", error)
+        return None
+
+    def _format_agent_prompt(
+        self,
+        agent: Agent,
+        user_content: str,
+        fallback_prompt: str,
+        *,
+        continuation: bool,
+    ) -> str:
+        rendered = self._render_chat_prompt(agent, user_content, continuation=continuation)
+        return rendered if rendered else fallback_prompt
 
     @staticmethod
     def build_initial_prompt(
@@ -783,11 +807,12 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del hub_agent_id, agent_count, is_final_turn
-        user_content = self._build_qwen_initial_user_content(context, question)
+        user_content = self._build_initial_user_content(context, question)
         return self._format_agent_prompt(
             agent,
             user_content,
             self._build_plain_initial_prompt(context, question),
+            continuation=False,
         )
 
     def build_followup_prompt(
@@ -799,13 +824,14 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del turn_index, is_final_turn
-        user_content = self._build_qwen_followup_user_content(question)
+        user_content = self._build_followup_user_content(question)
         agent = self.agents.get(agent_id)
         if agent is not None:
             return self._format_agent_prompt(
                 agent,
                 user_content,
                 self._build_plain_followup_prompt(question),
+                continuation=True,
             )
         return self._build_plain_followup_prompt(question)
 

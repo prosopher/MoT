@@ -1,7 +1,7 @@
 {
   "timestamp": null,
   "output_path": null,
-  "model_ids": "gpt2,gpt2",
+  "model_ids": "Qwen/Qwen3-4B-Instruct-2507, Qwen/Qwen3-4B-Instruct-2507",
   "model_directions": "A_to_B",
   "max_steps": 500,
   "batch_size": 4,
