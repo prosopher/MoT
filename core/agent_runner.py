@@ -53,8 +53,6 @@ def normalize_agent_runner_alg(alg: str) -> str:
 def resolve_agent_count(
     agent_count: Optional[int],
     total_nodes: int,
-    *,
-    allow_unbounded_homogeneous_agents: bool = False,
 ) -> int:
     total_nodes = int(total_nodes)
     if total_nodes < 2:
@@ -64,11 +62,6 @@ def resolve_agent_count(
     resolved = int(agent_count)
     if resolved < 1:
         raise ValueError(f"agent_count must be at least 1, got {resolved}")
-    if not allow_unbounded_homogeneous_agents and resolved > total_nodes:
-        raise ValueError(
-            f"agent_count={resolved} exceeds checkpoint nodes={total_nodes}. "
-            "Use a homogeneous checkpoint model pool to run more logical agents than trained nodes."
-        )
     return resolved
 
 
@@ -175,7 +168,6 @@ class KVCacheTranslationAdapter:
         self.translator_pool = translator_pool
         self.alg = normalize_agent_runner_alg(alg)
         self.edge_map = build_edge_map(ctx.edges)
-        self._homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
         self._canonical_edge = next(iter(ctx.edges), None)
 
     def _get_edge(self, src_node_id: str, tgt_node_id: str) -> Edge:
@@ -183,11 +175,9 @@ class KVCacheTranslationAdapter:
         edge = self.edge_map.get(edge_id)
         if edge is not None:
             return edge
-        if self._homogeneous_model_pool and self._canonical_edge is not None:
-            # When every logical Agent is backed by the same model family/checkpoint, a single
-            # trained direction such as A_to_B can be reused as a universal logical edge.
-            # The canonical physical edge supplies the learned adapter weights and target
-            # model space; logical source/target ids are still used by AgentRunner records.
+        if self._canonical_edge is not None:
+            # AgentRunner only accepts homogeneous checkpoints, so a single trained direction
+            # such as A_to_B is the universal physical translator for every logical handoff.
             return self._canonical_edge
         raise ValueError(
             f"Missing translator edge {edge_id!r}. AgentRunner requires every KV offload edge used by the "
@@ -546,8 +536,7 @@ class AgentRunner:
         agent_count: Optional[int] = None,
     ) -> None:
         total_nodes = len(ctx.nodes)
-        homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
-        if not homogeneous_model_pool:
+        if not _is_homogeneous_model_pool(ctx.nodes):
             raise ValueError(
                 "AgentRunner is a homogeneous-model control experiment and does not support "
                 "heterogeneous model pools. Use the same model_id for every checkpoint node."
@@ -562,11 +551,7 @@ class AgentRunner:
             raise ValueError(f"Unsupported cache_mode={cache_mode!r}; expected one of {SUPPORTED_CACHE_MODES}")
         if resolved_alg in RETAIN_ONLY_ALGS and cache_mode != CACHE_MODE_RETAIN:
             raise ValueError(f"alg={resolved_alg!r} supports only cache_mode='retain'.")
-        resolved_agent_count = resolve_agent_count(
-            agent_count,
-            total_nodes,
-            allow_unbounded_homogeneous_agents=homogeneous_model_pool,
-        )
+        resolved_agent_count = resolve_agent_count(agent_count, total_nodes)
 
         self.ctx = ctx
         self.translator_pool = translator_pool
@@ -582,12 +567,7 @@ class AgentRunner:
         self.device = ctx.config.device
         self.profiler = InferenceProfiler(self.device)
         self.cache_translator = KVCacheTranslationAdapter(ctx=ctx, translator_pool=translator_pool, alg=alg)
-        self._homogeneous_model_pool = homogeneous_model_pool
-        self._canonical_model_node_id = (
-            self.cache_translator._canonical_edge.tgt_id
-            if self._homogeneous_model_pool and self.cache_translator._canonical_edge is not None
-            else ctx.nodes[0].id
-        )
+        self._canonical_model_node_id = ctx.nodes[0].id
 
         if self.agent_count <= total_nodes:
             self.active_nodes = list(ctx.nodes[: self.agent_count])
@@ -609,9 +589,7 @@ class AgentRunner:
         self.logical_to_physical_node_id: Dict[str, str] = {}
         for index, node in enumerate(self.active_nodes):
             agent_cls = HubAgent if index == 0 else Agent
-            physical_node_id = node.id if node.id in {ctx_node.id for ctx_node in ctx.nodes} else self._canonical_model_node_id
-            if self._homogeneous_model_pool:
-                physical_node_id = self._canonical_model_node_id
+            physical_node_id = self._canonical_model_node_id
             self.logical_to_physical_node_id[node.id] = physical_node_id
             self.agent_sequence.append(
                 agent_cls(
@@ -657,11 +635,7 @@ class AgentRunner:
                 "AgentRunner is a homogeneous-model control experiment and does not support "
                 "heterogeneous checkpoints. All model_ids in the training config must be identical."
             )
-        resolve_agent_count(
-            config.agent_count,
-            len(all_nodes),
-            allow_unbounded_homogeneous_agents=True,
-        )
+        resolve_agent_count(config.agent_count, len(all_nodes))
 
         train_mod = importlib.import_module(TRAIN_MODULE_BY_ALG[resolved_alg])
         loaded = train_mod.load_translator_pool_from_checkpoint(
