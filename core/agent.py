@@ -122,7 +122,7 @@ class Agent:
         max_input_tokens: Optional[int] = None,
         truncation_side: str = "left",
     ) -> TokenIDs:
-        encoded = self.model.tokenizer(text, return_tensors="pt")
+        encoded = self.model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         token_ids = TokenIDs(encoded.input_ids, model_id=self.model.id)
         token_limit = self.max_prompt_tokens if max_input_tokens is None else max_input_tokens
         if token_limit is not None and token_ids.shape[1] > token_limit:
