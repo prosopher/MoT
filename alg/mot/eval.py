@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from core.context import Context
 from core.eval_util import *
 from core.train_util import blocks_to_partial_past_key_values
-from alg.mot.train import build_replayed_target_past
+from alg.mot.train import build_replayed_target_past_from_target_context
 
 
 
@@ -47,10 +47,8 @@ def _build_logit_edge_artifacts(
     past_by_node_id,
     translator_pool,
 ) -> LogitEvalEdgeArtifacts:
-    mixed_target_past, _ = build_replayed_target_past(
+    mixed_target_past, _ = build_replayed_target_past_from_target_context(
         ctx,
-        source_past_key_values=past_by_node_id[edge.src_id],
-        source_context_token_ids=source_context_token_ids,
         target_context_token_ids=target_context_token_ids,
         source_model=ctx.tp.get_model(edge.src_id),
         target_model=ctx.tp.get_model(edge.tgt_id),
@@ -145,10 +143,8 @@ def evaluate_generation_dataset(
                     for node_id in {edge.src_id, edge.tgt_id}
                 }
 
-                mixed_target_past, _ = build_replayed_target_past(
+                mixed_target_past, _ = build_replayed_target_past_from_target_context(
                     ctx,
-                    source_past_key_values=past_by_node_id[edge.src_id],
-                    source_context_token_ids=source_context_token_ids,
                     target_context_token_ids=target_context_token_ids,
                     source_model=ctx.tp.get_model(edge.src_id),
                     target_model=ctx.tp.get_model(edge.tgt_id),
@@ -268,10 +264,8 @@ def run_eval(
         target_context_token_ids: TokenIDs,
         past_by_node_id,
     ) -> PastKeyValues:
-        mixed_target_past, _ = build_replayed_target_past(
+        mixed_target_past, _ = build_replayed_target_past_from_target_context(
             ctx,
-            source_past_key_values=past_by_node_id[edge.src_id],
-            source_context_token_ids=source_context_token_ids,
             target_context_token_ids=target_context_token_ids,
             source_model=ctx.tp.get_model(edge.src_id),
             target_model=ctx.tp.get_model(edge.tgt_id),
@@ -289,10 +283,8 @@ def run_eval(
         past_by_node_id,
         **_,
     ) -> Dict[str, PastKeyValues]:
-        _, translated_window_past = build_replayed_target_past(
+        _, translated_window_past = build_replayed_target_past_from_target_context(
             ctx,
-            source_past_key_values=past_by_node_id[edge.src_id],
-            source_context_token_ids=source_context_token_ids,
             target_context_token_ids=target_context_token_ids,
             source_model=ctx.tp.get_model(edge.src_id),
             target_model=ctx.tp.get_model(edge.tgt_id),

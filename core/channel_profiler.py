@@ -532,20 +532,20 @@ class ChannelProfiler:
                 DataLoader(dataset, batch_size=1, num_workers=0, collate_fn=collate_token_ids)
             )
 
-        source_loader = build_loader(source_model)
         target_loader = build_loader(target_model)
 
         bank: List[Dict[str, Any]] = []
         for _ in range(num_examples):
-            source_token_ids = next(source_loader).to(self.config.device)
             target_token_ids = next(target_loader).to(self.config.device)
-            source_context_token_ids = split_context_and_prompt_token_ids(
-                token_ids=source_token_ids,
-                context_tokens=self.config.prefix_tokens,
-            )[0]
             target_context_token_ids, prompt_token_ids, label_token_ids = split_context_and_prompt_token_ids(
                 token_ids=target_token_ids,
                 context_tokens=self.config.prefix_tokens,
+            )
+            from alg.mot.train import _retokenize_target_context_row_for_source
+            source_context_token_ids = _retokenize_target_context_row_for_source(
+                source_model=source_model,
+                target_model=target_model,
+                target_context_token_ids=target_context_token_ids,
             )
             with torch.no_grad():
                 native_target_past_key_values = extract_past_key_values(
@@ -554,6 +554,7 @@ class ChannelProfiler:
                 )
                 bank.append(
                     {
+                        "source_context_token_ids": source_context_token_ids,
                         "target_context_token_ids": target_context_token_ids,
                         "prompt_token_ids": prompt_token_ids,
                         "label_token_ids": label_token_ids,
@@ -684,15 +685,31 @@ class ChannelProfiler:
         sample: Dict[str, Any],
     ) -> torch.Tensor:
         from .common import compute_prefix_correction_and_suffix_lm_loss, past_key_values_to_blocks
-        from alg.mot.train import replay_target_prefill_with_injected_window
+        from alg.mot.train import (
+            align_cache_blocks_to_target_tokens,
+            build_cross_token_alignment,
+            replay_target_prefill_with_injected_window,
+        )
 
         src_layer_indices = self._get_src_layer_indices(channels)
         target_layer_indices = self._get_tgt_layer_indices(channels)
         selected_past = tuple(sample["source_past_key_values"][layer_idx] for layer_idx in src_layer_indices)
         key_block, value_block = past_key_values_to_blocks(selected_past)
-        translated_key, translated_value = proxy(key_block, value_block)
         tgt_spec = self.tp.get_model_spec(edge.tgt_id)
+        source_model = self.tp.get_model(edge.src_id)
         target_model = self.tp.get_model(edge.tgt_id)
+        alignment_weights, _, _ = build_cross_token_alignment(
+            source_model=source_model,
+            target_model=target_model,
+            source_context_token_ids=sample["source_context_token_ids"],
+            target_context_token_ids=sample["target_context_token_ids"],
+        )
+        key_block, value_block = align_cache_blocks_to_target_tokens(
+            key_block,
+            value_block,
+            alignment_weights=alignment_weights,
+        )
+        translated_key, translated_value = proxy(key_block, value_block)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             context_token_ids=sample["target_context_token_ids"],
@@ -719,15 +736,31 @@ class ChannelProfiler:
         sample: Dict[str, Any],
     ) -> torch.Tensor:
         from .common import compute_prefix_correction_and_suffix_lm_loss, past_key_values_to_blocks
-        from alg.mot.train import replay_target_prefill_with_injected_window
+        from alg.mot.train import (
+            align_cache_blocks_to_target_tokens,
+            build_cross_token_alignment,
+            replay_target_prefill_with_injected_window,
+        )
 
         src_layer_indices = self._get_src_layer_indices(channels)
         target_layer_indices = self._get_tgt_layer_indices(channels)
         selected_past = tuple(sample["source_past_key_values"][layer_idx] for layer_idx in src_layer_indices)
         key_block, value_block = past_key_values_to_blocks(selected_past)
-        translated_key, translated_value = proxy(key_block, value_block)
         tgt_spec = self.tp.get_model_spec(edge.tgt_id)
+        source_model = self.tp.get_model(edge.src_id)
         target_model = self.tp.get_model(edge.tgt_id)
+        alignment_weights, _, _ = build_cross_token_alignment(
+            source_model=source_model,
+            target_model=target_model,
+            source_context_token_ids=sample["source_context_token_ids"],
+            target_context_token_ids=sample["target_context_token_ids"],
+        )
+        key_block, value_block = align_cache_blocks_to_target_tokens(
+            key_block,
+            value_block,
+            alignment_weights=alignment_weights,
+        )
+        translated_key, translated_value = proxy(key_block, value_block)
         mixed_target_past = replay_target_prefill_with_injected_window(
             target_model=target_model,
             context_token_ids=sample["target_context_token_ids"],
