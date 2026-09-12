@@ -211,6 +211,44 @@ class KVCacheTranslationAdapter:
             model_id=model_id,
         )
 
+    def _build_target_context_token_ids(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        token_ids: Sequence[int],
+    ) -> TokenIDs:
+        if source_agent.model.id == target_agent.model.id:
+            return self._build_token_ids(
+                token_ids,
+                model_id=target_agent.model.id,
+                device=target_agent.device,
+            )
+
+        context_text = source_agent.model.tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=False,
+        )
+        target_tokenized = target_agent.model.tokenizer(
+            context_text,
+            return_tensors="pt",
+        )
+        target_context_token_ids = TokenIDs(
+            target_tokenized.input_ids.to(target_agent.device),
+            model_id=target_agent.model.id,
+        )
+        target_tokens = int(target_context_token_ids.shape[1])
+        source_tokens = len(token_ids)
+        if target_tokens != source_tokens:
+            raise ValueError(
+                f"Retokenized target context length mismatch for "
+                f"{source_agent.node_id}->{target_agent.node_id}: "
+                f"source_tokens={source_tokens} target_tokens={target_tokens}. "
+                "Free-mode KV delta slicing requires source and target token ledgers "
+                "to have the same length."
+            )
+        return target_context_token_ids
+
     @torch.inference_mode()
     def build_pretranslated_past_for_edge(
         self,
@@ -242,17 +280,10 @@ class KVCacheTranslationAdapter:
             model_id=source_agent.model.id,
             device=source_agent.device,
         )
-        context_text = source_agent.model.tokenizer.decode(
-            token_ids,
-            skip_special_tokens=False,
-        )
-        target_tokenized = target_agent.model.tokenizer(
-            context_text,
-            return_tensors="pt",
-        )
-        target_context_token_ids = TokenIDs(
-            target_tokenized.input_ids.to(target_agent.device),
-            model_id=target_agent.model.id,
+        target_context_token_ids = self._build_target_context_token_ids(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            token_ids=token_ids,
         )
         translated_past = self._build_algorithm_translated_past(
             edge=edge,
@@ -704,6 +735,29 @@ class AgentRunner:
         return "qwen" in haystack
 
     @staticmethod
+    def _is_qwen3_agent(agent: Agent) -> bool:
+        model_type = str(getattr(agent.model.config, "model_type", ""))
+        haystack = " ".join([agent.model.id, model_type]).lower()
+        return "qwen3" in haystack
+
+    @staticmethod
+    def _explicit_chat_template(agent: Agent):
+        """Return a tokenizer-provided chat template, never a library default.
+
+        transformers 4.35 falls back to a generic ChatML template when a
+        tokenizer has no ``chat_template``.  That behavior is unsafe for base /
+        non-Instruct checkpoints, so AgentRunner only opts into chat formatting
+        when the checkpoint itself explicitly provides a template.
+        """
+
+        template = getattr(agent.model.tokenizer, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default") or next(iter(template.values()), None)
+        if isinstance(template, str) and template.strip():
+            return template
+        return None
+
+    @staticmethod
     def _qwen_system_prompt() -> str:
         return (
             "You are a helpful QA assistant. "
@@ -731,33 +785,80 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _render_qwen_chat_prompt(agent: Agent, user_content: str) -> str:
+    def _render_qwen_chat_prompt(agent: Agent, user_content: str) -> Optional[str]:
+        tokenizer = agent.model.tokenizer
+        chat_template = AgentRunner._explicit_chat_template(agent)
+        if chat_template is None:
+            return None
+
         system_content = AgentRunner._qwen_system_prompt()
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_content.strip()},
         ]
+
+        if AgentRunner._is_qwen3_agent(agent):
+            # Qwen3 enables thinking by default, while Agent.generate_response
+            # intentionally uses deterministic greedy decoding. Qwen recommends
+            # non-thinking mode for this style of efficient generation.  The
+            # project pins transformers==4.35.2, whose apply_chat_template()
+            # does not forward arbitrary template variables, so render the
+            # checkpoint's own Jinja template directly when possible.
+            compile_template = getattr(tokenizer, "_compile_jinja_template", None)
+            if callable(compile_template):
+                try:
+                    compiled = compile_template(chat_template)
+                    template_values = dict(getattr(tokenizer, "special_tokens_map", {}) or {})
+                    rendered = compiled.render(
+                        messages=messages,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                        **template_values,
+                    )
+                    if rendered:
+                        return str(rendered)
+                except Exception as error:
+                    logging.debug("Qwen3 direct chat-template rendering failed: %s", error)
+
         try:
-            rendered = agent.model.tokenizer.apply_chat_template(
+            template_kwargs = {"enable_thinking": False} if AgentRunner._is_qwen3_agent(agent) else {}
+            rendered = tokenizer.apply_chat_template(
                 messages,
+                chat_template=chat_template,
                 tokenize=False,
                 add_generation_prompt=True,
+                **template_kwargs,
             )
             if rendered:
                 return str(rendered)
-        except Exception:
-            pass
-        return (
-            "<|im_start|>system\n"
-            f"{system_content}<|im_end|>\n"
-            "<|im_start|>user\n"
-            f"{user_content.strip()}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
+        except TypeError as error:
+            # Older/custom tokenizer wrappers may expose apply_chat_template()
+            # without accepting arbitrary template kwargs.  In that case keep
+            # using the checkpoint-provided template rather than falling all
+            # the way back to a plain prompt.
+            if AgentRunner._is_qwen3_agent(agent):
+                try:
+                    rendered = tokenizer.apply_chat_template(
+                        messages,
+                        chat_template=chat_template,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    if rendered:
+                        return str(rendered)
+                except Exception as retry_error:
+                    logging.debug("Qwen3 chat-template retry failed: %s", retry_error)
+            else:
+                logging.debug("Qwen chat-template rendering failed; using plain prompt: %s", error)
+        except Exception as error:
+            logging.debug("Qwen chat-template rendering failed; using plain prompt: %s", error)
+        return None
 
     def _format_agent_prompt(self, agent: Agent, user_content: str, fallback_prompt: str) -> str:
         if self._is_qwen_agent(agent):
-            return self._render_qwen_chat_prompt(agent, user_content)
+            rendered = self._render_qwen_chat_prompt(agent, user_content)
+            if rendered:
+                return rendered
         return fallback_prompt
 
     @staticmethod

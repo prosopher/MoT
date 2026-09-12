@@ -953,6 +953,33 @@ def expand_sparse_attention_indices(sparse_attention_indices: torch.Tensor, num_
     )
 
 
+def prepare_sparse_attention_indices(
+    sparse_attention_indices: torch.Tensor,
+    *,
+    num_heads: int,
+    seq_len: int,
+) -> torch.Tensor:
+    sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+    query_len = int(sparse_attention_indices.size(2))
+    seq_len = int(seq_len)
+    if query_len == seq_len:
+        return sparse_attention_indices
+    if seq_len < 0:
+        raise ValueError(f"seq_len must be non-negative, got {seq_len}")
+    if query_len > seq_len:
+        return sparse_attention_indices[:, :, :seq_len, :].contiguous()
+
+    batch_size, expanded_heads, _, top_k = sparse_attention_indices.shape
+    if top_k < 1:
+        raise ValueError("sparse_attention_indices must have at least one selected key per query.")
+    missing_len = seq_len - query_len
+    query_positions = torch.arange(query_len, seq_len, device=sparse_attention_indices.device).view(1, 1, missing_len, 1)
+    offsets = torch.arange(top_k, device=sparse_attention_indices.device).view(1, 1, 1, top_k)
+    fallback = (query_positions - (top_k - 1 - offsets)).clamp_min(0)
+    fallback = fallback.expand(batch_size, expanded_heads, -1, -1).to(dtype=sparse_attention_indices.dtype)
+    return torch.cat([sparse_attention_indices, fallback], dim=2).contiguous()
+
+
 def gather_sparse_sequence_vectors(sequence: torch.Tensor, sparse_attention_indices: torch.Tensor) -> torch.Tensor:
     batch_size, num_heads, seq_len, head_dim = sequence.shape
     sparse_attention_indices = sparse_attention_indices.to(device=sequence.device, dtype=torch.long).clamp(0, seq_len - 1)
@@ -1056,7 +1083,11 @@ def run_gpt2_block(
         )
 
     if sparse_attention_indices is not None:
-        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        sparse_attention_indices = prepare_sparse_attention_indices(
+            sparse_attention_indices,
+            num_heads=num_heads,
+            seq_len=seq_len,
+        )
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
@@ -1134,7 +1165,11 @@ def run_opt_block(
         )
 
     if sparse_attention_indices is not None:
-        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        sparse_attention_indices = prepare_sparse_attention_indices(
+            sparse_attention_indices,
+            num_heads=num_heads,
+            seq_len=seq_len,
+        )
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1)
@@ -1244,7 +1279,11 @@ def run_qwen2_block(
     scaling = float(getattr(attn, "scaling", head_dim ** -0.5))
 
     if sparse_attention_indices is not None:
-        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        sparse_attention_indices = prepare_sparse_attention_indices(
+            sparse_attention_indices,
+            num_heads=num_query_heads,
+            seq_len=seq_len,
+        )
         selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
@@ -1375,7 +1414,11 @@ def run_gemma3_block(
     sliding_window = getattr(attn, "sliding_window", None)
 
     if sparse_attention_indices is not None:
-        sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        sparse_attention_indices = prepare_sparse_attention_indices(
+            sparse_attention_indices,
+            num_heads=num_query_heads,
+            seq_len=seq_len,
+        )
         selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
