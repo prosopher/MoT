@@ -7,6 +7,11 @@ from core.agent_runner import AgentRunner
 from core.context import Context
 
 
+def _render_qwen_chat_prompt(agent, user_content: str):
+    """Test-only alias used to exercise the generic chat renderer with Qwen fixtures."""
+    return AgentRunner._render_chat_prompt(agent, user_content, continuation=False)
+
+
 def _ctx(model_ids: str) -> Context:
     return Context(
         SimpleNamespace(
@@ -118,7 +123,7 @@ def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides(
         )
     )
 
-    rendered = AgentRunner._render_qwen_chat_prompt(fake_agent, "question")
+    rendered = _render_qwen_chat_prompt(fake_agent, "question")
 
     assert rendered == "rendered-chat"
     assert tokenizer.kwargs == {
@@ -126,3 +131,92 @@ def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides(
         "tokenize": False,
         "add_generation_prompt": True,
     }
+
+
+def test_chat_template_is_used_for_non_qwen_and_falls_back_when_system_role_is_unsupported() -> None:
+    class GemmaLikeTokenizer:
+        chat_template = "gemma-template"
+        bos_token = "<bos>"
+
+        def __init__(self):
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            if messages[0]["role"] == "system":
+                raise ValueError("system role unsupported")
+            return "<bos><start_of_turn>user\nhello<end_of_turn>\n<start_of_turn>model\n"
+
+    tokenizer = GemmaLikeTokenizer()
+    agent = SimpleNamespace(model=SimpleNamespace(id="google/gemma-3-1b-it", tokenizer=tokenizer))
+
+    rendered = AgentRunner._render_chat_prompt(agent, "hello", continuation=False)
+
+    assert rendered.startswith("<bos>")
+    assert len(tokenizer.calls) == 2
+    assert tokenizer.calls[0][0][0]["role"] == "system"
+    assert tokenizer.calls[1][0][0]["role"] == "user"
+
+
+def test_chat_continuation_uses_user_only_fragment_and_strips_leading_bos() -> None:
+    class LlamaLikeTokenizer:
+        chat_template = "llama-template"
+        bos_token = "<|begin_of_text|>"
+
+        def __init__(self):
+            self.messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            return "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\nquestion"
+
+    tokenizer = LlamaLikeTokenizer()
+    agent = SimpleNamespace(model=SimpleNamespace(id="meta-llama/Llama-3.2-1B-Instruct", tokenizer=tokenizer))
+
+    rendered = AgentRunner._render_chat_prompt(agent, "question", continuation=True)
+
+    assert tokenizer.messages == [{"role": "user", "content": "question"}]
+    assert not rendered.startswith(tokenizer.bos_token)
+    assert rendered.startswith("<|start_header_id|>user")
+
+
+def test_agent_caches_generated_eos_as_turn_terminator() -> None:
+    import torch
+
+    class OneTokenTokenizer:
+        eos_token_id = 9
+        bos_token = None
+
+        def __call__(self, text, return_tensors=None, add_special_tokens=False):
+            assert add_special_tokens is False
+            ids = torch.tensor([[5]], dtype=torch.long)
+            return SimpleNamespace(input_ids=ids) if return_tensors == "pt" else SimpleNamespace(input_ids=[5])
+
+        def decode(self, token_ids, skip_special_tokens=True):
+            return ""
+
+    class EosModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.id = "fake-chat"
+            self.tokenizer = OneTokenTokenizer()
+            self.config = SimpleNamespace(eos_token_id=9)
+            self.generation_config = SimpleNamespace(eos_token_id=9)
+            self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+
+        def forward(self, input_ids, past_key_values=None, use_cache=True):
+            del use_cache
+            old_len = 0 if past_key_values is None else int(past_key_values[0][0].shape[2])
+            new_len = old_len + int(input_ids.shape[1])
+            key = torch.zeros(1, 1, new_len, 1)
+            value = torch.zeros_like(key)
+            logits = torch.zeros(1, input_ids.shape[1], 16)
+            logits[..., 9] = 1.0
+            return SimpleNamespace(past_key_values=((key, value),), logits=logits)
+
+    agent = Agent(node_id="A", model=EosModel(), device="cpu", max_new_tokens=4)
+    generation = agent.generate_response("x")
+
+    assert generation.generated_token_ids == []
+    assert agent.cache_token_ids == [5, 9]
+    assert agent.cache_seq_len == 2

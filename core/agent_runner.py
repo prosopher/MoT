@@ -599,9 +599,6 @@ class AgentRunner:
             ]
         self.node_ids = [node.id for node in self.active_nodes]
         stop_sequences = tuple(f"\nAgent {node.id}:" for node in self.active_nodes) + (
-            "<|im_end|>",
-            "\n<|im_start|>",
-            "<|endoftext|>",
             "\n### Instruction:",
             "\n### Passage:",
             "\n### Question:",
@@ -708,21 +705,8 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _is_qwen_agent(agent: Agent) -> bool:
-        model_type = str(getattr(agent.model.config, "model_type", ""))
-        haystack = " ".join([agent.model.id, model_type]).lower()
-        return "qwen" in haystack
-
-    @staticmethod
     def _explicit_chat_template(agent: Agent):
-        """Return a tokenizer-provided chat template, never a library default.
-
-        transformers 4.35 falls back to a generic ChatML template when a
-        tokenizer has no ``chat_template``.  That behavior is unsafe for base /
-        non-Instruct checkpoints, so AgentRunner only opts into chat formatting
-        when the checkpoint itself explicitly provides a template.
-        """
-
+        """Return a tokenizer-provided chat template, never a library default."""
         template = getattr(agent.model.tokenizer, "chat_template", None)
         if isinstance(template, dict):
             template = template.get("default") or next(iter(template.values()), None)
@@ -731,14 +715,14 @@ class AgentRunner:
         return None
 
     @staticmethod
-    def _qwen_system_prompt() -> str:
+    def _system_prompt() -> str:
         return (
             "You are a helpful QA assistant. "
             "Answer the given question accurately, using only the provided passage and prior agent response when available."
         )
 
     @staticmethod
-    def _build_qwen_initial_user_content(context: str, question: str) -> str:
+    def _build_initial_user_content(context: str, question: str) -> str:
         return (
             "### Instruction:\n"
             "Use the passage to answer the Question accurately.\n"
@@ -749,7 +733,7 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_qwen_followup_user_content(question: str) -> str:
+    def _build_followup_user_content(question: str) -> str:
         return (
             "### Instruction:\n"
             "Using the passage and previous Agent's response, improve the answer to the Question.\n"
@@ -758,35 +742,73 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _render_qwen_chat_prompt(agent: Agent, user_content: str) -> Optional[str]:
+    def _strip_leading_bos_for_continuation(tokenizer, rendered: str) -> str:
+        bos_token = getattr(tokenizer, "bos_token", None)
+        if isinstance(bos_token, str) and bos_token and rendered.startswith(bos_token):
+            return rendered[len(bos_token) :]
+        return rendered
+
+    @staticmethod
+    def _render_chat_prompt(
+        agent: Agent,
+        user_content: str,
+        *,
+        continuation: bool,
+    ) -> Optional[str]:
         tokenizer = agent.model.tokenizer
         chat_template = AgentRunner._explicit_chat_template(agent)
         if chat_template is None:
             return None
 
-        messages = [
-            {"role": "system", "content": AgentRunner._qwen_system_prompt()},
-            {"role": "user", "content": user_content.strip()},
-        ]
-        try:
-            rendered = tokenizer.apply_chat_template(
-                messages,
-                chat_template=chat_template,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            if rendered:
-                return str(rendered)
-        except Exception as error:
-            logging.debug("Qwen chat-template rendering failed; using plain prompt: %s", error)
+        if continuation:
+            # The existing KV cache already contains the prior conversation and
+            # its generated EOS/end-of-turn token. Append only a new user turn.
+            message_sets = [[{"role": "user", "content": user_content.strip()}]]
+        else:
+            # Some checkpoints (for example Gemma-family templates) do not accept
+            # a system role. Try the canonical system+user form first, then fold
+            # the system instruction into the user message without model-specific
+            # branching.
+            message_sets = [
+                [
+                    {"role": "system", "content": AgentRunner._system_prompt()},
+                    {"role": "user", "content": user_content.strip()},
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": f"{AgentRunner._system_prompt()}\n\n{user_content.strip()}",
+                    }
+                ],
+            ]
+
+        for messages in message_sets:
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    chat_template=chat_template,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if rendered:
+                    rendered = str(rendered)
+                    if continuation:
+                        rendered = AgentRunner._strip_leading_bos_for_continuation(tokenizer, rendered)
+                    return rendered
+            except Exception as error:
+                logging.debug("Chat-template rendering failed; trying fallback/plain prompt: %s", error)
         return None
 
-    def _format_agent_prompt(self, agent: Agent, user_content: str, fallback_prompt: str) -> str:
-        if self._is_qwen_agent(agent):
-            rendered = self._render_qwen_chat_prompt(agent, user_content)
-            if rendered:
-                return rendered
-        return fallback_prompt
+    def _format_agent_prompt(
+        self,
+        agent: Agent,
+        user_content: str,
+        fallback_prompt: str,
+        *,
+        continuation: bool,
+    ) -> str:
+        rendered = self._render_chat_prompt(agent, user_content, continuation=continuation)
+        return rendered if rendered else fallback_prompt
 
     @staticmethod
     def build_initial_prompt(
@@ -811,11 +833,12 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del hub_agent_id, agent_count, is_final_turn
-        user_content = self._build_qwen_initial_user_content(context, question)
+        user_content = self._build_initial_user_content(context, question)
         return self._format_agent_prompt(
             agent,
             user_content,
             self._build_plain_initial_prompt(context, question),
+            continuation=False,
         )
 
     def build_followup_prompt(
@@ -827,13 +850,14 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del turn_index, is_final_turn
-        user_content = self._build_qwen_followup_user_content(question)
+        user_content = self._build_followup_user_content(question)
         agent = self.agents.get(agent_id)
         if agent is not None:
             return self._format_agent_prompt(
                 agent,
                 user_content,
                 self._build_plain_followup_prompt(question),
+                continuation=True,
             )
         return self._build_plain_followup_prompt(question)
 
