@@ -11,20 +11,22 @@ checkpoint's native module/state-dict layout:
 * query-pre-attention scaling,
 * alternating local/global RoPE bases and sliding-window attention.
 
-It intentionally supports the text-only ``gemma3_text`` checkpoint.  The
-multimodal Gemma 3 checkpoints use a separate outer model/vision tower and are
-outside this compatibility path.
+It supports both standalone ``gemma3_text`` checkpoints and multimodal
+``gemma3`` checkpoints.  For multimodal checkpoints MoT loads only the nested
+``language_model`` weights; the vision tower and projector are intentionally
+not materialized because train/eval/AgentRunner are text-only.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import GenerationConfig, PretrainedConfig
 from transformers.utils import cached_file
 
 from .qwen2_compat import (
@@ -43,16 +45,16 @@ class Gemma3TextConfig(Qwen2Config):
 
     def __init__(
         self,
-        vocab_size: int = 262144,
-        hidden_size: int = 1152,
-        intermediate_size: int = 6912,
+        vocab_size: int = 262208,
+        hidden_size: int = 2304,
+        intermediate_size: int = 9216,
         num_hidden_layers: int = 26,
-        num_attention_heads: int = 4,
-        num_key_value_heads: Optional[int] = 1,
+        num_attention_heads: int = 8,
+        num_key_value_heads: Optional[int] = 4,
         head_dim: int = 256,
         hidden_activation: str = "gelu_pytorch_tanh",
         hidden_act: Optional[str] = None,
-        max_position_embeddings: int = 32768,
+        max_position_embeddings: int = 131072,
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-6,
         use_cache: bool = True,
@@ -63,7 +65,7 @@ class Gemma3TextConfig(Qwen2Config):
         attention_dropout: float = 0.0,
         attention_bias: bool = False,
         query_pre_attn_scalar: float = 256.0,
-        sliding_window: Optional[int] = 512,
+        sliding_window: Optional[int] = 4096,
         sliding_window_pattern: int = 6,
         final_logit_softcapping: Optional[float] = None,
         attn_logit_softcapping: Optional[float] = None,
@@ -73,7 +75,11 @@ class Gemma3TextConfig(Qwen2Config):
         if use_bidirectional_attention:
             raise ValueError("MoT Gemma3 compatibility supports causal text attention only.")
         if rope_scaling not in (None, {}):
-            raise ValueError("MoT Gemma3 compatibility currently supports the default Gemma3 RoPE only.")
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type")) if isinstance(rope_scaling, dict) else None
+            if rope_type != "linear" or float(rope_scaling.get("factor", 0.0)) < 1.0:
+                raise ValueError(
+                    "MoT Gemma3 compatibility supports default RoPE or linear full-attention RoPE scaling only."
+                )
         if int(sliding_window_pattern) < 1:
             raise ValueError("sliding_window_pattern must be >= 1")
 
@@ -173,6 +179,13 @@ class Gemma3RotaryEmbedding(Qwen2RotaryEmbedding):
             max_position_embeddings=config.max_position_embeddings,
             base=float(base),
         )
+        # Modern Gemma 3 applies serialized ``rope_scaling`` only to global
+        # (full-attention) layers.  Linear scaling is equivalent to dividing
+        # inverse frequencies by the configured factor; local/sliding layers
+        # keep the unscaled local RoPE base.
+        if layer_type == "full_attention" and config.rope_scaling not in (None, {}):
+            factor = float(config.rope_scaling["factor"])
+            self.inv_freq = self.inv_freq / factor
         self.layer_type = layer_type
 
 
@@ -374,22 +387,83 @@ class Gemma3ForCausalLM(Qwen2ForCausalLM):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
+class Gemma3MultimodalConfig(PretrainedConfig):
+    """Minimal outer config used only to stream ``language_model.*`` weights."""
+
+    model_type = "gemma3"
+
+    def __init__(self, text_config: Optional[Dict[str, Any]] = None, **kwargs) -> None:
+        if isinstance(text_config, Gemma3TextConfig):
+            self.text_config = text_config
+        else:
+            self.text_config = Gemma3TextConfig(**(text_config or {}))
+        super().__init__(**kwargs)
+
+
+class Gemma3TextOnlyFromMultimodal(Qwen2PreTrainedModel):
+    """Checkpoint-loading shell matching Gemma 3 multimodal weight prefixes."""
+
+    config_class = Gemma3MultimodalConfig
+    _no_split_modules = ["Gemma3DecoderLayer"]
+
+    def __init__(self, config: Gemma3MultimodalConfig) -> None:
+        super().__init__(config)
+        self.language_model = Gemma3ForCausalLM(config.text_config)
+
+
+def _gemma3_text_config_from_outer(config_dict: Dict[str, Any]) -> Gemma3TextConfig:
+    text_config_dict = dict(config_dict.get("text_config") or {})
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        if name not in text_config_dict and name in config_dict:
+            text_config_dict[name] = config_dict[name]
+    return Gemma3TextConfig(**text_config_dict)
+
+
 def load_gemma3_compat_model(model_id: str, *, torch_dtype: torch.dtype):
-    """Load a text-only Gemma 3 checkpoint without new Transformers classes."""
+    """Load Gemma 3 text decoding weights on transformers==4.35.2.
+
+    ``google/gemma-3-1b-it`` is a standalone ``gemma3_text`` checkpoint.
+    Larger instruction checkpoints such as ``google/gemma-3-4b-it`` are
+    multimodal ``gemma3`` checkpoints whose causal LM lives under
+    ``language_model.*``.  MoT is text-only, so the latter are loaded through a
+    lightweight shell that matches that prefix and omits vision modules.
+    """
     config_path = cached_file(model_id, "config.json")
     if config_path is None:
         raise FileNotFoundError(f"config.json was not found for {model_id}")
     with open(config_path, "r", encoding="utf-8") as handle:
         config_dict = json.load(handle)
 
-    if str(config_dict.get("model_type", "")).lower() != "gemma3_text":
-        raise ValueError(
-            f"{model_id} is not a text-only Gemma 3 checkpoint (expected model_type='gemma3_text')."
+    model_type = str(config_dict.get("model_type", "")).lower()
+    if model_type == "gemma3_text":
+        config = Gemma3TextConfig(**config_dict)
+        return Gemma3ForCausalLM.from_pretrained(
+            model_id,
+            config=config,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
         )
-    config = Gemma3TextConfig(**config_dict)
-    return Gemma3ForCausalLM.from_pretrained(
+
+    if model_type != "gemma3" or not isinstance(config_dict.get("text_config"), dict):
+        raise ValueError(
+            f"{model_id} is not a supported Gemma 3 text or multimodal checkpoint."
+        )
+
+    text_config = _gemma3_text_config_from_outer(config_dict)
+    outer_kwargs = {key: value for key, value in config_dict.items() if key != "text_config"}
+    outer_config = Gemma3MultimodalConfig(text_config=text_config, **outer_kwargs)
+    shell = Gemma3TextOnlyFromMultimodal.from_pretrained(
         model_id,
-        config=config,
+        config=outer_config,
         torch_dtype=torch_dtype,
         trust_remote_code=True,
     )
+    language_model = shell.language_model
+    # Preserve generation metadata loaded from the outer repository (notably
+    # Gemma 3's [<eos>, <end_of_turn>] EOS list) on the returned causal LM.
+    try:
+        language_model.generation_config = GenerationConfig.from_pretrained(model_id)
+    except (OSError, ValueError, TypeError):
+        if hasattr(shell, "generation_config"):
+            language_model.generation_config = shell.generation_config
+    return language_model

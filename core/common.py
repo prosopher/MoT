@@ -429,6 +429,45 @@ def _load_llama32_tokenizer_with_legacy_tokenizers(model_id: str) -> PreTrainedT
     return load_llama32_tokenizer_compat(model_id)
 
 
+def _attach_checkpoint_chat_template(tokenizer: PreTrainedTokenizerBase, model_id: str) -> None:
+    """Load standalone chat_template.json used by newer HF checkpoints.
+
+    transformers==4.35.2 predates the standalone chat-template file convention.
+    Newer checkpoints (notably multimodal Gemma 3) may therefore load a fully
+    functional tokenizer while silently losing their explicit chat template.
+    """
+    existing = getattr(tokenizer, "chat_template", None)
+    if isinstance(existing, str) and existing.strip():
+        return
+    if isinstance(existing, dict) and existing:
+        return
+
+    try:
+        from transformers.utils import cached_file
+
+        template_path = cached_file(model_id, "chat_template.json")
+    except Exception:
+        return
+    if template_path is None:
+        return
+    try:
+        with open(template_path, "r", encoding="utf-8") as handle:
+            template_data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return
+    template = template_data.get("chat_template") if isinstance(template_data, dict) else None
+    if isinstance(template, str) and template.strip():
+        tokenizer.chat_template = template
+
+
+def _finalize_tokenizer(tokenizer: PreTrainedTokenizerBase, model_id: str) -> PreTrainedTokenizerBase:
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    _attach_checkpoint_chat_template(tokenizer, model_id)
+    return tokenizer
+
+
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
     is_qwen3 = _looks_like_qwen3_model_id(model_id)
     is_llama32 = _looks_like_llama32_model_id(model_id)
@@ -452,10 +491,7 @@ def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
             if not _is_legacy_tokenizers_model_error(error):
                 raise
             tokenizer = _load_tokenizer_with_legacy_bpe(model_id, prefix="gemma3")
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-        return tokenizer
+        return _finalize_tokenizer(tokenizer, model_id)
 
     if is_llama32:
         # The official Llama 3.2 tokenizer is already a generic fast tokenizer.
@@ -467,10 +503,7 @@ def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
             if not _is_legacy_tokenizers_model_error(error):
                 raise
             tokenizer = _load_llama32_tokenizer_with_legacy_tokenizers(model_id)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "right"
-        return tokenizer
+        return _finalize_tokenizer(tokenizer, model_id)
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -495,10 +528,7 @@ def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
             tokenizer = _load_qwen3_tokenizer_with_legacy_tokenizers(model_id)
         else:
             raise
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    return tokenizer
+    return _finalize_tokenizer(tokenizer, model_id)
 
 
 def freeze_model(model: PreTrainedModel) -> None:

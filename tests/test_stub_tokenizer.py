@@ -40,3 +40,21 @@ def test_eval_text_preparation_matches_training_special_token_policy() -> None:
     expected = tokenizer("abcd", add_special_tokens=False).input_ids
     assert full["token_ids"].shape[1] == len(expected)
     assert cached["token_ids"].shape[1] == len(expected)
+
+
+def test_checkpoint_chat_template_is_loaded_from_standalone_file(tmp_path, monkeypatch) -> None:
+    import json
+    import types
+    from core.common import _attach_checkpoint_chat_template
+
+    template_path = tmp_path / "chat_template.json"
+    template_path.write_text(json.dumps({"chat_template": "{{ bos_token }} hello"}), encoding="utf-8")
+
+    utils_module = types.ModuleType("transformers.utils")
+    utils_module.cached_file = lambda model_id, filename: str(template_path)
+    monkeypatch.setitem(sys.modules, "transformers.utils", utils_module)
+
+    tokenizer = TinyTokenizer("gemma-test")
+    assert getattr(tokenizer, "chat_template", None) is None
+    _attach_checkpoint_chat_template(tokenizer, "google/gemma-3-4b-it")
+    assert tokenizer.chat_template == "{{ bos_token }} hello"
