@@ -58,6 +58,9 @@ class Gemma3TextConfig(Qwen2Config):
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-6,
         use_cache: bool = True,
+        pad_token_id: Optional[int] = 0,
+        eos_token_id: Optional[int] = 1,
+        bos_token_id: Optional[int] = 2,
         tie_word_embeddings: bool = True,
         rope_theta: float = 1000000.0,
         rope_local_base_freq: float = 10000.0,
@@ -111,6 +114,9 @@ class Gemma3TextConfig(Qwen2Config):
             initializer_range=initializer_range,
             rms_norm_eps=rms_norm_eps,
             use_cache=use_cache,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            bos_token_id=bos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             rope_theta=rope_theta,
             attention_dropout=attention_dropout,
@@ -397,11 +403,19 @@ class Gemma3MultimodalConfig(PretrainedConfig):
             self.text_config = text_config
         else:
             self.text_config = Gemma3TextConfig(**(text_config or {}))
+        kwargs.setdefault("tie_word_embeddings", self.text_config.tie_word_embeddings)
         super().__init__(**kwargs)
 
 
 class Gemma3TextOnlyFromMultimodal(Qwen2PreTrainedModel):
-    """Checkpoint-loading shell matching Gemma 3 multimodal weight prefixes."""
+    """Checkpoint-loading shell matching Gemma 3 multimodal weight prefixes.
+
+    The multimodal checkpoints omit ``language_model.lm_head.weight`` because
+    Gemma 3 ties it to ``language_model.model.embed_tokens.weight``.  Exposing
+    the nested input/output embeddings here is essential: Transformers 4.35.2
+    calls ``tie_weights()`` on the *outer* object during ``from_pretrained``.
+    Without these delegates the inner LM head stays randomly initialized.
+    """
 
     config_class = Gemma3MultimodalConfig
     _no_split_modules = ["Gemma3DecoderLayer"]
@@ -409,14 +423,35 @@ class Gemma3TextOnlyFromMultimodal(Qwen2PreTrainedModel):
     def __init__(self, config: Gemma3MultimodalConfig) -> None:
         super().__init__(config)
         self.language_model = Gemma3ForCausalLM(config.text_config)
+        tied_keys = getattr(self.language_model, "_tied_weights_keys", None)
+        if tied_keys is not None:
+            self._tied_weights_keys = [f"language_model.{key}" for key in tied_keys]
+
+    def get_input_embeddings(self):
+        return self.language_model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def get_output_embeddings(self):
+        return self.language_model.get_output_embeddings()
+
+    def set_output_embeddings(self, value):
+        self.language_model.set_output_embeddings(value)
+
+    def get_decoder(self):
+        return self.language_model.get_decoder()
+
+    def set_decoder(self, decoder):
+        self.language_model.set_decoder(decoder)
 
 
 def _gemma3_text_config_from_outer(config_dict: Dict[str, Any]) -> Gemma3TextConfig:
-    text_config_dict = dict(config_dict.get("text_config") or {})
-    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
-        if name not in text_config_dict and name in config_dict:
-            text_config_dict[name] = config_dict[name]
-    return Gemma3TextConfig(**text_config_dict)
+    # Gemma3Config constructs its nested Gemma3TextConfig directly from
+    # ``text_config``.  In particular, the multimodal outer eos_token_id=106
+    # must not replace the text model's eos_token_id=1; generation_config.json
+    # carries the valid [1, 106] generation terminators.
+    return Gemma3TextConfig(**dict(config_dict.get("text_config") or {}))
 
 
 def load_gemma3_compat_model(model_id: str, *, torch_dtype: torch.dtype):
@@ -459,6 +494,16 @@ def load_gemma3_compat_model(model_id: str, *, torch_dtype: torch.dtype):
         trust_remote_code=True,
     )
     language_model = shell.language_model
+    if language_model.config.tie_word_embeddings:
+        # ``from_pretrained`` should already have tied these through the outer
+        # delegates above.  Re-apply and verify so a future loader change cannot
+        # silently leave Gemma's output head randomly initialized again.
+        language_model.tie_weights()
+        input_weight = language_model.get_input_embeddings().weight
+        output_weight = language_model.get_output_embeddings().weight
+        if input_weight.data_ptr() != output_weight.data_ptr():
+            raise RuntimeError("Gemma 3 input embeddings and LM head were not tied after checkpoint loading.")
+
     # Preserve generation metadata loaded from the outer repository (notably
     # Gemma 3's [<eos>, <end_of_turn>] EOS list) on the returned causal LM.
     try:
