@@ -440,6 +440,8 @@ def translate_layer_window(
     past_key_values: PastKeyValues,
     src_node_id: str,
     tgt_node_id: str,
+    *,
+    token_alignment_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     edge_id = f"{src_node_id}_to_{tgt_node_id}"
     edge_ids = tuple(edge.id for edge in ctx.edges)
@@ -461,8 +463,278 @@ def translate_layer_window(
         past_key_values=past_key_values,
         edge_id=edge_id,
     )
+    if token_alignment_weights is not None:
+        key_block, value_block = align_cache_blocks_to_target_tokens(
+            key_block,
+            value_block,
+            alignment_weights=token_alignment_weights,
+        )
     translated_key, translated_value = ctx.tp.translators[translator_id](key_block, value_block)
     return translated_key, translated_value
+
+
+
+def _decode_token_ids(tokenizer, token_ids: List[int]) -> str:
+    kwargs = {
+        "skip_special_tokens": False,
+        "clean_up_tokenization_spaces": False,
+    }
+    try:
+        return tokenizer.decode(token_ids, **kwargs)
+    except TypeError:
+        kwargs.pop("clean_up_tokenization_spaces", None)
+        return tokenizer.decode(token_ids, **kwargs)
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    idx = 0
+    while idx < limit and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
+def _token_spans_for_ids(tokenizer, token_ids: List[int], text: str) -> List[Tuple[int, int]]:
+    """Return character spans for exactly ``token_ids`` over ``text``.
+
+    Fast-tokenizer offset mappings are used when the decode/encode round trip
+    reproduces the supplied ids.  A decoder-prefix fallback keeps this usable
+    for tokenizers that do not expose offset mappings (or for special tokens).
+    """
+    try:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        encoded_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+        offsets = encoded["offset_mapping"] if isinstance(encoded, dict) else encoded.offset_mapping
+        if (
+            list(encoded_ids) == list(token_ids)
+            and len(offsets) == len(token_ids)
+        ):
+            return [(int(start), int(end)) for start, end in offsets]
+    except (TypeError, ValueError, KeyError, AttributeError, NotImplementedError):
+        pass
+
+    spans: List[Tuple[int, int]] = []
+    previous_end = 0
+    for end_idx in range(1, len(token_ids) + 1):
+        prefix_text = _decode_token_ids(tokenizer, token_ids[:end_idx])
+        current_end = _common_prefix_length(text, prefix_text)
+        current_end = max(previous_end, min(len(text), current_end))
+        spans.append((previous_end, current_end))
+        previous_end = current_end
+    if spans and spans[-1][1] < len(text):
+        spans[-1] = (spans[-1][0], len(text))
+    return spans
+
+
+def _nearest_span_index(span: Tuple[int, int], candidates: List[Tuple[int, int]]) -> int:
+    start, end = span
+    center = 0.5 * (start + end)
+    best_idx = 0
+    best_distance = float("inf")
+    for idx, (candidate_start, candidate_end) in enumerate(candidates):
+        candidate_center = 0.5 * (candidate_start + candidate_end)
+        distance = abs(candidate_center - center)
+        if distance < best_distance:
+            best_idx = idx
+            best_distance = distance
+    return best_idx
+
+
+def _build_overlap_weights(
+    source_spans: List[Tuple[int, int]],
+    target_spans: List[Tuple[int, int]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    source_len = len(source_spans)
+    target_len = len(target_spans)
+    if source_len < 1 or target_len < 1:
+        raise ValueError("Cross-token alignment requires non-empty source and target token sequences.")
+
+    overlap = torch.zeros(target_len, source_len, dtype=torch.float32)
+    for target_idx, (target_start, target_end) in enumerate(target_spans):
+        for source_idx, (source_start, source_end) in enumerate(source_spans):
+            amount = max(0, min(target_end, source_end) - max(target_start, source_start))
+            if amount > 0:
+                overlap[target_idx, source_idx] = float(amount)
+        if not torch.any(overlap[target_idx] > 0):
+            overlap[target_idx, _nearest_span_index((target_start, target_end), source_spans)] = 1.0
+
+    row_sums = overlap.sum(dim=1, keepdim=True).clamp_min(1.0)
+    target_from_source_weights = overlap / row_sums
+    target_to_source = overlap.argmax(dim=1).to(dtype=torch.long)
+
+    source_to_target = torch.empty(source_len, dtype=torch.long)
+    for source_idx, source_span in enumerate(source_spans):
+        column = overlap[:, source_idx]
+        if torch.any(column > 0):
+            source_to_target[source_idx] = int(column.argmax().item())
+        else:
+            source_to_target[source_idx] = _nearest_span_index(source_span, target_spans)
+
+    return target_from_source_weights, target_to_source, source_to_target
+
+
+def build_cross_token_alignment(
+    source_model: Model,
+    target_model: Model,
+    source_context_token_ids: TokenIDs,
+    target_context_token_ids: TokenIDs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build semantic token-grid alignment from decoded character spans.
+
+    Returns:
+      weights: [batch, target_seq, source_seq]
+      target_to_source: [batch, target_seq]
+      source_to_target: [batch, source_seq]
+    """
+    ensure_token_ids_model(source_model, source_context_token_ids)
+    ensure_token_ids_model(target_model, target_context_token_ids)
+    if source_context_token_ids.ndim != 2 or target_context_token_ids.ndim != 2:
+        raise ValueError("Cross-token alignment expects rank-2 token id tensors.")
+    if source_context_token_ids.shape[0] != target_context_token_ids.shape[0]:
+        raise ValueError(
+            "Cross-token alignment requires matching batch sizes, "
+            f"got {source_context_token_ids.shape[0]} and {target_context_token_ids.shape[0]}"
+        )
+
+    source_rows = source_context_token_ids.as_tensor().detach().cpu().tolist()
+    target_rows = target_context_token_ids.as_tensor().detach().cpu().tolist()
+    all_weights = []
+    all_target_to_source = []
+    all_source_to_target = []
+
+    for source_ids, target_ids in zip(source_rows, target_rows):
+        target_text = _decode_token_ids(target_model.tokenizer, target_ids)
+        source_spans = _token_spans_for_ids(source_model.tokenizer, source_ids, target_text)
+        target_spans = _token_spans_for_ids(target_model.tokenizer, target_ids, target_text)
+        weights, target_to_source, source_to_target = _build_overlap_weights(source_spans, target_spans)
+        all_weights.append(weights)
+        all_target_to_source.append(target_to_source)
+        all_source_to_target.append(source_to_target)
+
+    return (
+        torch.stack(all_weights, dim=0),
+        torch.stack(all_target_to_source, dim=0),
+        torch.stack(all_source_to_target, dim=0),
+    )
+
+
+def align_cache_blocks_to_target_tokens(
+    key_block: torch.Tensor,
+    value_block: torch.Tensor,
+    *,
+    alignment_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if key_block.shape != value_block.shape:
+        raise ValueError(
+            "Key/value blocks must have identical shapes before token alignment, "
+            f"got {tuple(key_block.shape)} vs {tuple(value_block.shape)}"
+        )
+    if key_block.ndim != 4:
+        raise ValueError(
+            "Cache blocks must have shape [batch, source_seq, layers, hidden], "
+            f"got {tuple(key_block.shape)}"
+        )
+    if alignment_weights.ndim != 3:
+        raise ValueError(
+            "alignment_weights must have shape [batch, target_seq, source_seq], "
+            f"got {tuple(alignment_weights.shape)}"
+        )
+    if key_block.shape[0] != alignment_weights.shape[0] or key_block.shape[1] != alignment_weights.shape[2]:
+        raise ValueError(
+            "Token-alignment shape mismatch: "
+            f"cache={tuple(key_block.shape)}, weights={tuple(alignment_weights.shape)}"
+        )
+
+    weights = alignment_weights.to(device=key_block.device, dtype=key_block.dtype)
+    aligned_key = torch.einsum("bts,bslh->btlh", weights, key_block)
+    aligned_value = torch.einsum("bts,bslh->btlh", weights, value_block)
+    return aligned_key, aligned_value
+
+
+def align_sparse_attention_indices_to_target_tokens(
+    sparse_attention_indices: torch.Tensor,
+    *,
+    target_to_source: torch.Tensor,
+    source_to_target: torch.Tensor,
+) -> torch.Tensor:
+    if sparse_attention_indices.ndim != 4:
+        raise ValueError(
+            "sparse_attention_indices must have shape [batch, heads|1, source_seq, k], "
+            f"got {tuple(sparse_attention_indices.shape)}"
+        )
+    batch_size, num_heads, source_seq_len, top_k = sparse_attention_indices.shape
+    if target_to_source.shape[0] != batch_size or source_to_target.shape != (batch_size, source_seq_len):
+        raise ValueError(
+            "Sparse token-alignment shape mismatch: "
+            f"indices={tuple(sparse_attention_indices.shape)}, "
+            f"target_to_source={tuple(target_to_source.shape)}, "
+            f"source_to_target={tuple(source_to_target.shape)}"
+        )
+
+    indices = sparse_attention_indices.to(dtype=torch.long)
+    target_to_source = target_to_source.to(device=indices.device, dtype=torch.long)
+    source_to_target = source_to_target.to(device=indices.device, dtype=torch.long)
+    target_seq_len = target_to_source.shape[1]
+
+    query_gather = target_to_source[:, None, :, None].expand(batch_size, num_heads, target_seq_len, top_k)
+    selected_source_indices = torch.gather(indices, dim=2, index=query_gather)
+    selected_source_indices = selected_source_indices.clamp(0, source_seq_len - 1)
+
+    key_lookup = source_to_target[:, None, None, :].expand(batch_size, num_heads, target_seq_len, source_seq_len)
+    remapped = torch.gather(key_lookup, dim=3, index=selected_source_indices)
+
+    # Multiple source tokens can collapse onto one target token.  Keep the
+    # highest-ranked occurrence and mark later duplicates with an out-of-range
+    # sentinel; gather_sparse_sequence_vectors clamps it for gathering while
+    # build_sparse_query_mask masks it out of the softmax.
+    for topk_idx in range(1, top_k):
+        duplicate = (remapped[..., topk_idx : topk_idx + 1] == remapped[..., :topk_idx]).any(dim=-1)
+        remapped[..., topk_idx] = torch.where(
+            duplicate,
+            torch.full_like(remapped[..., topk_idx], target_seq_len),
+            remapped[..., topk_idx],
+        )
+    return remapped
+
+
+def _retokenize_target_context_row_for_source(
+    source_model: Model,
+    target_model: Model,
+    target_context_token_ids: TokenIDs,
+) -> TokenIDs:
+    ensure_token_ids_model(target_model, target_context_token_ids)
+    if target_context_token_ids.shape[0] != 1:
+        raise ValueError("Target-context retokenization expects a single batch row.")
+    target_ids = target_context_token_ids.as_tensor()[0].detach().cpu().tolist()
+    context_text = _decode_token_ids(target_model.tokenizer, target_ids)
+    encoded = source_model.tokenizer(
+        context_text,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    source_token_ids = TokenIDs(encoded.input_ids, model_id=source_model.id).to(source_model.device)
+    if source_token_ids.shape[1] < 1:
+        raise ValueError("Retokenized source context must contain at least one token.")
+    return source_token_ids
+
+
+def _concat_past_batches(past_batches: List[PastKeyValues]) -> PastKeyValues:
+    if not past_batches:
+        raise ValueError("past_batches must contain at least one batch.")
+    num_layers = len(past_batches[0])
+    if any(len(past) != num_layers for past in past_batches):
+        raise ValueError("All past batches must have the same number of layers.")
+    return tuple(
+        (
+            torch.cat([past[layer_idx][0] for past in past_batches], dim=0),
+            torch.cat([past[layer_idx][1] for past in past_batches], dim=0),
+        )
+        for layer_idx in range(num_layers)
+    )
 
 
 def build_replayed_target_past(
@@ -478,18 +750,6 @@ def build_replayed_target_past(
     tgt_spec: ModelSpec,
 ) -> Tuple[PastKeyValues, PastKeyValues]:
     edge_id = f"{src_node_id}_to_{tgt_node_id}"
-    translated_key, translated_value = translate_layer_window(
-        ctx=ctx,
-        past_key_values=source_past_key_values,
-        src_node_id=src_node_id,
-        tgt_node_id=tgt_node_id,
-    )
-    translated_window_past = blocks_to_partial_past_key_values(
-        key_block=translated_key,
-        value_block=translated_value,
-        num_heads=tgt_spec.num_key_value_heads,
-        head_dim=tgt_spec.head_dim,
-    )
     node_model_ids = {node.id: node.model_id for node in ctx.nodes}
     src_spec = ctx.tp.get_model_spec(src_node_id)
     sparse_attention_indices = build_extrapolated_sparse_attention_indices(
@@ -501,6 +761,46 @@ def build_replayed_target_past(
         num_target_layers=tgt_spec.num_layers,
         source_model_id=node_model_ids.get(src_node_id),
         top_k=ctx.config.topk_sparse_attn,
+    )
+
+    needs_token_alignment = (
+        source_model.id != target_model.id
+        or source_context_token_ids.shape != target_context_token_ids.shape
+        or not torch.equal(
+            source_context_token_ids.as_tensor().detach().cpu(),
+            target_context_token_ids.as_tensor().detach().cpu(),
+        )
+    )
+    alignment_weights = None
+    if needs_token_alignment:
+        alignment_weights, target_to_source, source_to_target = build_cross_token_alignment(
+            source_model=source_model,
+            target_model=target_model,
+            source_context_token_ids=source_context_token_ids,
+            target_context_token_ids=target_context_token_ids,
+        )
+        sparse_attention_indices = [
+            align_sparse_attention_indices_to_target_tokens(
+                sparse_indices,
+                target_to_source=target_to_source,
+                source_to_target=source_to_target,
+            )
+            for sparse_indices in sparse_attention_indices
+        ]
+
+    translated_key, translated_value = translate_layer_window(
+        ctx=ctx,
+        past_key_values=source_past_key_values,
+        src_node_id=src_node_id,
+        tgt_node_id=tgt_node_id,
+        token_alignment_weights=alignment_weights,
+    )
+
+    translated_window_past = blocks_to_partial_past_key_values(
+        key_block=translated_key,
+        value_block=translated_value,
+        num_heads=tgt_spec.num_key_value_heads,
+        head_dim=tgt_spec.head_dim,
     )
     mixed_target_past = replay_target_prefill_with_injected_window(
         target_model=target_model,
@@ -514,6 +814,52 @@ def build_replayed_target_past(
         num_bottom_full_attn=ctx.config.num_bottom_full_attn,
     )
     return mixed_target_past, translated_window_past
+
+
+def build_replayed_target_past_from_target_context(
+    ctx: Context,
+    *,
+    target_context_token_ids: TokenIDs,
+    source_model: Model,
+    target_model: Model,
+    src_node_id: str,
+    tgt_node_id: str,
+    tgt_spec: ModelSpec,
+) -> Tuple[PastKeyValues, PastKeyValues]:
+    """Replay a target batch using source caches built from the exact same text.
+
+    Heterogeneous tokenizers can produce different source lengths for each row,
+    so source prefill/replay is performed row-wise and the target-grid caches are
+    concatenated after semantic token alignment.
+    """
+    ensure_token_ids_model(target_model, target_context_token_ids)
+    mixed_batches: List[PastKeyValues] = []
+    translated_batches: List[PastKeyValues] = []
+    for batch_idx in range(target_context_token_ids.shape[0]):
+        target_row = target_context_token_ids[batch_idx : batch_idx + 1]
+        source_row = _retokenize_target_context_row_for_source(
+            source_model=source_model,
+            target_model=target_model,
+            target_context_token_ids=target_row,
+        )
+        with torch.no_grad():
+            source_past = extract_past_key_values(source_model, source_row)
+        mixed_row, translated_row = build_replayed_target_past(
+            ctx,
+            source_past_key_values=source_past,
+            source_context_token_ids=source_row,
+            target_context_token_ids=target_row,
+            source_model=source_model,
+            target_model=target_model,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
+            tgt_spec=tgt_spec,
+        )
+        mixed_batches.append(mixed_row)
+        translated_batches.append(translated_row)
+
+    return _concat_past_batches(mixed_batches), _concat_past_batches(translated_batches)
+
 
 def build_channel_map(
     ctx: Context,
@@ -1861,11 +2207,8 @@ def run_train(
             total_direction_loss = 0.0
             for edge in edges:
                 target_context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
-                source_context_token_ids = batches_by_node_id[edge.src_id][0]
-                mixed_target_past, _ = build_replayed_target_past(
+                mixed_target_past, _ = build_replayed_target_past_from_target_context(
                     ctx,
-                    source_past_key_values=past_by_node_id[edge.src_id],
-                    source_context_token_ids=source_context_token_ids,
                     target_context_token_ids=target_context_token_ids,
                     source_model=ctx.tp.get_model(edge.src_id),
                     target_model=ctx.tp.get_model(edge.tgt_id),

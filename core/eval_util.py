@@ -2277,7 +2277,7 @@ def prepare_cache_text_inputs(
     max_input_tokens: Optional[int] = None,
     truncation_side: str = "left",
 ) -> Dict[str, TokenIDs]:
-    tokenized = model.tokenizer(text, return_tensors="pt")
+    tokenized = model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
     token_ids = TokenIDs(tokenized.input_ids, model_id=model.id)
     was_truncated = False
 
@@ -2354,7 +2354,7 @@ def prepare_full_text_inputs(
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    tokenizer_kwargs = {"return_tensors": "pt"}
+    tokenizer_kwargs = {"return_tensors": "pt", "add_special_tokens": False}
     if max_input_tokens is not None:
         if max_input_tokens < 1:
             raise ValueError("max_input_tokens must be >= 1")
