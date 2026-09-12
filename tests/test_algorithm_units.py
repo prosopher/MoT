@@ -14,12 +14,16 @@ from alg.kvcomm.train import KVCommSelectionTranslator, _resolve_candidate_targe
 from alg.lsc.train import blocks_to_past_key_values
 from alg.mot.train import (
     MixtureOfTranslators,
+    align_sparse_attention_indices_to_target_tokens,
+    align_cache_blocks_to_target_tokens,
+    build_cross_token_alignment,
     collect_mot_balance_metrics,
-    resize_sparse_attention_indices,
-    resize_sequence_cache,
+    translate_layer_window,
 )
 from core.common import TokenIDs
 from core.model_spec import ModelSpec
+from core.channel_manager import Channel
+from core.topology import Edge, Node, get_translator_id
 
 
 class ConstantTranslator(torch.nn.Module):
@@ -186,31 +190,111 @@ def test_mot_top_k_router_masks_inactive_experts_and_exposes_balance_metrics() -
     }
 
 
-def test_mot_sparse_indices_resize_between_tokenizer_lengths() -> None:
-    source_indices = torch.tensor([[[[0, 286], [1, 285], [143, 200]]]])
+class SpanTokenizer:
+    def __init__(self, ids, offsets, pieces):
+        self.ids = list(ids)
+        self.offsets = list(offsets)
+        self.pieces = dict(pieces)
 
-    resized = resize_sparse_attention_indices(
-        source_indices,
-        target_query_len=286,
-        target_key_len=286,
+    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False, **_):
+        assert text == "abcd"
+        result = {"input_ids": list(self.ids)}
+        if return_offsets_mapping:
+            result["offset_mapping"] = list(self.offsets)
+        return result
+
+    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        del skip_special_tokens, clean_up_tokenization_spaces
+        return "".join(self.pieces[int(token_id)] for token_id in token_ids)
+
+
+def test_mot_cross_token_alignment_uses_text_spans_not_sequence_interpolation() -> None:
+    source_model = SimpleNamespace(
+        id="source",
+        tokenizer=SpanTokenizer(
+            ids=[10, 11, 12],
+            offsets=[(0, 1), (1, 3), (3, 4)],
+            pieces={10: "a", 11: "bc", 12: "d"},
+        ),
+    )
+    target_model = SimpleNamespace(
+        id="target",
+        tokenizer=SpanTokenizer(
+            ids=[20, 21],
+            offsets=[(0, 3), (3, 4)],
+            pieces={20: "abc", 21: "d"},
+        ),
+    )
+    source_ids = TokenIDs(torch.tensor([[10, 11, 12]]), model_id="source")
+    target_ids = TokenIDs(torch.tensor([[20, 21]]), model_id="target")
+
+    weights, target_to_source, source_to_target = build_cross_token_alignment(
+        source_model=source_model,
+        target_model=target_model,
+        source_context_token_ids=source_ids,
+        target_context_token_ids=target_ids,
     )
 
-    assert resized.shape == (1, 1, 286, 2)
-    assert resized.dtype == torch.long
-    assert int(resized.min()) >= 0
-    assert int(resized.max()) < 286
-    assert torch.equal(resized[:, :, 0, :], source_indices[:, :, 0, :].clamp(max=285))
+    assert weights.shape == (1, 2, 3)
+    assert torch.allclose(weights[0, 0], torch.tensor([1.0 / 3.0, 2.0 / 3.0, 0.0]))
+    assert torch.allclose(weights[0, 1], torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.equal(target_to_source, torch.tensor([[1, 2]]))
+    assert torch.equal(source_to_target, torch.tensor([[0, 0, 1]]))
 
-    expanded = source_indices.expand(-1, 4, -1, -1)
-    expanded_resized = resize_sparse_attention_indices(
-        expanded,
-        target_query_len=286,
-        target_key_len=286,
+    source_cache = torch.tensor([[[[3.0]], [[6.0]], [[9.0]]]])
+    aligned_key, aligned_value = align_cache_blocks_to_target_tokens(
+        source_cache,
+        source_cache,
+        alignment_weights=weights,
     )
-    assert expanded_resized.shape == (1, 4, 286, 2)
+    assert aligned_key.shape == (1, 2, 1, 1)
+    assert torch.allclose(aligned_key.flatten(), torch.tensor([5.0, 9.0]))
+    assert torch.equal(aligned_key, aligned_value)
 
-    cache = torch.arange(1 * 1 * 287 * 2, dtype=torch.float32).view(1, 1, 287, 2)
-    resized_cache = resize_sequence_cache(cache, target_seq_len=286)
-    assert resized_cache.shape == (1, 1, 286, 2)
-    assert torch.equal(resized_cache[:, :, 0, :], cache[:, :, 0, :])
-    assert torch.equal(resized_cache[:, :, -1, :], cache[:, :, -1, :])
+    sparse = torch.tensor([[[[0, 0], [0, 1], [1, 2]]]])
+    aligned_sparse = align_sparse_attention_indices_to_target_tokens(
+        sparse,
+        target_to_source=target_to_source,
+        source_to_target=source_to_target,
+    )
+    assert aligned_sparse.shape == (1, 1, 2, 2)
+    assert torch.equal(aligned_sparse, torch.tensor([[[[0, 2], [0, 1]]]]))
+
+
+def test_mot_aligns_source_cache_before_translator() -> None:
+    class CaptureTranslator:
+        def __init__(self):
+            self.key_input = None
+
+        def __call__(self, key_block, value_block):
+            self.key_input = key_block.detach().clone()
+            return key_block, value_block
+
+    edge = Edge(id="A_to_B", src_id="A", tgt_id="B")
+    nodes = [Node(id="A", model_id="src-model"), Node(id="B", model_id="tgt-model")]
+    translator = CaptureTranslator()
+    ctx = SimpleNamespace(
+        edges=[edge],
+        nodes=nodes,
+        cm=SimpleNamespace(get_channels=lambda edge_id: [Channel(src_layer_idx=0, dst_layer_idx=0)]),
+        tp=SimpleNamespace(
+            translators={get_translator_id("src-model", "tgt-model"): translator},
+        ),
+    )
+    source_key = torch.tensor([[[[3.0], [6.0], [9.0]]]])
+    source_value = source_key + 10.0
+    weights = torch.tensor([[[1.0 / 3.0, 2.0 / 3.0, 0.0], [0.0, 0.0, 1.0]]])
+
+    translated_key, translated_value = translate_layer_window(
+        ctx,
+        past_key_values=((source_key, source_value),),
+        src_node_id="A",
+        tgt_node_id="B",
+        token_alignment_weights=weights,
+    )
+
+    assert translator.key_input is not None
+    assert translator.key_input.shape == (1, 2, 1, 1)
+    assert torch.allclose(translator.key_input.flatten(), torch.tensor([5.0, 9.0]))
+    assert torch.equal(translated_key, translator.key_input)
+    assert translated_value.shape == translated_key.shape
