@@ -12,7 +12,12 @@ from alg.interlat.train import (
 )
 from alg.kvcomm.train import KVCommSelectionTranslator, _resolve_candidate_target_layers, target_to_source_layer_map
 from alg.lsc.train import blocks_to_past_key_values
-from alg.mot.train import MixtureOfTranslators, collect_mot_balance_metrics
+from alg.mot.train import (
+    MixtureOfTranslators,
+    collect_mot_balance_metrics,
+    resize_sparse_attention_indices,
+    resize_sequence_cache,
+)
 from core.common import TokenIDs
 from core.model_spec import ModelSpec
 
@@ -179,3 +184,33 @@ def test_mot_top_k_router_masks_inactive_experts_and_exposes_balance_metrics() -
         "gate_load_cv2",
         "gate_importance_entropy",
     }
+
+
+def test_mot_sparse_indices_resize_between_tokenizer_lengths() -> None:
+    source_indices = torch.tensor([[[[0, 286], [1, 285], [143, 200]]]])
+
+    resized = resize_sparse_attention_indices(
+        source_indices,
+        target_query_len=286,
+        target_key_len=286,
+    )
+
+    assert resized.shape == (1, 1, 286, 2)
+    assert resized.dtype == torch.long
+    assert int(resized.min()) >= 0
+    assert int(resized.max()) < 286
+    assert torch.equal(resized[:, :, 0, :], source_indices[:, :, 0, :].clamp(max=285))
+
+    expanded = source_indices.expand(-1, 4, -1, -1)
+    expanded_resized = resize_sparse_attention_indices(
+        expanded,
+        target_query_len=286,
+        target_key_len=286,
+    )
+    assert expanded_resized.shape == (1, 4, 286, 2)
+
+    cache = torch.arange(1 * 1 * 287 * 2, dtype=torch.float32).view(1, 1, 287, 2)
+    resized_cache = resize_sequence_cache(cache, target_seq_len=286)
+    assert resized_cache.shape == (1, 1, 286, 2)
+    assert torch.equal(resized_cache[:, :, 0, :], cache[:, :, 0, :])
+    assert torch.equal(resized_cache[:, :, -1, :], cache[:, :, -1, :])

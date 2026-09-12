@@ -965,6 +965,73 @@ def gather_sparse_sequence_vectors(sequence: torch.Tensor, sparse_attention_indi
     return gathered.view(batch_size, num_heads, target_len, top_k, head_dim)
 
 
+def resize_sparse_attention_indices(
+    sparse_attention_indices: torch.Tensor,
+    *,
+    target_query_len: int,
+    target_key_len: int,
+) -> torch.Tensor:
+    """Remap source-token attention indices to a target model's token grid."""
+    if sparse_attention_indices.ndim != 4:
+        raise ValueError(
+            "sparse_attention_indices must have shape [batch, heads|1, seq, k], "
+            f"got {tuple(sparse_attention_indices.shape)}"
+        )
+    if target_query_len < 1 or target_key_len < 1:
+        raise ValueError(
+            "target_query_len and target_key_len must be positive, "
+            f"got {target_query_len} and {target_key_len}"
+        )
+
+    indices = sparse_attention_indices.to(dtype=torch.long)
+    source_query_len = indices.size(2)
+    if source_query_len < 1:
+        raise ValueError("sparse_attention_indices must contain at least one query position")
+
+    if source_query_len != target_query_len:
+        query_positions = torch.linspace(
+            0,
+            source_query_len - 1,
+            steps=target_query_len,
+            device=indices.device,
+        ).round().to(dtype=torch.long)
+        indices = indices.index_select(2, query_positions)
+
+    if source_query_len != target_key_len:
+        if source_query_len == 1:
+            indices = torch.zeros_like(indices)
+        else:
+            indices = indices.to(dtype=torch.float32)
+            indices = indices * ((target_key_len - 1) / float(source_query_len - 1))
+            indices = indices.round().to(dtype=torch.long)
+
+    # The input may be an expanded multi-head view with aliased storage, so
+    # avoid in-place clamping here.
+    return indices.clamp(0, target_key_len - 1)
+
+
+def resize_sequence_cache(sequence: torch.Tensor, *, target_seq_len: int) -> torch.Tensor:
+    """Resize a [batch, heads, sequence, head_dim] cache to a target grid."""
+    if sequence.ndim != 4:
+        raise ValueError(
+            "sequence cache must have shape [batch, heads, seq, head_dim], "
+            f"got {tuple(sequence.shape)}"
+        )
+    if target_seq_len < 1:
+        raise ValueError(f"target_seq_len must be positive, got {target_seq_len}")
+
+    source_seq_len = sequence.size(2)
+    if source_seq_len == target_seq_len:
+        return sequence
+    positions = torch.linspace(
+        0,
+        source_seq_len - 1,
+        steps=target_seq_len,
+        device=sequence.device,
+    ).round().to(dtype=torch.long)
+    return sequence.index_select(2, positions)
+
+
 def build_sparse_query_mask(sparse_attention_indices: torch.Tensor, seq_len: int, num_heads: int) -> torch.Tensor:
     sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
     query_positions = torch.arange(seq_len, device=sparse_attention_indices.device).view(1, 1, seq_len, 1)
@@ -1049,6 +1116,9 @@ def run_gpt2_block(
 
     attention_key = native_like_key if injected_key is None else injected_key
     attention_value = native_like_value if injected_value is None else injected_value
+    if injected_key is not None:
+        attention_key = resize_sequence_cache(attention_key, target_seq_len=seq_len)
+        attention_value = resize_sequence_cache(attention_value, target_seq_len=seq_len)
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for GPT-2 layer replay: "
@@ -1057,6 +1127,11 @@ def run_gpt2_block(
 
     if sparse_attention_indices is not None:
         sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        sparse_attention_indices = resize_sparse_attention_indices(
+            sparse_attention_indices,
+            target_query_len=seq_len,
+            target_key_len=attention_key.size(-2),
+        )
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_scores = (query.unsqueeze(-2) * selected_key).sum(dim=-1)
@@ -1127,6 +1202,9 @@ def run_opt_block(
 
     attention_key = native_like_key if injected_key is None else injected_key
     attention_value = native_like_value if injected_value is None else injected_value
+    if injected_key is not None:
+        attention_key = resize_sequence_cache(attention_key, target_seq_len=seq_len)
+        attention_value = resize_sequence_cache(attention_value, target_seq_len=seq_len)
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for OPT layer replay: "
@@ -1135,6 +1213,11 @@ def run_opt_block(
 
     if sparse_attention_indices is not None:
         sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
+        sparse_attention_indices = resize_sparse_attention_indices(
+            sparse_attention_indices,
+            target_query_len=seq_len,
+            target_key_len=attention_key.size(-2),
+        )
         selected_key = gather_sparse_sequence_vectors(attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1)
@@ -1233,6 +1316,9 @@ def run_qwen2_block(
 
     attention_key = native_like_key if injected_key is None else injected_key
     attention_value = native_like_value if injected_value is None else injected_value
+    if injected_key is not None:
+        attention_key = resize_sequence_cache(attention_key, target_seq_len=seq_len)
+        attention_value = resize_sequence_cache(attention_value, target_seq_len=seq_len)
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for rotary GQA layer replay: "
@@ -1245,6 +1331,11 @@ def run_qwen2_block(
 
     if sparse_attention_indices is not None:
         sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        sparse_attention_indices = resize_sparse_attention_indices(
+            sparse_attention_indices,
+            target_query_len=seq_len,
+            target_key_len=attention_key.size(-2),
+        )
         selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
@@ -1363,6 +1454,9 @@ def run_gemma3_block(
 
     attention_key = native_like_key if injected_key is None else injected_key
     attention_value = native_like_value if injected_value is None else injected_value
+    if injected_key is not None:
+        attention_key = resize_sequence_cache(attention_key, target_seq_len=seq_len)
+        attention_value = resize_sequence_cache(attention_value, target_seq_len=seq_len)
     if tuple(attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for Gemma3 replay: "
@@ -1376,6 +1470,11 @@ def run_gemma3_block(
 
     if sparse_attention_indices is not None:
         sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
+        sparse_attention_indices = resize_sparse_attention_indices(
+            sparse_attention_indices,
+            target_query_len=seq_len,
+            target_key_len=attention_key.size(-2),
+        )
         selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
