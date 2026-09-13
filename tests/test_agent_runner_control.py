@@ -281,12 +281,24 @@ def test_agent_runner_final_answer_parser_uses_final_response_and_preserves_mult
     assert AgentRunner.extract_final_answer(transcript, "first line\nsecond line") == "first line\nsecond line"
 
 
-def test_agent_runner_final_prompt_requests_final_marker_only_on_final_turn() -> None:
-    ordinary = AgentRunner._build_followup_user_content("question", is_final_turn=False)
-    final = AgentRunner._build_followup_user_content("question", is_final_turn=True)
+def test_agent_runner_followup_and_final_prompt_instructions() -> None:
+    ordinary = AgentRunner._build_followup_user_content("question", agent_id="B", is_final_turn=False)
+    final = AgentRunner._build_followup_user_content("question", agent_id="A", is_final_turn=True)
 
+    assert "Agent B" in ordinary
+    assert "entire conversation history" in ordinary
+    assert "new opinion" in ordinary
+    assert "repetition" in ordinary
+    assert "reasoning" in ordinary
+    assert "short" in ordinary
+    assert "immediate" in ordinary
     assert "FINAL:" not in ordinary
+
+    assert "Agent A" in final
+    assert "entire conversation history" in final
+    assert "most prevalent opinion" in final
     assert "FINAL: <concise answer>" in final
+    assert "improve" not in final.lower()
 
 
 def test_multi_agents_qa_defaults_to_all_context_reference_roles() -> None:
