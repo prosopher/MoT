@@ -60,6 +60,20 @@ def test_agent_runner_virtual_agents_share_one_physical_model() -> None:
     assert ctx.tp.get_model("A") is ctx.tp.get_model("B")
 
 
+def test_agent_runner_defaults_to_mallm_sampling_temperature() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_turns=False,
+    )
+
+    assert runner.generation_temperature == 1.0
+    assert [agent.temperature for agent in runner.agent_sequence] == [1.0, 1.0]
+
+
 def test_agent_runner_rejects_heterogeneous_model_pool() -> None:
     ctx = _ctx("tiny-a,tiny-b")
 
@@ -279,7 +293,7 @@ def test_agent_runner_final_answer_parser_extracts_strategyqa_binary_answer() ->
     assert AgentRunner.extract_final_answer(transcript, "Reasoning... answer: no") == "no"
 
 
-def test_agent_runner_prompts_use_mallm_memory_simple_and_judge() -> None:
+def test_agent_runner_prompts_use_mallm_memory_critical_and_judge() -> None:
     ordinary = AgentRunner._build_followup_user_content(
         "question", agent_id="B", previous_agent_id="A", is_final_turn=False
     )
@@ -294,12 +308,12 @@ def test_agent_runner_prompts_use_mallm_memory_simple_and_judge() -> None:
     assert "FINAL:" not in ordinary
     assert "shared memory" in ordinary
     assert "full discussion history from all previous Agents" in ordinary
-    assert "Improve the current solution" in ordinary
-    assert "If you agree with the current solution" in ordinary
-    assert "[AGREE] Answer: yes" in ordinary
-    assert "[DISAGREE] Answer: no" in ordinary
+    assert "Critically evaluate the current solution" in ordinary
+    assert "Identify potential weaknesses or missing facts" in ordinary
+    assert "[AGREE]" in ordinary
+    assert "[DISAGREE]" in ordinary
     assert "improved solution" in ordinary
-    assert "generation limit" in ordinary
+    assert "End with 'Answer: yes' or 'Answer: no'" in ordinary
     assert "Agent A" in ordinary
     assert "I agree with Agent [agent id]" not in ordinary
 

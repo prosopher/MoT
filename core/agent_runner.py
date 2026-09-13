@@ -104,6 +104,7 @@ class AgentRunnerConfig:
     device: str = "auto"
     max_turns: int = 4
     generation_max_new_tokens: int = 48
+    generation_temperature: float = 1.0
     max_prompt_tokens: Optional[int] = None
     seed: int = 42
     log_turns: bool = True
@@ -530,6 +531,7 @@ class AgentRunner:
         alg: str,
         max_turns: int = 4,
         generation_max_new_tokens: int = 48,
+        generation_temperature: float = 1.0,
         max_prompt_tokens: Optional[int] = None,
         seed: int = 42,
         log_turns: bool = True,
@@ -562,6 +564,11 @@ class AgentRunner:
         if self.max_turns < 1:
             raise ValueError(f"max_turns must be at least 1, got {self.max_turns}")
         self.generation_max_new_tokens = int(generation_max_new_tokens)
+        self.generation_temperature = float(generation_temperature)
+        if self.generation_temperature < 0.0:
+            raise ValueError(
+                f"generation_temperature must be >= 0, got {self.generation_temperature}"
+            )
         self.max_prompt_tokens = max_prompt_tokens
         self.seed = int(seed)
         self.log_turns = bool(log_turns)
@@ -602,6 +609,7 @@ class AgentRunner:
                     max_new_tokens=self.generation_max_new_tokens,
                     stop_sequences=stop_sequences,
                     max_prompt_tokens=max_prompt_tokens,
+                    temperature=self.generation_temperature,
                 )
             )
 
@@ -653,6 +661,7 @@ class AgentRunner:
             alg=resolved_alg,
             max_turns=config.max_turns,
             generation_max_new_tokens=config.generation_max_new_tokens,
+            generation_temperature=config.generation_temperature,
             max_prompt_tokens=config.max_prompt_tokens,
             seed=config.seed,
             log_turns=config.log_turns,
@@ -670,19 +679,18 @@ class AgentRunner:
         return (
             f"You are Agent {agent_id}, the first participant in a collaborative discussion with shared memory. "
             "No solution has been proposed yet. Answer the StrategyQA question using your own knowledge and reasoning. "
-            "Start with 'Answer: yes' or 'Answer: no', then give a concise justification in at most two sentences."
+            "Give a concise justification, then end with 'Answer: yes' or 'Answer: no'."
         )
 
     @staticmethod
     def _ordinary_agent_instruction(agent_id: str, previous_agent_id: str) -> str:
         return (
             f"You are Agent {agent_id} in a collaborative discussion with shared memory. You can use the full "
-            "discussion history from all previous Agents. Improve the current solution, which is the most recent "
-            f"solution proposed by Agent {previous_agent_id}. If you agree with the current solution, start with "
-            "'[AGREE] Answer: yes' or "
-            "'[AGREE] Answer: no' and briefly explain why. Otherwise start with '[DISAGREE] Answer: yes' or "
-            "'[DISAGREE] Answer: no', briefly explain why, and provide the improved solution. Keep the response "
-            "concise so the complete solution fits within the generation limit."
+            "discussion history from all previous Agents. Critically evaluate the current solution, which is the most "
+            f"recent solution proposed by Agent {previous_agent_id}. Identify potential weaknesses or missing facts "
+            "instead of simply repeating the prior reasoning. If you believe the current solution is correct, begin "
+            "with [AGREE] and briefly explain why. Otherwise begin with [DISAGREE], explain the problem, and provide "
+            "an improved solution. End with 'Answer: yes' or 'Answer: no'."
         )
 
     @staticmethod
@@ -1547,6 +1555,8 @@ class AgentRunner:
         gold_answers: Sequence[str],
         example_index: Optional[int] = None,
     ) -> AgentRunnerResult:
+        example_seed = self.seed if example_index is None else self.seed + max(0, int(example_index) - 1)
+        set_seed(example_seed)
         self._peak_memory_breakdown_bytes = None
         for agent in self.agent_sequence:
             agent.reset()

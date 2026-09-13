@@ -57,6 +57,7 @@ class Agent:
         max_new_tokens: int = 64,
         stop_sequences: Optional[Sequence[str]] = None,
         max_prompt_tokens: Optional[int] = None,
+        temperature: float = 0.0,
     ) -> None:
         self.node_id = node_id
         self.model = model
@@ -64,6 +65,9 @@ class Agent:
         self.max_new_tokens = int(max_new_tokens)
         self.stop_sequences = tuple(stop_sequences or ())
         self.max_prompt_tokens = max_prompt_tokens
+        self.temperature = float(temperature)
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0, got {self.temperature}")
         self.past_key_values: Optional[PastKeyValues] = None
         # Token ids corresponding 1:1 to the resident KV cache.
         # past_key_values itself does not store the input token ids, so the runner
@@ -289,7 +293,13 @@ class Agent:
             # the final one-token cache append below.
             uncached_generated_token = None
 
-            next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
+            next_token_logits = outputs.logits[:, -1, :]
+            if self.temperature > 0.0:
+                probabilities = torch.softmax(next_token_logits.float() / self.temperature, dim=-1)
+                next_token_tensor = torch.multinomial(probabilities, num_samples=1)
+            else:
+                next_token_tensor = next_token_logits.argmax(dim=-1, keepdim=True)
+            next_token = TokenIDs(next_token_tensor, model_id=current_token_ids.model_id)
             next_token_id = int(next_token.item())
 
             if next_token_id in eos_token_ids:

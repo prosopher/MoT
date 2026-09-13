@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--generation-max-new-tokens", type=int, default=48)
+    parser.add_argument(
+        "--generation-temperature",
+        type=float,
+        default=1.0,
+        help="Agent sampling temperature. MALLM experiments use temperature=1.0; use 0 for greedy decoding.",
+    )
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
     parser.add_argument("--log-turns", dest="log_turns", action="store_true", default=True, help="Print per-turn AgentRunner logs.")
     parser.add_argument("--no-log-turns", dest="log_turns", action="store_false", help="Disable per-turn AgentRunner logs.")
@@ -193,6 +199,7 @@ def main() -> None:
             device=args.device,
             max_turns=args.max_turns,
             generation_max_new_tokens=args.generation_max_new_tokens,
+            generation_temperature=args.generation_temperature,
             max_prompt_tokens=args.max_prompt_tokens,
             agent_count=args.agent_count,
             seed=args.seed,
