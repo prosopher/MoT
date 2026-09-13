@@ -670,7 +670,7 @@ class AgentRunner:
         return (
             f"You are Agent {agent_id}, the first participant in a collaborative discussion with shared memory. "
             "No solution has been proposed yet. Answer the StrategyQA question using your own knowledge and reasoning. "
-            "Give a concise justification, then end your response with 'Answer: yes' or 'Answer: no'."
+            "Start with 'Answer: yes' or 'Answer: no', then give a concise justification in at most two sentences."
         )
 
     @staticmethod
@@ -678,9 +678,11 @@ class AgentRunner:
         return (
             f"You are Agent {agent_id} in a collaborative discussion with shared memory. You can use the full "
             "discussion history from all previous Agents. Improve the current solution, which is the most recent "
-            f"solution proposed by Agent {previous_agent_id}. If you agree with the current solution, answer with "
-            "[AGREE]. Otherwise answer with [DISAGREE], explain why, and provide an improved solution. "
-            "Let's think step-by-step. End with 'Answer: yes' or 'Answer: no'."
+            f"solution proposed by Agent {previous_agent_id}. If you agree with the current solution, start with "
+            "'[AGREE] Answer: yes' or "
+            "'[AGREE] Answer: no' and briefly explain why. Otherwise start with '[DISAGREE] Answer: yes' or "
+            "'[DISAGREE] Answer: no', briefly explain why, and provide the improved solution. Keep the response "
+            "concise so the complete solution fits within the generation limit."
         )
 
     @staticmethod
@@ -832,15 +834,17 @@ class AgentRunner:
         user_content: str,
         *,
         continuation: bool,
+        include_system: bool = True,
     ) -> Optional[str]:
         tokenizer = agent.model.tokenizer
         chat_template = AgentRunner._explicit_chat_template(agent)
         if chat_template is None:
             return None
 
-        if continuation:
-            # The existing KV cache already contains the prior conversation and
-            # its generated EOS/end-of-turn token. Append only a new user turn.
+        if continuation or not include_system:
+            # A continuation already has its system prompt in KV. The Judge is a
+            # separate decision call and intentionally receives only the task and
+            # candidate solutions, matching MALLM's Judge protocol.
             message_sets = [[{"role": "user", "content": user_content.strip()}]]
         else:
             # Some checkpoints (for example Gemma-family templates) do not accept
@@ -972,6 +976,35 @@ class AgentRunner:
             is_final_turn=is_final_turn,
             judge_solutions=judge_solutions,
         )
+
+    def build_judge_prompt(
+        self,
+        question: str,
+        *,
+        previous_agent_id: str,
+        judge_solutions: Sequence[Tuple[str, str]],
+    ) -> str:
+        user_content = self._build_followup_user_content(
+            question,
+            agent_id=self.hub_agent.node_id,
+            previous_agent_id=previous_agent_id,
+            is_final_turn=True,
+            judge_solutions=judge_solutions,
+        )
+        fallback_prompt = self._build_plain_followup_prompt(
+            question,
+            agent_id=self.hub_agent.node_id,
+            previous_agent_id=previous_agent_id,
+            is_final_turn=True,
+            judge_solutions=judge_solutions,
+        )
+        rendered = self._render_chat_prompt(
+            self.hub_agent,
+            user_content,
+            continuation=False,
+            include_system=False,
+        )
+        return rendered if rendered else fallback_prompt
 
     @staticmethod
     def _append_turn_to_transcript(transcript: str, agent_id: str, response: str) -> str:
@@ -1368,14 +1401,13 @@ class AgentRunner:
         last_normal_turn_index = normal_turn_count - 1
 
         # max_turns counts ordinary collaborative generations. After those
-        # generations complete, the Hub always performs one separate FINAL turn.
-        # Each turn record has two distinct directions:
+        # generations complete, the Hub model performs one separate Judge call.
+        # Each discussion turn record has two distinct directions:
         #   - translated_*: the incoming KV delta used by this agent's generation.
         #   - offload_*:   the physical outgoing KV delta sent by this agent after generation.
         # Handoffs use a hub-centered star topology. If two consecutive logical
-        # turns use the same Agent (for example agent_count=1, or the mandatory
-        # final Hub turn immediately follows a normal Hub turn), no KV handoff is
-        # needed because that Agent already owns the current resident cache.
+        # discussion turns use the same Agent (for example agent_count=1), no KV
+        # handoff is needed because that Agent already owns the current resident cache.
         for turn_index in range(1, normal_turn_count):
             current_source = self._agent_for_turn(turn_index - 1)
             current_target = self._agent_for_turn(turn_index)
@@ -1425,13 +1457,6 @@ class AgentRunner:
                         source_agent=current_target,
                         logical_target_agent=next_target,
                     )
-            elif current_target.node_id != self.hub_agent.node_id:
-                # Prepare the mandatory final handoff while the source cache is
-                # still resident. The handoff itself is performed below.
-                self._prepare_outgoing_route_translation(
-                    source_agent=current_target,
-                    logical_target_agent=self.hub_agent,
-                )
 
             self._update_peak_memory_breakdown()
             transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
@@ -1445,47 +1470,26 @@ class AgentRunner:
             )
             last_response = generation.text
 
-        # Always perform one separate final Hub generation after exactly max_turns
-        # ordinary collaborative generations, even when the last ordinary turn
-        # was already produced by the Hub.
+        # After exactly max_turns collaborative generations, run the Judge as a
+        # separate decision call over the agents' latest solutions. MALLM's Judge
+        # does not continue the discussion memory; it receives the task and the
+        # candidate solutions explicitly. Free/Retain behavior above is unchanged
+        # during the discussion itself.
         final_turn_index = len(turns)
         current_source = self._agent_for_turn(last_normal_turn_index)
         source_record = turns[-1]
-        edge_id = None
-        incoming_offload_kind = None
-        tokens_received = 0
-
-        if current_source.node_id != self.hub_agent.node_id:
-            (
-                record_offload_target,
-                source_offload_meta,
-                source_cache_cleared,
-                incoming_from_agent,
-                incoming_meta,
-            ) = self._star_offload_to_turn_target(
-                source_agent=current_source,
-                target_agent=self.hub_agent,
-            )
-            self._apply_offload_metadata_to_record(
-                source_record,
-                target_agent=record_offload_target,
-                offload_meta=source_offload_meta,
-                source_was_freed=source_cache_cleared,
-            )
-            edge_id = str(incoming_meta.get("edge_id", "")) or None
-            incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
-            tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
-            del incoming_from_agent
-
         self._update_peak_memory_breakdown()
         self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
 
-        final_prompt = self.build_followup_prompt(
-            self.hub_agent.node_id,
-            final_turn_index,
+        judge_solutions = self._latest_agent_solutions(turns)
+        for agent in self.agent_sequence:
+            agent.reset()
+        self._pending_pretranslated_second_hops.clear()
+
+        final_prompt = self.build_judge_prompt(
             question,
-            is_final_turn=True,
-            judge_solutions=self._latest_agent_solutions(turns),
+            previous_agent_id=current_source.node_id,
+            judge_solutions=judge_solutions,
         )
         final_generation = self.hub_agent.generate_response(final_prompt)
         self._update_peak_memory_breakdown()
@@ -1494,17 +1498,10 @@ class AgentRunner:
             self.hub_agent.node_id,
             final_generation.text,
         )
-        turns.append(
-            self._turn_record(
-                final_generation,
-                translated_edge_id=edge_id,
-                translated_offload_kind=incoming_offload_kind,
-                tokens_received=tokens_received,
-            )
-        )
+        turns.append(self._turn_record(final_generation))
         last_response = final_generation.text
 
-        # The final Hub turn has no following offload inside this run.
+        # The Judge is a terminal decision call and has no following KV handoff.
         self._log_turn(example_index=example_index, turn_index=final_turn_index, record=turns[-1])
         return transcript, last_response
 

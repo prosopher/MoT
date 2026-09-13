@@ -296,9 +296,10 @@ def test_agent_runner_prompts_use_mallm_memory_simple_and_judge() -> None:
     assert "full discussion history from all previous Agents" in ordinary
     assert "Improve the current solution" in ordinary
     assert "If you agree with the current solution" in ordinary
-    assert "[AGREE]" in ordinary
-    assert "[DISAGREE]" in ordinary
+    assert "[AGREE] Answer: yes" in ordinary
+    assert "[DISAGREE] Answer: no" in ordinary
     assert "improved solution" in ordinary
+    assert "generation limit" in ordinary
     assert "Agent A" in ordinary
     assert "I agree with Agent [agent id]" not in ordinary
 
@@ -310,6 +311,32 @@ def test_agent_runner_prompts_use_mallm_memory_simple_and_judge() -> None:
     assert "FINAL: yes" in final
     assert "FINAL: no" in final
     assert "Hub" not in final
+
+
+def test_agent_runner_judge_chat_prompt_is_standalone_user_turn() -> None:
+    class ChatTokenizer:
+        chat_template = "checkpoint-template"
+
+        def __init__(self):
+            self.messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            del kwargs
+            self.messages = messages
+            return "rendered-judge"
+
+    tokenizer = ChatTokenizer()
+    fake_agent = SimpleNamespace(model=SimpleNamespace(tokenizer=tokenizer))
+
+    rendered = AgentRunner._render_chat_prompt(
+        fake_agent,
+        "judge input",
+        continuation=False,
+        include_system=False,
+    )
+
+    assert rendered == "rendered-judge"
+    assert tokenizer.messages == [{"role": "user", "content": "judge input"}]
 
 
 def test_agent_runner_judge_uses_latest_solution_per_agent() -> None:
@@ -400,3 +427,60 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
     assert result.profile["num_agent_turns"] == 6
     assert result.prediction == "yes"
     assert result.accuracy == 1.0
+
+
+def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=4,
+        max_turns=4,
+        log_turns=False,
+    )
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            is_final = "You are the Judge" in prompt_text
+            text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+            )
+
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    runner._update_peak_memory_breakdown = lambda: None
+    offload_pairs = []
+
+    def fake_star_offload(*, source_agent, target_agent):
+        offload_pairs.append((source_agent.node_id, target_agent.node_id))
+        meta = {
+            "edge_id": "A_to_B",
+            "offload_kind": "delta",
+            "tokens_sent": 1,
+            "tokens_received": 1,
+            "expected_delta_tokens": 1,
+        }
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_turn_target = fake_star_offload
+
+    result = runner.run(context="", question="question", gold_answers=["yes"])
+
+    assert offload_pairs == [("A", "B"), ("B", "C"), ("C", "D")]
+    assert result.turns[-1].translated_edge_id is None
+    assert result.turns[-1].tokens_received == 0
+    assert result.prediction == "yes"
