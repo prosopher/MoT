@@ -96,8 +96,21 @@ class InferenceProfileAccumulator:
 
 
 @contextmanager
-def temporarily_offload_module(module: Optional[torch.nn.Module], device: str):
-    if module is None or not isinstance(module, torch.nn.Module):
+def temporarily_offload_module(module: Optional[Any], device: str):
+    """Temporarily move a module-like object off CUDA and restore it afterwards.
+
+    Besides ``nn.Module``, callers pass ``TranslatorPool`` here.  TranslatorPool
+    deliberately is not an ``nn.Module`` but exposes a compatible ``to()`` method
+    that moves every translator it owns.  Restricting this helper to nn.Module
+    therefore leaves translators resident on GPU and contaminates memory profiles
+    that are intended to exclude translator parameters.
+    """
+    if module is None:
+        yield
+        return
+
+    move_to = getattr(module, "to", None)
+    if not callable(move_to):
         yield
         return
     if not (torch.cuda.is_available() and str(device).startswith("cuda")):
@@ -108,11 +121,11 @@ def temporarily_offload_module(module: Optional[torch.nn.Module], device: str):
     device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
 
     try:
-        module.to("cpu")
+        move_to("cpu")
         torch.cuda.synchronize(device_index)
         yield
     finally:
-        module.to(device)
+        move_to(device)
         torch.cuda.synchronize(device_index)
 
 
