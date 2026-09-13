@@ -215,6 +215,54 @@ class Agent:
         add_ids(getattr(getattr(self.model, "generation_config", None), "eos_token_id", None))
         return eos_token_ids
 
+    def _turn_terminator_token_id(self) -> Optional[int]:
+        """Resolve the chat-template assistant turn terminator without model-family branches."""
+        tokenizer = self.model.tokenizer
+        eos_token_ids = self._eos_token_ids()
+        template = getattr(tokenizer, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default") or next(iter(template.values()), None)
+
+        if isinstance(template, str) and template.strip() and hasattr(tokenizer, "apply_chat_template"):
+            marker = "__AGENT_RUNNER_ASSISTANT_END_PROBE__"
+            messages = [
+                {"role": "user", "content": "probe"},
+                {"role": "assistant", "content": marker},
+            ]
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    messages,
+                    chat_template=template,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                rendered = str(rendered)
+                marker_idx = rendered.rfind(marker)
+                if marker_idx >= 0:
+                    suffix = rendered[marker_idx + len(marker) :]
+                    encoded = tokenizer(suffix, add_special_tokens=False)
+                    suffix_ids = getattr(encoded, "input_ids", encoded.get("input_ids") if isinstance(encoded, dict) else None)
+                    if isinstance(suffix_ids, torch.Tensor):
+                        suffix_ids = suffix_ids.detach().cpu().reshape(-1).tolist()
+                    elif suffix_ids and isinstance(suffix_ids[0], (list, tuple)):
+                        suffix_ids = list(suffix_ids[0])
+                    for token_id in suffix_ids or []:
+                        token_id = int(token_id)
+                        if token_id in eos_token_ids:
+                            return token_id
+            except Exception as error:
+                logging.debug("Could not infer assistant turn terminator from chat template: %s", error)
+
+        # Plain-prompt models do not have a chat-specific terminator.  Their declared
+        # tokenizer EOS is the safest generic fallback; if absent, use any configured EOS.
+        tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+        if tokenizer_eos is not None:
+            try:
+                return int(tokenizer_eos)
+            except (TypeError, ValueError):
+                pass
+        return min(eos_token_ids) if eos_token_ids else None
+
     @torch.inference_mode()
     def generate_response(self, prompt_text: str) -> AgentGeneration:
         tokens_before = self.cache_seq_len
@@ -226,6 +274,7 @@ class Agent:
         # it is added only when it is fed back as input in the next decoding step.
         # Track only the generated token that is still visible but not yet cached.
         uncached_generated_token: Optional[torch.Tensor] = None
+        stopped_by_stop_sequence = False
 
         for _ in range(max(0, self.max_new_tokens)):
             ensure_token_ids_model(self.model, current_token_ids)
@@ -260,7 +309,15 @@ class Agent:
             _, matched_stop = self._trim_at_stop_sequence(decoded_so_far, self.stop_sequences)
             current_token_ids = next_token
             if matched_stop is not None:
+                stopped_by_stop_sequence = True
                 break
+
+        hit_max_new_tokens = (
+            self.max_new_tokens > 0
+            and terminal_token_id is None
+            and not stopped_by_stop_sequence
+            and len(generated_token_ids) >= self.max_new_tokens
+        )
 
         # The final predicted visible token has not entered the KV cache if the
         # loop ended before another decoding step consumed it. This includes an
@@ -270,6 +327,25 @@ class Agent:
             ensure_token_ids_model(self.model, uncached_generated_token)
             outputs = self.model(
                 input_ids=uncached_generated_token.as_tensor(),
+                past_key_values=current_past,
+                use_cache=True,
+            )
+            current_past = outputs.past_key_values
+
+        if hit_max_new_tokens:
+            forced_terminal_token_id = self._turn_terminator_token_id()
+            if forced_terminal_token_id is None:
+                raise RuntimeError(
+                    f"Agent {self.node_id} reached max_new_tokens without EOS, but no turn terminator could be resolved."
+                )
+            terminal_token_id = int(forced_terminal_token_id)
+            forced_terminal = TokenIDs(
+                torch.tensor([[terminal_token_id]], dtype=torch.long, device=self.device),
+                model_id=self.model.id,
+            )
+            ensure_token_ids_model(self.model, forced_terminal)
+            outputs = self.model(
+                input_ids=forced_terminal.as_tensor(),
                 past_key_values=current_past,
                 use_cache=True,
             )

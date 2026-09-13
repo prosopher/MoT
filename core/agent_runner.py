@@ -557,6 +557,8 @@ class AgentRunner:
         self.translator_pool = translator_pool
         self.alg = resolved_alg
         self.max_turns = int(max_turns)
+        if self.max_turns < 1:
+            raise ValueError(f"max_turns must be at least 1, got {self.max_turns}")
         self.generation_max_new_tokens = int(generation_max_new_tokens)
         self.max_prompt_tokens = max_prompt_tokens
         self.seed = int(seed)
@@ -659,9 +661,15 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_plain_initial_prompt(context: str, question: str) -> str:
+    def _final_answer_instruction() -> str:
+        return "This is the final turn. Return only the concise final answer as: FINAL: <concise answer>"
+
+    @staticmethod
+    def _build_plain_initial_prompt(context: str, question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
             "### Instruction: Use the passage to answer the Question accurately.\n"
+            f"{final_instruction}"
             f"### Passage:\n{context.strip()}\n"
             "### Question:\n"
             f"{question.strip()}\n"
@@ -669,10 +677,12 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_plain_followup_prompt(question: str) -> str:
+    def _build_plain_followup_prompt(question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
             "\n### Instruction:\n"
             "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            f"{final_instruction}"
             "### Question:\n"
             f"{question.strip()}\n"
             "### Response:\n"
@@ -696,10 +706,12 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_initial_user_content(context: str, question: str) -> str:
+    def _build_initial_user_content(context: str, question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
             "### Instruction:\n"
             "Use the passage to answer the Question accurately.\n"
+            f"{final_instruction}"
             "### Passage:\n"
             f"{context.strip()}\n"
             "### Question:\n"
@@ -707,10 +719,12 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_followup_user_content(question: str) -> str:
+    def _build_followup_user_content(question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
             "### Instruction:\n"
             "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            f"{final_instruction}"
             "### Question:\n"
             f"{question.strip()}"
         )
@@ -793,8 +807,8 @@ class AgentRunner:
         agent_count: int = 2,
         is_final_turn: bool = False,
     ) -> str:
-        del hub_agent_id, agent_count, is_final_turn
-        return AgentRunner._build_plain_initial_prompt(context, question)
+        del hub_agent_id, agent_count
+        return AgentRunner._build_plain_initial_prompt(context, question, is_final_turn=is_final_turn)
 
     def build_initial_prompt_for_agent(
         self,
@@ -806,12 +820,12 @@ class AgentRunner:
         agent_count: int = 2,
         is_final_turn: bool = False,
     ) -> str:
-        del hub_agent_id, agent_count, is_final_turn
-        user_content = self._build_initial_user_content(context, question)
+        del hub_agent_id, agent_count
+        user_content = self._build_initial_user_content(context, question, is_final_turn=is_final_turn)
         return self._format_agent_prompt(
             agent,
             user_content,
-            self._build_plain_initial_prompt(context, question),
+            self._build_plain_initial_prompt(context, question, is_final_turn=is_final_turn),
             continuation=False,
         )
 
@@ -823,17 +837,17 @@ class AgentRunner:
         *,
         is_final_turn: bool = False,
     ) -> str:
-        del turn_index, is_final_turn
-        user_content = self._build_followup_user_content(question)
+        del turn_index
+        user_content = self._build_followup_user_content(question, is_final_turn=is_final_turn)
         agent = self.agents.get(agent_id)
         if agent is not None:
             return self._format_agent_prompt(
                 agent,
                 user_content,
-                self._build_plain_followup_prompt(question),
+                self._build_plain_followup_prompt(question, is_final_turn=is_final_turn),
                 continuation=True,
             )
-        return self._build_plain_followup_prompt(question)
+        return self._build_plain_followup_prompt(question, is_final_turn=is_final_turn)
 
     @staticmethod
     def _append_turn_to_transcript(transcript: str, agent_id: str, response: str) -> str:
@@ -842,12 +856,15 @@ class AgentRunner:
 
     @staticmethod
     def extract_final_answer(transcript: str, fallback_response: str) -> str:
-        matches = list(re.finditer(r"FINAL\s*:\s*(.+)", transcript, flags=re.IGNORECASE))
+        # The final prompt itself contains the literal template "FINAL: <concise answer>",
+        # so parse only the final hub response rather than searching the whole transcript.
+        del transcript
+        matches = list(re.finditer(r"FINAL\s*:\s*(.+)", fallback_response or "", flags=re.IGNORECASE))
         if matches:
             candidate = matches[-1].group(1).strip()
             candidate = re.split(r"[\n\r]", candidate, maxsplit=1)[0].strip()
             return postprocess_generated_answer(candidate)
-        return postprocess_generated_answer(fallback_response)
+        return (fallback_response or "").strip()
 
     @staticmethod
     def _preview_text(text: str, max_chars: int) -> str:
@@ -1235,81 +1252,98 @@ class AgentRunner:
         example_index: Optional[int],
     ) -> Tuple[str, str]:
         last_response = initial_generation.text
-        effective_max_turns = 1 if len(self.agent_sequence) == 1 else max(1, self.max_turns)
-        last_turn_index = effective_max_turns - 1
-        needs_extra_hub_final = self._agent_for_turn(last_turn_index).node_id != self.hub_agent.node_id
+        normal_turn_count = self.max_turns
+        last_normal_turn_index = normal_turn_count - 1
 
+        # max_turns counts ordinary collaborative generations. After those
+        # generations complete, the Hub always performs one separate FINAL turn.
         # Each turn record has two distinct directions:
         #   - translated_*: the incoming KV delta used by this agent's generation.
         #   - offload_*:   the physical outgoing KV delta sent by this agent after generation.
-        # There is no separate whole-cache offload mode. The delta is always the source cache suffix
-        # that the target does not currently have. Handoffs use a hub-centered star topology:
-        # direct if source or target is the hub, otherwise source->hub followed by hub->target.
-        # In free mode, a cleared non-hub target has no cache, so its next incoming delta
-        # spans the entire source cache.
-        for turn_index in range(1, effective_max_turns):
+        # Handoffs use a hub-centered star topology. If two consecutive logical
+        # turns use the same Agent (for example agent_count=1, or the mandatory
+        # final Hub turn immediately follows a normal Hub turn), no KV handoff is
+        # needed because that Agent already owns the current resident cache.
+        for turn_index in range(1, normal_turn_count):
             current_source = self._agent_for_turn(turn_index - 1)
             current_target = self._agent_for_turn(turn_index)
             source_record = turns[turn_index - 1]
 
-            (
-                record_offload_target,
-                source_offload_meta,
-                source_cache_cleared,
-                incoming_from_agent,
-                incoming_meta,
-            ) = self._star_offload_to_turn_target(
-                source_agent=current_source,
-                target_agent=current_target,
-            )
+            edge_id: Optional[str] = None
+            incoming_offload_kind: Optional[str] = None
+            tokens_received = 0
+            if current_source.node_id != current_target.node_id:
+                (
+                    record_offload_target,
+                    source_offload_meta,
+                    source_cache_cleared,
+                    incoming_from_agent,
+                    incoming_meta,
+                ) = self._star_offload_to_turn_target(
+                    source_agent=current_source,
+                    target_agent=current_target,
+                )
 
-            self._apply_offload_metadata_to_record(
-                source_record,
-                target_agent=record_offload_target,
-                offload_meta=source_offload_meta,
-                source_was_freed=source_cache_cleared,
-            )
+                self._apply_offload_metadata_to_record(
+                    source_record,
+                    target_agent=record_offload_target,
+                    offload_meta=source_offload_meta,
+                    source_was_freed=source_cache_cleared,
+                )
+                edge_id = str(incoming_meta.get("edge_id", "")) or None
+                incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
+                tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
+                del incoming_from_agent
+
             self._update_kv_peak_memory()
             self._log_turn(example_index=example_index, turn_index=turn_index - 1, record=source_record)
-
-            edge_id = str(incoming_meta.get("edge_id", "")) or None
-            incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
-            tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
 
             prompt = self.build_followup_prompt(
                 current_target.node_id,
                 turn_index,
                 question,
+                is_final_turn=False,
             )
             generation = current_target.generate_response(prompt)
-            if turn_index < last_turn_index:
-                self._prepare_outgoing_route_translation(
-                    source_agent=current_target,
-                    logical_target_agent=self._agent_for_turn(turn_index + 1),
-                )
-            elif needs_extra_hub_final:
+
+            if turn_index < last_normal_turn_index:
+                next_target = self._agent_for_turn(turn_index + 1)
+                if current_target.node_id != next_target.node_id:
+                    self._prepare_outgoing_route_translation(
+                        source_agent=current_target,
+                        logical_target_agent=next_target,
+                    )
+            elif current_target.node_id != self.hub_agent.node_id:
+                # Prepare the mandatory final handoff while the source cache is
+                # still resident. The handoff itself is performed below.
                 self._prepare_outgoing_route_translation(
                     source_agent=current_target,
                     logical_target_agent=self.hub_agent,
                 )
+
             self._update_kv_peak_memory()
             transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
-
-            del incoming_from_agent
-            record = self._turn_record(
-                generation,
-                translated_edge_id=edge_id,
-                translated_offload_kind=incoming_offload_kind,
-                tokens_received=tokens_received,
+            turns.append(
+                self._turn_record(
+                    generation,
+                    translated_edge_id=edge_id,
+                    translated_offload_kind=incoming_offload_kind,
+                    tokens_received=tokens_received,
+                )
             )
-            turns.append(record)
             last_response = generation.text
 
-        if needs_extra_hub_final:
-            final_turn_index = len(turns)
-            current_source = self._agent_for_turn(last_turn_index)
-            source_record = turns[-1]
+        # Always perform one separate final Hub generation after exactly max_turns
+        # ordinary collaborative generations, even when the last ordinary turn
+        # was already produced by the Hub.
+        final_turn_index = len(turns)
+        current_source = self._agent_for_turn(last_normal_turn_index)
+        source_record = turns[-1]
+        edge_id = None
+        incoming_offload_kind = None
+        tokens_received = 0
 
+        if current_source.node_id != self.hub_agent.node_id:
             (
                 record_offload_target,
                 source_offload_meta,
@@ -1326,34 +1360,39 @@ class AgentRunner:
                 offload_meta=source_offload_meta,
                 source_was_freed=source_cache_cleared,
             )
-            self._update_kv_peak_memory()
-            self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
-
             edge_id = str(incoming_meta.get("edge_id", "")) or None
             incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
             tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
-            prompt = self.build_followup_prompt(
-                self.hub_agent.node_id,
-                final_turn_index,
-                question,
-            )
-            generation = self.hub_agent.generate_response(prompt)
-            self._update_kv_peak_memory()
-            transcript = self._append_turn_to_transcript(transcript + prompt, self.hub_agent.node_id, generation.text)
             del incoming_from_agent
-            record = self._turn_record(
-                generation,
+
+        self._update_kv_peak_memory()
+        self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
+
+        final_prompt = self.build_followup_prompt(
+            self.hub_agent.node_id,
+            final_turn_index,
+            question,
+            is_final_turn=True,
+        )
+        final_generation = self.hub_agent.generate_response(final_prompt)
+        self._update_kv_peak_memory()
+        transcript = self._append_turn_to_transcript(
+            transcript + final_prompt,
+            self.hub_agent.node_id,
+            final_generation.text,
+        )
+        turns.append(
+            self._turn_record(
+                final_generation,
                 translated_edge_id=edge_id,
                 translated_offload_kind=incoming_offload_kind,
                 tokens_received=tokens_received,
             )
-            turns.append(record)
-            last_response = generation.text
+        )
+        last_response = final_generation.text
 
-        # The last generated turn has no following offload inside this run. Log it after
-        # all earlier source records have been annotated with their outgoing handoffs.
-        self._log_turn(example_index=example_index, turn_index=len(turns) - 1, record=turns[-1])
-
+        # The final Hub turn has no following offload inside this run.
+        self._log_turn(example_index=example_index, turn_index=final_turn_index, record=turns[-1])
         return transcript, last_response
 
     def _run_retain_turns(
@@ -1418,11 +1457,13 @@ class AgentRunner:
 
         # The first node is the HubAgent and starts from native Base Context + Prompt.
         generation = self.hub_agent.generate_response(transcript)
-        if len(self.agent_sequence) > 1 and max(1, self.max_turns) > 1:
-            self._prepare_outgoing_route_translation(
-                source_agent=self.hub_agent,
-                logical_target_agent=self._agent_for_turn(1),
-            )
+        if self.max_turns > 1:
+            next_target = self._agent_for_turn(1)
+            if self.hub_agent.node_id != next_target.node_id:
+                self._prepare_outgoing_route_translation(
+                    source_agent=self.hub_agent,
+                    logical_target_agent=next_target,
+                )
         self._update_kv_peak_memory()
         transcript = self._append_turn_to_transcript(transcript, self.hub_agent.node_id, generation.text)
         record = self._turn_record(generation)
@@ -1522,7 +1563,7 @@ class AgentRunner:
             "latency_sec": float(latency_sec),
             "tokens": len(result.turns) * max(1, self.generation_max_new_tokens),
             "num_agent_turns": len(result.turns),
-            "requested_max_turns": max(1, self.max_turns),
+            "requested_max_turns": self.max_turns,
             "peak_memory_bytes": self._kv_peak_memory_bytes,
         }
         return result

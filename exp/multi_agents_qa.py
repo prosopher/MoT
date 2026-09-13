@@ -57,11 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-reference-roles",
         choices=["all", "user", "agent"],
-        default="user",
+        default="all",
         help=(
             "Which collapsed turns supply sp_id references for Base Context. "
-            "user follows the requested setting: Base Context comes from the question/user turn sp_id; "
-            "all also includes gold answer turns; agent uses only answer turns."
+            "all (default) includes both question/user and gold-answer turn references; "
+            "user uses only question/user turn references; agent uses only answer-turn references."
         ),
     )
     parser.add_argument(
@@ -105,15 +105,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-eval-stream", nargs="?", const=True, default=False, type=_str_to_bool)
     parser.add_argument("--shuffle-buffer", type=int, default=1024)
-    parser.add_argument("--max-turns", "--max-turn", dest="max_turns", type=int, default=4)
+    parser.add_argument(
+        "--max-turns",
+        "--max-turn",
+        dest="max_turns",
+        type=int,
+        default=4,
+        help="Number of ordinary collaborative inference turns before one mandatory final Hub turn.",
+    )
     parser.add_argument(
         "--agent-count",
         type=int,
         default=None,
         help=(
-            "Number of agents to use from the checkpoint translator-pool nodes. "
-            "Use 1 to evaluate the Hub-only single-turn baseline without communication. "
-            "Default: use all available nodes, preserving the previous behavior."
+            "Number of logical agents. Use 1 for a Hub-only baseline without communication; "
+            "--max-turns still controls its ordinary inference turns, followed by one final Hub turn. "
+            "Default: use all available nodes."
         ),
     )
     parser.add_argument("--generation-max-new-tokens", type=int, default=48)
