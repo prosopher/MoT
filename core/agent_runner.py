@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
 from dataclasses import dataclass
 import importlib
 import logging
@@ -15,9 +14,9 @@ from core.common import PastKeyValues, TokenIDs, extract_past_key_values, read_j
 from core.config import resolve_device
 from core.context import Context
 from core.eval_util import (
-    InferenceProfiler,
-    temporarily_offload_module,
+    GPUMemoryBreakdownBytes,
     compute_generation_f1,
+    measure_gpu_memory_breakdown_bytes,
     postprocess_generated_answer,
 )
 from core.topology import Edge, Node, build_edge_map, build_nodes_and_edges, index_to_node_id
@@ -149,10 +148,14 @@ class AgentRunnerResult:
 
     @property
     def peak_memory_gib(self) -> float:
-        peak = self.profile.get("peak_memory_bytes")
-        if peak is None:
+        values = [
+            self.profile.get("model_memory_bytes"),
+            self.profile.get("translator_memory_bytes"),
+            self.profile.get("kv_memory_bytes"),
+        ]
+        if any(value is None for value in values):
             return float("nan")
-        return float(peak) / (1024 ** 3)
+        return sum(float(value) for value in values if value is not None) / (1024 ** 3)
 
 
 class KVCacheTranslationAdapter:
@@ -567,7 +570,6 @@ class AgentRunner:
         self.cache_mode = cache_mode
         self.agent_count = resolved_agent_count
         self.device = ctx.config.device
-        self.profiler = InferenceProfiler(self.device)
         self.cache_translator = KVCacheTranslationAdapter(ctx=ctx, translator_pool=translator_pool, alg=alg)
         self._canonical_model_node_id = ctx.nodes[0].id
 
@@ -618,7 +620,7 @@ class AgentRunner:
         # precomputed right after the source generation, before any offload starts,
         # then installed on the hub after the first hop updates the hub cache.
         self._pending_pretranslated_second_hops: Dict[Tuple[str, str], Tuple[str, PastKeyValues, List[int]]] = {}
-        self._kv_peak_memory_bytes: Optional[int] = None
+        self._peak_memory_breakdown_bytes: Optional[GPUMemoryBreakdownBytes] = None
 
     @classmethod
     def from_checkpoint(cls, config: AgentRunnerConfig) -> "AgentRunner":
@@ -879,36 +881,23 @@ class AgentRunner:
     def _agent_for_turn(self, turn_index: int) -> Agent:
         return self.agent_sequence[turn_index % len(self.agent_sequence)]
 
-    def _iter_unique_gpu_modules_for_kv_measurement(self):
-        seen = set()
-        modules = [self.translator_pool] + [
-            self.ctx.tp.get_model(node.id)
-            for node in self.ctx.nodes
-        ]
-        for module in modules:
-            module_id = id(module)
-            if module_id in seen:
-                continue
-            seen.add(module_id)
-            yield module
-
-    def _measure_kv_cache_only_memory_bytes(self) -> Optional[int]:
-        if not (torch.cuda.is_available() and str(self.device).startswith("cuda")):
-            return None
-        device_obj = torch.device(self.device)
-        device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
-        with ExitStack() as stack:
-            for module in self._iter_unique_gpu_modules_for_kv_measurement():
-                stack.enter_context(temporarily_offload_module(module, self.device))
-            torch.cuda.synchronize(device_index)
-            return int(torch.cuda.memory_allocated(device_index))
-
-    def _update_kv_peak_memory(self) -> None:
-        measured = self._measure_kv_cache_only_memory_bytes()
+    def _update_peak_memory_breakdown(self) -> None:
+        measured = measure_gpu_memory_breakdown_bytes(
+            self.device,
+            models=self.ctx.tp.models.values(),
+            translator_pool=self.translator_pool,
+        )
         if measured is None:
             return
-        if self._kv_peak_memory_bytes is None or measured > self._kv_peak_memory_bytes:
-            self._kv_peak_memory_bytes = measured
+        previous = self._peak_memory_breakdown_bytes
+        if previous is None:
+            self._peak_memory_breakdown_bytes = measured
+            return
+        self._peak_memory_breakdown_bytes = GPUMemoryBreakdownBytes(
+            model_bytes=max(previous.model_bytes, measured.model_bytes),
+            translator_bytes=max(previous.translator_bytes, measured.translator_bytes),
+            kv_bytes=max(previous.kv_bytes, measured.kv_bytes),
+        )
 
     def _log_example_start(
         self,
@@ -1295,7 +1284,7 @@ class AgentRunner:
                 tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
                 del incoming_from_agent
 
-            self._update_kv_peak_memory()
+            self._update_peak_memory_breakdown()
             self._log_turn(example_index=example_index, turn_index=turn_index - 1, record=source_record)
 
             prompt = self.build_followup_prompt(
@@ -1321,7 +1310,7 @@ class AgentRunner:
                     logical_target_agent=self.hub_agent,
                 )
 
-            self._update_kv_peak_memory()
+            self._update_peak_memory_breakdown()
             transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
             turns.append(
                 self._turn_record(
@@ -1365,7 +1354,7 @@ class AgentRunner:
             tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
             del incoming_from_agent
 
-        self._update_kv_peak_memory()
+        self._update_peak_memory_breakdown()
         self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
 
         final_prompt = self.build_followup_prompt(
@@ -1375,7 +1364,7 @@ class AgentRunner:
             is_final_turn=True,
         )
         final_generation = self.hub_agent.generate_response(final_prompt)
-        self._update_kv_peak_memory()
+        self._update_peak_memory_breakdown()
         transcript = self._append_turn_to_transcript(
             transcript + final_prompt,
             self.hub_agent.node_id,
@@ -1437,7 +1426,7 @@ class AgentRunner:
         gold_answers: Sequence[str],
         example_index: Optional[int] = None,
     ) -> AgentRunnerResult:
-        self._kv_peak_memory_bytes = None
+        self._peak_memory_breakdown_bytes = None
         for agent in self.agent_sequence:
             agent.reset()
         self._pending_pretranslated_second_hops.clear()
@@ -1464,7 +1453,7 @@ class AgentRunner:
                     source_agent=self.hub_agent,
                     logical_target_agent=next_target,
                 )
-        self._update_kv_peak_memory()
+        self._update_peak_memory_breakdown()
         transcript = self._append_turn_to_transcript(transcript, self.hub_agent.node_id, generation.text)
         record = self._turn_record(generation)
         turns.append(record)
@@ -1559,12 +1548,15 @@ class AgentRunner:
             device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
             torch.cuda.synchronize(device_index)
         latency_sec = time.perf_counter() - started_at
+        peak_memory = self._peak_memory_breakdown_bytes
         result.profile = {
             "latency_sec": float(latency_sec),
             "tokens": len(result.turns) * max(1, self.generation_max_new_tokens),
             "num_agent_turns": len(result.turns),
             "requested_max_turns": self.max_turns,
-            "peak_memory_bytes": self._kv_peak_memory_bytes,
+            "model_memory_bytes": None if peak_memory is None else peak_memory.model_bytes,
+            "translator_memory_bytes": None if peak_memory is None else peak_memory.translator_bytes,
+            "kv_memory_bytes": None if peak_memory is None else peak_memory.kv_bytes,
         }
         return result
 

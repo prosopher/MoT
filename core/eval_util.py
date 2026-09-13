@@ -48,27 +48,131 @@ OPENWEBTEXT_TSNE_DISPLAY_NAMES = {
 OPENWEBTEXT_TSNE_FILE_BASENAME = "openwebtext_validation_tsne"
 
 
+@dataclass(frozen=True)
+class GPUMemoryBreakdownBytes:
+    model_bytes: int
+    translator_bytes: int
+    kv_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return self.model_bytes + self.translator_bytes + self.kv_bytes
+
+
+def _iter_module_like_tensors(module: Optional[Any]):
+    if module is None:
+        return
+
+    modules_fn = getattr(module, "modules", None)
+    if callable(modules_fn):
+        for submodule in modules_fn():
+            parameters_fn = getattr(submodule, "parameters", None)
+            if callable(parameters_fn):
+                yield from parameters_fn(recurse=False)
+            buffers_fn = getattr(submodule, "buffers", None)
+            if callable(buffers_fn):
+                yield from buffers_fn(recurse=False)
+        return
+
+    parameters_fn = getattr(module, "parameters", None)
+    if callable(parameters_fn):
+        yield from parameters_fn()
+
+
+def _cuda_storage_bytes(
+    modules: Iterable[Any],
+    *,
+    device_index: int,
+    seen_storage_keys: Optional[set] = None,
+) -> int:
+    seen = seen_storage_keys if seen_storage_keys is not None else set()
+    total = 0
+    for module in modules:
+        for tensor in _iter_module_like_tensors(module):
+            if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cuda":
+                continue
+            tensor_device_index = torch.cuda.current_device() if tensor.device.index is None else tensor.device.index
+            if tensor_device_index != device_index:
+                continue
+            storage = tensor.untyped_storage()
+            key = (tensor_device_index, storage.data_ptr())
+            if key in seen:
+                continue
+            seen.add(key)
+            total += int(storage.nbytes())
+    return total
+
+
+def measure_gpu_memory_breakdown_bytes(
+    device: str,
+    *,
+    models: Iterable[Any],
+    translator_pool: Optional[Any],
+) -> Optional[GPUMemoryBreakdownBytes]:
+    """Partition current CUDA allocated memory into model, translator, and KV bytes.
+
+    Model and translator memory are measured from their unique CUDA tensor storages.
+    The remaining live CUDA allocation is attributed to KV/cache state. Callers sample
+    this only at stable points where temporary forward tensors have been released.
+    """
+    if not (torch.cuda.is_available() and str(device).startswith("cuda")):
+        return None
+
+    device_obj = torch.device(device)
+    device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+    torch.cuda.synchronize(device_index)
+
+    seen_storages = set()
+    model_bytes = _cuda_storage_bytes(
+        models,
+        device_index=device_index,
+        seen_storage_keys=seen_storages,
+    )
+    translator_bytes = _cuda_storage_bytes(
+        [translator_pool] if translator_pool is not None else [],
+        device_index=device_index,
+        seen_storage_keys=seen_storages,
+    )
+    allocated_bytes = int(torch.cuda.memory_allocated(device_index))
+    kv_bytes = max(0, allocated_bytes - model_bytes - translator_bytes)
+    return GPUMemoryBreakdownBytes(
+        model_bytes=model_bytes,
+        translator_bytes=translator_bytes,
+        kv_bytes=kv_bytes,
+    )
+
+
 @dataclass
 class InferenceProfileAccumulator:
     total_latency_sec: float = 0.0
     total_tokens: int = 0
     num_calls: int = 0
-    peak_memory_bytes: Optional[int] = None
+    model_memory_bytes: Optional[int] = None
+    translator_memory_bytes: Optional[int] = None
+    kv_memory_bytes: Optional[int] = None
 
     def update(
         self,
         *,
         latency_sec: float,
         tokens: int,
-        peak_memory_bytes: Optional[int],
+        model_memory_bytes: Optional[int],
+        translator_memory_bytes: Optional[int],
+        kv_memory_bytes: Optional[int],
     ) -> None:
         self.total_latency_sec += float(latency_sec)
         self.total_tokens += tokens
         self.num_calls += 1
-        if peak_memory_bytes is not None:
-            peak_value = peak_memory_bytes
-            if self.peak_memory_bytes is None or peak_value > self.peak_memory_bytes:
-                self.peak_memory_bytes = peak_value
+        for field_name, value in (
+            ("model_memory_bytes", model_memory_bytes),
+            ("translator_memory_bytes", translator_memory_bytes),
+            ("kv_memory_bytes", kv_memory_bytes),
+        ):
+            if value is None:
+                continue
+            current = getattr(self, field_name)
+            if current is None or value > current:
+                setattr(self, field_name, int(value))
 
     def summary(self) -> Dict[str, float]:
         if self.num_calls <= 0:
@@ -81,30 +185,32 @@ class InferenceProfileAccumulator:
         else:
             throughput_tokens_per_sec = float("nan")
 
-        if self.peak_memory_bytes is None:
-            peak_memory_gib = float("nan")
-        else:
-            peak_memory_gib = float(self.peak_memory_bytes) / (1024 ** 3)
+        def to_gib(value: Optional[int]) -> float:
+            return float("nan") if value is None else float(value) / (1024 ** 3)
+
+        model_memory_gib = to_gib(self.model_memory_bytes)
+        translator_memory_gib = to_gib(self.translator_memory_bytes)
+        kv_memory_gib = to_gib(self.kv_memory_bytes)
+        component_values = [self.model_memory_bytes, self.translator_memory_bytes, self.kv_memory_bytes]
+        peak_memory_gib = (
+            float("nan")
+            if any(value is None for value in component_values)
+            else sum(int(value) for value in component_values if value is not None) / (1024 ** 3)
+        )
 
         return {
             "avg_latency_ms": avg_latency_ms,
             "throughput_tokens_per_sec": throughput_tokens_per_sec,
+            "model_memory_gib": model_memory_gib,
+            "translator_memory_gib": translator_memory_gib,
+            "kv_memory_gib": kv_memory_gib,
             "peak_memory_gib": peak_memory_gib,
         }
 
 
-
-
 @contextmanager
 def temporarily_offload_module(module: Optional[Any], device: str):
-    """Temporarily move a module-like object off CUDA and restore it afterwards.
-
-    Besides ``nn.Module``, callers pass ``TranslatorPool`` here.  TranslatorPool
-    deliberately is not an ``nn.Module`` but exposes a compatible ``to()`` method
-    that moves every translator it owns.  Restricting this helper to nn.Module
-    therefore leaves translators resident on GPU and contaminates memory profiles
-    that are intended to exclude translator parameters.
-    """
+    """Temporarily move a module-like object to CPU and restore it afterwards."""
     if module is None:
         yield
         return
@@ -130,70 +236,43 @@ def temporarily_offload_module(module: Optional[Any], device: str):
 
 
 class InferenceProfiler:
-    def __init__(self, device: str, *, sample_interval_sec: float = 0.005) -> None:
+    def __init__(self, device: str, *, models: Iterable[Any], translator_pool: Optional[Any]) -> None:
         self.device = device
-        self.reader = CurrentProcessGPUMemoryReader(device)
-        self.enabled = self.reader.enabled
-        self.sample_interval_sec = max(float(sample_interval_sec), 0.001)
+        self.models = list(models)
+        self.translator_pool = translator_pool
+        self.enabled = torch.cuda.is_available() and str(device).startswith("cuda")
         if self.enabled:
             device_index = torch.device(self.device).index
             self.device_index = torch.cuda.current_device() if device_index is None else device_index
         else:
             self.device_index = None
 
-    def _measure_peak_allocated_bytes(self, fn: Callable[[], T]) -> Tuple[T, Optional[int]]:
-        if not self.enabled:
-            return fn(), None
-
-        peak_memory_bytes = 0
-        stop_event = threading.Event()
-        peak_lock = threading.Lock()
-
-        def sample_memory() -> None:
-            nonlocal peak_memory_bytes
-            while not stop_event.is_set():
-                allocated = self.reader.read_allocated_bytes()
-                if allocated is not None:
-                    with peak_lock:
-                        peak_memory_bytes = max(peak_memory_bytes, int(allocated))
-                stop_event.wait(self.sample_interval_sec)
-
-        sampler = threading.Thread(
-            target=sample_memory,
-            name="inference-memory-profiler",
-            daemon=True,
-        )
-
-        initial_allocated = self.reader.read_allocated_bytes()
-        if initial_allocated is not None:
-            peak_memory_bytes = max(peak_memory_bytes, int(initial_allocated))
-
-        sampler.start()
-        try:
-            result = fn()
-            torch.cuda.synchronize(self.device_index)
-        finally:
-            stop_event.set()
-            sampler.join(timeout=max(1.0, self.sample_interval_sec * 4.0))
-
-        final_allocated = self.reader.read_allocated_bytes()
-        if final_allocated is not None:
-            peak_memory_bytes = max(peak_memory_bytes, int(final_allocated))
-
-        return result, peak_memory_bytes
-
-    def measure(self, fn: Callable[[], T], *, tokens: int) -> Tuple[T, Dict[str, Optional[float]]]:
+    def measure(
+        self,
+        fn: Callable[[], T],
+        *,
+        tokens: int,
+    ) -> Tuple[T, Dict[str, Optional[float]]]:
         if self.enabled:
             torch.cuda.synchronize(self.device_index)
 
         started_at = time.perf_counter()
-        result, peak_memory_bytes = self._measure_peak_allocated_bytes(fn)
+        result = fn()
+        if self.enabled:
+            torch.cuda.synchronize(self.device_index)
         latency_sec = time.perf_counter() - started_at
 
+        measured = measure_gpu_memory_breakdown_bytes(
+            self.device,
+            models=self.models,
+            translator_pool=self.translator_pool,
+        )
         return result, {
             "latency_sec": float(latency_sec),
             "tokens": tokens,
-            "peak_memory_bytes": peak_memory_bytes,
+            "model_memory_bytes": None if measured is None else measured.model_bytes,
+            "translator_memory_bytes": None if measured is None else measured.translator_bytes,
+            "kv_memory_bytes": None if measured is None else measured.kv_bytes,
         }
 
 
@@ -896,6 +975,9 @@ def summarize_openwebtext_named_losses(
         field_prefix = f"{prefix}_" if prefix else ""
         summary[f"{field_prefix}latency_ms"] = float(profile_summary.get("avg_latency_ms", float("nan")))
         summary[f"{field_prefix}throughput_tokens_per_sec"] = float(profile_summary.get("throughput_tokens_per_sec", float("nan")))
+        summary[f"{field_prefix}model_memory_gib"] = float(profile_summary.get("model_memory_gib", float("nan")))
+        summary[f"{field_prefix}translator_memory_gib"] = float(profile_summary.get("translator_memory_gib", float("nan")))
+        summary[f"{field_prefix}kv_memory_gib"] = float(profile_summary.get("kv_memory_gib", float("nan")))
         summary[f"{field_prefix}peak_memory_gib"] = float(profile_summary.get("peak_memory_gib", float("nan")))
 
     if loss_delta_reference_name is not None:
@@ -925,9 +1007,9 @@ def run_openwebtext_greedy_inference(
     past_key_values: PastKeyValues,
     seed_token: TokenIDs,
     max_new_tokens: int,
-) -> int:
+) -> Tuple[int, PastKeyValues]:
     if max_new_tokens <= 0:
-        return 0
+        return 0, past_key_values
 
     current_token_ids = seed_token
     current_past = past_key_values
@@ -941,11 +1023,12 @@ def run_openwebtext_greedy_inference(
             use_cache=True,
         )
         next_token = TokenIDs(outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True), model_id=current_token_ids.model_id)
+        current_past = outputs.past_key_values
+        del outputs
         total_generated_tokens += int(next_token.numel())
         current_token_ids = next_token
-        current_past = outputs.past_key_values
 
-    return total_generated_tokens
+    return total_generated_tokens, current_past
 
 
 
@@ -1026,7 +1109,9 @@ def evaluate_openwebtext_validation_loss_metrics(
                 accumulator.update(
                     latency_sec=float(profile_values.get("latency_sec", 0.0)),
                     tokens=profile_values.get("tokens", 0),
-                    peak_memory_bytes=profile_values.get("peak_memory_bytes"),
+                    model_memory_bytes=profile_values.get("model_memory_bytes"),
+                    translator_memory_bytes=profile_values.get("translator_memory_bytes"),
+                    kv_memory_bytes=profile_values.get("kv_memory_bytes"),
                 )
             counts[edge.id] += batch_examples
 
@@ -1098,7 +1183,11 @@ def evaluate_openwebtext_validation_loss_top_layers(
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    profiler = InferenceProfiler(train_config.device)
+    profiler = InferenceProfiler(
+        train_config.device,
+        models=ctx.tp.models.values(),
+        translator_pool=translator_pool,
+    )
 
     def evaluate_edge_losses_fn(
         *,
@@ -1135,7 +1224,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
             ).item()
         )
 
-        def run_translated_inference() -> int:
+        def run_translated_inference():
             return run_openwebtext_greedy_inference(
                 model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
@@ -1143,7 +1232,7 @@ def evaluate_openwebtext_validation_loss_top_layers(
                 max_new_tokens=generation_steps,
             )
 
-        def run_native_inference() -> int:
+        def run_native_inference():
             return run_openwebtext_greedy_inference(
                 model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
@@ -1151,15 +1240,17 @@ def evaluate_openwebtext_validation_loss_top_layers(
                 max_new_tokens=generation_steps,
             )
 
-        _, translated_profile = profiler.measure(
+        translated_result, translated_profile = profiler.measure(
             run_translated_inference,
             tokens=profile_tokens,
         )
+        del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
-            _, native_profile = profiler.measure(
+            native_result, native_profile = profiler.measure(
                 run_native_inference,
                 tokens=profile_tokens,
             )
+            del native_result
         return (
             {
                 "translated": translated_loss,
@@ -1196,7 +1287,11 @@ def evaluate_openwebtext_validation_loss_replay(
     build_visualization_pasts_fn: Optional[Callable[..., Dict[str, PastKeyValues]]] = None,
 ) -> Dict[str, Dict[str, float]]:
     train_config = ctx.config
-    profiler = InferenceProfiler(train_config.device)
+    profiler = InferenceProfiler(
+        train_config.device,
+        models=ctx.tp.models.values(),
+        translator_pool=translator_pool,
+    )
 
     def evaluate_edge_losses_fn(
         *,
@@ -1239,7 +1334,7 @@ def evaluate_openwebtext_validation_loss_replay(
             ).item()
         )
 
-        def run_translated_inference() -> int:
+        def run_translated_inference():
             mixed_target_past = build_translated_target_past_fn(
                 edge=edge,
                 source_context_token_ids=source_context_token_ids,
@@ -1253,7 +1348,7 @@ def evaluate_openwebtext_validation_loss_replay(
                 max_new_tokens=generation_steps,
             )
 
-        def run_native_inference() -> int:
+        def run_native_inference():
             return run_openwebtext_greedy_inference(
                 model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
@@ -1261,15 +1356,17 @@ def evaluate_openwebtext_validation_loss_replay(
                 max_new_tokens=generation_steps,
             )
 
-        _, translated_profile = profiler.measure(
+        translated_result, translated_profile = profiler.measure(
             run_translated_inference,
             tokens=profile_tokens,
         )
+        del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
-            _, native_profile = profiler.measure(
+            native_result, native_profile = profiler.measure(
                 run_native_inference,
                 tokens=profile_tokens,
             )
+            del native_result
         return (
             {
                 "translated": translated_loss,
@@ -3265,9 +3362,15 @@ def build_openwebtext_profile_fields(row: Dict[str, float], *, prefix: str = "")
         latency_text = f"{latency_text} ms"
     throughput_value = row.get(f"{field_prefix}throughput_tokens_per_sec", float("nan"))
     throughput_text = _format_summary_throughput(throughput_value)
-    peak_text = _format_summary_float(row.get(f"{field_prefix}peak_memory_gib", float("nan")))
-    if peak_text != "N/A":
-        peak_text = f"{peak_text} GiB"
+
+    total_text = _format_summary_float(row.get(f"{field_prefix}peak_memory_gib", float("nan")))
+    model_text = _format_summary_float(row.get(f"{field_prefix}model_memory_gib", float("nan")))
+    translator_text = _format_summary_float(row.get(f"{field_prefix}translator_memory_gib", float("nan")))
+    kv_text = _format_summary_float(row.get(f"{field_prefix}kv_memory_gib", float("nan")))
+    if total_text == "N/A":
+        peak_text = "N/A"
+    else:
+        peak_text = f"{total_text} GiB (M {model_text} / T {translator_text} / KV {kv_text})"
     return latency_text, throughput_text, peak_text
 
 def build_openwebtext_profile_cell(row: Dict[str, float], *, prefix: str = "") -> str:

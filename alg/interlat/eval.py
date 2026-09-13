@@ -111,7 +111,11 @@ def evaluate_openwebtext_validation_loss_interlat(
     """
 
     train_config = ctx.config
-    profiler = InferenceProfiler(train_config.device)
+    profiler = InferenceProfiler(
+        train_config.device,
+        models=ctx.tp.models.values(),
+        translator_pool=translator_pool,
+    )
 
     def evaluate_edge_losses_fn(
         *,
@@ -150,7 +154,7 @@ def evaluate_openwebtext_validation_loss_interlat(
             ).item()
         )
 
-        def run_translated_inference() -> int:
+        def run_translated_inference():
             return run_openwebtext_greedy_inference(
                 model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=translated_target_past,
@@ -158,7 +162,7 @@ def evaluate_openwebtext_validation_loss_interlat(
                 max_new_tokens=generation_steps,
             )
 
-        def run_native_inference() -> int:
+        def run_native_inference():
             return run_openwebtext_greedy_inference(
                 model=ctx.tp.get_model(edge.tgt_id),
                 past_key_values=past_by_node_id[edge.tgt_id],
@@ -166,9 +170,11 @@ def evaluate_openwebtext_validation_loss_interlat(
                 max_new_tokens=generation_steps,
             )
 
-        _, translated_profile = profiler.measure(run_translated_inference, tokens=profile_tokens)
+        translated_result, translated_profile = profiler.measure(run_translated_inference, tokens=profile_tokens)
+        del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
-            _, native_profile = profiler.measure(run_native_inference, tokens=profile_tokens)
+            native_result, native_profile = profiler.measure(run_native_inference, tokens=profile_tokens)
+            del native_result
         return (
             {"translated": translated_loss, "native": native_loss},
             {"translated": translated_profile, "native": native_profile},

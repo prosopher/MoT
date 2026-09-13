@@ -675,22 +675,6 @@ def count_trainable_parameters(module: nn.Module) -> int:
 
 
 
-class CurrentProcessGPUMemoryReader:
-    def __init__(self, device: str) -> None:
-        self.device = device
-        self.enabled = torch.cuda.is_available() and device.startswith("cuda")
-        if self.enabled:
-            device_index = torch.device(device).index
-            self.device_index = torch.cuda.current_device() if device_index is None else device_index
-        else:
-            self.device_index = None
-
-    def read_allocated_bytes(self) -> Optional[int]:
-        if not self.enabled:
-            return None
-        return int(torch.cuda.memory_allocated(self.device_index))
-
-
 def read_json(path: Union[str, Path]) -> Dict[str, Any]:
     path_obj = Path(path)
     with path_obj.open("r", encoding="utf-8") as fp:

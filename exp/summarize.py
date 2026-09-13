@@ -723,7 +723,7 @@ def parse_metric_number(raw_value: str) -> Optional[float]:
         r"^([-+]?\d*\.?\d+)\s*%$",
         r"^([-+]?\d*\.?\d+)\s*ms$",
         r"^([-+]?\d*\.?\d+)\s*tok/s$",
-        r"^([-+]?\d*\.?\d+)\s*GiB$",
+        r"^([-+]?\d*\.?\d+)\s*GiB(?:\s.*)?$",
         r"^([-+]?\d*\.?\d+)$",
     ]
     for pattern in patterns:

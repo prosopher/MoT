@@ -160,12 +160,16 @@ def load_one_method_metrics(
             f"but --agent-count={expected_agent_count} was requested."
         )
 
-    gpu_peak_memory_gib = payload.get("gpu_peak_memory_gib")
-    if gpu_peak_memory_gib is None:
-        gpu_peak_memory_bytes = _read_metric_value(payload, "gpu_peak_memory_bytes", path)
-        gpu_peak_memory_gib = gpu_peak_memory_bytes / (1024**3)
-    else:
-        gpu_peak_memory_gib = float(gpu_peak_memory_gib)
+    gpu_peak_memory = payload.get("gpu_peak_memory")
+    if not isinstance(gpu_peak_memory, dict):
+        raise KeyError(f"Missing 'gpu_peak_memory' breakdown in {path}")
+    memory_components = []
+    for key in ("model_bytes", "translator_bytes", "kv_bytes"):
+        value = gpu_peak_memory.get(key)
+        if value is None:
+            raise KeyError(f"Missing 'gpu_peak_memory.{key}' in {path}")
+        memory_components.append(float(value))
+    gpu_peak_memory_gib = sum(memory_components) / (1024**3)
 
     f1 = _read_metric_value(payload, "f1", path)
 

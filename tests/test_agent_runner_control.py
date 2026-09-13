@@ -333,7 +333,7 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
         agent.generate_response = fake_generate(agent)
 
     runner._prepare_outgoing_route_translation = lambda **kwargs: None
-    runner._update_kv_peak_memory = lambda: None
+    runner._update_peak_memory_breakdown = lambda: None
 
     def fake_star_offload(*, source_agent, target_agent):
         meta = {

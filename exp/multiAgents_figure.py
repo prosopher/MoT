@@ -151,13 +151,19 @@ def load_data_from_metrics(
                     f"folder implies {agent_count}, json says {json_agent_count}."
                 )
 
+            gpu_peak_memory = metrics.get("gpu_peak_memory")
+            if not isinstance(gpu_peak_memory, dict):
+                raise KeyError(f"Missing 'gpu_peak_memory' breakdown in {path}")
+            memory_components = []
+            for key in ("model_bytes", "translator_bytes", "kv_bytes"):
+                value = gpu_peak_memory.get(key)
+                if value is None:
+                    raise KeyError(f"Missing 'gpu_peak_memory.{key}' in {path}")
+                memory_components.append(float(value))
+
             data.setdefault(agent_count, {})[method] = {
                 "f1": _read_metric_value(metrics, "f1", path),
-                "gpu_peak_memory_gib": _read_metric_value(
-                    metrics,
-                    "gpu_peak_memory_gib",
-                    path,
-                ),
+                "gpu_peak_memory_gib": sum(memory_components) / (1024 ** 3),
             }
             loaded_paths.append(path)
 
