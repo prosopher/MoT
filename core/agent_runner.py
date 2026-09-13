@@ -664,39 +664,14 @@ class AgentRunner:
 
     @staticmethod
     def _final_answer_instruction() -> str:
-        return (
-            "This is the final Hub turn. Review and synthesize the entire conversation history, "
-            "select the most prevalent opinion among the Agents, and return only that opinion as: "
-            "FINAL: <concise answer>"
-        )
+        return "This is the final turn. Return only the concise final answer as: FINAL: <concise answer>"
 
     @staticmethod
-    def _followup_instruction() -> str:
+    def _build_plain_initial_prompt(context: str, question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
-            "Review the entire conversation history before answering. "
-            "If you do not agree with any prior Agent opinion, respond with a new opinion. "
-            "If you agree with any prior Agent opinion, do not repeat the existing response and do not add further reasoning. "
-            "Respond only with a short statement such as 'I agree with Agent A.' that identifies the Agent, "
-            "then end the response immediately. For agreement responses: no repetition, no additional reasoning; "
-            "keep the response short and immediate."
-        )
-
-    @staticmethod
-    def _build_plain_initial_prompt(
-        context: str,
-        question: str,
-        *,
-        agent_id: str,
-        is_final_turn: bool = False,
-    ) -> str:
-        instruction = (
-            AgentRunner._final_answer_instruction()
-            if is_final_turn
-            else "Use the passage to answer the Question accurately."
-        )
-        return (
-            f"### Current Agent:\nAgent {agent_id}\n"
-            f"### Instruction:\n{instruction}\n"
+            "### Instruction: Use the passage to answer the Question accurately.\n"
+            f"{final_instruction}"
             f"### Passage:\n{context.strip()}\n"
             "### Question:\n"
             f"{question.strip()}\n"
@@ -704,20 +679,12 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_plain_followup_prompt(
-        question: str,
-        *,
-        agent_id: str,
-        is_final_turn: bool = False,
-    ) -> str:
-        instruction = (
-            AgentRunner._final_answer_instruction()
-            if is_final_turn
-            else AgentRunner._followup_instruction()
-        )
+    def _build_plain_followup_prompt(question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
-            f"\n### Current Agent:\nAgent {agent_id}\n"
-            f"### Instruction:\n{instruction}\n"
+            "\n### Instruction:\n"
+            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            f"{final_instruction}"
             "### Question:\n"
             f"{question.strip()}\n"
             "### Response:\n"
@@ -737,25 +704,16 @@ class AgentRunner:
     def _system_prompt() -> str:
         return (
             "You are a helpful QA assistant. "
-            "Answer the given question accurately, using only the provided passage and conversation history when available."
+            "Answer the given question accurately, using only the provided passage and prior agent response when available."
         )
 
     @staticmethod
-    def _build_initial_user_content(
-        context: str,
-        question: str,
-        *,
-        agent_id: str,
-        is_final_turn: bool = False,
-    ) -> str:
-        instruction = (
-            AgentRunner._final_answer_instruction()
-            if is_final_turn
-            else "Use the passage to answer the Question accurately."
-        )
+    def _build_initial_user_content(context: str, question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
-            f"### Current Agent:\nAgent {agent_id}\n"
-            f"### Instruction:\n{instruction}\n"
+            "### Instruction:\n"
+            "Use the passage to answer the Question accurately.\n"
+            f"{final_instruction}"
             "### Passage:\n"
             f"{context.strip()}\n"
             "### Question:\n"
@@ -763,20 +721,12 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _build_followup_user_content(
-        question: str,
-        *,
-        agent_id: str,
-        is_final_turn: bool = False,
-    ) -> str:
-        instruction = (
-            AgentRunner._final_answer_instruction()
-            if is_final_turn
-            else AgentRunner._followup_instruction()
-        )
+    def _build_followup_user_content(question: str, *, is_final_turn: bool = False) -> str:
+        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
         return (
-            f"### Current Agent:\nAgent {agent_id}\n"
-            f"### Instruction:\n{instruction}\n"
+            "### Instruction:\n"
+            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
+            f"{final_instruction}"
             "### Question:\n"
             f"{question.strip()}"
         )
@@ -859,13 +809,8 @@ class AgentRunner:
         agent_count: int = 2,
         is_final_turn: bool = False,
     ) -> str:
-        del agent_count
-        return AgentRunner._build_plain_initial_prompt(
-            context,
-            question,
-            agent_id=hub_agent_id,
-            is_final_turn=is_final_turn,
-        )
+        del hub_agent_id, agent_count
+        return AgentRunner._build_plain_initial_prompt(context, question, is_final_turn=is_final_turn)
 
     def build_initial_prompt_for_agent(
         self,
@@ -878,21 +823,11 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del hub_agent_id, agent_count
-        user_content = self._build_initial_user_content(
-            context,
-            question,
-            agent_id=agent.node_id,
-            is_final_turn=is_final_turn,
-        )
+        user_content = self._build_initial_user_content(context, question, is_final_turn=is_final_turn)
         return self._format_agent_prompt(
             agent,
             user_content,
-            self._build_plain_initial_prompt(
-                context,
-                question,
-                agent_id=agent.node_id,
-                is_final_turn=is_final_turn,
-            ),
+            self._build_plain_initial_prompt(context, question, is_final_turn=is_final_turn),
             continuation=False,
         )
 
@@ -905,28 +840,16 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del turn_index
-        user_content = self._build_followup_user_content(
-            question,
-            agent_id=agent_id,
-            is_final_turn=is_final_turn,
-        )
+        user_content = self._build_followup_user_content(question, is_final_turn=is_final_turn)
         agent = self.agents.get(agent_id)
         if agent is not None:
             return self._format_agent_prompt(
                 agent,
                 user_content,
-                self._build_plain_followup_prompt(
-                    question,
-                    agent_id=agent_id,
-                    is_final_turn=is_final_turn,
-                ),
+                self._build_plain_followup_prompt(question, is_final_turn=is_final_turn),
                 continuation=True,
             )
-        return self._build_plain_followup_prompt(
-            question,
-            agent_id=agent_id,
-            is_final_turn=is_final_turn,
-        )
+        return self._build_plain_followup_prompt(question, is_final_turn=is_final_turn)
 
     @staticmethod
     def _append_turn_to_transcript(transcript: str, agent_id: str, response: str) -> str:
