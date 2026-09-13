@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.common import (
-    GPUMemoryTracker,
     build_step_pasts_and_batches,
     PastKeyValues,
     TokenIDs,
@@ -367,10 +366,7 @@ def load_translator_pool_from_checkpoint(
     return ctx, translator_pool
 
 
-def run_train(
-    ctx: Context,
-    gpu_memory_tracker: GPUMemoryTracker,
-) -> Path:
+def run_train(ctx: Context) -> Path:
     config: TrainConfig = ctx.config
     set_seed(config.seed)
     output_path = Path(config.output_path)
@@ -546,8 +542,6 @@ def run_train(
         torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
-        gpu_memory_tracker.update()
-
         running_total_loss += step_total_loss
         running_ce_loss += step_ce_loss
         running_plan_loss += step_plan_loss
@@ -571,9 +565,8 @@ def run_train(
                 cos=f"{avg_positive_cosine:.4f}",
                 lr=f"{scheduler.lr:.2e}",
             )
-            gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] loss=%.4f | ce=%.4f | plan=%.4f | random=%.4f | positive_cosine=%.4f | plan_w=%.4f | random_w=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] loss=%.4f | ce=%.4f | plan=%.4f | random=%.4f | positive_cosine=%.4f | plan_w=%.4f | random_w=%.4f | lr=%.2e",
                 step,
                 avg_total_loss,
                 avg_ce_loss,
@@ -583,8 +576,6 @@ def run_train(
                 avg_plan_weight,
                 avg_random_weight,
                 scheduler.lr,
-                gpu_memory["avg_allocated_pretty"],
-                gpu_memory["peak_allocated_pretty"],
             )
             running_total_loss = 0.0
             running_ce_loss = 0.0
@@ -596,13 +587,6 @@ def run_train(
 
     final_path = get_train_checkpoint_path(output_path)
     save_translator_checkpoints(output_path, translator_pool)
-    final_gpu_memory = gpu_memory_tracker.summary()
-    logging.info(
-        "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
-        final_gpu_memory["avg_allocated_pretty"],
-        final_gpu_memory["peak_allocated_pretty"],
-        final_gpu_memory["num_samples"],
-    )
     logging.info("[Params] trainable_translator_params=%s", f"{count_trainable_parameters(translator_pool):,}")
     logging.info("[Done] final translator checkpoints saved to %s", final_path)
     logging.info("Saved train log to %s", log_path)

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from core.common import GPUMemoryTracker, OpenWebTextSequenceStream, TokenIDs, ensure_token_ids_model, read_json, set_seed, write_json
+from core.common import OpenWebTextSequenceStream, TokenIDs, ensure_token_ids_model, read_json, set_seed, write_json
 from core.config import Config, resolve_device
 from core.context import Context
 from core.model import Model
@@ -604,7 +604,7 @@ def _select_layers_for_edge(
     )
 
 
-def run_train(ctx: Context, gpu_memory_tracker: GPUMemoryTracker) -> Path:
+def run_train(ctx: Context) -> Path:
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges

@@ -403,7 +403,6 @@ def run_train(
         weight_decay=config.weight_decay,
     )
     scheduler = WarmupCosineScheduler(optimizer, config.warmup_steps, config.max_steps)
-    gpu_memory_tracker = GPUMemoryTracker(config.device)
     running_loss = 0.0
 
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="LayerPositionTrain")
@@ -461,20 +460,15 @@ def run_train(
         torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
-        gpu_memory_tracker.update()
-
         running_loss += step_loss_value
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
             progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.lr:.2e}")
-            gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] loss=%.4f | lr=%.2e",
                 step,
                 avg_loss,
                 scheduler.lr,
-                gpu_memory["avg_allocated_pretty"],
-                gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
 

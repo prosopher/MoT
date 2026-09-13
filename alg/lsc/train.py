@@ -351,10 +351,7 @@ def load_translator_pool_from_checkpoint(
 
 
 
-def run_train(
-    ctx: Context,
-    gpu_memory_tracker: GPUMemoryTracker,
-) -> Path:
+def run_train(ctx: Context) -> Path:
     config = ctx.config
     nodes = ctx.nodes
     edges = ctx.edges
@@ -445,8 +442,6 @@ def run_train(
         torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
-        gpu_memory_tracker.update()
-
         running_loss += step_loss_value
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
@@ -454,26 +449,16 @@ def run_train(
                 loss=f"{avg_loss:.4f}",
                 lr=f"{scheduler.lr:.2e}",
             )
-            gpu_memory = gpu_memory_tracker.summary()
             logging.info(
-                "[Step %04d] loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] loss=%.4f | lr=%.2e",
                 step,
                 avg_loss,
                 scheduler.lr,
-                gpu_memory["avg_allocated_pretty"],
-                gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
     save_translator_checkpoints(output_path, translator_pool)
-    final_gpu_memory = gpu_memory_tracker.summary()
-    logging.info(
-        "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
-        final_gpu_memory["avg_allocated_pretty"],
-        final_gpu_memory["peak_allocated_pretty"],
-        final_gpu_memory["num_samples"],
-    )
     logging.info("[Done] final translator checkpoints saved to %s", final_path)
     logging.info("Saved train log to %s", log_path)
     return final_path
