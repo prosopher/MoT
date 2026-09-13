@@ -153,10 +153,10 @@ def _example_row(result, example: Doc2DialQAPair, *, example_index: int) -> Dict
         "gold_answers": result.gold_answers,
         "prediction": result.prediction,
         "f1": result.f1,
-        "gpu_memory_bytes": {
-            "model": result.profile.get("model_memory_bytes"),
-            "translator": result.profile.get("translator_memory_bytes"),
-            "kv": result.profile.get("kv_memory_bytes"),
+        "gpu_memory_gib": {
+            "model_gib": result.profile.get("model_memory_gib"),
+            "translator_gib": result.profile.get("translator_memory_gib"),
+            "kv_gib": result.profile.get("kv_memory_gib"),
         },
         "latency_sec": result.profile.get("latency_sec"),
         "agent_ids": result.agent_ids,
@@ -251,7 +251,7 @@ def main() -> None:
 
     rows: List[Dict[str, Any]] = []
     total_f1 = 0.0
-    peak_memory_bytes = {"model": None, "translator": None, "kv": None}
+    peak_memory_gib = {"model_gib": None, "translator_gib": None, "kv_gib": None}
 
     selected_count = len(selected_examples)
     for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
@@ -262,19 +262,19 @@ def main() -> None:
             example_index=example_index,
         )
         total_f1 += float(result.f1)
-        for component, profile_key in (
-            ("model", "model_memory_bytes"),
-            ("translator", "translator_memory_bytes"),
-            ("kv", "kv_memory_bytes"),
+        for component_key, profile_key in (
+            ("model_gib", "model_memory_gib"),
+            ("translator_gib", "translator_memory_gib"),
+            ("kv_gib", "kv_memory_gib"),
         ):
             current_peak = result.profile.get(profile_key)
             if current_peak is None:
                 continue
-            previous_peak = peak_memory_bytes[component]
-            peak_memory_bytes[component] = (
-                int(current_peak)
+            previous_peak = peak_memory_gib[component_key]
+            peak_memory_gib[component_key] = (
+                float(current_peak)
                 if previous_peak is None
-                else max(int(previous_peak), int(current_peak))
+                else max(float(previous_peak), float(current_peak))
             )
         rows.append(_example_row(result, example, example_index=example_index))
         print(
@@ -286,15 +286,15 @@ def main() -> None:
 
     count = len(rows)
     mean_f1 = total_f1 / count if count else float("nan")
-    peak_memory_gib = {
-        component: (float("nan") if value is None else int(value) / (1024 ** 3))
-        for component, value in peak_memory_bytes.items()
-    }
     peak_memory_total_gib = (
         float("nan")
-        if any(value is None for value in peak_memory_bytes.values())
-        else sum(int(value) for value in peak_memory_bytes.values() if value is not None) / (1024 ** 3)
+        if any(value is None for value in peak_memory_gib.values())
+        else sum(float(value) for value in peak_memory_gib.values() if value is not None)
     )
+    peak_memory_for_log = {
+        key: float("nan") if value is None else float(value)
+        for key, value in peak_memory_gib.items()
+    }
     metrics = {
         "algorithm": args.alg,
         "cache_mode": args.cache_mode,
@@ -321,10 +321,10 @@ def main() -> None:
         },
         "count": count,
         "f1": mean_f1,
-        "gpu_peak_memory": {
-            "model_bytes": peak_memory_bytes["model"],
-            "translator_bytes": peak_memory_bytes["translator"],
-            "kv_bytes": peak_memory_bytes["kv"],
+        "gpu_peak_memory_gib": {
+            "model_gib": peak_memory_gib["model_gib"],
+            "translator_gib": peak_memory_gib["translator_gib"],
+            "kv_gib": peak_memory_gib["kv_gib"],
         },
         "examples": rows,
         "args": vars(args),
@@ -337,9 +337,9 @@ def main() -> None:
     print(
         "GPU Peak Memory: "
         f"total={peak_memory_total_gib:.3f} GiB | "
-        f"model={peak_memory_gib['model']:.3f} GiB | "
-        f"translator={peak_memory_gib['translator']:.3f} GiB | "
-        f"kv={peak_memory_gib['kv']:.3f} GiB"
+        f"model={peak_memory_for_log['model_gib']:.3f} GiB | "
+        f"translator={peak_memory_for_log['translator_gib']:.3f} GiB | "
+        f"kv={peak_memory_for_log['kv_gib']:.3f} GiB"
     )
     print(f"Saved metrics: {metrics_path}")
 

@@ -149,13 +149,13 @@ class AgentRunnerResult:
     @property
     def peak_memory_gib(self) -> float:
         values = [
-            self.profile.get("model_memory_bytes"),
-            self.profile.get("translator_memory_bytes"),
-            self.profile.get("kv_memory_bytes"),
+            self.profile.get("model_memory_gib"),
+            self.profile.get("translator_memory_gib"),
+            self.profile.get("kv_memory_gib"),
         ]
         if any(value is None for value in values):
             return float("nan")
-        return sum(float(value) for value in values if value is not None) / (1024 ** 3)
+        return sum(float(value) for value in values if value is not None)
 
 
 class KVCacheTranslationAdapter:
@@ -1554,9 +1554,9 @@ class AgentRunner:
             "tokens": len(result.turns) * max(1, self.generation_max_new_tokens),
             "num_agent_turns": len(result.turns),
             "requested_max_turns": self.max_turns,
-            "model_memory_bytes": None if peak_memory is None else peak_memory.model_bytes,
-            "translator_memory_bytes": None if peak_memory is None else peak_memory.translator_bytes,
-            "kv_memory_bytes": None if peak_memory is None else peak_memory.kv_bytes,
+            "model_memory_gib": None if peak_memory is None else peak_memory.model_bytes / (1024 ** 3),
+            "translator_memory_gib": None if peak_memory is None else peak_memory.translator_bytes / (1024 ** 3),
+            "kv_memory_gib": None if peak_memory is None else peak_memory.kv_bytes / (1024 ** 3),
         }
         return result
 
