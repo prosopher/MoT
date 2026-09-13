@@ -4,7 +4,7 @@ import argparse
 from dataclasses import asdict
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 
@@ -14,11 +14,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from core.agent_runner import AgentRunner, AgentRunnerConfig
 from core.common import setup_logging, write_json
-from core.doc2dial_dataset import (
-    DOC2DIAL_DEFAULT_DATA_DIR,
-    DOC2DIAL_DEFAULT_URL,
-    Doc2DialQAPair,
-    load_doc2dial_qa_pairs,
+from core.strategyqa_dataset import (
+    STRATEGYQA_DEFAULT_DATA_DIR,
+    STRATEGYQA_DEFAULT_SPLIT,
+    StrategyQAExample,
+    load_strategyqa_examples,
 )
 
 
@@ -31,53 +31,38 @@ def _str_to_bool(value) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run Doc2Dial multi-agent QA from official raw JSON files. "
-            "Consecutive user turns are merged into one question, and the "
-            "immediately following consecutive agent turns are merged into the gold answer."
+            "Run StrategyQA with shared-memory multi-agent reasoning. "
+            "Each Agent can use the full accumulated discussion; the final model acts as the Judge."
         )
     )
     parser.add_argument("alg", choices=["mot", "interlat", "lsc", "c2c-pr", "kvcomm"], help="Algorithm to run.")
     parser.add_argument("--checkpoint-dir-path", required=True)
-    parser.add_argument("--outputs-path", default="outputs/multi_agents", help="Root output directory. Default run directory: {algorithm}_{cache_mode}_{agent_count}.")
+    parser.add_argument(
+        "--outputs-path",
+        default="outputs/multi_agents",
+        help="Root output directory. Default run directory: {algorithm}_{cache_mode}_{agent_count}.",
+    )
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--device", default="auto")
 
     parser.add_argument(
         "--data-dir",
-        default=DOC2DIAL_DEFAULT_DATA_DIR,
-        help=(
-            "Local Doc2Dial v1.0.1 directory. If this folder already exists and contains "
-            "doc2dial_doc.json, doc2dial_dial_train.json, and doc2dial_dial_validation.json, "
-            "it is reused. Otherwise the official zip is downloaded and extracted here."
-        ),
-    )
-    parser.add_argument("--doc2dial-url", default=DOC2DIAL_DEFAULT_URL, help="Official Doc2Dial v1.0.1 zip URL.")
-    parser.add_argument("--split", default="validation", help="Doc2Dial dialogue split, usually validation or train.")
-    parser.add_argument("--domain", default=None, help="Optional Doc2Dial domain filter such as dmv, ssa, va, or uscis.")
-    parser.add_argument(
-        "--context-reference-roles",
-        choices=["all", "user", "agent"],
-        default="all",
-        help=(
-            "Which collapsed turns supply sp_id references for Base Context. "
-            "all (default) includes both question/user and gold-answer turn references; "
-            "user uses only question/user turn references; agent uses only answer-turn references."
-        ),
+        default=STRATEGYQA_DEFAULT_DATA_DIR,
+        help="Local StrategyQA directory. Missing train/dev JSON is downloaded from the official StrategyQA repository.",
     )
     parser.add_argument(
-        "--context-max-chars",
-        type=int,
-        default=None,
-        help="Optional character truncation for Base Context after referenced text_sp spans are joined.",
+        "--split",
+        choices=["train", "dev"],
+        default=STRATEGYQA_DEFAULT_SPLIT,
+        help="StrategyQA split. Default: dev.",
     )
-
     parser.add_argument(
         "--max-examples",
         type=int,
         default=10,
         help=(
-            "Number of collapsed Doc2Dial QA examples to run. When --start-example is greater than 1, "
-            "this many examples are run starting from that 1-based global example index unless --end-example is set."
+            "Number of StrategyQA examples to run. When --start-example is greater than 1, this many examples are "
+            "run starting from that 1-based global example index unless --end-example is set."
         ),
     )
     parser.add_argument(
@@ -86,10 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="start_example",
         type=int,
         default=1,
-        help=(
-            "1-based global Doc2Dial QA example index to start from after split/domain/shuffle/context filters. "
-            "Use 16 to resume from the same example 16 used by every algorithm with the same dataset arguments."
-        ),
+        help="1-based StrategyQA example index to start from after optional shuffling.",
     )
     parser.add_argument(
         "--end-example",
@@ -97,30 +79,25 @@ def build_parser() -> argparse.ArgumentParser:
         dest="end_example",
         type=int,
         default=None,
-        help=(
-            "Optional 1-based inclusive global Doc2Dial QA example index to stop at. "
-            "For example, --start-example 16 --end-example 30 runs exactly examples 16 through 30."
-        ),
+        help="Optional 1-based inclusive StrategyQA example index to stop at.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-eval-stream", nargs="?", const=True, default=False, type=_str_to_bool)
-    parser.add_argument("--shuffle-buffer", type=int, default=1024)
     parser.add_argument(
         "--max-turns",
         "--max-turn",
         dest="max_turns",
         type=int,
         default=4,
-        help="Number of ordinary collaborative inference turns before one mandatory final Hub turn.",
+        help="Number of ordinary shared-memory discussion turns before one mandatory final Judge turn.",
     )
     parser.add_argument(
         "--agent-count",
         type=int,
         default=None,
         help=(
-            "Number of logical agents. Use 1 for a Hub-only baseline without communication; "
-            "--max-turns still controls its ordinary inference turns, followed by one final Hub turn. "
-            "Default: use all available nodes."
+            "Number of logical Agents in the discussion. Use 1 for a single-model baseline; the final turn still uses "
+            "the same model as Judge. Default: use all available nodes."
         ),
     )
     parser.add_argument("--generation-max-new-tokens", type=int, default=48)
@@ -137,22 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _example_row(result, example: Doc2DialQAPair, *, example_index: int) -> Dict[str, Any]:
+def _example_row(result, example: StrategyQAExample, *, example_index: int) -> Dict[str, Any]:
     return {
         "example_index": example_index,
         "id": example.id,
-        "dial_id": example.dial_id,
-        "doc_id": example.doc_id,
-        "domain": example.domain,
-        "user_turn_ids": example.user_turn_ids,
-        "agent_turn_ids": example.agent_turn_ids,
-        "reference_sp_ids": example.reference_sp_ids,
-        "missing_reference_sp_ids": example.missing_reference_sp_ids,
-        "context": example.context,
         "question": result.question,
-        "gold_answers": result.gold_answers,
+        "gold_answer": example.answers[0],
         "prediction": result.prediction,
-        "f1": result.f1,
+        "accuracy": result.accuracy,
+        "facts": example.facts,
         "gpu_memory_gib": {
             "model_gib": result.profile.get("model_memory_gib"),
             "translator_gib": result.profile.get("translator_memory_gib"),
@@ -160,7 +130,7 @@ def _example_row(result, example: Doc2DialQAPair, *, example_index: int) -> Dict
         },
         "latency_sec": result.profile.get("latency_sec"),
         "agent_ids": result.agent_ids,
-        "hub_agent_id": result.hub_agent_id,
+        "judge_agent_id": result.hub_agent_id,
         "cache_mode": result.cache_mode,
         "turns": [asdict(turn) for turn in result.turns],
         "transcript": result.transcript,
@@ -188,24 +158,15 @@ def main() -> None:
     else:
         load_max_examples = None
 
-    examples = load_doc2dial_qa_pairs(
+    examples = load_strategyqa_examples(
         data_dir=args.data_dir,
-        url=args.doc2dial_url,
         split=args.split,
-        # Load enough examples from the original deterministic stream first, then slice below.
-        # This keeps --start-example/--end-example aligned across algorithms.
         max_examples=load_max_examples,
         shuffle=bool(args.shuffle_eval_stream),
         seed=args.seed,
-        shuffle_buffer=args.shuffle_buffer,
-        domain_filter=args.domain,
-        context_reference_roles=args.context_reference_roles,
-        context_max_chars=args.context_max_chars,
     )
     if not examples:
-        raise RuntimeError(
-            "No Doc2Dial QA examples were produced. Check --data-dir, --split, --domain, and turn references."
-        )
+        raise RuntimeError("No StrategyQA examples were produced. Check --data-dir and --split.")
 
     indexed_examples = list(enumerate(examples, start=1))
     if args.end_example is not None:
@@ -220,11 +181,9 @@ def main() -> None:
             selected_examples = selected_examples[: args.max_examples]
 
     if not selected_examples:
-        available = len(examples)
         raise RuntimeError(
-            f"No Doc2Dial QA examples selected for start={args.start_example}, "
-            f"end={args.end_example}, max_examples={args.max_examples}. "
-            f"Only {available} example(s) were available after filters."
+            f"No StrategyQA examples selected for start={args.start_example}, "
+            f"end={args.end_example}, max_examples={args.max_examples}."
         )
 
     runner = AgentRunner.from_checkpoint(
@@ -250,18 +209,18 @@ def main() -> None:
     setup_logging(str(output_path / "eval.log"))
 
     rows: List[Dict[str, Any]] = []
-    total_f1 = 0.0
+    total_accuracy = 0.0
     peak_memory_gib = {"model_gib": None, "translator_gib": None, "kv_gib": None}
 
     selected_count = len(selected_examples)
     for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
         result = runner.run(
-            context=example.context,
+            context="",
             question=example.question,
             gold_answers=example.answers,
             example_index=example_index,
         )
-        total_f1 += float(result.f1)
+        total_accuracy += float(result.accuracy)
         for component_key, profile_key in (
             ("model_gib", "model_memory_gib"),
             ("translator_gib", "translator_memory_gib"),
@@ -272,45 +231,38 @@ def main() -> None:
                 continue
             previous_peak = peak_memory_gib[component_key]
             peak_memory_gib[component_key] = (
-                float(current_peak)
-                if previous_peak is None
-                else max(float(previous_peak), float(current_peak))
+                float(current_peak) if previous_peak is None else max(float(previous_peak), float(current_peak))
             )
         rows.append(_example_row(result, example, example_index=example_index))
         print(
             f"[{local_idx}/{selected_count} | example={example_index}] "
-            f"dial_id={example.dial_id} user_turns={example.user_turn_ids} "
-            f"agent_turns={example.agent_turn_ids} F1={result.f1:.4f} | "
-            f"prediction={result.prediction!r} | gold={result.gold_answers[:1]}"
+            f"qid={example.id} accuracy={result.accuracy:.0f} | "
+            f"prediction={result.prediction!r} | gold={example.answers[0]!r}"
         )
 
     count = len(rows)
-    mean_f1 = total_f1 / count if count else float("nan")
+    accuracy = total_accuracy / count if count else float("nan")
     peak_memory_total_gib = (
         float("nan")
         if any(value is None for value in peak_memory_gib.values())
         else sum(float(value) for value in peak_memory_gib.values() if value is not None)
     )
     peak_memory_for_log = {
-        key: float("nan") if value is None else float(value)
-        for key, value in peak_memory_gib.items()
+        key: float("nan") if value is None else float(value) for key, value in peak_memory_gib.items()
     }
     metrics = {
         "algorithm": args.alg,
         "cache_mode": args.cache_mode,
+        "discussion": "memory",
         "agent_count": len(runner.agent_sequence),
         "requested_agent_count": args.agent_count,
         "agent_ids": runner.node_ids,
-        "hub_agent_id": runner.hub_agent.node_id,
-        # "free_mode_peak_cache_agent_bound": runner._free_mode_peak_cache_agent_bound(),
+        "judge_agent_id": runner.hub_agent.node_id,
         "checkpoint_dir_path": args.checkpoint_dir_path,
         "dataset": {
+            "name": "StrategyQA",
             "data_dir": args.data_dir,
-            "doc2dial_url": args.doc2dial_url,
             "split": args.split,
-            "domain": args.domain,
-            "context_reference_roles": args.context_reference_roles,
-            "context_max_chars": args.context_max_chars,
         },
         "example_range": {
             "start_example": args.start_example,
@@ -320,7 +272,7 @@ def main() -> None:
             "selected_example_indices": [example_index for example_index, _ in selected_examples],
         },
         "count": count,
-        "f1": mean_f1,
+        "accuracy": accuracy,
         "gpu_peak_memory_gib": {
             "model_gib": peak_memory_gib["model_gib"],
             "translator_gib": peak_memory_gib["translator_gib"],
@@ -332,8 +284,8 @@ def main() -> None:
     metrics_path = output_path / "agent_runner_metrics.json"
     write_json(str(metrics_path), metrics)
 
-    print("===== AgentRunner Doc2Dial sample =====")
-    print(f"F1 Score: {mean_f1:.4f}")
+    print("===== AgentRunner StrategyQA memory =====")
+    print(f"Accuracy: {accuracy:.4f}")
     print(
         "GPU Peak Memory: "
         f"total={peak_memory_total_gib:.3f} GiB | "

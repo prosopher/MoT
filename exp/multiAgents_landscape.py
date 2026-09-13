@@ -171,7 +171,7 @@ def load_one_method_metrics(
         memory_components.append(float(value))
     gpu_peak_memory_gib = sum(memory_components)
 
-    f1 = _read_metric_value(payload, "f1", path)
+    accuracy = _read_metric_value(payload, "accuracy", path)
 
     if not math.isfinite(gpu_peak_memory_gib):
         raise ValueError(
@@ -183,7 +183,7 @@ def load_one_method_metrics(
         "algorithm": algorithm,
         "cache_mode": cache_mode,
         "agent_count": agent_count,
-        "f1": f1,
+        "accuracy": accuracy,
         "gpu_peak_memory_gib": gpu_peak_memory_gib,
         "metrics_path": str(path),
     }
@@ -344,7 +344,7 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
     for item in data:
         name = item["name"]
         x = item["gpu_peak_memory_gib"]
-        y = item["f1"]
+        y = item["accuracy"]
 
         ax.scatter(
             x,
@@ -374,7 +374,7 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
     style_axes_common(ax)
 
     ax.set_xlabel("Peak GPU Memory (GiB)", fontsize=20, fontweight="semibold")
-    ax.set_ylabel("F1", fontsize=20, fontweight="semibold")
+    ax.set_ylabel("Accuracy", fontsize=20, fontweight="semibold")
 
     ax.tick_params(axis="both", labelsize=20)
 
@@ -384,9 +384,9 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
         if math.isfinite(d["gpu_peak_memory_gib"])
     ]
     y_values = [
-        d["f1"]
+        d["accuracy"]
         for d in data
-        if math.isfinite(d["f1"])
+        if math.isfinite(d["accuracy"])
     ]
 
     x_min, x_max = min(x_values), max(x_values)
@@ -463,7 +463,7 @@ def main() -> None:
     for item in data:
         print(
             f"  - {item['name']}: "
-            f"F1={item['f1']:.6f}, "
+            f"Accuracy={item['accuracy']:.6f}, "
             f"GPU={item['gpu_peak_memory_gib']:.6f} GiB, "
             f"agent_count={item.get('agent_count')}, "
             f"path={item['metrics_path']}"

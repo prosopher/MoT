@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.agent import Agent, AgentGeneration
-from core.agent_runner import AgentRunner
+from core.agent_runner import AgentRunner, AgentTurnRecord
 from core.context import Context
 
 
@@ -272,28 +272,62 @@ def test_agent_forces_chat_turn_terminator_when_max_new_tokens_is_reached() -> N
     assert agent.cache_seq_len == 4
 
 
-def test_agent_runner_final_answer_parser_uses_final_response_and_preserves_multiline_fallback() -> None:
-    transcript = "This prompt contains FINAL: <concise answer> before the model response.\n"
+def test_agent_runner_final_answer_parser_extracts_strategyqa_binary_answer() -> None:
+    transcript = "Earlier text says FINAL: no, but only the final response should be parsed.\n"
 
-    assert AgentRunner.extract_final_answer(transcript, "FINAL: license and registration can be suspended") == (
-        "license and registration can be suspended"
+    assert AgentRunner.extract_final_answer(transcript, "FINAL: YES") == "yes"
+    assert AgentRunner.extract_final_answer(transcript, "Reasoning... answer: no") == "no"
+
+
+def test_agent_runner_prompts_use_mallm_memory_simple_and_judge() -> None:
+    ordinary = AgentRunner._build_followup_user_content(
+        "question", agent_id="B", previous_agent_id="A", is_final_turn=False
     )
-    assert AgentRunner.extract_final_answer(transcript, "first line\nsecond line") == "first line\nsecond line"
-
-
-def test_agent_runner_final_prompt_requests_final_marker_only_on_final_turn() -> None:
-    ordinary = AgentRunner._build_followup_user_content("question", is_final_turn=False)
-    final = AgentRunner._build_followup_user_content("question", is_final_turn=True)
+    final = AgentRunner._build_followup_user_content(
+        "question",
+        agent_id="A",
+        previous_agent_id="D",
+        is_final_turn=True,
+        judge_solutions=(("A", "Answer: yes"), ("B", "Answer: no")),
+    )
 
     assert "FINAL:" not in ordinary
-    assert "FINAL: <concise answer>" in final
+    assert "shared memory" in ordinary
+    assert "full discussion history from all previous Agents" in ordinary
+    assert "Improve the current solution" in ordinary
+    assert "If you agree with the current solution" in ordinary
+    assert "[AGREE]" in ordinary
+    assert "[DISAGREE]" in ordinary
+    assert "improved solution" in ordinary
+    assert "Agent A" in ordinary
+    assert "I agree with Agent [agent id]" not in ordinary
+
+    assert "You are the Judge" in final
+    assert "decision on the listed solutions" in final
+    assert "### Solutions:" in final
+    assert "Solution 1 (Agent A): Answer: yes" in final
+    assert "Solution 2 (Agent B): Answer: no" in final
+    assert "FINAL: yes" in final
+    assert "FINAL: no" in final
+    assert "Hub" not in final
 
 
-def test_multi_agents_qa_defaults_to_all_context_reference_roles() -> None:
+def test_agent_runner_judge_uses_latest_solution_per_agent() -> None:
+    turns = [
+        AgentTurnRecord("A", "", "A old", 0, 0, 0, 0),
+        AgentTurnRecord("B", "", "B only", 0, 0, 0, 0),
+        AgentTurnRecord("A", "", "A latest", 0, 0, 0, 0),
+    ]
+
+    assert AgentRunner._latest_agent_solutions(turns) == [("A", "A latest"), ("B", "B only")]
+
+
+def test_multi_agents_qa_defaults_to_strategyqa_dev() -> None:
     from exp.multi_agents_qa import build_parser
 
     args = build_parser().parse_args(["mot", "--checkpoint-dir-path", "checkpoint"])
-    assert args.context_reference_roles == "all"
+    assert args.split == "dev"
+    assert args.data_dir == "./strategyqa"
 
 
 
@@ -312,9 +346,9 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
 
     def fake_generate(agent):
         def generate(prompt_text: str) -> AgentGeneration:
-            is_final = "FINAL: <concise answer>" in prompt_text
+            is_final = "You are the Judge" in prompt_text
             calls.append((agent.node_id, is_final))
-            text = "FINAL: done" if is_final else f"ordinary-{agent.node_id}"
+            text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
             return AgentGeneration(
                 agent_id=agent.node_id,
                 prompt_text=prompt_text,
@@ -350,7 +384,7 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
     result = runner.run(
         context="context",
         question="question",
-        gold_answers=["done"],
+        gold_answers=["yes"],
     )
 
     assert calls == [
@@ -364,4 +398,5 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
     assert len(result.turns) == 6
     assert result.profile["requested_max_turns"] == 5
     assert result.profile["num_agent_turns"] == 6
-    assert result.prediction == "done"
+    assert result.prediction == "yes"
+    assert result.accuracy == 1.0

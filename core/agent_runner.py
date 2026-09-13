@@ -15,7 +15,6 @@ from core.config import resolve_device
 from core.context import Context
 from core.eval_util import (
     GPUMemoryBreakdownBytes,
-    compute_generation_f1,
     measure_gpu_memory_breakdown_bytes,
     postprocess_generated_answer,
 )
@@ -138,7 +137,7 @@ class AgentRunnerResult:
     question: str
     gold_answers: List[str]
     prediction: str
-    f1: float
+    accuracy: float
     transcript: str
     turns: List[AgentTurnRecord]
     profile: Dict[str, Optional[float]]
@@ -664,29 +663,96 @@ class AgentRunner:
 
     @staticmethod
     def _final_answer_instruction() -> str:
-        return "This is the final turn. Return only the concise final answer as: FINAL: <concise answer>"
+        return "Return only one of: FINAL: yes or FINAL: no"
 
     @staticmethod
-    def _build_plain_initial_prompt(context: str, question: str, *, is_final_turn: bool = False) -> str:
-        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
+    def _initial_agent_instruction(agent_id: str) -> str:
         return (
-            "### Instruction: Use the passage to answer the Question accurately.\n"
-            f"{final_instruction}"
-            f"### Passage:\n{context.strip()}\n"
+            f"You are Agent {agent_id}, the first participant in a collaborative discussion with shared memory. "
+            "No solution has been proposed yet. Answer the StrategyQA question using your own knowledge and reasoning. "
+            "Give a concise justification, then end your response with 'Answer: yes' or 'Answer: no'."
+        )
+
+    @staticmethod
+    def _ordinary_agent_instruction(agent_id: str, previous_agent_id: str) -> str:
+        return (
+            f"You are Agent {agent_id} in a collaborative discussion with shared memory. You can use the full "
+            "discussion history from all previous Agents. Improve the current solution, which is the most recent "
+            f"solution proposed by Agent {previous_agent_id}. If you agree with the current solution, answer with "
+            "[AGREE]. Otherwise answer with [DISAGREE], explain why, and provide an improved solution. "
+            "Let's think step-by-step. End with 'Answer: yes' or 'Answer: no'."
+        )
+
+    @staticmethod
+    def _judge_instruction(previous_agent_id: str) -> str:
+        del previous_agent_id
+        return (
+            "You are the Judge. Provide a decision on the listed solutions and combine them into a single answer "
+            "to solve the StrategyQA question. Only answer with the final solution. "
+            f"{AgentRunner._final_answer_instruction()}"
+        )
+
+    @staticmethod
+    def _format_judge_solutions(solutions: Sequence[Tuple[str, str]]) -> str:
+        return "\n".join(
+            f"Solution {index} (Agent {agent_id}): {response.strip()}"
+            for index, (agent_id, response) in enumerate(solutions, start=1)
+        )
+
+    @staticmethod
+    def _latest_agent_solutions(turns: Sequence[AgentTurnRecord]) -> List[Tuple[str, str]]:
+        latest = {}
+        order = []
+        for turn in turns:
+            if turn.agent_id not in latest:
+                order.append(turn.agent_id)
+            latest[turn.agent_id] = turn.response
+        return [(agent_id, latest[agent_id]) for agent_id in order]
+
+    @staticmethod
+    def _build_plain_initial_prompt(
+        context: str,
+        question: str,
+        *,
+        agent_id: str = "A",
+        is_final_turn: bool = False,
+    ) -> str:
+        del is_final_turn
+        instruction = AgentRunner._initial_agent_instruction(agent_id)
+        context_block = f"### Context:\n{context.strip()}\n" if context.strip() else ""
+        return (
+            f"### Instruction: {instruction}\n"
+            f"{context_block}"
             "### Question:\n"
             f"{question.strip()}\n"
             "### Response:\n"
         )
 
     @staticmethod
-    def _build_plain_followup_prompt(question: str, *, is_final_turn: bool = False) -> str:
-        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
+    def _build_plain_followup_prompt(
+        question: str,
+        *,
+        agent_id: str,
+        previous_agent_id: str,
+        is_final_turn: bool = False,
+        judge_solutions: Sequence[Tuple[str, str]] = (),
+    ) -> str:
+        instruction = (
+            AgentRunner._judge_instruction(previous_agent_id)
+            if is_final_turn
+            else AgentRunner._ordinary_agent_instruction(agent_id, previous_agent_id)
+        )
+        solutions_block = (
+            f"### Solutions:\n{AgentRunner._format_judge_solutions(judge_solutions)}\n"
+            if is_final_turn and judge_solutions
+            else ""
+        )
         return (
             "\n### Instruction:\n"
-            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
-            f"{final_instruction}"
+            f"{instruction}\n"
             "### Question:\n"
             f"{question.strip()}\n"
+            f"{solutions_block}"
             "### Response:\n"
         )
 
@@ -703,32 +769,54 @@ class AgentRunner:
     @staticmethod
     def _system_prompt() -> str:
         return (
-            "You are a helpful QA assistant. "
-            "Answer the given question accurately, using only the provided passage and prior agent response when available."
+            "You are participating in a collaborative discussion to solve a StrategyQA yes/no question. "
+            "The discussion uses shared memory: each participant can use the full discussion history produced so far."
         )
 
     @staticmethod
-    def _build_initial_user_content(context: str, question: str, *, is_final_turn: bool = False) -> str:
-        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
+    def _build_initial_user_content(
+        context: str,
+        question: str,
+        *,
+        agent_id: str = "A",
+        is_final_turn: bool = False,
+    ) -> str:
+        del is_final_turn
+        instruction = AgentRunner._initial_agent_instruction(agent_id)
+        context_block = f"### Context:\n{context.strip()}\n" if context.strip() else ""
         return (
             "### Instruction:\n"
-            "Use the passage to answer the Question accurately.\n"
-            f"{final_instruction}"
-            "### Passage:\n"
-            f"{context.strip()}\n"
+            f"{instruction}\n"
+            f"{context_block}"
             "### Question:\n"
             f"{question.strip()}"
         )
 
     @staticmethod
-    def _build_followup_user_content(question: str, *, is_final_turn: bool = False) -> str:
-        final_instruction = f"{AgentRunner._final_answer_instruction()}\n" if is_final_turn else ""
+    def _build_followup_user_content(
+        question: str,
+        *,
+        agent_id: str,
+        previous_agent_id: str,
+        is_final_turn: bool = False,
+        judge_solutions: Sequence[Tuple[str, str]] = (),
+    ) -> str:
+        instruction = (
+            AgentRunner._judge_instruction(previous_agent_id)
+            if is_final_turn
+            else AgentRunner._ordinary_agent_instruction(agent_id, previous_agent_id)
+        )
+        solutions_block = (
+            f"\n### Solutions:\n{AgentRunner._format_judge_solutions(judge_solutions)}"
+            if is_final_turn and judge_solutions
+            else ""
+        )
         return (
             "### Instruction:\n"
-            "Using the passage and previous Agent's response, improve the answer to the Question.\n"
-            f"{final_instruction}"
+            f"{instruction}\n"
             "### Question:\n"
             f"{question.strip()}"
+            f"{solutions_block}"
         )
 
     @staticmethod
@@ -809,8 +897,13 @@ class AgentRunner:
         agent_count: int = 2,
         is_final_turn: bool = False,
     ) -> str:
-        del hub_agent_id, agent_count
-        return AgentRunner._build_plain_initial_prompt(context, question, is_final_turn=is_final_turn)
+        del agent_count
+        return AgentRunner._build_plain_initial_prompt(
+            context,
+            question,
+            agent_id=hub_agent_id,
+            is_final_turn=is_final_turn,
+        )
 
     def build_initial_prompt_for_agent(
         self,
@@ -823,11 +916,21 @@ class AgentRunner:
         is_final_turn: bool = False,
     ) -> str:
         del hub_agent_id, agent_count
-        user_content = self._build_initial_user_content(context, question, is_final_turn=is_final_turn)
+        user_content = self._build_initial_user_content(
+            context,
+            question,
+            agent_id=agent.node_id,
+            is_final_turn=is_final_turn,
+        )
         return self._format_agent_prompt(
             agent,
             user_content,
-            self._build_plain_initial_prompt(context, question, is_final_turn=is_final_turn),
+            self._build_plain_initial_prompt(
+                context,
+                question,
+                agent_id=agent.node_id,
+                is_final_turn=is_final_turn,
+            ),
             continuation=False,
         )
 
@@ -838,18 +941,37 @@ class AgentRunner:
         question: str,
         *,
         is_final_turn: bool = False,
+        judge_solutions: Sequence[Tuple[str, str]] = (),
     ) -> str:
-        del turn_index
-        user_content = self._build_followup_user_content(question, is_final_turn=is_final_turn)
+        previous_agent_id = self._agent_for_turn(max(0, turn_index - 1)).node_id
+        user_content = self._build_followup_user_content(
+            question,
+            agent_id=agent_id,
+            previous_agent_id=previous_agent_id,
+            is_final_turn=is_final_turn,
+            judge_solutions=judge_solutions,
+        )
         agent = self.agents.get(agent_id)
         if agent is not None:
             return self._format_agent_prompt(
                 agent,
                 user_content,
-                self._build_plain_followup_prompt(question, is_final_turn=is_final_turn),
+                self._build_plain_followup_prompt(
+                    question,
+                    agent_id=agent_id,
+                    previous_agent_id=previous_agent_id,
+                    is_final_turn=is_final_turn,
+                    judge_solutions=judge_solutions,
+                ),
                 continuation=True,
             )
-        return self._build_plain_followup_prompt(question, is_final_turn=is_final_turn)
+        return self._build_plain_followup_prompt(
+            question,
+            agent_id=agent_id,
+            previous_agent_id=previous_agent_id,
+            is_final_turn=is_final_turn,
+            judge_solutions=judge_solutions,
+        )
 
     @staticmethod
     def _append_turn_to_transcript(transcript: str, agent_id: str, response: str) -> str:
@@ -858,15 +980,16 @@ class AgentRunner:
 
     @staticmethod
     def extract_final_answer(transcript: str, fallback_response: str) -> str:
-        # The final prompt itself contains the literal template "FINAL: <concise answer>",
-        # so parse only the final hub response rather than searching the whole transcript.
         del transcript
-        matches = list(re.finditer(r"FINAL\s*:\s*(.+)", fallback_response or "", flags=re.IGNORECASE))
-        if matches:
-            candidate = matches[-1].group(1).strip()
-            candidate = re.split(r"[\n\r]", candidate, maxsplit=1)[0].strip()
-            return postprocess_generated_answer(candidate)
-        return (fallback_response or "").strip()
+        final_matches = list(
+            re.finditer(r"FINAL\s*:\s*(yes|no)\b", fallback_response or "", flags=re.IGNORECASE)
+        )
+        if final_matches:
+            return final_matches[-1].group(1).lower()
+        binary_matches = list(re.finditer(r"\b(yes|no)\b", fallback_response or "", flags=re.IGNORECASE))
+        if binary_matches:
+            return binary_matches[-1].group(1).lower()
+        return postprocess_generated_answer((fallback_response or "").strip())
 
     @staticmethod
     def _preview_text(text: str, max_chars: int) -> str:
@@ -911,7 +1034,7 @@ class AgentRunner:
         label = "?" if example_index is None else str(example_index)
         turn_order = "->".join(self.node_ids + ([self.node_ids[0]] if len(self.node_ids) > 1 else []))
         logging.info(
-            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | hub=%s | topology=star | turn_order=%s | "
+            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | judge=%s | discussion=memory | physical_topology=star | turn_order=%s | "
             "question=%s | gold=%s",
             label,
             self.cache_mode,
@@ -962,16 +1085,16 @@ class AgentRunner:
             self._preview_text(record.response, self.log_max_chars),
         )
 
-    def _log_example_end(self, *, example_index: Optional[int], prediction: str, f1: float) -> None:
+    def _log_example_end(self, *, example_index: Optional[int], prediction: str, accuracy: float) -> None:
         if not self.log_turns:
             return
         label = "?" if example_index is None else str(example_index)
         logging.info(
-            "[AgentRunner][example=%s] end | mode=%s | prediction=%s | f1=%.4f",
+            "[AgentRunner][example=%s] end | mode=%s | prediction=%s | accuracy=%.4f",
             label,
             self.cache_mode,
             self._preview_text(prediction, self.log_max_chars),
-            f1,
+            accuracy,
         )
 
     def _should_clear_source_after_offload(self, source_agent: Agent) -> bool:
@@ -1362,6 +1485,7 @@ class AgentRunner:
             final_turn_index,
             question,
             is_final_turn=True,
+            judge_solutions=self._latest_agent_solutions(turns),
         )
         final_generation = self.hub_agent.generate_response(final_prompt)
         self._update_peak_memory_breakdown()
@@ -1477,13 +1601,15 @@ class AgentRunner:
             )
 
         prediction = self.extract_final_answer(transcript, last_response)
-        f1 = compute_generation_f1(prediction, list(gold_answers))
-        self._log_example_end(example_index=example_index, prediction=prediction, f1=f1)
+        normalized_prediction = prediction.strip().lower()
+        normalized_gold = {str(answer).strip().lower() for answer in gold_answers}
+        accuracy = float(normalized_prediction in normalized_gold)
+        self._log_example_end(example_index=example_index, prediction=prediction, accuracy=accuracy)
         return AgentRunnerResult(
             question=question,
             gold_answers=list(gold_answers),
             prediction=prediction,
-            f1=f1,
+            accuracy=accuracy,
             transcript=transcript,
             turns=turns,
             profile={},

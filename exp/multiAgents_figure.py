@@ -72,7 +72,7 @@ METHOD_COLORS = {
     "mot-free": "#C0504D",
 }
 
-F1_COLOR = "#4BACC6"
+ACCURACY_COLOR = "#4BACC6"
 
 
 def _safe_folder_name(algorithm: str, cache_mode: str, agent_count: int) -> str:
@@ -108,7 +108,7 @@ def load_data_from_metrics(
     """Load metrics for existing folders only.
 
     The returned structure is:
-        data[agent_count][method] = {"f1": ..., "gpu_peak_memory_gib": ...}
+        data[agent_count][method] = {"accuracy": ..., "gpu_peak_memory_gib": ...}
     """
 
     data: dict[int, dict[str, dict[str, float]]] = {}
@@ -162,7 +162,7 @@ def load_data_from_metrics(
                 memory_components.append(float(value))
 
             data.setdefault(agent_count, {})[method] = {
-                "f1": _read_metric_value(metrics, "f1", path),
+                "accuracy": _read_metric_value(metrics, "accuracy", path),
                 "gpu_peak_memory_gib": sum(memory_components),
             }
             loaded_paths.append(path)
@@ -186,8 +186,8 @@ def load_data_from_metrics(
 def compute_global_axis_limits(
     data: dict[int, dict[str, dict[str, float]]]
 ) -> tuple[float, float]:
-    global_f1_max = (
-        max(entry["f1"] for agent_data in data.values() for entry in agent_data.values())
+    global_accuracy_max = (
+        max(entry["accuracy"] for agent_data in data.values() for entry in agent_data.values())
         * 1.25
     )
     global_memory_max = (
@@ -198,7 +198,7 @@ def compute_global_axis_limits(
         )
         * 1.25
     )
-    return global_f1_max, global_memory_max
+    return global_accuracy_max, global_memory_max
 
 
 # ---------------------------------------------------------------------------
@@ -291,38 +291,38 @@ def draw_manual_legend_on_axes(ax) -> None:
         zorder=26,
     )
 
-    f1_x = box_x + 0.64
+    accuracy_x = box_x + 0.64
     handle_half_len = 0.040
 
     ax.plot(
-        [f1_x - handle_half_len, f1_x + handle_half_len],
+        [accuracy_x - handle_half_len, accuracy_x + handle_half_len],
         [y, y],
         transform=ax.transAxes,
         linestyle="-",
         linewidth=OVERLEAF_LINE_WIDTH,
-        color=F1_COLOR,
+        color=ACCURACY_COLOR,
         clip_on=False,
         zorder=25,
     )
 
     ax.plot(
-        [f1_x],
+        [accuracy_x],
         [y],
         transform=ax.transAxes,
         linestyle="",
         marker="o",
         markersize=OVERLEAF_MARKER_SIZE * 0.90,
         markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
-        markeredgecolor=F1_COLOR,
+        markeredgecolor=ACCURACY_COLOR,
         markeredgewidth=OVERLEAF_MARKER_EDGE_WIDTH,
         clip_on=False,
         zorder=26,
     )
 
     ax.text(
-        f1_x + handle_half_len + 0.025,
+        accuracy_x + handle_half_len + 0.025,
         y,
-        "F1",
+        "Accuracy",
         transform=ax.transAxes,
         ha="left",
         va="center",
@@ -338,7 +338,7 @@ def draw_agent_plot(
     agent_count: int,
     agent_data: dict[str, dict[str, float]],
     global_memory_max: float,
-    global_f1_max: float,
+    global_accuracy_max: float,
     output_base: Path,
 ) -> None:
     plt = require_matplotlib_pyplot()
@@ -348,11 +348,11 @@ def draw_agent_plot(
         raise ValueError(f"No methods available for agent_count={agent_count}")
 
     fig, ax_mem = plt.subplots(figsize=FIGSIZE)
-    ax_f1 = ax_mem.twinx()
+    ax_accuracy = ax_mem.twinx()
 
     fig.patch.set_facecolor("white")
     ax_mem.set_facecolor("white")
-    ax_f1.set_facecolor("white")
+    ax_accuracy.set_facecolor("white")
 
     x = np.arange(len(plotted_methods), dtype=float)
     bar_width = 0.56
@@ -360,7 +360,7 @@ def draw_agent_plot(
     memory_values = [
         agent_data[method]["gpu_peak_memory_gib"] for method in plotted_methods
     ]
-    f1_values = [agent_data[method]["f1"] for method in plotted_methods]
+    accuracy_values = [agent_data[method]["accuracy"] for method in plotted_methods]
 
     for idx, method in enumerate(plotted_methods):
         ax_mem.bar(
@@ -373,26 +373,26 @@ def draw_agent_plot(
             zorder=2,
         )
 
-    ax_f1.plot(
+    ax_accuracy.plot(
         x,
-        f1_values,
+        accuracy_values,
         linestyle="-",
         linewidth=OVERLEAF_LINE_WIDTH,
-        color=F1_COLOR,
+        color=ACCURACY_COLOR,
         zorder=4,
     )
 
     for idx, method in enumerate(plotted_methods):
-        ax_f1.plot(
+        ax_accuracy.plot(
             [x[idx]],
-            [f1_values[idx]],
+            [accuracy_values[idx]],
             linestyle="",
             marker=AI_PAPER_MARKERS[idx % len(AI_PAPER_MARKERS)],
             markersize=OVERLEAF_MARKER_SIZE,
             markerfacecolor=AI_PAPER_MARKER_FACE_COLOR,
-            markeredgecolor=F1_COLOR,
+            markeredgecolor=ACCURACY_COLOR,
             markeredgewidth=OVERLEAF_MARKER_EDGE_WIDTH,
-            color=F1_COLOR,
+            color=ACCURACY_COLOR,
             zorder=5,
         )
 
@@ -401,23 +401,23 @@ def draw_agent_plot(
 
     ax_mem.set_xlabel("")
     ax_mem.set_ylabel("GPU Peak Memory (GiB)")
-    ax_f1.set_ylabel("F1")
+    ax_accuracy.set_ylabel("Accuracy")
 
     ax_mem.set_ylim(0.0, global_memory_max)
-    ax_f1.set_ylim(0.0, global_f1_max)
+    ax_accuracy.set_ylim(0.0, global_accuracy_max)
 
     style_axes_common(ax_mem, grid=True, grid_axis="y", title=False)
-    style_axes_common(ax_f1, grid=False, grid_axis="y", title=False)
+    style_axes_common(ax_accuracy, grid=False, grid_axis="y", title=False)
 
     apply_large_text_style(ax_mem)
-    apply_large_text_style(ax_f1)
+    apply_large_text_style(ax_accuracy)
     style_method_tick_labels(ax_mem)
 
     ax_mem.set_zorder(1)
-    ax_f1.set_zorder(2)
-    ax_f1.patch.set_visible(False)
+    ax_accuracy.set_zorder(2)
+    ax_accuracy.patch.set_visible(False)
 
-    draw_manual_legend_on_axes(ax_f1)
+    draw_manual_legend_on_axes(ax_accuracy)
 
     fig.subplots_adjust(left=0.125, right=0.875, bottom=0.155, top=0.80)
 
@@ -426,7 +426,7 @@ def draw_agent_plot(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create agent-wise F1 vs GPU Peak Memory plots from metrics json files."
+        description="Create agent-wise Accuracy vs GPU Peak Memory plots from metrics json files."
     )
     parser.add_argument(
         "--metrics-root",
@@ -463,7 +463,7 @@ def main() -> None:
 
     agent_counts = args.agent_counts if args.agent_counts is not None else DEFAULT_AGENT_COUNTS
     data = load_data_from_metrics(args.metrics_root, agent_counts=agent_counts)
-    global_f1_max, global_memory_max = compute_global_axis_limits(data)
+    global_accuracy_max, global_memory_max = compute_global_axis_limits(data)
 
     for agent_count in sorted(data):
         output_base = args.output_dir / f"agents_{agent_count}"
@@ -471,7 +471,7 @@ def main() -> None:
             agent_count=agent_count,
             agent_data=data[agent_count],
             global_memory_max=global_memory_max,
-            global_f1_max=global_f1_max,
+            global_accuracy_max=global_accuracy_max,
             output_base=output_base,
         )
         print(output_base.with_suffix(".png"))
