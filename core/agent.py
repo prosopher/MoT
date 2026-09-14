@@ -21,7 +21,6 @@ class AgentGeneration:
     tokens_after: int
     tokens_prompt: int
     tokens_completion: int
-    terminal_token_id: Optional[int] = None
 
     @property
     def generated_tokens(self) -> int:
@@ -58,6 +57,7 @@ class Agent:
         max_new_tokens: int = 64,
         stop_sequences: Optional[Sequence[str]] = None,
         max_prompt_tokens: Optional[int] = None,
+        temperature: float = 0.0,
     ) -> None:
         self.node_id = node_id
         self.model = model
@@ -65,6 +65,9 @@ class Agent:
         self.max_new_tokens = int(max_new_tokens)
         self.stop_sequences = tuple(stop_sequences or ())
         self.max_prompt_tokens = max_prompt_tokens
+        self.temperature = float(temperature)
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0, got {self.temperature}")
         self.past_key_values: Optional[PastKeyValues] = None
         # Token ids corresponding 1:1 to the resident KV cache.
         # past_key_values itself does not store the input token ids, so the runner
@@ -269,11 +272,11 @@ class Agent:
         self,
         prompt_text: str,
         *,
-        temperature: float = 0.0,
+        temperature: Optional[float] = None,
     ) -> AgentGeneration:
-        temperature = float(temperature)
-        if temperature < 0.0:
-            raise ValueError(f"temperature must be >= 0, got {temperature}")
+        effective_temperature = self.temperature if temperature is None else float(temperature)
+        if effective_temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0, got {effective_temperature}")
         tokens_before = self.cache_seq_len
         current_past, current_token_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
@@ -299,8 +302,8 @@ class Agent:
             uncached_generated_token = None
 
             next_token_logits = outputs.logits[:, -1, :]
-            if temperature > 0.0:
-                probabilities = torch.softmax(next_token_logits.float() / temperature, dim=-1)
+            if effective_temperature > 0.0:
+                probabilities = torch.softmax(next_token_logits.float() / effective_temperature, dim=-1)
                 next_token_tensor = torch.multinomial(probabilities, num_samples=1)
             else:
                 next_token_tensor = next_token_logits.argmax(dim=-1, keepdim=True)
@@ -405,64 +408,6 @@ class Agent:
             tokens_after=self.cache_seq_len,
             tokens_prompt=tokens_prompt,
             tokens_completion=len(generated_token_ids),
-            terminal_token_id=terminal_token_id,
-        )
-
-    @torch.inference_mode()
-    def commit_generation(self, prompt_text: str, generation: AgentGeneration) -> AgentGeneration:
-        """Append a previously decoded response to this agent's current shared cache.
-
-        The response token ids come from an isolated/revision decode, while the
-        resident cache contains only the shared debate history. This lets callers
-        keep private draft reasoning out of the cache handed to the next agent.
-        """
-        tokens_before = self.cache_seq_len
-        prompt_ids = self.encode_text(prompt_text)
-        prompt_tokens = int(prompt_ids.shape[1])
-        prompt_id_list = prompt_ids.squeeze(0).detach().cpu().tolist()
-
-        if self.past_key_values is None:
-            current_past = extract_past_key_values(self.model, prompt_ids)
-        else:
-            current_past = append_token_ids_to_past(
-                model=self.model,
-                past_key_values=self.past_key_values,
-                token_ids=prompt_ids,
-            )
-
-        committed_ids = list(generation.generated_token_ids)
-        if generation.terminal_token_id is not None:
-            committed_ids.append(int(generation.terminal_token_id))
-        if committed_ids:
-            response_ids = TokenIDs(
-                torch.tensor([committed_ids], dtype=torch.long, device=self.device),
-                model_id=self.model.id,
-            )
-            current_past = append_token_ids_to_past(
-                model=self.model,
-                past_key_values=current_past,
-                token_ids=response_ids,
-            )
-
-        self.past_key_values = current_past
-        self.cache_token_ids = list(self.cache_token_ids) + prompt_id_list + committed_ids
-        if len(self.cache_token_ids) != self.cache_seq_len:
-            raise ValueError(
-                f"Committed cache/token-id length mismatch for Agent {self.node_id}: "
-                f"token_ids={len(self.cache_token_ids)} past_tokens={self.cache_seq_len}"
-            )
-        self.invalidate_pretranslated_caches()
-        return AgentGeneration(
-            agent_id=self.node_id,
-            prompt_text=prompt_text,
-            text=generation.text,
-            raw_text=generation.raw_text,
-            generated_token_ids=list(generation.generated_token_ids),
-            tokens_before=tokens_before,
-            tokens_after=self.cache_seq_len,
-            tokens_prompt=prompt_tokens,
-            tokens_completion=generation.tokens_completion,
-            terminal_token_id=generation.terminal_token_id,
         )
 
 

@@ -99,13 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--generation-max-new-tokens", type=int, default=48)
     parser.add_argument(
-        "--first-pass-temperature",
+        "--generation-temperature",
         type=float,
         default=1.0,
-        help=(
-            "Sampling temperature for each debater's independent first pass. "
-            "The history-aware second pass and terminal Judge remain greedy. Use 0 for greedy first passes."
-        ),
+        help="Sampling temperature for debaters and Judge. Use 0 for deterministic greedy decoding.",
     )
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
     parser.add_argument("--log-turns", dest="log_turns", action="store_true", default=True, help="Print per-turn AgentRunner logs.")
@@ -201,7 +198,7 @@ def main() -> None:
             device=args.device,
             max_turns=args.max_turns,
             generation_max_new_tokens=args.generation_max_new_tokens,
-            first_pass_temperature=args.first_pass_temperature,
+            generation_temperature=args.generation_temperature,
             max_prompt_tokens=args.max_prompt_tokens,
             agent_count=args.agent_count,
             seed=args.seed,
@@ -244,7 +241,7 @@ def main() -> None:
             )
         rows.append(_example_row(result, example, example_index=example_index))
         print(
-            f"\n[{local_idx}/{selected_count} | example={example_index}] "
+            f"[{local_idx}/{selected_count} | example={example_index}] "
             f"uid={example.id} accuracy={result.accuracy:.0f} | "
             f"prediction={result.prediction!r} | gold={example.answers[0]!r}"
         )
