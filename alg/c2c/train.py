@@ -156,6 +156,139 @@ def get_trainable_module_label(config: TrainConfig) -> str:
     return "C2C-Project" if is_projection_only_variant(config) else "C2C"
 
 
+def _decode_single_token(tokenizer, token_id: int) -> str:
+    try:
+        return tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode([token_id], skip_special_tokens=False)
+
+
+def _encode_without_special_tokens(tokenizer, text: str) -> List[int]:
+    encode_fn = getattr(tokenizer, "encode", None)
+    if callable(encode_fn):
+        return list(encode_fn(text, add_special_tokens=False, return_tensors=None))
+
+    encoded = tokenizer(text, add_special_tokens=False)
+    if isinstance(encoded, dict):
+        token_ids = encoded["input_ids"]
+    else:
+        token_ids = encoded.input_ids
+    if isinstance(token_ids, torch.Tensor):
+        token_ids = token_ids.tolist()
+    return list(token_ids)
+
+
+def _map_c2c_special_token(receiver_tokenizer, sharer_tokenizer, token_id: int, token_text: str) -> int:
+    # C2C's TokenAligner fills a missing pad token with eos before constructing
+    # this map. Mirror that behavior locally without mutating either tokenizer.
+    receiver_pad_id = getattr(receiver_tokenizer, "pad_token_id", None)
+    if receiver_pad_id is None:
+        receiver_pad_id = getattr(receiver_tokenizer, "eos_token_id", None)
+    sharer_pad_id = getattr(sharer_tokenizer, "pad_token_id", None)
+    if sharer_pad_id is None:
+        sharer_pad_id = getattr(sharer_tokenizer, "eos_token_id", None)
+
+    special_token_map = {
+        receiver_pad_id: sharer_pad_id,
+        getattr(receiver_tokenizer, "eos_token_id", None): getattr(sharer_tokenizer, "eos_token_id", None),
+        getattr(receiver_tokenizer, "bos_token_id", None): getattr(sharer_tokenizer, "bos_token_id", None),
+        getattr(receiver_tokenizer, "unk_token_id", None): getattr(sharer_tokenizer, "unk_token_id", None),
+    }
+    mapped = special_token_map.get(token_id)
+    if mapped is not None:
+        return int(mapped)
+
+    convert_fn = getattr(sharer_tokenizer, "convert_tokens_to_ids", None)
+    sharer_unk_id = getattr(sharer_tokenizer, "unk_token_id", None)
+    if callable(convert_fn):
+        try:
+            mapped = convert_fn(token_text)
+            if mapped is not None and mapped != sharer_unk_id:
+                return int(mapped)
+        except Exception:
+            pass
+    return int(sharer_unk_id if sharer_unk_id is not None else 0)
+
+
+def align_receiver_token_ids_to_sharer_for_c2c_project(
+    *,
+    receiver_token_ids: TokenIDs,
+    receiver_model: Model,
+    sharer_model: Model,
+) -> TokenIDs:
+    """Apply the official C2C cross-tokenizer alignment for Project.
+
+    C2C uses the receiver token sequence as the positional reference. Each
+    receiver token is decoded independently and re-encoded with the sharer
+    tokenizer. When that produces multiple sharer tokens, the paper's
+    cross-tokenizer setting uses the ``longest`` strategy: keep the candidate
+    whose decoded string has the greatest coverage. The output therefore has
+    exactly the receiver sequence length and can be projected position-wise.
+    """
+    ensure_token_ids_model(receiver_model, receiver_token_ids)
+    receiver_tokenizer = receiver_model.tokenizer
+    sharer_tokenizer = sharer_model.tokenizer
+    receiver_special_ids = set(getattr(receiver_tokenizer, "all_special_ids", []) or [])
+
+    rows = receiver_token_ids.as_tensor().detach().cpu().tolist()
+    aligned_rows: List[List[int]] = []
+    token_cache = {}
+
+    for row in rows:
+        aligned_row: List[int] = []
+        for raw_token_id in row:
+            token_id = int(raw_token_id)
+            if token_id in token_cache:
+                aligned_row.append(token_cache[token_id])
+                continue
+
+            token_text = _decode_single_token(receiver_tokenizer, token_id)
+            if token_id in receiver_special_ids:
+                selected = _map_c2c_special_token(
+                    receiver_tokenizer, sharer_tokenizer, token_id, token_text
+                )
+            else:
+                candidates = _encode_without_special_tokens(sharer_tokenizer, token_text)
+                if not candidates:
+                    selected = int(getattr(sharer_tokenizer, "unk_token_id", None) or 0)
+                elif len(candidates) == 1:
+                    selected = int(candidates[0])
+                else:
+                    selected = max(
+                        (int(candidate) for candidate in candidates),
+                        key=lambda candidate: len(_decode_single_token(sharer_tokenizer, candidate)),
+                    )
+
+            token_cache[token_id] = selected
+            aligned_row.append(selected)
+        aligned_rows.append(aligned_row)
+
+    aligned = torch.tensor(
+        aligned_rows,
+        dtype=receiver_token_ids.dtype,
+        device=receiver_token_ids.device,
+    )
+    return TokenIDs(aligned, model_id=sharer_model.id)
+
+
+@torch.no_grad()
+def extract_aligned_sharer_past_for_c2c_project(
+    *,
+    receiver_context_token_ids: TokenIDs,
+    receiver_model: Model,
+    sharer_model: Model,
+) -> PastKeyValues:
+    aligned_sharer_token_ids = align_receiver_token_ids_to_sharer_for_c2c_project(
+        receiver_token_ids=receiver_context_token_ids,
+        receiver_model=receiver_model,
+        sharer_model=sharer_model,
+    )
+    return extract_past_key_values(sharer_model, aligned_sharer_token_ids)
+
 
 def translate_top_layers(
     translator_pool: TranslatorPool,
@@ -837,11 +970,18 @@ def run_train(ctx: Context) -> Path:
 
             total_direction_loss = 0.0
             for edge in edges:
-                _, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                target_context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                sharer_past_key_values = past_by_node_id[edge.src_id]
+                if is_projection_only_variant(config):
+                    sharer_past_key_values = extract_aligned_sharer_past_for_c2c_project(
+                        receiver_context_token_ids=target_context_token_ids,
+                        receiver_model=ctx.tp.get_model(edge.tgt_id),
+                        sharer_model=ctx.tp.get_model(edge.src_id),
+                    )
                 translated_top_past = translate_top_layers(
                     translator_pool=translator_pool,
                     train_config=config,
-                    sharer_past_key_values=past_by_node_id[edge.src_id],
+                    sharer_past_key_values=sharer_past_key_values,
                     receiver_past_key_values=past_by_node_id[edge.tgt_id],
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
