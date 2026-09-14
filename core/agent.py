@@ -119,6 +119,50 @@ class Agent:
         if empty_cuda_cache and torch.cuda.is_available() and str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
 
+    def truncate_kv_cache(self, seq_len: int) -> None:
+        """Keep only the first ``seq_len`` tokens of the resident cache."""
+        seq_len = int(seq_len)
+        if seq_len < 0 or seq_len > self.cache_seq_len:
+            raise ValueError(
+                f"Invalid KV truncation for Agent {self.node_id}: "
+                f"requested={seq_len} current={self.cache_seq_len}"
+            )
+        if seq_len == 0:
+            self.clear_kv_cache()
+            return
+        assert self.past_key_values is not None
+        self.past_key_values = tuple(
+            (
+                key[:, :, :seq_len, :].contiguous(),
+                value[:, :, :seq_len, :].contiguous(),
+            )
+            for key, value in self.past_key_values
+        )
+        self.cache_token_ids = self.cache_token_ids[:seq_len]
+        self.invalidate_pretranslated_caches()
+
+    @torch.inference_mode()
+    def append_context_text(self, text: str) -> int:
+        """Append already-rendered context to KV without generating a response."""
+        token_ids = self.encode_text(text)
+        num_tokens = int(token_ids.shape[1])
+        if self.past_key_values is None:
+            self.past_key_values = extract_past_key_values(self.model, token_ids)
+        else:
+            self.past_key_values = append_token_ids_to_past(
+                model=self.model,
+                past_key_values=self.past_key_values,
+                token_ids=token_ids,
+            )
+        self.cache_token_ids.extend(token_ids.squeeze(0).detach().cpu().tolist())
+        if len(self.cache_token_ids) != self.cache_seq_len:
+            raise ValueError(
+                f"Appended context/cache mismatch for Agent {self.node_id}: "
+                f"token_ids={len(self.cache_token_ids)} past_tokens={self.cache_seq_len}"
+            )
+        self.invalidate_pretranslated_caches()
+        return num_tokens
+
     def encode_text(
         self,
         text: str,

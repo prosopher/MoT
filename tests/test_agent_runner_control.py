@@ -60,6 +60,58 @@ def test_agent_runner_virtual_agents_share_one_physical_model() -> None:
     assert ctx.tp.get_model("A") is ctx.tp.get_model("B")
 
 
+def test_agent_runner_expert_persona_prompt_is_generated_per_example() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=4,
+        log_turns=False,
+    )
+
+    class CapturingTokenizer:
+        chat_template = "capture-template"
+
+        def __init__(self):
+            self.messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            return "rendered-expert-persona"
+
+    tokenizer = CapturingTokenizer()
+    original_tokenizer = runner.hub_agent.model.tokenizer
+    runner.hub_agent.model.tokenizer = tokenizer
+    try:
+        assert runner.agent_personas == {}
+        prompt = runner._build_expert_persona_prompt(
+            context="premise",
+            question="hypothesis",
+            existing_personas=(("Semantic Expert", "Checks meaning."),),
+        )
+    finally:
+        runner.hub_agent.model.tokenizer = original_tokenizer
+
+    assert prompt == "rendered-expert-persona"
+    assert [message["role"] for message in tokenizer.messages] == ["system", "user", "system", "user"]
+    assert "one participant at a time" in tokenizer.messages[0]["content"]
+    assert "complementing the existing participants" in tokenizer.messages[0]["content"]
+    assert "Example 1:" in tokenizer.messages[0]["content"]
+    assert "Example 2:" in tokenizer.messages[0]["content"]
+    assert "Example 3:" in tokenizer.messages[0]["content"]
+    assert "Now generate a participant" in tokenizer.messages[1]["content"]
+    assert "Context:\npremise hypothesis" in tokenizer.messages[1]["content"]
+    assert "Already Generated Participants" in tokenizer.messages[2]["content"]
+    assert "Semantic Expert" in tokenizer.messages[2]["content"]
+    assert "Only answer with the JSON for the next persona" in tokenizer.messages[3]["content"]
+    assert AgentRunner._parse_persona('{"role":"Reviewer","description":"Checks errors."}', 1) == (
+        "Reviewer",
+        "Checks errors.",
+    )
+    assert tokenizer.messages[0]["content"].startswith("\nWhen faced with a task")
+    assert AgentRunner._try_parse_persona('{"name":"Reviewer","description":"Checks errors."}') is None
+
 def test_agent_runner_defaults_to_mallm_sampling_temperature() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
@@ -194,6 +246,37 @@ def test_chat_continuation_uses_user_only_fragment_and_strips_leading_bos() -> N
     assert rendered.startswith("<|start_header_id|>user")
 
 
+def test_mallm_turn_renderer_preserves_system_and_user_roles_for_memory_continuation() -> None:
+    class LlamaLikeTokenizer:
+        chat_template = "llama-template"
+        bos_token = "<|begin_of_text|>"
+
+        def __init__(self):
+            self.messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            return "<|begin_of_text|><system>general debate</system><user>simple</user><assistant>"
+
+    tokenizer = LlamaLikeTokenizer()
+    agent = SimpleNamespace(model=SimpleNamespace(id="meta-llama/Llama-3.2-1B-Instruct", tokenizer=tokenizer))
+
+    rendered = AgentRunner._render_mallm_turn_prompt(
+        agent,
+        "general debate",
+        ["simple", "Let's think step by step."],
+        continuation=True,
+    )
+
+    assert tokenizer.messages == [
+        {"role": "system", "content": "general debate"},
+        {"role": "user", "content": "simple"},
+        {"role": "user", "content": "Let's think step by step."},
+    ]
+    assert not rendered.startswith(tokenizer.bos_token)
+    assert rendered.startswith("<system>general debate")
+
+
 def test_agent_caches_generated_eos_as_turn_terminator() -> None:
     import torch
 
@@ -286,110 +369,335 @@ def test_agent_forces_chat_turn_terminator_when_max_new_tokens_is_reached() -> N
     assert agent.cache_seq_len == 4
 
 
-def test_agent_runner_final_answer_parser_extracts_strategyqa_binary_answer() -> None:
-    transcript = "Earlier text says FINAL: no, but only the final response should be parsed.\n"
+def test_agent_runner_final_answer_parser_extracts_anli_label() -> None:
+    transcript = "Earlier text says FINAL: neutral, but only the final response should be parsed.\n"
 
-    assert AgentRunner.extract_final_answer(transcript, "FINAL: YES") == "yes"
-    assert AgentRunner.extract_final_answer(transcript, "Reasoning... answer: no") == "no"
+    assert AgentRunner.extract_final_answer(transcript, "FINAL: ENTAILMENT") == "entailment"
+    assert AgentRunner.extract_final_answer(transcript, "Reasoning... Label: contradiction") == "contradiction"
 
 
-def test_agent_runner_prompts_use_mallm_memory_critical_and_judge() -> None:
-    ordinary = AgentRunner._build_followup_user_content(
-        "question", agent_id="B", previous_agent_id="A", is_final_turn=False
-    )
-    final = AgentRunner._build_followup_user_content(
-        "question",
-        agent_id="A",
-        previous_agent_id="D",
-        is_final_turn=True,
-        judge_solutions=(("A", "Answer: yes"), ("B", "Answer: no")),
+def test_agent_runner_persists_mallm_discussion_field_in_shared_memory() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_turns=False,
     )
 
-    assert "FINAL:" not in ordinary
-    assert "shared memory" in ordinary
-    assert "full discussion history from all previous Agents" in ordinary
-    assert "Critically evaluate the current solution" in ordinary
-    assert "Identify potential weaknesses or missing facts" in ordinary
-    assert "[AGREE]" in ordinary
-    assert "[DISAGREE]" in ordinary
-    assert "improved solution" in ordinary
-    assert "End with 'Answer: yes' or 'Answer: no'" in ordinary
-    assert "Agent A" in ordinary
-    assert "I agree with Agent [agent id]" not in ordinary
+    first_memory = runner._render_memory_entry(
+        agent=runner.agents["A"],
+        persona=("Semantic Expert", "Checks meaning."),
+        response="Label: neutral. Reasoning.",
+        context="premise",
+        question="hypothesis",
+        include_base=True,
+    )
+    later_memory = runner._render_memory_entry(
+        agent=runner.agents["B"],
+        persona=("Logic Reviewer", "Checks inference."),
+        response="[AGREE]",
+        context="premise",
+        question="hypothesis",
+        include_base=False,
+    )
 
-    assert "You are the Judge" in final
-    assert "decision on the listed solutions" in final
-    assert "### Solutions:" in final
-    assert "Solution 1 (Agent A): Answer: yes" in final
-    assert "Solution 2 (Agent B): Answer: no" in final
-    assert "FINAL: yes" in final
-    assert "FINAL: no" in final
-    assert "Hub" not in final
+    assert first_memory.startswith("This is the discussion to the current point:")
+    assert "Semantic Expert: Label: neutral. Reasoning." in first_memory
+    assert "This is the discussion to the current point:" not in later_memory
+    assert "Logic Reviewer: [AGREE]" in later_memory
+    assert "Current Solution:" not in later_memory
+    assert "Improve the current solution." not in later_memory
 
 
-def test_agent_runner_judge_chat_prompt_is_standalone_user_turn() -> None:
-    class ChatTokenizer:
-        chat_template = "checkpoint-template"
+def test_agent_runner_memory_uses_official_header_and_nonself_user_role() -> None:
+    class CapturingTokenizer:
+        chat_template = "capture-template"
+        bos_token = "<bos>"
 
         def __init__(self):
             self.messages = None
 
         def apply_chat_template(self, messages, **kwargs):
-            del kwargs
             self.messages = messages
-            return "rendered-judge"
+            return "<bos><system>This is the discussion to the current point:</system>"
 
-    tokenizer = ChatTokenizer()
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_turns=False,
+    )
+    tokenizer = CapturingTokenizer()
     fake_agent = SimpleNamespace(model=SimpleNamespace(tokenizer=tokenizer))
-
-    rendered = AgentRunner._render_chat_prompt(
-        fake_agent,
-        "judge input",
-        continuation=False,
-        include_system=False,
+    rendered = runner._render_memory_entry(
+        agent=fake_agent,
+        persona=("Semantic Expert", "Checks meaning."),
+        response="Label: neutral",
+        context="premise",
+        question="hypothesis",
+        include_base=True,
     )
 
-    assert rendered == "rendered-judge"
-    assert tokenizer.messages == [{"role": "user", "content": "judge input"}]
+    assert [message["role"] for message in tokenizer.messages] == ["system", "user"]
+    assert tokenizer.messages[0]["content"] == "This is the discussion to the current point: "
+    assert tokenizer.messages[1]["content"] == "Semantic Expert: Label: neutral"
+    assert rendered.startswith("<bos><system>")
+
+def test_agent_runner_prompts_match_kv_native_mallm_memory_simple_structure() -> None:
+    initial = AgentRunner._build_initial_user_content(
+        "premise",
+        "hypothesis",
+        persona=("Semantic Expert", "Checks meaning."),
+    )
+    ordinary = AgentRunner._build_followup_user_content(
+        "hypothesis",
+        context="premise",
+        persona=("Adversarial Reviewer", "Find missed evidence."),
+        current_solution="neutral",
+    )
+    plain_initial = AgentRunner._build_plain_initial_prompt(
+        "premise",
+        "hypothesis",
+        persona=("Semantic Expert", "Checks meaning."),
+    )
+
+    assert initial.startswith("You take part in a discussion to solve a task.")
+    assert "Task:" in initial
+    assert "Context:\npremise" in initial
+    assert "Input: hypothesis" in initial
+    assert "Your role: Semantic Expert (Checks meaning.)" in initial
+    assert "Nobody proposed a solution yet." not in initial
+    assert "Current Solution:" not in initial
+    assert "This is the discussion to the current point:" not in initial
+
+    assert ordinary.startswith("You take part in a discussion to solve a task.")
+    assert "Context:\npremise" in ordinary
+    assert "Input: hypothesis" in ordinary
+    assert "Your role: Adversarial Reviewer (Find missed evidence.)" in ordinary
+    assert "Current Solution: neutral" in ordinary
+    # The official Memory header lives in the reusable KV prefix in AgentRunner
+    # because causal KV reuse requires the history to precede dynamic control.
+    assert "This is the discussion to the current point:" not in ordinary
+    assert (
+        "Improve the current solution. If you agree with the current solution, answer with [AGREE], "
+        "else answer with [DISAGREE] and explain why and provide an improved solution."
+    ) in ordinary
+    assert "Let's think step by step." in ordinary
+
+    assert "Propose a solution." in plain_initial
+    assert "Improve the current solution." not in plain_initial
+    assert "Let's think step by step." in plain_initial
+
+def test_agent_runner_solution_extraction_matches_mallm_system_user_roles() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_turns=False,
+    )
+    runner.agent_personas["A"] = ("Semantic Expert", "Checks meaning.")
+
+    class CapturingTokenizer:
+        chat_template = "capture-template"
+
+        def __init__(self):
+            self.messages = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            return "rendered-extraction"
+
+    tokenizer = CapturingTokenizer()
+    fake_agent = SimpleNamespace(
+        node_id="A",
+        model=SimpleNamespace(tokenizer=tokenizer),
+    )
+    prompt = runner._build_solution_extraction_prompt(
+        agent=fake_agent,
+        context="premise",
+        question="hypothesis",
+        response="[DISAGREE] entailment because ...",
+    )
+
+    assert prompt == "rendered-extraction"
+    assert [message["role"] for message in tokenizer.messages] == ["system", "user", "user"]
+    assert tokenizer.messages[0]["content"] == (
+        "You are tasked with creating a final solution based on the given input and your previous response."
+    )
+    user_content = tokenizer.messages[1]["content"]
+    assert "Task:" in user_content
+    assert "Context:\npremise" in user_content
+    assert "Input: hypothesis" in user_content
+    assert "Your previous response: [DISAGREE] entailment because ..." in user_content
+    assert "Semantic Expert" not in "\n".join(message["content"] for message in tokenizer.messages)
+    assert "Extract the final solution to the task from the provided text." in tokenizer.messages[2]["content"]
 
 
-def test_agent_runner_judge_uses_latest_solution_per_agent() -> None:
-    turns = [
-        AgentTurnRecord("A", "", "A old", 0, 0, 0, 0),
-        AgentTurnRecord("B", "", "B only", 0, 0, 0, 0),
-        AgentTurnRecord("A", "", "A latest", 0, 0, 0, 0),
-    ]
+def test_agent_runner_anli_task_instruction_does_not_force_custom_output_format() -> None:
+    instruction = AgentRunner._task_instruction()
 
-    assert AgentRunner._latest_agent_solutions(turns) == [("A", "A latest"), ("B", "B only")]
+    assert "entailment" in instruction
+    assert "neutral" in instruction
+    assert "contradiction" in instruction
+    assert "Label:" not in instruction
+    assert "before the explanation" not in instruction
+
+def test_agent_runner_preserves_mallm_extracted_solution_as_current_draft() -> None:
+    response = (
+        "[DISAGREE] The old Label: neutral misses a geographic implication. "
+        "The relationship should be classified as entailment because Brazil is in South America."
+    )
+    extracted_solution = "The relationship is entailment"
+
+    solution, label, state = AgentRunner._response_updates_solution(
+        response,
+        current_solution="neutral",
+        current_label="neutral",
+        extracted_solution=extracted_solution,
+    )
+
+    # FreeTextResponseGenerator keeps extract_result() verbatim in Response.solution.
+    assert solution == extracted_solution
+    assert label == "entailment"
+    assert state == "revise"
+    assert response not in solution
 
 
-def test_multi_agents_qa_defaults_to_strategyqa_dev() -> None:
-    from exp.multi_agents_qa import build_parser
+def test_agent_runner_anli_label_parser_normalizes_common_variants() -> None:
+    assert AgentRunner._extract_anli_label("Label: entailed\nReason") == "entailment"
+    assert AgentRunner._extract_anli_label("Label: contradictory\nReason") == "contradiction"
+    assert AgentRunner._extract_anli_label(
+        "[DISAGREE] The old Label: neutral is wrong. The relationship is classified as entailment."
+    ) == "entailment"
 
-    args = build_parser().parse_args(["mot", "--checkpoint-dir-path", "checkpoint"])
-    assert args.split == "dev"
-    assert args.data_dir == "./strategyqa"
 
-
-
-def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn() -> None:
+def test_agent_runner_majority_consensus_tracks_agreement_on_current_solution() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=4,
-        max_turns=5,
         log_turns=False,
     )
 
+    decision, recent = runner._majority_consensus([(False, "entailment")])
+    assert decision is None
+    assert recent == [(False, "entailment")]
+
+    # Match the official ThresholdConsensus implementation literally: agreeing
+    # Panelists carry the previous truthy solution, so the reverse scan still
+    # finds a solution at position 1 and does not accumulate a 2/4 majority.
+    decision, _ = runner._majority_consensus(
+        [(False, "entailment"), (True, "entailment")]
+    )
+    assert decision is None
+
+    # If the newest agreement has no solution, the previous proposal is at
+    # reverse position 2 and exactly 2/4 satisfies the official >= 0.5 check.
+    decision, _ = runner._majority_consensus(
+        [(False, "entailment"), (True, "")]
+    )
+    assert decision == "entailment"
+
+    two_agent_runner = AgentRunner(
+        ctx=ctx, translator_pool=ctx.tp, alg="mot", agent_count=2, log_turns=False
+    )
+    decision, _ = two_agent_runner._majority_consensus([(False, "entailment")])
+    assert decision == "entailment"
+
+    solution, label, state = AgentRunner._response_updates_solution(
+        "[AGREE]",
+        current_solution="Label: neutral because ...",
+        current_label="neutral",
+    )
+    assert solution == "Label: neutral because ..."
+    assert label == "neutral"
+    assert state == "agree"
+
+    solution, label, state = AgentRunner._response_updates_solution(
+        "I agree with the current solution.",
+        current_solution="Label: neutral because ...",
+        current_label="neutral",
+    )
+    assert solution == "Label: neutral because ..."
+    assert label == "neutral"
+    assert state == "agree"
+
+    solution, label, state = AgentRunner._response_updates_solution(
+        "[DISAGREE] Different reasoning, but still neutral. Label: neutral",
+        current_solution="Label: neutral because ...",
+        current_label="neutral",
+        extracted_solution="neutral",
+    )
+    assert label == "neutral"
+    assert solution == "neutral"
+    assert state == "revise"
+
+    solution, label, state = AgentRunner._response_updates_solution(
+        "[DISAGREE] The premise rules it out. Label: contradiction",
+        current_solution="Label: neutral because ...",
+        current_label="neutral",
+        extracted_solution="contradiction",
+    )
+    assert label == "contradiction"
+    assert solution == "contradiction"
+    assert state == "revise"
+
+    solution, label, state = AgentRunner._response_updates_solution(
+        "[DISAGREE] I cannot support the current draft.",
+        current_solution="Label: neutral because ...",
+        current_label="neutral",
+        extracted_solution="",
+    )
+    assert solution == ""
+    assert label is None
+    assert state == "revise"
+
+def test_multi_agents_qa_defaults_to_anli_r3_dev() -> None:
+    from exp.multi_agents_qa import build_parser
+
+    args = build_parser().parse_args(["mot", "--checkpoint-dir-path", "checkpoint"])
+    assert args.split == "dev_r3"
+    assert args.data_dir == "./anli"
+    assert args.max_turns == 7
+    assert args.generation_max_new_tokens == 1024
+    assert args.generation_temperature == 1.0
+    assert args.agent_count == 3
+
+
+
+def test_agent_runner_stops_early_when_majority_consensus_is_reached() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        max_turns=4,
+        log_turns=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._extract_solution_with_model = lambda *, agent, context, question, response: AgentRunner._solution_from_response(response)
+
     calls = []
+    responses = {
+        "A": "Label: neutral because ...",
+        "B": "[AGREE]",
+    }
 
     def fake_generate(agent):
         def generate(prompt_text: str) -> AgentGeneration:
-            is_final = "You are the Judge" in prompt_text
-            calls.append((agent.node_id, is_final))
-            text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
+            calls.append(agent.node_id)
+            text = responses[agent.node_id]
             return AgentGeneration(
                 agent_id=agent.node_id,
                 prompt_text=prompt_text,
@@ -401,12 +709,10 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
                 tokens_prompt=1,
                 tokens_completion=1,
             )
-
         return generate
 
     for agent in runner.agent_sequence:
         agent.generate_response = fake_generate(agent)
-
     runner._prepare_outgoing_route_translation = lambda **kwargs: None
     runner._update_peak_memory_breakdown = lambda: None
 
@@ -421,29 +727,135 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
         return target_agent, meta, False, source_agent, meta
 
     runner._star_offload_to_turn_target = fake_star_offload
+    result = runner.run(context="premise", question="hypothesis", gold_answers=["neutral"])
 
-    result = runner.run(
-        context="context",
-        question="question",
-        gold_answers=["yes"],
+    assert calls == ["A"]
+    assert len(result.turns) == 1
+    assert result.prediction == "neutral"
+    assert result.profile["consensus_reached"] is True
+    assert result.profile["consensus_turn"] == 1
+    assert result.profile["persona_generator"] == "expert"
+    assert result.profile["response_generator"] == "simple"
+    assert result.profile["discussion_paradigm"] == "memory"
+    assert result.profile["decision_protocol"] == "majority_consensus"
+    assert result.profile["use_chain_of_thought"] is True
+    assert result.profile["requested_max_turns"] == 4
+    assert result.profile["num_agent_turns"] == 1
+
+
+def test_agent_runner_max_turns_counts_mallm_rounds() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=3,
+        max_turns=2,
+        log_turns=False,
     )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._extract_solution_with_model = lambda *, agent, context, question, response: AgentRunner._solution_from_response(response)
+    calls = []
+    responses = {
+        "A": "[DISAGREE] Label: entailment",
+        "B": "[DISAGREE] Label: contradiction",
+        "C": "[DISAGREE] Label: neutral",
+    }
 
-    assert calls == [
-        ("A", False),
-        ("B", False),
-        ("C", False),
-        ("D", False),
-        ("A", False),
-        ("A", True),
-    ]
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            calls.append(agent.node_id)
+            text = responses[agent.node_id]
+            return AgentGeneration(
+                agent_id=agent.node_id, prompt_text=prompt_text, text=text, raw_text=text,
+                generated_token_ids=[1], tokens_before=0, tokens_after=1,
+                tokens_prompt=1, tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    runner._update_peak_memory_breakdown = lambda: None
+
+    def fake_star_offload(*, source_agent, target_agent):
+        meta = {"edge_id": "edge", "offload_kind": "delta", "tokens_sent": 1,
+                "tokens_received": 1, "expected_delta_tokens": 1}
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_turn_target = fake_star_offload
+    result = runner.run(context="premise", question="hypothesis", gold_answers=["contradiction"])
+
+    assert calls == ["A", "B", "C", "A", "B", "C"]
     assert len(result.turns) == 6
-    assert result.profile["requested_max_turns"] == 5
+    assert result.profile["consensus_reached"] is False
     assert result.profile["num_agent_turns"] == 6
-    assert result.prediction == "yes"
-    assert result.accuracy == 1.0
+
+def test_agent_runner_disagreement_resets_consensus_even_when_label_is_unchanged() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=5,
+        max_turns=4,
+        log_turns=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._extract_solution_with_model = lambda *, agent, context, question, response: AgentRunner._solution_from_response(response)
+
+    responses = {
+        "A": "Label: neutral. First draft.",
+        "B": "[AGREE]",
+        "C": "[DISAGREE] Label: neutral. Revised reasoning.",
+        "D": "[AGREE]",
+        "E": "[DISAGREE] Label: neutral. Another revision.",
+    }
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            text = responses[agent.node_id]
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    runner._update_peak_memory_breakdown = lambda: None
+
+    def fake_star_offload(*, source_agent, target_agent):
+        meta = {
+            "edge_id": "A_to_B",
+            "offload_kind": "delta",
+            "tokens_sent": 1,
+            "tokens_received": 1,
+            "expected_delta_tokens": 1,
+        }
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_turn_target = fake_star_offload
+    result = runner.run(context="premise", question="hypothesis", gold_answers=["neutral"])
+
+    assert len(result.turns) == 20
+    assert result.prediction == "neutral"
+    assert result.profile["consensus_reached"] is False
 
 
-def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
+def test_agent_runner_returns_current_solution_when_max_turns_end_without_consensus() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
@@ -453,11 +865,23 @@ def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
         max_turns=4,
         log_turns=False,
     )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._extract_solution_with_model = lambda *, agent, context, question, response: AgentRunner._solution_from_response(response)
+
+    responses = {
+        "A": "Label: entailment",
+        "B": "[DISAGREE] Label: contradiction",
+        "C": "[DISAGREE] Label: neutral",
+        "D": "[DISAGREE] Label: contradiction",
+    }
+    calls = []
 
     def fake_generate(agent):
         def generate(prompt_text: str) -> AgentGeneration:
-            is_final = "You are the Judge" in prompt_text
-            text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
+            calls.append(agent.node_id)
+            text = responses[agent.node_id]
             return AgentGeneration(
                 agent_id=agent.node_id,
                 prompt_text=prompt_text,
@@ -469,18 +893,14 @@ def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
                 tokens_prompt=1,
                 tokens_completion=1,
             )
-
         return generate
 
     for agent in runner.agent_sequence:
         agent.generate_response = fake_generate(agent)
-
     runner._prepare_outgoing_route_translation = lambda **kwargs: None
     runner._update_peak_memory_breakdown = lambda: None
-    offload_pairs = []
 
     def fake_star_offload(*, source_agent, target_agent):
-        offload_pairs.append((source_agent.node_id, target_agent.node_id))
         meta = {
             "edge_id": "A_to_B",
             "offload_kind": "delta",
@@ -491,10 +911,27 @@ def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
         return target_agent, meta, False, source_agent, meta
 
     runner._star_offload_to_turn_target = fake_star_offload
+    result = runner.run(context="premise", question="hypothesis", gold_answers=["neutral"])
 
-    result = runner.run(context="", question="question", gold_answers=["yes"])
+    assert calls == ["A", "B", "C", "D"] * 4
+    assert len(result.turns) == 16
+    assert result.prediction == "contradiction"
+    assert result.profile["consensus_reached"] is False
+    assert result.profile["consensus_turn"] is None
 
-    assert offload_pairs == [("A", "B"), ("B", "C"), ("C", "D")]
-    assert result.turns[-1].translated_edge_id is None
-    assert result.turns[-1].tokens_received == 0
-    assert result.prediction == "yes"
+
+
+def test_agent_runner_strips_llama_date_metadata_from_rendered_prompt() -> None:
+    rendered = (
+        "<|start_header_id|>system<|end_header_id|>\n\n"
+        "Cutting Knowledge Date: December 2023\n"
+        "Today Date: 26 Jul 2024\n\n"
+        "You take part in a discussion to solve a task."
+    )
+
+    cleaned = AgentRunner._strip_irrelevant_chat_template_metadata(rendered)
+
+    assert "Cutting Knowledge Date" not in cleaned
+    assert "Today Date" not in cleaned
+    assert "<|start_header_id|>system<|end_header_id|>" in cleaned
+    assert "You take part in a discussion to solve a task." in cleaned

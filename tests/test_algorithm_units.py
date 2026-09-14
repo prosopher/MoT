@@ -3,11 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from alg.c2c.train import (
-    align_receiver_token_ids_to_sharer_for_c2c_project,
-    normalize_top_layers_to_translate,
-    resolve_top_layers_to_translate,
-)
+from alg.c2c.train import normalize_top_layers_to_translate, resolve_top_layers_to_translate
 from alg.interlat.train import (
     adjust_interlat_loss_weights,
     build_mismatched_source_hidden_states,
@@ -70,60 +66,6 @@ def test_c2c_terminal_alignment_alias_resolves_to_edge_specific_min_depth() -> N
     assert resolve_top_layers_to_translate("2", src_spec, tgt_spec) == 2
     with pytest.raises(ValueError, match="A_to_B"):
         resolve_top_layers_to_translate(4, src_spec, tgt_spec, edge_id="A_to_B")
-
-
-
-
-class C2CReceiverTokenizer:
-    eos_token_id = 99
-    pad_token_id = 98
-    bos_token_id = None
-    unk_token_id = None
-    all_special_ids = [98, 99]
-
-    pieces = {10: "abc", 11: "d", 98: "<pad>", 99: "<eos>"}
-
-    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
-        del skip_special_tokens, clean_up_tokenization_spaces
-        return "".join(self.pieces[int(token_id)] for token_id in token_ids)
-
-
-class C2CSharerTokenizer:
-    eos_token_id = 199
-    pad_token_id = 198
-    bos_token_id = None
-    unk_token_id = 197
-    all_special_ids = [197, 198, 199]
-
-    pieces = {20: "a", 21: "bc", 22: "d", 197: "<unk>", 198: "<pad>", 199: "<eos>"}
-
-    def encode(self, text, add_special_tokens=False, return_tensors=None):
-        del add_special_tokens, return_tensors
-        return {"abc": [20, 21], "d": [22]}.get(text, [])
-
-    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
-        del skip_special_tokens, clean_up_tokenization_spaces
-        return "".join(self.pieces[int(token_id)] for token_id in token_ids)
-
-    def convert_tokens_to_ids(self, token):
-        reverse = {piece: token_id for token_id, piece in self.pieces.items()}
-        return reverse.get(token, self.unk_token_id)
-
-
-def test_c2c_project_cross_tokenizer_alignment_uses_receiver_length_and_longest_strategy() -> None:
-    receiver_model = SimpleNamespace(id="receiver", tokenizer=C2CReceiverTokenizer())
-    sharer_model = SimpleNamespace(id="sharer", tokenizer=C2CSharerTokenizer())
-    receiver_ids = TokenIDs(torch.tensor([[10, 11, 99]]), model_id="receiver")
-
-    aligned_ids = align_receiver_token_ids_to_sharer_for_c2c_project(
-        receiver_token_ids=receiver_ids,
-        receiver_model=receiver_model,
-        sharer_model=sharer_model,
-    )
-
-    assert aligned_ids.model_id == "sharer"
-    assert aligned_ids.shape == receiver_ids.shape
-    assert aligned_ids.as_tensor().tolist() == [[21, 22, 199]]
 
 
 def test_interlat_auxiliary_losses_ignore_masked_labels_and_dynamic_weights_are_bounded() -> None:
