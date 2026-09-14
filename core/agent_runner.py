@@ -106,7 +106,7 @@ class AgentRunnerConfig:
     device: str = "auto"
     max_turns: int = 4
     generation_max_new_tokens: int = 48
-    generation_temperature: float = 1.0
+    first_pass_temperature: float = 1.0
     max_prompt_tokens: Optional[int] = None
     seed: int = 42
     log_turns: bool = True
@@ -124,6 +124,8 @@ class AgentTurnRecord:
     tokens_after: int
     tokens_prompt: int
     tokens_completion: int
+    initial_response: Optional[str] = None
+    revision_prompt: Optional[str] = None
     cache_mode: str = CACHE_MODE_RETAIN
     is_hub: bool = False
     translated_edge_id: Optional[str] = None
@@ -534,7 +536,7 @@ class AgentRunner:
         benchmark_info: BenchmarkInfo,
         max_turns: int = 4,
         generation_max_new_tokens: int = 48,
-        generation_temperature: float = 1.0,
+        first_pass_temperature: float = 1.0,
         max_prompt_tokens: Optional[int] = None,
         seed: int = 42,
         log_turns: bool = True,
@@ -568,10 +570,10 @@ class AgentRunner:
         if self.max_turns < 1:
             raise ValueError(f"max_turns must be at least 1, got {self.max_turns}")
         self.generation_max_new_tokens = int(generation_max_new_tokens)
-        self.generation_temperature = float(generation_temperature)
-        if self.generation_temperature < 0.0:
+        self.first_pass_temperature = float(first_pass_temperature)
+        if self.first_pass_temperature < 0.0:
             raise ValueError(
-                f"generation_temperature must be >= 0, got {self.generation_temperature}"
+                f"first_pass_temperature must be >= 0, got {self.first_pass_temperature}"
             )
         self.max_prompt_tokens = max_prompt_tokens
         self.seed = int(seed)
@@ -612,7 +614,6 @@ class AgentRunner:
                     max_new_tokens=self.generation_max_new_tokens,
                     stop_sequences=stop_sequences,
                     max_prompt_tokens=max_prompt_tokens,
-                    temperature=self.generation_temperature,
                 )
             )
 
@@ -665,7 +666,7 @@ class AgentRunner:
             benchmark_info=config.benchmark_info,
             max_turns=config.max_turns,
             generation_max_new_tokens=config.generation_max_new_tokens,
-            generation_temperature=config.generation_temperature,
+            first_pass_temperature=config.first_pass_temperature,
             max_prompt_tokens=config.max_prompt_tokens,
             seed=config.seed,
             log_turns=config.log_turns,
@@ -686,11 +687,20 @@ class AgentRunner:
 
     def _ordinary_agent_instruction(self) -> str:
         return (
-            "The debate history above contains the solutions and reasoning from previous debaters. Using these "
-            f"solutions as additional information, can you give an updated response to the {self.benchmark_info.name} "
-            f"question? Begin your response with 'Answer: <choice>', where <choice> is one of: {self._choices_text()}. "
-            "Then examine the previous solutions and reasoning carefully, correct any factual or logical errors you "
-            "find, and explain your updated reasoning."
+            f"Provide your final response for this {self.benchmark_info.name} debate turn after considering the "
+            "discussion history. "
+            f"Begin your response with 'Answer: <choice>', where <choice> is one of: {self._choices_text()}. "
+            "Then explain the reasoning for that final choice."
+        )
+
+    def _revision_agent_instruction(self, initial_response: str) -> str:
+        return (
+            "Before seeing the debate history, you independently produced the draft response below. Compare that "
+            "independent view with all previous debaters' responses in the history. Change your conclusion only if the "
+            "history provides stronger factual or logical evidence; otherwise keep your original conclusion. Produce a "
+            "standalone final response without referring to this private draft. "
+            f"Begin with 'Answer: <choice>', where <choice> is one of: {self._choices_text()}. "
+            f"\n\n### Independent Draft:\n{initial_response.strip()}"
         )
 
     def _judge_instruction(self) -> str:
@@ -738,6 +748,23 @@ class AgentRunner:
         return (
             "### Instruction:\n"
             f"{instruction}\n"
+            "### Question:\n"
+            f"{question.strip()}"
+        )
+
+    def _build_revision_user_content(
+        self,
+        context: str,
+        question: str,
+        initial_response: str,
+        *,
+        include_context: bool,
+    ) -> str:
+        context_block = f"### Context:\n{context.strip()}\n" if include_context and context.strip() else ""
+        return (
+            "### Instruction:\n"
+            f"{self._revision_agent_instruction(initial_response)}\n"
+            f"{context_block}"
             "### Question:\n"
             f"{question.strip()}"
         )
@@ -837,6 +864,37 @@ class AgentRunner:
             )
         return self._build_plain_followup_prompt(question, is_final_turn=False)
 
+    def build_revision_prompt(
+        self,
+        agent: Agent,
+        context: str,
+        question: str,
+        initial_response: str,
+        *,
+        continuation: bool,
+    ) -> str:
+        user_content = self._build_revision_user_content(
+            context,
+            question,
+            initial_response,
+            include_context=not continuation,
+        )
+        context_block = f"### Context:\n{context.strip()}\n" if not continuation and context.strip() else ""
+        fallback_prompt = (
+            "\n### Instruction:\n"
+            f"{self._revision_agent_instruction(initial_response)}\n"
+            f"{context_block}"
+            "### Question:\n"
+            f"{question.strip()}\n"
+            "### Response:\n"
+        )
+        return self._format_agent_prompt(
+            agent,
+            user_content,
+            fallback_prompt,
+            continuation=continuation,
+        )
+
     def build_judge_prompt(self, question: str) -> str:
         user_content = self._build_followup_user_content(question, is_final_turn=True)
         fallback_prompt = self._build_plain_followup_prompt(question, is_final_turn=True)
@@ -922,24 +980,38 @@ class AgentRunner:
         label = "?" if example_index is None else str(example_index)
         turn_order = "->".join(self.node_ids + ([self.node_ids[0]] if len(self.node_ids) > 1 else []))
         logging.info(
-            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | judge=%s | discussion=sequential_mad | physical_topology=star | turn_order=%s | "
-            "question=%s | gold=%s",
+            "\n%s\n[AgentRunner][example=%s] START | mode=%s | alg=%s | agents=%s | judge=%s | "
+            "discussion=sequential_mad | physical_topology=star | turn_order=%s\n"
+            "[AgentRunner][example=%s] question=%s | gold=%s\n%s",
+            "=" * 96,
             label,
             self.cache_mode,
             self.alg,
             len(self.agent_sequence),
             self.hub_agent.node_id,
             turn_order,
+            label,
             self._preview_text(question, self.log_max_chars),
             list(gold_answers)[:3],
+            "=" * 96,
         )
 
     def _log_turn(self, *, example_index: Optional[int], turn_index: int, record: AgentTurnRecord) -> None:
         if not self.log_turns:
             return
         label = "?" if example_index is None else str(example_index)
+        is_judge = record.initial_response is None
+        turn_role = "JUDGE" if is_judge else f"DEBATER {record.agent_id}"
         logging.info(
-            "[AgentRunner][example=%s][turn=%d] mode=%s | agent=%s | hub=%s | "
+            "\n%s\n[AgentRunner][example=%s][turn=%d] %s\n%s",
+            "-" * 96,
+            label,
+            turn_index,
+            turn_role,
+            "-" * 96,
+        )
+        logging.info(
+            "[AgentRunner][example=%s][turn=%d] cache | mode=%s | agent=%s | hub=%s | "
             "translated_edge_id=%s(%s) | offload_edge_id=%s(%s) | "
             "tokens_before=%d | tokens_after=%d | tokens_prompt=%d | tokens_completion=%d | "
             "tokens_received=%d | tokens_sent=%d | tokens_sent_check_passed=%s",
@@ -961,28 +1033,58 @@ class AgentRunner:
             record.tokens_sent_check_passed,
         )
         logging.info(
-            "[AgentRunner][example=%s][turn=%d] prompt: %s",
+            "[AgentRunner][example=%s][turn=%d] %s: %s",
             label,
             turn_index,
+            "judge_prompt" if is_judge else "public_prompt",
             self._preview_text(record.prompt, self.log_max_chars),
         )
-        logging.info(
-            "[AgentRunner][example=%s][turn=%d] response: %s",
-            label,
-            turn_index,
-            self._preview_text(record.response, self.log_max_chars),
-        )
+        if record.initial_response is not None:
+            logging.info(
+                "[AgentRunner][example=%s][turn=%d] >>> 1ST PASS | independent_response: %s",
+                label,
+                turn_index,
+                self._preview_text(record.initial_response, self.log_max_chars),
+            )
+        if record.revision_prompt is not None:
+            logging.info(
+                "[AgentRunner][example=%s][turn=%d] >>> 2ND PASS | revision_prompt: %s",
+                label,
+                turn_index,
+                self._preview_text(record.revision_prompt, self.log_max_chars),
+            )
+            logging.info(
+                "[AgentRunner][example=%s][turn=%d] >>> 2ND PASS | FINAL response: %s",
+                label,
+                turn_index,
+                self._preview_text(record.response, self.log_max_chars),
+            )
+        elif record.initial_response is not None:
+            logging.info(
+                "[AgentRunner][example=%s][turn=%d] >>> 1ST PASS | FINAL response (no revision): %s",
+                label,
+                turn_index,
+                self._preview_text(record.response, self.log_max_chars),
+            )
+        else:
+            logging.info(
+                "[AgentRunner][example=%s][turn=%d] >>> JUDGE | FINAL response: %s",
+                label,
+                turn_index,
+                self._preview_text(record.response, self.log_max_chars),
+            )
 
     def _log_example_end(self, *, example_index: Optional[int], prediction: str, accuracy: float) -> None:
         if not self.log_turns:
             return
         label = "?" if example_index is None else str(example_index)
         logging.info(
-            "[AgentRunner][example=%s] end | mode=%s | prediction=%s | accuracy=%.4f",
+            "\n[AgentRunner][example=%s] RESULT | mode=%s | prediction=%s | accuracy=%.4f\n%s",
             label,
             self.cache_mode,
             self._preview_text(prediction, self.log_max_chars),
             accuracy,
+            "=" * 96,
         )
 
     def _should_clear_source_after_offload(self, source_agent: Agent) -> bool:
@@ -1242,12 +1344,81 @@ class AgentRunner:
         record.tokens_sent = tokens_sent
         record.tokens_sent_check_passed = self._tokens_sent_check_passed(record, offload_meta)
 
+    @staticmethod
+    def _snapshot_agent_cache(agent: Agent):
+        return (
+            agent.past_key_values,
+            list(agent.cache_token_ids),
+            dict(agent.pretranslated_past_by_edge),
+            dict(agent.pretranslated_token_ids_by_edge),
+        )
+
+    @staticmethod
+    def _restore_agent_cache(agent: Agent, snapshot) -> None:
+        (
+            agent.past_key_values,
+            cache_token_ids,
+            pretranslated_past_by_edge,
+            pretranslated_token_ids_by_edge,
+        ) = snapshot
+        agent.cache_token_ids = list(cache_token_ids)
+        agent.pretranslated_past_by_edge = dict(pretranslated_past_by_edge)
+        agent.pretranslated_token_ids_by_edge = dict(pretranslated_token_ids_by_edge)
+
+    def _run_two_pass_debater(
+        self,
+        *,
+        agent: Agent,
+        context: str,
+        question: str,
+        shared_prompt: str,
+        continuation: bool,
+    ) -> Tuple[AgentGeneration, str, AgentGeneration]:
+        """Generate a private independent draft, then a history-aware final response.
+
+        The private draft and revision prompt are never committed to the shared KV
+        cache. Only the second-pass response is replayed onto the incoming shared
+        history and can therefore be handed to the next debater.
+        """
+        shared_cache = self._snapshot_agent_cache(agent)
+
+        # Pass 1: reason independently from the benchmark input, without debate history.
+        agent.reset()
+        independent_prompt = self.build_initial_prompt_for_agent(agent, context, question)
+        initial_generation = agent.generate_response(
+            independent_prompt,
+            temperature=self.first_pass_temperature,
+        )
+        self._update_peak_memory_breakdown()
+
+        # Pass 2: restore the incoming history, then reconsider the private draft
+        # against all previous final debate responses.
+        self._restore_agent_cache(agent, shared_cache)
+        revision_prompt = self.build_revision_prompt(
+            agent,
+            context,
+            question,
+            initial_generation.text,
+            continuation=continuation,
+        )
+        revised_generation = agent.generate_response(revision_prompt)
+        self._update_peak_memory_breakdown()
+
+        # The revision prompt contains the private draft, so do not propagate its KV.
+        # Restore the shared history and replay only the final second-pass response
+        # under the canonical public turn prompt.
+        self._restore_agent_cache(agent, shared_cache)
+        committed_generation = agent.commit_generation(shared_prompt, revised_generation)
+        self._update_peak_memory_breakdown()
+        return initial_generation, revision_prompt, committed_generation
+
     def _run_offload_turns(
         self,
         *,
         transcript: str,
         initial_generation: AgentGeneration,
         turns: List[AgentTurnRecord],
+        context: str,
         question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
@@ -1298,7 +1469,13 @@ class AgentRunner:
             self._log_turn(example_index=example_index, turn_index=turn_index - 1, record=source_record)
 
             prompt = self.build_followup_prompt(current_target.node_id, question)
-            generation = current_target.generate_response(prompt)
+            initial_generation, revision_prompt, generation = self._run_two_pass_debater(
+                agent=current_target,
+                context=context,
+                question=question,
+                shared_prompt=prompt,
+                continuation=current_target.cache_seq_len > 0,
+            )
 
             if turn_index < last_normal_turn_index:
                 next_target = self._agent_for_turn(turn_index + 1)
@@ -1316,6 +1493,8 @@ class AgentRunner:
                     translated_edge_id=edge_id,
                     translated_offload_kind=incoming_offload_kind,
                     tokens_received=tokens_received,
+                    initial_response=initial_generation.text,
+                    revision_prompt=revision_prompt,
                 )
             )
             last_response = generation.text
@@ -1364,8 +1543,7 @@ class AgentRunner:
         self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
 
         final_prompt = self.build_judge_prompt(question)
-        # Keep debate generation diverse while making the terminal adjudication reproducible.
-        final_generation = self.hub_agent.generate_response(final_prompt, temperature=0.0)
+        final_generation = self.hub_agent.generate_response(final_prompt)
         self._update_peak_memory_breakdown()
         transcript = self._append_turn_to_transcript(transcript + final_prompt, final_generation.text)
         turns.append(
@@ -1388,6 +1566,7 @@ class AgentRunner:
         transcript: str,
         initial_generation: AgentGeneration,
         turns: List[AgentTurnRecord],
+        context: str,
         question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
@@ -1395,6 +1574,7 @@ class AgentRunner:
             transcript=transcript,
             initial_generation=initial_generation,
             turns=turns,
+            context=context,
             question=question,
             example_index=example_index,
         )
@@ -1405,6 +1585,7 @@ class AgentRunner:
         transcript: str,
         initial_generation: AgentGeneration,
         turns: List[AgentTurnRecord],
+        context: str,
         question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
@@ -1412,6 +1593,7 @@ class AgentRunner:
             transcript=transcript,
             initial_generation=initial_generation,
             turns=turns,
+            context=context,
             question=question,
             example_index=example_index,
         )
@@ -1424,8 +1606,7 @@ class AgentRunner:
         gold_answers: Sequence[str],
         example_index: Optional[int] = None,
     ) -> AgentRunnerResult:
-        example_seed = self.seed if example_index is None else self.seed + max(0, int(example_index) - 1)
-        set_seed(example_seed)
+        set_seed(self.seed)
         self._peak_memory_breakdown_bytes = None
         for agent in self.agent_sequence:
             agent.reset()
@@ -1438,8 +1619,15 @@ class AgentRunner:
         transcript = self.build_initial_prompt_for_agent(self.hub_agent, context, question)
         turns: List[AgentTurnRecord] = []
 
-        # The first node is the HubAgent and starts from native Base Context + Prompt.
-        generation = self.hub_agent.generate_response(transcript)
+        # The first debater has no prior debate history to revise against, so its
+        # independent first pass is already the public/final response for this turn.
+        # Later debaters use two passes: sampled independent draft, then greedy revision.
+        generation = self.hub_agent.generate_response(
+            transcript,
+            temperature=self.first_pass_temperature,
+        )
+        initial_generation = generation
+        revision_prompt = None
         if self.max_turns > 1:
             next_target = self._agent_for_turn(1)
             if self.hub_agent.node_id != next_target.node_id:
@@ -1449,7 +1637,11 @@ class AgentRunner:
                 )
         self._update_peak_memory_breakdown()
         transcript = self._append_turn_to_transcript(transcript, generation.text)
-        record = self._turn_record(generation)
+        record = self._turn_record(
+            generation,
+            initial_response=initial_generation.text,
+            revision_prompt=revision_prompt,
+        )
         turns.append(record)
 
         last_response = generation.text
@@ -1458,6 +1650,7 @@ class AgentRunner:
                 transcript=transcript,
                 initial_generation=generation,
                 turns=turns,
+                context=context,
                 question=question,
                 example_index=example_index,
             )
@@ -1466,6 +1659,7 @@ class AgentRunner:
                 transcript=transcript,
                 initial_generation=generation,
                 turns=turns,
+                context=context,
                 question=question,
                 example_index=example_index,
             )
@@ -1499,6 +1693,8 @@ class AgentRunner:
         offload_kind: Optional[str] = None,
         tokens_sent: int = 0,
         tokens_sent_check_passed: bool = True,
+        initial_response: Optional[str] = None,
+        revision_prompt: Optional[str] = None,
     ) -> AgentTurnRecord:
         agent = self.agents[generation.agent_id]
         return AgentTurnRecord(
@@ -1509,6 +1705,8 @@ class AgentRunner:
             tokens_after=generation.tokens_after,
             tokens_prompt=generation.tokens_prompt,
             tokens_completion=generation.tokens_completion,
+            initial_response=initial_response,
+            revision_prompt=revision_prompt,
             cache_mode=self.cache_mode,
             is_hub=agent.node_id == self.hub_agent.node_id,
             translated_edge_id=translated_edge_id,

@@ -65,7 +65,7 @@ def test_agent_runner_virtual_agents_share_one_physical_model() -> None:
     assert ctx.tp.get_model("A") is ctx.tp.get_model("B")
 
 
-def test_agent_runner_defaults_to_stochastic_debate_sampling() -> None:
+def test_agent_runner_samples_only_independent_first_passes() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
@@ -76,8 +76,8 @@ def test_agent_runner_defaults_to_stochastic_debate_sampling() -> None:
         log_turns=False,
     )
 
-    assert runner.generation_temperature == 1.0
-    assert [agent.temperature for agent in runner.agent_sequence] == [1.0, 1.0]
+    assert runner.first_pass_temperature == 1.0
+    assert all(not hasattr(agent, "temperature") for agent in runner.agent_sequence)
 
 
 def test_agent_runner_rejects_heterogeneous_model_pool() -> None:
@@ -320,14 +320,24 @@ def test_agent_runner_prompts_use_benchmark_metadata_and_answer_first() -> None:
         assert "'alpha'" in prompt
         assert "'beta'" in prompt
 
+    revision = runner._build_revision_user_content(
+        "context",
+        "question",
+        "Answer: alpha\nIndependent reasoning",
+        include_context=False,
+    )
+
     assert "Begin your response with 'Answer: <choice>'" in initial
     assert "Begin your response with 'Answer: <choice>'" in ordinary
     assert "at the end" not in initial
     assert "at the end" not in ordinary
-    assert "solutions and reasoning from previous debaters" in ordinary
-    assert "additional information" in ordinary
-    assert "updated response" in ordinary
-    assert "correct any factual or logical errors" in ordinary
+    assert "final response" in ordinary
+    assert "independently produced the draft response" in revision
+    assert "all previous debaters' responses" in revision
+    assert "Change your conclusion only if" in revision
+    assert "otherwise keep your original conclusion" in revision
+    assert "### Independent Draft:" in revision
+    assert "Answer: alpha" in revision
 
     assert "Judge acting as moderator" in final
     assert "whole debate history" in final
@@ -366,11 +376,11 @@ def test_multi_agents_qa_defaults_to_anli_dev_r3() -> None:
 
     args = build_parser().parse_args(["mot", "--checkpoint-dir-path", "checkpoint"])
     assert args.split == "dev_r3"
-    assert args.generation_temperature == 1.0
+    assert args.first_pass_temperature == 1.0
 
 
 
-def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn() -> None:
+def test_agent_runner_first_debater_is_single_pass_then_later_debaters_are_two_pass() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
@@ -386,10 +396,15 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
 
     def fake_generate(agent):
         def generate(prompt_text: str, **kwargs) -> AgentGeneration:
-            del kwargs
             is_final = "Judge acting as moderator" in prompt_text
-            calls.append((agent.node_id, is_final))
-            text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
+            is_revision = "### Independent Draft:" in prompt_text
+            phase = "judge" if is_final else ("revision" if is_revision else "independent")
+            calls.append((agent.node_id, phase, kwargs.get("temperature", 0.0)))
+            text = (
+                "FINAL: yes"
+                if is_final
+                else (f"final-{agent.node_id}" if is_revision else f"draft-{agent.node_id}")
+            )
             return AgentGeneration(
                 agent_id=agent.node_id,
                 prompt_text=prompt_text,
@@ -429,14 +444,25 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
     )
 
     assert calls == [
-        ("A", False),
-        ("B", False),
-        ("C", False),
-        ("D", False),
-        ("A", False),
-        ("A", True),
+        ("A", "independent", 1.0),
+        ("B", "independent", 1.0),
+        ("B", "revision", 0.0),
+        ("C", "independent", 1.0),
+        ("C", "revision", 0.0),
+        ("D", "independent", 1.0),
+        ("D", "revision", 0.0),
+        ("A", "independent", 1.0),
+        ("A", "revision", 0.0),
+        ("A", "judge", 0.0),
     ]
     assert len(result.turns) == 6
+    assert all(turn.initial_response is not None for turn in result.turns[:-1])
+    assert result.turns[0].revision_prompt is None
+    assert all(turn.revision_prompt is not None for turn in result.turns[1:-1])
+    assert result.turns[-1].initial_response is None
+    assert "draft-A" in result.transcript
+    assert "draft-B" not in result.transcript
+    assert "final-B" in result.transcript
     assert result.profile["requested_max_turns"] == 5
     assert result.profile["num_agent_turns"] == 6
     assert result.prediction == "yes"
