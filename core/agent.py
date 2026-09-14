@@ -268,7 +268,15 @@ class Agent:
         return min(eos_token_ids) if eos_token_ids else None
 
     @torch.inference_mode()
-    def generate_response(self, prompt_text: str) -> AgentGeneration:
+    def generate_response(
+        self,
+        prompt_text: str,
+        *,
+        temperature: Optional[float] = None,
+    ) -> AgentGeneration:
+        effective_temperature = self.temperature if temperature is None else float(temperature)
+        if effective_temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0, got {effective_temperature}")
         tokens_before = self.cache_seq_len
         current_past, current_token_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
@@ -294,8 +302,8 @@ class Agent:
             uncached_generated_token = None
 
             next_token_logits = outputs.logits[:, -1, :]
-            if self.temperature > 0.0:
-                probabilities = torch.softmax(next_token_logits.float() / self.temperature, dim=-1)
+            if effective_temperature > 0.0:
+                probabilities = torch.softmax(next_token_logits.float() / effective_temperature, dim=-1)
                 next_token_tensor = torch.multinomial(probabilities, num_samples=1)
             else:
                 next_token_tensor = next_token_logits.argmax(dim=-1, keepdim=True)

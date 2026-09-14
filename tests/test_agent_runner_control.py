@@ -3,8 +3,12 @@ from types import SimpleNamespace
 import pytest
 
 from core.agent import Agent, AgentGeneration
-from core.agent_runner import AgentRunner, AgentTurnRecord
+from core.agent_runner import AgentRunner
+from core.benchmark import BenchmarkInfo
 from core.context import Context
+
+
+TEST_BENCHMARK_INFO = BenchmarkInfo(name="TestBench", choices=("yes", "no"))
 
 
 def _render_qwen_chat_prompt(agent, user_content: str):
@@ -50,6 +54,7 @@ def test_agent_runner_virtual_agents_share_one_physical_model() -> None:
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
+        benchmark_info=TEST_BENCHMARK_INFO,
         agent_count=6,
         log_turns=False,
     )
@@ -60,12 +65,13 @@ def test_agent_runner_virtual_agents_share_one_physical_model() -> None:
     assert ctx.tp.get_model("A") is ctx.tp.get_model("B")
 
 
-def test_agent_runner_defaults_to_mallm_sampling_temperature() -> None:
+def test_agent_runner_defaults_to_stochastic_debate_sampling() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
+        benchmark_info=TEST_BENCHMARK_INFO,
         agent_count=2,
         log_turns=False,
     )
@@ -82,6 +88,7 @@ def test_agent_runner_rejects_heterogeneous_model_pool() -> None:
             ctx=ctx,
             translator_pool=ctx.tp,
             alg="mot",
+            benchmark_info=TEST_BENCHMARK_INFO,
             agent_count=2,
             log_turns=False,
         )
@@ -109,6 +116,7 @@ def test_agent_runner_rejects_heterogeneous_checkpoint_before_loading_models(tmp
         AgentRunner.from_checkpoint(
             AgentRunnerConfig(
                 alg="mot",
+                benchmark_info=TEST_BENCHMARK_INFO,
                 checkpoint_dir_path=str(tmp_path),
                 device="cpu",
             )
@@ -124,8 +132,7 @@ def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides(
 
         def apply_chat_template(self, messages, **kwargs):
             self.kwargs = kwargs
-            assert messages[0]["role"] == "system"
-            assert messages[1]["role"] == "user"
+            assert messages == [{"role": "user", "content": "question"}]
             return "rendered-chat"
 
     tokenizer = ChatTokenizer()
@@ -147,7 +154,7 @@ def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides(
     }
 
 
-def test_chat_template_is_used_for_non_qwen_and_falls_back_when_system_role_is_unsupported() -> None:
+def test_chat_template_is_used_for_non_qwen_without_synthetic_system_role() -> None:
     class GemmaLikeTokenizer:
         chat_template = "gemma-template"
         bos_token = "<bos>"
@@ -157,8 +164,6 @@ def test_chat_template_is_used_for_non_qwen_and_falls_back_when_system_role_is_u
 
         def apply_chat_template(self, messages, **kwargs):
             self.calls.append((messages, kwargs))
-            if messages[0]["role"] == "system":
-                raise ValueError("system role unsupported")
             return "<bos><start_of_turn>user\nhello<end_of_turn>\n<start_of_turn>model\n"
 
     tokenizer = GemmaLikeTokenizer()
@@ -167,9 +172,8 @@ def test_chat_template_is_used_for_non_qwen_and_falls_back_when_system_role_is_u
     rendered = AgentRunner._render_chat_prompt(agent, "hello", continuation=False)
 
     assert rendered.startswith("<bos>")
-    assert len(tokenizer.calls) == 2
-    assert tokenizer.calls[0][0][0]["role"] == "system"
-    assert tokenizer.calls[1][0][0]["role"] == "user"
+    assert len(tokenizer.calls) == 1
+    assert tokenizer.calls[0][0] == [{"role": "user", "content": "hello"}]
 
 
 def test_chat_continuation_uses_user_only_fragment_and_strips_leading_bos() -> None:
@@ -286,48 +290,53 @@ def test_agent_forces_chat_turn_terminator_when_max_new_tokens_is_reached() -> N
     assert agent.cache_seq_len == 4
 
 
-def test_agent_runner_final_answer_parser_extracts_strategyqa_binary_answer() -> None:
-    transcript = "Earlier text says FINAL: no, but only the final response should be parsed.\n"
+def test_agent_runner_final_answer_parser_uses_benchmark_choices() -> None:
+    transcript = "Earlier text is ignored.\n"
+    choices = ("alpha", "beta")
 
-    assert AgentRunner.extract_final_answer(transcript, "FINAL: YES") == "yes"
-    assert AgentRunner.extract_final_answer(transcript, "Reasoning... answer: no") == "no"
+    assert AgentRunner.extract_final_answer(transcript, "FINAL: BETA", choices) == "beta"
+    assert AgentRunner.extract_final_answer(transcript, "Answer: alpha\nreasoning", choices) == "alpha"
 
 
-def test_agent_runner_prompts_use_mallm_memory_critical_and_judge() -> None:
-    ordinary = AgentRunner._build_followup_user_content(
-        "question", agent_id="B", previous_agent_id="A", is_final_turn=False
+def test_agent_runner_prompts_use_benchmark_metadata_and_answer_first() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    benchmark = BenchmarkInfo(name="CustomBench", choices=("alpha", "beta"))
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        benchmark_info=benchmark,
+        agent_count=2,
+        log_turns=False,
     )
-    final = AgentRunner._build_followup_user_content(
-        "question",
-        agent_id="A",
-        previous_agent_id="D",
-        is_final_turn=True,
-        judge_solutions=(("A", "Answer: yes"), ("B", "Answer: no")),
-    )
 
-    assert "FINAL:" not in ordinary
-    assert "shared memory" in ordinary
-    assert "full discussion history from all previous Agents" in ordinary
-    assert "Critically evaluate the current solution" in ordinary
-    assert "Identify potential weaknesses or missing facts" in ordinary
-    assert "[AGREE]" in ordinary
-    assert "[DISAGREE]" in ordinary
-    assert "improved solution" in ordinary
-    assert "End with 'Answer: yes' or 'Answer: no'" in ordinary
-    assert "Agent A" in ordinary
-    assert "I agree with Agent [agent id]" not in ordinary
+    initial = runner._build_initial_user_content("", "question")
+    ordinary = runner._build_followup_user_content("question", is_final_turn=False)
+    final = runner._build_followup_user_content("question", is_final_turn=True)
 
-    assert "You are the Judge" in final
-    assert "decision on the listed solutions" in final
-    assert "### Solutions:" in final
-    assert "Solution 1 (Agent A): Answer: yes" in final
-    assert "Solution 2 (Agent B): Answer: no" in final
-    assert "FINAL: yes" in final
-    assert "FINAL: no" in final
-    assert "Hub" not in final
+    for prompt in (initial, ordinary, final):
+        assert "ANLI" not in prompt
+        assert "CustomBench" in prompt
+        assert "'alpha'" in prompt
+        assert "'beta'" in prompt
+
+    assert "Begin your response with 'Answer: <choice>'" in initial
+    assert "Begin your response with 'Answer: <choice>'" in ordinary
+    assert "at the end" not in initial
+    assert "at the end" not in ordinary
+    assert "solutions and reasoning from previous debaters" in ordinary
+    assert "additional information" in ordinary
+    assert "updated response" in ordinary
+    assert "correct any factual or logical errors" in ordinary
+
+    assert "Judge acting as moderator" in final
+    assert "whole debate history" in final
+    assert "independently check their factual and logical support" in final
+    assert "rather than following the latest response or a majority by default" in final
+    assert "Begin your response with 'FINAL: <choice>'" in final
 
 
-def test_agent_runner_judge_chat_prompt_is_standalone_user_turn() -> None:
+def test_agent_runner_judge_chat_prompt_is_history_continuation() -> None:
     class ChatTokenizer:
         chat_template = "checkpoint-template"
 
@@ -345,30 +354,19 @@ def test_agent_runner_judge_chat_prompt_is_standalone_user_turn() -> None:
     rendered = AgentRunner._render_chat_prompt(
         fake_agent,
         "judge input",
-        continuation=False,
-        include_system=False,
+        continuation=True,
     )
 
     assert rendered == "rendered-judge"
     assert tokenizer.messages == [{"role": "user", "content": "judge input"}]
 
 
-def test_agent_runner_judge_uses_latest_solution_per_agent() -> None:
-    turns = [
-        AgentTurnRecord("A", "", "A old", 0, 0, 0, 0),
-        AgentTurnRecord("B", "", "B only", 0, 0, 0, 0),
-        AgentTurnRecord("A", "", "A latest", 0, 0, 0, 0),
-    ]
-
-    assert AgentRunner._latest_agent_solutions(turns) == [("A", "A latest"), ("B", "B only")]
-
-
-def test_multi_agents_qa_defaults_to_strategyqa_dev() -> None:
+def test_multi_agents_qa_defaults_to_anli_dev_r3() -> None:
     from exp.multi_agents_qa import build_parser
 
     args = build_parser().parse_args(["mot", "--checkpoint-dir-path", "checkpoint"])
-    assert args.split == "dev"
-    assert args.data_dir == "./strategyqa"
+    assert args.split == "dev_r3"
+    assert args.generation_temperature == 1.0
 
 
 
@@ -378,6 +376,7 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
+        benchmark_info=TEST_BENCHMARK_INFO,
         agent_count=4,
         max_turns=5,
         log_turns=False,
@@ -386,8 +385,9 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
     calls = []
 
     def fake_generate(agent):
-        def generate(prompt_text: str) -> AgentGeneration:
-            is_final = "You are the Judge" in prompt_text
+        def generate(prompt_text: str, **kwargs) -> AgentGeneration:
+            del kwargs
+            is_final = "Judge acting as moderator" in prompt_text
             calls.append((agent.node_id, is_final))
             text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
             return AgentGeneration(
@@ -443,20 +443,22 @@ def test_agent_runner_runs_exact_normal_turn_count_then_separate_final_hub_turn(
     assert result.accuracy == 1.0
 
 
-def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
+def test_agent_runner_judge_receives_complete_discussion_kv_handoff() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
+        benchmark_info=TEST_BENCHMARK_INFO,
         agent_count=4,
         max_turns=4,
         log_turns=False,
     )
 
     def fake_generate(agent):
-        def generate(prompt_text: str) -> AgentGeneration:
-            is_final = "You are the Judge" in prompt_text
+        def generate(prompt_text: str, **kwargs) -> AgentGeneration:
+            del kwargs
+            is_final = "Judge acting as moderator" in prompt_text
             text = "FINAL: yes" if is_final else f"ordinary-{agent.node_id}"
             return AgentGeneration(
                 agent_id=agent.node_id,
@@ -494,7 +496,7 @@ def test_agent_runner_judge_does_not_receive_discussion_kv_handoff() -> None:
 
     result = runner.run(context="", question="question", gold_answers=["yes"])
 
-    assert offload_pairs == [("A", "B"), ("B", "C"), ("C", "D")]
-    assert result.turns[-1].translated_edge_id is None
-    assert result.turns[-1].tokens_received == 0
+    assert offload_pairs == [("A", "B"), ("B", "C"), ("C", "D"), ("D", "A")]
+    assert result.turns[-1].translated_edge_id == "A_to_B"
+    assert result.turns[-1].tokens_received == 1
     assert result.prediction == "yes"

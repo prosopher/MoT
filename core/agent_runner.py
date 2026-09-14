@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from core.agent import Agent, AgentGeneration, HubAgent, get_past_seq_len, slice_past_suffix
+from core.benchmark import BenchmarkInfo
 from core.common import PastKeyValues, TokenIDs, extract_past_key_values, read_json, replace_top_layers, set_seed
 from core.config import resolve_device
 from core.context import Context
@@ -100,6 +101,7 @@ def _concat_past_key_values(prefix: Optional[PastKeyValues], suffix: PastKeyValu
 @dataclass
 class AgentRunnerConfig:
     alg: str
+    benchmark_info: BenchmarkInfo
     checkpoint_dir_path: str = ""
     device: str = "auto"
     max_turns: int = 4
@@ -529,6 +531,7 @@ class AgentRunner:
         ctx: Context,
         translator_pool,
         alg: str,
+        benchmark_info: BenchmarkInfo,
         max_turns: int = 4,
         generation_max_new_tokens: int = 48,
         generation_temperature: float = 1.0,
@@ -560,6 +563,7 @@ class AgentRunner:
         self.ctx = ctx
         self.translator_pool = translator_pool
         self.alg = resolved_alg
+        self.benchmark_info = benchmark_info
         self.max_turns = int(max_turns)
         if self.max_turns < 1:
             raise ValueError(f"max_turns must be at least 1, got {self.max_turns}")
@@ -588,12 +592,11 @@ class AgentRunner:
                 for index in range(self.agent_count)
             ]
         self.node_ids = [node.id for node in self.active_nodes]
-        stop_sequences = tuple(f"\nAgent {node.id}:" for node in self.active_nodes) + (
+        stop_sequences = (
             "\n### Instruction:",
-            "\n### Passage:",
+            "\n### Context:",
             "\n### Question:",
             "\nQuestion:",
-            "\nPassage:",
         )
         self.agent_sequence: List[Agent] = []
         self.logical_to_physical_node_id: Dict[str, str] = {}
@@ -659,6 +662,7 @@ class AgentRunner:
             ctx=ctx,
             translator_pool=translator_pool,
             alg=resolved_alg,
+            benchmark_info=config.benchmark_info,
             max_turns=config.max_turns,
             generation_max_new_tokens=config.generation_max_new_tokens,
             generation_temperature=config.generation_temperature,
@@ -670,100 +674,72 @@ class AgentRunner:
             agent_count=config.agent_count,
         )
 
-    @staticmethod
-    def _final_answer_instruction() -> str:
-        return "Return only one of: FINAL: yes or FINAL: no"
+    def _choices_text(self) -> str:
+        return ", ".join(repr(choice) for choice in self.benchmark_info.choices)
 
-    @staticmethod
-    def _initial_agent_instruction(agent_id: str) -> str:
+    def _initial_agent_instruction(self) -> str:
         return (
-            f"You are Agent {agent_id}, the first participant in a collaborative discussion with shared memory. "
-            "No solution has been proposed yet. Answer the StrategyQA question using your own knowledge and reasoning. "
-            "Give a concise justification, then end with 'Answer: yes' or 'Answer: no'."
+            f"Can you answer the {self.benchmark_info.name} question as accurately as possible? "
+            f"Begin your response with 'Answer: <choice>', where <choice> is one of: {self._choices_text()}. "
+            "Then explain your reasoning."
         )
 
-    @staticmethod
-    def _ordinary_agent_instruction(agent_id: str, previous_agent_id: str) -> str:
+    def _ordinary_agent_instruction(self) -> str:
         return (
-            f"You are Agent {agent_id} in a collaborative discussion with shared memory. You can use the full "
-            "discussion history from all previous Agents. Critically evaluate the current solution, which is the most "
-            f"recent solution proposed by Agent {previous_agent_id}. Identify potential weaknesses or missing facts "
-            "instead of simply repeating the prior reasoning. If you believe the current solution is correct, begin "
-            "with [AGREE] and briefly explain why. Otherwise begin with [DISAGREE], explain the problem, and provide "
-            "an improved solution. End with 'Answer: yes' or 'Answer: no'."
+            "The debate history above contains the solutions and reasoning from previous debaters. Using these "
+            f"solutions as additional information, can you give an updated response to the {self.benchmark_info.name} "
+            f"question? Begin your response with 'Answer: <choice>', where <choice> is one of: {self._choices_text()}. "
+            "Then examine the previous solutions and reasoning carefully, correct any factual or logical errors you "
+            "find, and explain your updated reasoning."
         )
 
-    @staticmethod
-    def _judge_instruction(previous_agent_id: str) -> str:
-        del previous_agent_id
+    def _judge_instruction(self) -> str:
         return (
-            "You are the Judge. Provide a decision on the listed solutions and combine them into a single answer "
-            "to solve the StrategyQA question. Only answer with the final solution. "
-            f"{AgentRunner._final_answer_instruction()}"
+            "You are the Judge acting as moderator. The debaters have presented their answers and discussed their "
+            f"perspectives on the {self.benchmark_info.name} question in the debate history above. Evaluate the answers "
+            "and reasoning in the whole debate history, independently check their factual and logical support, and decide "
+            "which answer is correct rather than following the latest response or a majority by default. "
+            f"Begin your response with 'FINAL: <choice>', where <choice> is one of: {self._choices_text()}. "
+            "Return only that final choice."
         )
 
-    @staticmethod
-    def _format_judge_solutions(solutions: Sequence[Tuple[str, str]]) -> str:
-        return "\n".join(
-            f"Solution {index} (Agent {agent_id}): {response.strip()}"
-            for index, (agent_id, response) in enumerate(solutions, start=1)
-        )
-
-    @staticmethod
-    def _latest_agent_solutions(turns: Sequence[AgentTurnRecord]) -> List[Tuple[str, str]]:
-        latest = {}
-        order = []
-        for turn in turns:
-            if turn.agent_id not in latest:
-                order.append(turn.agent_id)
-            latest[turn.agent_id] = turn.response
-        return [(agent_id, latest[agent_id]) for agent_id in order]
-
-    @staticmethod
-    def _build_plain_initial_prompt(
-        context: str,
-        question: str,
-        *,
-        agent_id: str = "A",
-        is_final_turn: bool = False,
-    ) -> str:
-        del is_final_turn
-        instruction = AgentRunner._initial_agent_instruction(agent_id)
+    def _build_plain_initial_prompt(self, context: str, question: str) -> str:
         context_block = f"### Context:\n{context.strip()}\n" if context.strip() else ""
         return (
-            f"### Instruction: {instruction}\n"
+            f"### Instruction: {self._initial_agent_instruction()}\n"
             f"{context_block}"
             "### Question:\n"
             f"{question.strip()}\n"
             "### Response:\n"
         )
 
-    @staticmethod
-    def _build_plain_followup_prompt(
-        question: str,
-        *,
-        agent_id: str,
-        previous_agent_id: str,
-        is_final_turn: bool = False,
-        judge_solutions: Sequence[Tuple[str, str]] = (),
-    ) -> str:
-        instruction = (
-            AgentRunner._judge_instruction(previous_agent_id)
-            if is_final_turn
-            else AgentRunner._ordinary_agent_instruction(agent_id, previous_agent_id)
-        )
-        solutions_block = (
-            f"### Solutions:\n{AgentRunner._format_judge_solutions(judge_solutions)}\n"
-            if is_final_turn and judge_solutions
-            else ""
-        )
+    def _build_plain_followup_prompt(self, question: str, *, is_final_turn: bool = False) -> str:
+        instruction = self._judge_instruction() if is_final_turn else self._ordinary_agent_instruction()
         return (
             "\n### Instruction:\n"
             f"{instruction}\n"
             "### Question:\n"
             f"{question.strip()}\n"
-            f"{solutions_block}"
             "### Response:\n"
+        )
+
+    def _build_initial_user_content(self, context: str, question: str) -> str:
+        context_block = f"### Context:\n{context.strip()}\n" if context.strip() else ""
+        return (
+            "### Instruction:\n"
+            f"{self._initial_agent_instruction()}\n"
+            f"{context_block}"
+            "### Question:\n"
+            f"{question.strip()}"
+        )
+
+    def _build_followup_user_content(self, question: str, *, is_final_turn: bool = False) -> str:
+        instruction = self._judge_instruction() if is_final_turn else self._ordinary_agent_instruction()
+        return (
+            "### Instruction:\n"
+            f"{instruction}\n"
+            "### Question:\n"
+            f"{question.strip()}"
         )
 
     @staticmethod
@@ -775,59 +751,6 @@ class AgentRunner:
         if isinstance(template, str) and template.strip():
             return template
         return None
-
-    @staticmethod
-    def _system_prompt() -> str:
-        return (
-            "You are participating in a collaborative discussion to solve a StrategyQA yes/no question. "
-            "The discussion uses shared memory: each participant can use the full discussion history produced so far."
-        )
-
-    @staticmethod
-    def _build_initial_user_content(
-        context: str,
-        question: str,
-        *,
-        agent_id: str = "A",
-        is_final_turn: bool = False,
-    ) -> str:
-        del is_final_turn
-        instruction = AgentRunner._initial_agent_instruction(agent_id)
-        context_block = f"### Context:\n{context.strip()}\n" if context.strip() else ""
-        return (
-            "### Instruction:\n"
-            f"{instruction}\n"
-            f"{context_block}"
-            "### Question:\n"
-            f"{question.strip()}"
-        )
-
-    @staticmethod
-    def _build_followup_user_content(
-        question: str,
-        *,
-        agent_id: str,
-        previous_agent_id: str,
-        is_final_turn: bool = False,
-        judge_solutions: Sequence[Tuple[str, str]] = (),
-    ) -> str:
-        instruction = (
-            AgentRunner._judge_instruction(previous_agent_id)
-            if is_final_turn
-            else AgentRunner._ordinary_agent_instruction(agent_id, previous_agent_id)
-        )
-        solutions_block = (
-            f"\n### Solutions:\n{AgentRunner._format_judge_solutions(judge_solutions)}"
-            if is_final_turn and judge_solutions
-            else ""
-        )
-        return (
-            "### Instruction:\n"
-            f"{instruction}\n"
-            "### Question:\n"
-            f"{question.strip()}"
-            f"{solutions_block}"
-        )
 
     @staticmethod
     def _strip_leading_bos_for_continuation(tokenizer, rendered: str) -> str:
@@ -842,35 +765,16 @@ class AgentRunner:
         user_content: str,
         *,
         continuation: bool,
-        include_system: bool = True,
     ) -> Optional[str]:
         tokenizer = agent.model.tokenizer
         chat_template = AgentRunner._explicit_chat_template(agent)
         if chat_template is None:
             return None
 
-        if continuation or not include_system:
-            # A continuation already has its system prompt in KV. The Judge is a
-            # separate decision call and intentionally receives only the task and
-            # candidate solutions, matching MALLM's Judge protocol.
-            message_sets = [[{"role": "user", "content": user_content.strip()}]]
-        else:
-            # Some checkpoints (for example Gemma-family templates) do not accept
-            # a system role. Try the canonical system+user form first, then fold
-            # the system instruction into the user message without model-specific
-            # branching.
-            message_sets = [
-                [
-                    {"role": "system", "content": AgentRunner._system_prompt()},
-                    {"role": "user", "content": user_content.strip()},
-                ],
-                [
-                    {
-                        "role": "user",
-                        "content": f"{AgentRunner._system_prompt()}\n\n{user_content.strip()}",
-                    }
-                ],
-            ]
+        # The paper prompts are user instructions. For continuation turns, the
+        # complete previous debate is already present in KV and only the new
+        # user instruction is appended.
+        message_sets = [[{"role": "user", "content": user_content.strip()}]]
 
         for messages in message_sets:
             try:
@@ -900,137 +804,80 @@ class AgentRunner:
         rendered = self._render_chat_prompt(agent, user_content, continuation=continuation)
         return rendered if rendered else fallback_prompt
 
-    @staticmethod
-    def build_initial_prompt(
-        context: str,
-        question: str,
-        *,
-        hub_agent_id: str = "A",
-        agent_count: int = 2,
-        is_final_turn: bool = False,
-    ) -> str:
-        del agent_count
-        return AgentRunner._build_plain_initial_prompt(
-            context,
-            question,
-            agent_id=hub_agent_id,
-            is_final_turn=is_final_turn,
-        )
+    def build_initial_prompt(self, context: str, question: str) -> str:
+        return self._build_plain_initial_prompt(context, question)
 
     def build_initial_prompt_for_agent(
         self,
         agent: Agent,
         context: str,
         question: str,
-        *,
-        hub_agent_id: str = "A",
-        agent_count: int = 2,
-        is_final_turn: bool = False,
     ) -> str:
-        del hub_agent_id, agent_count
-        user_content = self._build_initial_user_content(
-            context,
-            question,
-            agent_id=agent.node_id,
-            is_final_turn=is_final_turn,
-        )
+        user_content = self._build_initial_user_content(context, question)
         return self._format_agent_prompt(
             agent,
             user_content,
-            self._build_plain_initial_prompt(
-                context,
-                question,
-                agent_id=agent.node_id,
-                is_final_turn=is_final_turn,
-            ),
+            self._build_plain_initial_prompt(context, question),
             continuation=False,
         )
 
     def build_followup_prompt(
         self,
-        agent_id: str,
-        turn_index: int,
+        target_agent_id: str,
         question: str,
-        *,
-        is_final_turn: bool = False,
-        judge_solutions: Sequence[Tuple[str, str]] = (),
     ) -> str:
-        previous_agent_id = self._agent_for_turn(max(0, turn_index - 1)).node_id
-        user_content = self._build_followup_user_content(
-            question,
-            agent_id=agent_id,
-            previous_agent_id=previous_agent_id,
-            is_final_turn=is_final_turn,
-            judge_solutions=judge_solutions,
-        )
-        agent = self.agents.get(agent_id)
+        user_content = self._build_followup_user_content(question, is_final_turn=False)
+        agent = self.agents.get(target_agent_id)
         if agent is not None:
             return self._format_agent_prompt(
                 agent,
                 user_content,
-                self._build_plain_followup_prompt(
-                    question,
-                    agent_id=agent_id,
-                    previous_agent_id=previous_agent_id,
-                    is_final_turn=is_final_turn,
-                    judge_solutions=judge_solutions,
-                ),
+                self._build_plain_followup_prompt(question, is_final_turn=False),
                 continuation=True,
             )
-        return self._build_plain_followup_prompt(
-            question,
-            agent_id=agent_id,
-            previous_agent_id=previous_agent_id,
-            is_final_turn=is_final_turn,
-            judge_solutions=judge_solutions,
-        )
+        return self._build_plain_followup_prompt(question, is_final_turn=False)
 
-    def build_judge_prompt(
-        self,
-        question: str,
-        *,
-        previous_agent_id: str,
-        judge_solutions: Sequence[Tuple[str, str]],
-    ) -> str:
-        user_content = self._build_followup_user_content(
-            question,
-            agent_id=self.hub_agent.node_id,
-            previous_agent_id=previous_agent_id,
-            is_final_turn=True,
-            judge_solutions=judge_solutions,
-        )
-        fallback_prompt = self._build_plain_followup_prompt(
-            question,
-            agent_id=self.hub_agent.node_id,
-            previous_agent_id=previous_agent_id,
-            is_final_turn=True,
-            judge_solutions=judge_solutions,
-        )
+    def build_judge_prompt(self, question: str) -> str:
+        user_content = self._build_followup_user_content(question, is_final_turn=True)
+        fallback_prompt = self._build_plain_followup_prompt(question, is_final_turn=True)
         rendered = self._render_chat_prompt(
             self.hub_agent,
             user_content,
-            continuation=False,
-            include_system=False,
+            continuation=True,
         )
         return rendered if rendered else fallback_prompt
 
     @staticmethod
-    def _append_turn_to_transcript(transcript: str, agent_id: str, response: str) -> str:
+    def _append_turn_to_transcript(transcript: str, response: str) -> str:
         clean_response = response.strip() or "[empty]"
         return f"{transcript}{clean_response}\n"
 
     @staticmethod
-    def extract_final_answer(transcript: str, fallback_response: str) -> str:
+    def extract_final_answer(
+        transcript: str,
+        fallback_response: str,
+        choices: Sequence[str],
+    ) -> str:
         del transcript
-        final_matches = list(
-            re.finditer(r"FINAL\s*:\s*(yes|no)\b", fallback_response or "", flags=re.IGNORECASE)
+        response = fallback_response or ""
+        alternatives = "|".join(
+            re.escape(choice)
+            for choice in sorted(choices, key=len, reverse=True)
         )
-        if final_matches:
-            return final_matches[-1].group(1).lower()
-        binary_matches = list(re.finditer(r"\b(yes|no)\b", fallback_response or "", flags=re.IGNORECASE))
-        if binary_matches:
-            return binary_matches[-1].group(1).lower()
-        return postprocess_generated_answer((fallback_response or "").strip())
+        for label in ("FINAL", "Answer"):
+            matches = list(
+                re.finditer(
+                    rf"{label}\s*:\s*({alternatives})(?=\s|$|[.,;!?])",
+                    response,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if matches:
+                matched = matches[-1].group(1).casefold()
+                for choice in choices:
+                    if choice.casefold() == matched:
+                        return choice
+        return postprocess_generated_answer(response.strip())
 
     @staticmethod
     def _preview_text(text: str, max_chars: int) -> str:
@@ -1075,7 +922,7 @@ class AgentRunner:
         label = "?" if example_index is None else str(example_index)
         turn_order = "->".join(self.node_ids + ([self.node_ids[0]] if len(self.node_ids) > 1 else []))
         logging.info(
-            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | judge=%s | discussion=memory | physical_topology=star | turn_order=%s | "
+            "[AgentRunner][example=%s] start | mode=%s | alg=%s | agents=%s | judge=%s | discussion=sequential_mad | physical_topology=star | turn_order=%s | "
             "question=%s | gold=%s",
             label,
             self.cache_mode,
@@ -1450,12 +1297,7 @@ class AgentRunner:
             self._update_peak_memory_breakdown()
             self._log_turn(example_index=example_index, turn_index=turn_index - 1, record=source_record)
 
-            prompt = self.build_followup_prompt(
-                current_target.node_id,
-                turn_index,
-                question,
-                is_final_turn=False,
-            )
+            prompt = self.build_followup_prompt(current_target.node_id, question)
             generation = current_target.generate_response(prompt)
 
             if turn_index < last_normal_turn_index:
@@ -1467,7 +1309,7 @@ class AgentRunner:
                     )
 
             self._update_peak_memory_breakdown()
-            transcript = self._append_turn_to_transcript(transcript + prompt, current_target.node_id, generation.text)
+            transcript = self._append_turn_to_transcript(transcript + prompt, generation.text)
             turns.append(
                 self._turn_record(
                     generation,
@@ -1478,38 +1320,65 @@ class AgentRunner:
             )
             last_response = generation.text
 
-        # After exactly max_turns collaborative generations, run the Judge as a
-        # separate decision call over the agents' latest solutions. MALLM's Judge
-        # does not continue the discussion memory; it receives the task and the
-        # candidate solutions explicitly. Free/Retain behavior above is unchanged
-        # during the discussion itself.
+        # After exactly max_turns sequential debate generations, hand the complete
+        # accumulated debate history to the Hub model and use it as the terminal
+        # moderator/Judge. This follows MAD's extractive Judge idea: the final
+        # decision is made from the whole debate history rather than an isolated
+        # list of per-agent final answers.
         final_turn_index = len(turns)
         current_source = self._agent_for_turn(last_normal_turn_index)
         source_record = turns[-1]
+
+        judge_edge_id: Optional[str] = None
+        judge_offload_kind: Optional[str] = None
+        judge_tokens_received = 0
+        if current_source.node_id != self.hub_agent.node_id:
+            self._prepare_outgoing_route_translation(
+                source_agent=current_source,
+                logical_target_agent=self.hub_agent,
+            )
+            (
+                record_offload_target,
+                source_offload_meta,
+                source_cache_cleared,
+                incoming_from_agent,
+                incoming_meta,
+            ) = self._star_offload_to_turn_target(
+                source_agent=current_source,
+                target_agent=self.hub_agent,
+            )
+            self._apply_offload_metadata_to_record(
+                source_record,
+                target_agent=record_offload_target,
+                offload_meta=source_offload_meta,
+                source_was_freed=source_cache_cleared,
+            )
+            judge_edge_id = str(incoming_meta.get("edge_id", "")) or None
+            judge_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
+            judge_tokens_received = int(
+                incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0))
+            )
+            del incoming_from_agent
+
         self._update_peak_memory_breakdown()
         self._log_turn(example_index=example_index, turn_index=final_turn_index - 1, record=source_record)
 
-        judge_solutions = self._latest_agent_solutions(turns)
-        for agent in self.agent_sequence:
-            agent.reset()
-        self._pending_pretranslated_second_hops.clear()
-
-        final_prompt = self.build_judge_prompt(
-            question,
-            previous_agent_id=current_source.node_id,
-            judge_solutions=judge_solutions,
-        )
-        final_generation = self.hub_agent.generate_response(final_prompt)
+        final_prompt = self.build_judge_prompt(question)
+        # Keep debate generation diverse while making the terminal adjudication reproducible.
+        final_generation = self.hub_agent.generate_response(final_prompt, temperature=0.0)
         self._update_peak_memory_breakdown()
-        transcript = self._append_turn_to_transcript(
-            transcript + final_prompt,
-            self.hub_agent.node_id,
-            final_generation.text,
+        transcript = self._append_turn_to_transcript(transcript + final_prompt, final_generation.text)
+        turns.append(
+            self._turn_record(
+                final_generation,
+                translated_edge_id=judge_edge_id,
+                translated_offload_kind=judge_offload_kind,
+                tokens_received=judge_tokens_received,
+            )
         )
-        turns.append(self._turn_record(final_generation))
         last_response = final_generation.text
 
-        # The Judge is a terminal decision call and has no following KV handoff.
+        # The Judge is terminal and therefore has no outgoing KV handoff.
         self._log_turn(example_index=example_index, turn_index=final_turn_index, record=turns[-1])
         return transcript, last_response
 
@@ -1566,13 +1435,7 @@ class AgentRunner:
             self.ctx.tp.get_model(node.id).eval()
 
         self._log_example_start(question=question, gold_answers=gold_answers, example_index=example_index)
-        transcript = self.build_initial_prompt_for_agent(
-            self.hub_agent,
-            context,
-            question,
-            hub_agent_id=self.hub_agent.node_id,
-            agent_count=len(self.agent_sequence),
-        )
+        transcript = self.build_initial_prompt_for_agent(self.hub_agent, context, question)
         turns: List[AgentTurnRecord] = []
 
         # The first node is the HubAgent and starts from native Base Context + Prompt.
@@ -1585,7 +1448,7 @@ class AgentRunner:
                     logical_target_agent=next_target,
                 )
         self._update_peak_memory_breakdown()
-        transcript = self._append_turn_to_transcript(transcript, self.hub_agent.node_id, generation.text)
+        transcript = self._append_turn_to_transcript(transcript, generation.text)
         record = self._turn_record(generation)
         turns.append(record)
 
@@ -1607,7 +1470,7 @@ class AgentRunner:
                 example_index=example_index,
             )
 
-        prediction = self.extract_final_answer(transcript, last_response)
+        prediction = self.extract_final_answer(transcript, last_response, self.benchmark_info.choices)
         normalized_prediction = prediction.strip().lower()
         normalized_gold = {str(answer).strip().lower() for answer in gold_answers}
         accuracy = float(normalized_prediction in normalized_gold)

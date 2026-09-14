@@ -24,7 +24,7 @@ python eval.py
 python eval.py --default-config-path configs/eval_toy.json
 ```
 
-## Case Study - Multi Agent Reasoning (StrategyQA Relay)
+## Case Study - Multi Agent Reasoning (ANLI Sequential MAD)
 ```cmd
 python exp/multi_agents_qa.py <algorithm> --checkpoint-dir-path <checkpoint_dir> --cache-mode <retain|free> --agent-count <N> --max-turns <T> --max-examples <M>
 
