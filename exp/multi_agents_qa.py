@@ -14,13 +14,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from core.agent_runner import AgentRunner, AgentRunnerConfig
 from core.common import setup_logging, write_json
-from core.anli_dataset import (
-    ANLI_BENCHMARK_INFO,
-    ANLI_DATASET_PATH,
-    ANLI_DEFAULT_SPLIT,
-    SUPPORTED_ANLI_SPLITS,
-    ANLIExample,
-    load_anli_examples,
+from core.strategyqa_dataset import (
+    STRATEGYQA_DEFAULT_DATA_DIR,
+    STRATEGYQA_DEFAULT_SPLIT,
+    StrategyQAExample,
+    load_strategyqa_examples,
 )
 
 
@@ -33,8 +31,8 @@ def _str_to_bool(value) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run ANLI with sequential MAD-style multi-agent debate. "
-            "Each debater uses the full accumulated debate history; the final model acts as moderator/Judge."
+            "Run StrategyQA with shared-memory multi-agent reasoning. "
+            "Each Agent can use the full accumulated discussion; the final model acts as the Judge."
         )
     )
     parser.add_argument("alg", choices=["mot", "interlat", "lsc", "c2c-pr", "kvcomm"], help="Algorithm to run.")
@@ -48,17 +46,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
 
     parser.add_argument(
+        "--data-dir",
+        default=STRATEGYQA_DEFAULT_DATA_DIR,
+        help="Local StrategyQA directory. Missing train/dev JSON is downloaded from the official StrategyQA repository.",
+    )
+    parser.add_argument(
         "--split",
-        choices=SUPPORTED_ANLI_SPLITS,
-        default=ANLI_DEFAULT_SPLIT,
-        help="ANLI split. Default: dev_r3.",
+        choices=["train", "dev"],
+        default=STRATEGYQA_DEFAULT_SPLIT,
+        help="StrategyQA split. Default: dev.",
     )
     parser.add_argument(
         "--max-examples",
         type=int,
         default=10,
         help=(
-            "Number of ANLI examples to run. When --start-example is greater than 1, this many examples are "
+            "Number of StrategyQA examples to run. When --start-example is greater than 1, this many examples are "
             "run starting from that 1-based global example index unless --end-example is set."
         ),
     )
@@ -68,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="start_example",
         type=int,
         default=1,
-        help="1-based ANLI example index to start from after optional shuffling.",
+        help="1-based StrategyQA example index to start from after optional shuffling.",
     )
     parser.add_argument(
         "--end-example",
@@ -76,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="end_example",
         type=int,
         default=None,
-        help="Optional 1-based inclusive ANLI example index to stop at.",
+        help="Optional 1-based inclusive StrategyQA example index to stop at.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-eval-stream", nargs="?", const=True, default=False, type=_str_to_bool)
@@ -86,14 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="max_turns",
         type=int,
         default=4,
-        help="Number of sequential debater responses before one mandatory final Judge turn.",
+        help="Number of ordinary shared-memory discussion turns before one mandatory final Judge turn.",
     )
     parser.add_argument(
         "--agent-count",
         type=int,
         default=None,
         help=(
-            "Number of logical debaters in the discussion. Use 1 for a single-model baseline; the final turn still uses "
+            "Number of logical Agents in the discussion. Use 1 for a single-model baseline; the final turn still uses "
             "the same model as Judge. Default: use all available nodes."
         ),
     )
@@ -102,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--generation-temperature",
         type=float,
         default=1.0,
-        help="Sampling temperature for debaters and Judge. Use 0 for deterministic greedy decoding.",
+        help="Agent sampling temperature. MALLM experiments use temperature=1.0; use 0 for greedy decoding.",
     )
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
     parser.add_argument("--log-turns", dest="log_turns", action="store_true", default=True, help="Print per-turn AgentRunner logs.")
@@ -117,17 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _example_row(result, example: ANLIExample, *, example_index: int) -> Dict[str, Any]:
+def _example_row(result, example: StrategyQAExample, *, example_index: int) -> Dict[str, Any]:
     return {
         "example_index": example_index,
         "id": example.id,
         "question": result.question,
-        "premise": example.premise,
-        "hypothesis": example.hypothesis,
         "gold_answer": example.answers[0],
         "prediction": result.prediction,
         "accuracy": result.accuracy,
-        "reason": example.reason,
+        "facts": example.facts,
         "gpu_memory_gib": {
             "model_gib": result.profile.get("model_memory_gib"),
             "translator_gib": result.profile.get("translator_memory_gib"),
@@ -163,14 +164,15 @@ def main() -> None:
     else:
         load_max_examples = None
 
-    examples = load_anli_examples(
+    examples = load_strategyqa_examples(
+        data_dir=args.data_dir,
         split=args.split,
         max_examples=load_max_examples,
         shuffle=bool(args.shuffle_eval_stream),
         seed=args.seed,
     )
     if not examples:
-        raise RuntimeError("No ANLI examples were produced. Check --split.")
+        raise RuntimeError("No StrategyQA examples were produced. Check --data-dir and --split.")
 
     indexed_examples = list(enumerate(examples, start=1))
     if args.end_example is not None:
@@ -186,14 +188,13 @@ def main() -> None:
 
     if not selected_examples:
         raise RuntimeError(
-            f"No ANLI examples selected for start={args.start_example}, "
+            f"No StrategyQA examples selected for start={args.start_example}, "
             f"end={args.end_example}, max_examples={args.max_examples}."
         )
 
     runner = AgentRunner.from_checkpoint(
         AgentRunnerConfig(
             alg=args.alg,
-            benchmark_info=ANLI_BENCHMARK_INFO,
             checkpoint_dir_path=args.checkpoint_dir_path,
             device=args.device,
             max_turns=args.max_turns,
@@ -221,7 +222,7 @@ def main() -> None:
     selected_count = len(selected_examples)
     for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
         result = runner.run(
-            context=example.context,
+            context="",
             question=example.question,
             gold_answers=example.answers,
             example_index=example_index,
@@ -242,7 +243,7 @@ def main() -> None:
         rows.append(_example_row(result, example, example_index=example_index))
         print(
             f"[{local_idx}/{selected_count} | example={example_index}] "
-            f"uid={example.id} accuracy={result.accuracy:.0f} | "
+            f"qid={example.id} accuracy={result.accuracy:.0f} | "
             f"prediction={result.prediction!r} | gold={example.answers[0]!r}"
         )
 
@@ -259,16 +260,15 @@ def main() -> None:
     metrics = {
         "algorithm": args.alg,
         "cache_mode": args.cache_mode,
-        "discussion": "sequential_mad",
+        "discussion": "memory",
         "agent_count": len(runner.agent_sequence),
         "requested_agent_count": args.agent_count,
         "agent_ids": runner.node_ids,
         "judge_agent_id": runner.hub_agent.node_id,
         "checkpoint_dir_path": args.checkpoint_dir_path,
         "dataset": {
-            "name": ANLI_BENCHMARK_INFO.name,
-            "path": ANLI_DATASET_PATH,
-            "choices": list(ANLI_BENCHMARK_INFO.choices),
+            "name": "StrategyQA",
+            "data_dir": args.data_dir,
             "split": args.split,
         },
         "example_range": {
@@ -291,7 +291,7 @@ def main() -> None:
     metrics_path = output_path / "agent_runner_metrics.json"
     write_json(str(metrics_path), metrics)
 
-    print("===== AgentRunner ANLI sequential MAD =====")
+    print("===== AgentRunner StrategyQA memory =====")
     print(f"Accuracy: {accuracy:.4f}")
     print(
         "GPU Peak Memory: "

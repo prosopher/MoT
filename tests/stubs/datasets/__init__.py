@@ -35,32 +35,6 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
         ]
         return FakeStreamingDataset(items)
 
-    if key == ("facebook/anli", None, "dev_r3"):
-        items = [
-            {
-                "uid": "anli-e",
-                "premise": "A dog is running through a park.",
-                "hypothesis": "An animal is outdoors.",
-                "label": 0,
-                "reason": "A dog is an animal and the park is outdoors.",
-            },
-            {
-                "uid": "anli-n",
-                "premise": "A person is reading a book.",
-                "hypothesis": "The book is a mystery novel.",
-                "label": 1,
-                "reason": "The genre is not stated.",
-            },
-            {
-                "uid": "anli-c",
-                "premise": "The room is empty.",
-                "hypothesis": "Several people are in the room.",
-                "label": 2,
-                "reason": "The hypothesis contradicts the premise.",
-            },
-        ]
-        return FakeMapDataset(items)
-
     if key == ("google/boolq", None, "validation"):
         items = [
             {"question": "Is water wet?", "passage": "Water makes things wet.", "answer": True},
