@@ -12,14 +12,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.agent_runner import AgentRunner, AgentRunnerConfig
+from core.agent_runner import AgentRunner, AgentRunnerConfig, MALLM_SUPERMAJORITY_THRESHOLD
 from core.common import setup_logging, write_json
-from core.anli_dataset import (
-    ANLI_DEFAULT_DATA_DIR,
-    ANLI_DEFAULT_SPLIT,
-    ANLIExample,
-    SUPPORTED_ANLI_SPLITS,
-    load_anli_examples,
+from core.strategyqa_dataset import (
+    STRATEGYQA_DEFAULT_DATA_DIR,
+    StrategyQAExample,
+    load_strategyqa_examples,
 )
 
 
@@ -32,8 +30,8 @@ def _str_to_bool(value) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run ANLI Round-3 with the MALLM discussion-experiment setup: Expert personas, Memory discussion, "
-            "Simple response generator, and Majority Consensus."
+            "Run StrategyQA with the MALLM configuration: Expert personas, Memory discussion, "
+            "Simple response generator, and Supermajority Consensus."
         )
     )
     parser.add_argument("alg", choices=["mot", "interlat", "lsc", "c2c-pr", "kvcomm"], help="Algorithm to run.")
@@ -48,22 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--data-dir",
-        default=ANLI_DEFAULT_DATA_DIR,
-        help="Local ANLI cache directory. Missing ANLI v1.0 data is downloaded from the official release.",
-    )
-    parser.add_argument(
-        "--split",
-        choices=SUPPORTED_ANLI_SPLITS,
-        default=ANLI_DEFAULT_SPLIT,
-        help="ANLI Round-3 split. Default: dev_r3.",
+        default=STRATEGYQA_DEFAULT_DATA_DIR,
+        help=(
+            "Local StrategyQA cache directory. Missing task.json is downloaded from the same "
+            "BIG-bench StrategyQA source used by MALLM."
+        ),
     )
     parser.add_argument(
         "--max-examples",
         type=int,
         default=10,
         help=(
-            "Number of ANLI R3 examples to run. When --start-example is greater than 1, this many examples are "
-            "run starting from that 1-based global example index unless --end-example is set."
+            "Number of StrategyQA examples to run. When --start-example is greater than 1, this many examples are "
+            "run starting from that 1-based evaluation-stream index unless --end-example is set."
         ),
     )
     parser.add_argument(
@@ -72,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="start_example",
         type=int,
         default=1,
-        help="1-based ANLI example index to start from after optional shuffling.",
+        help="1-based StrategyQA example index to start from after optional shuffling.",
     )
     parser.add_argument(
         "--end-example",
@@ -80,19 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="end_example",
         type=int,
         default=None,
-        help="Optional 1-based inclusive ANLI example index to stop at.",
+        help="Optional 1-based inclusive StrategyQA example index to stop at.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-eval-stream", nargs="?", const=True, default=False, type=_str_to_bool)
     parser.add_argument(
-        "--max-turns",
-        "--max-turn",
-        dest="max_turns",
+        "--max-rounds",
+        dest="max_rounds",
         type=int,
         default=7,
         help=(
-            "Maximum number of MALLM discussion rounds. Each round lets all Agents participate in order; "
-            "majority consensus can stop the discussion early after any Agent contribution."
+            "Maximum number of discussion rounds. Each round lets every Agent participate once in order; "
+            "Supermajority Consensus (>66%) is evaluated only after the full round completes."
         ),
     )
     parser.add_argument(
@@ -101,19 +95,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help=(
             "Number of logical Agents in the discussion. MALLM experiments use 3 agents by default; "
-            "this remains independent of --max-turns."
+            "this remains independent of --max-rounds."
         ),
     )
     parser.add_argument("--generation-max-new-tokens", type=int, default=1024)
     parser.add_argument(
+        "--verification-max-retries",
+        type=int,
+        default=3,
+        help=(
+            "Corrective retries for StrategyQA follow-ups whose [AGREE]/[DISAGREE] marker, "
+            "explicit Yes/No answer, and extracted solution are logically inconsistent."
+        ),
+    )
+    parser.add_argument(
         "--generation-temperature",
         type=float,
         default=1.0,
-        help="Agent sampling temperature. MALLM experiments use temperature=1.0; use 0 for greedy decoding.",
+        help="Agent sampling temperature. Use 0 for greedy decoding.",
     )
     parser.add_argument("--max-prompt-tokens", type=int, default=None)
-    parser.add_argument("--log-turns", dest="log_turns", action="store_true", default=True, help="Print per-turn AgentRunner logs.")
-    parser.add_argument("--no-log-turns", dest="log_turns", action="store_false", help="Disable per-turn AgentRunner logs.")
+    parser.add_argument("--log-agents", dest="log_agents", action="store_true", default=True, help="Print per-agent AgentRunner logs.")
+    parser.add_argument("--no-log-agents", dest="log_agents", action="store_false", help="Disable per-agent AgentRunner logs.")
     parser.add_argument("--log-max-chars", type=int, default=600)
     parser.add_argument(
         "--cache-mode",
@@ -124,21 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _example_row(result, example: ANLIExample, *, example_index: int) -> Dict[str, Any]:
+def _example_row(result, example: StrategyQAExample, *, example_index: int) -> Dict[str, Any]:
     return {
         "example_index": example_index,
         "id": example.id,
-        "premise": example.premise,
-        "hypothesis": example.hypothesis,
-        "gold_label": example.label,
+        "question": example.question,
+        "input": example.input_text,
+        "choices": list(example.choices),
+        "gold_answer": example.reference,
         "prediction": result.prediction,
         "accuracy": result.accuracy,
-        "reason": example.reason,
         "gpu_memory_gib": {
             "model_gib": result.profile.get("model_memory_gib"),
             "translator_gib": result.profile.get("translator_memory_gib"),
             "kv_gib": result.profile.get("kv_memory_gib"),
         },
+        "peak_cache_residency": result.profile.get("peak_cache_residency", {}),
         "latency_sec": result.profile.get("latency_sec"),
         "agent_ids": result.agent_ids,
         "hub_agent_id": result.hub_agent_id,
@@ -146,11 +150,16 @@ def _example_row(result, example: ANLIExample, *, example_index: int) -> Dict[st
             agent_id: {"role": persona[0], "description": persona[1]}
             for agent_id, persona in result.personas.items()
         },
-        "decision_protocol": "majority_consensus",
+        "decision_protocol": "supermajority_consensus",
+        "supermajority_threshold": result.profile.get("supermajority_threshold", MALLM_SUPERMAJORITY_THRESHOLD),
+        "supermajority_comparison": result.profile.get("supermajority_comparison", ">"),
         "consensus_reached": result.profile.get("consensus_reached"),
-        "consensus_turn": result.profile.get("consensus_turn"),
+        "consensus_round": result.profile.get("consensus_round"),
+        "rounds": [asdict(round_record) for round_record in result.rounds],
+        "verification_retry_count": result.profile.get("verification_retry_count", 0),
+        "verification_failure_count": result.profile.get("verification_failure_count", 0),
         "cache_mode": result.cache_mode,
-        "turns": [asdict(turn) for turn in result.turns],
+        "agent_messages": [asdict(message) for message in result.agent_messages],
         "transcript": result.transcript,
     }
 
@@ -168,7 +177,6 @@ def main() -> None:
         )
     if args.max_examples is not None and args.max_examples <= 0:
         raise ValueError(f"--max-examples must be positive when set, got {args.max_examples}")
-
     if args.end_example is not None:
         load_max_examples = args.end_example
     elif args.max_examples is not None:
@@ -176,15 +184,14 @@ def main() -> None:
     else:
         load_max_examples = None
 
-    examples = load_anli_examples(
+    examples = load_strategyqa_examples(
         data_dir=args.data_dir,
-        split=args.split,
         max_examples=load_max_examples,
         shuffle=bool(args.shuffle_eval_stream),
         seed=args.seed,
     )
     if not examples:
-        raise RuntimeError("No ANLI examples were produced. Check --data-dir and --split.")
+        raise RuntimeError("No StrategyQA examples were produced. Check --data-dir/task.json.")
 
     indexed_examples = list(enumerate(examples, start=1))
     if args.end_example is not None:
@@ -200,7 +207,7 @@ def main() -> None:
 
     if not selected_examples:
         raise RuntimeError(
-            f"No ANLI examples selected for start={args.start_example}, "
+            f"No StrategyQA examples selected for start={args.start_example}, "
             f"end={args.end_example}, max_examples={args.max_examples}."
         )
 
@@ -209,15 +216,16 @@ def main() -> None:
             alg=args.alg,
             checkpoint_dir_path=args.checkpoint_dir_path,
             device=args.device,
-            max_turns=args.max_turns,
+            max_rounds=args.max_rounds,
             generation_max_new_tokens=args.generation_max_new_tokens,
             generation_temperature=args.generation_temperature,
             max_prompt_tokens=args.max_prompt_tokens,
             agent_count=args.agent_count,
             seed=args.seed,
-            log_turns=bool(args.log_turns),
+            log_agents=bool(args.log_agents),
             log_max_chars=args.log_max_chars,
             cache_mode=args.cache_mode,
+            verification_max_retries=args.verification_max_retries,
         )
     )
 
@@ -230,12 +238,13 @@ def main() -> None:
     rows: List[Dict[str, Any]] = []
     total_accuracy = 0.0
     peak_memory_gib = {"model_gib": None, "translator_gib": None, "kv_gib": None}
+    peak_cache_residency: Dict[str, Any] = {}
 
     selected_count = len(selected_examples)
     for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
         result = runner.run(
-            context=example.premise,
-            question=example.hypothesis,
+            context="",
+            question=example.input_text,
             gold_answers=example.answers,
             example_index=example_index,
         )
@@ -252,11 +261,16 @@ def main() -> None:
             peak_memory_gib[component_key] = (
                 float(current_peak) if previous_peak is None else max(float(previous_peak), float(current_peak))
             )
+        current_residency = result.profile.get("peak_cache_residency") or {}
+        if int(current_residency.get("total_cache_token_copies", 0) or 0) > int(
+            peak_cache_residency.get("total_cache_token_copies", 0) or 0
+        ):
+            peak_cache_residency = dict(current_residency)
         rows.append(_example_row(result, example, example_index=example_index))
         print(
             f"[{local_idx}/{selected_count} | example={example_index}] "
-            f"uid={example.id} accuracy={result.accuracy:.0f} | "
-            f"prediction={result.prediction!r} | gold={example.label!r}\n"
+            f"id={example.id} accuracy={result.accuracy:.0f} | "
+            f"prediction={result.prediction!r} | gold={example.reference!r}\n"
         )
 
     count = len(rows)
@@ -279,13 +293,19 @@ def main() -> None:
         "hub_agent_id": runner.hub_agent.node_id,
         "persona_generator": "expert",
         "response_generator": "simple",
-        "decision_protocol": "majority_consensus",
+        "decision_protocol": "supermajority_consensus",
+        "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
+        "supermajority_comparison": ">",
+        "verification": {
+            "max_retries": args.verification_max_retries,
+            "retry_count": sum(int(row.get("verification_retry_count", 0) or 0) for row in rows),
+            "failure_count": sum(int(row.get("verification_failure_count", 0) or 0) for row in rows),
+        },
         "checkpoint_dir_path": args.checkpoint_dir_path,
         "dataset": {
-            "name": "ANLI",
-            "round": 3,
+            "name": "StrategyQA",
             "data_dir": args.data_dir,
-            "split": args.split,
+            "task_file": "task.json",
         },
         "example_range": {
             "start_example": args.start_example,
@@ -301,13 +321,14 @@ def main() -> None:
             "translator_gib": peak_memory_gib["translator_gib"],
             "kv_gib": peak_memory_gib["kv_gib"],
         },
+        "peak_cache_residency": peak_cache_residency,
         "examples": rows,
         "args": vars(args),
     }
     metrics_path = output_path / "agent_runner_metrics.json"
     write_json(str(metrics_path), metrics)
 
-    print("===== AgentRunner ANLI R3 memory =====")
+    print("===== AgentRunner StrategyQA memory =====")
     print(f"Accuracy: {accuracy:.4f}")
     print(
         "GPU Peak Memory: "
