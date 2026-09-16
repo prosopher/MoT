@@ -1416,12 +1416,31 @@ def run_gpt2_block(
             attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "attn_pdrop", 0.0)), training=block.training)
         attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
     else:
-        attn_output, _ = attn._attn(
-            query,
-            attention_key,
-            attention_value,
-            attention_mask=None,
-            head_mask=None,
+        # GPT-2's _attn returns probabilities that this replay immediately
+        # discards. Reproduce its scaling/causal semantics through SDPA instead
+        # of materializing the full [B,H,Q,K] matrix.
+        scaling = 1.0
+        if bool(getattr(attn, "scale_attn_weights", True)):
+            scaling /= math.sqrt(head_dim)
+        if bool(getattr(attn, "scale_attn_by_inverse_layer_idx", False)):
+            layer_idx = getattr(attn, "layer_idx", None)
+            if layer_idx is None:
+                raise ValueError("GPT-2 inverse-layer attention scaling requires layer_idx.")
+            scaling /= float(int(layer_idx) + 1)
+        attn_dropout = getattr(attn, "attn_dropout", None)
+        dropout_p = (
+            float(attn_dropout.p)
+            if isinstance(attn_dropout, nn.Dropout)
+            else float(getattr(attn, "attn_pdrop", 0.0))
+        )
+        sdpa_query = query * (scaling * math.sqrt(head_dim))
+        attn_output = F.scaled_dot_product_attention(
+            sdpa_query.contiguous(),
+            attention_key.contiguous(),
+            attention_value.contiguous(),
+            attn_mask=None,
+            dropout_p=dropout_p if block.training else 0.0,
+            is_causal=True,
         )
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
@@ -1490,12 +1509,20 @@ def run_opt_block(
         attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
         attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
     else:
-        attn_weights = torch.matmul(query_states, attention_key.transpose(-1, -2))
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=float(getattr(attn, "dropout", 0.0)), training=block.training)
-        attn_output = torch.matmul(attn_weights, attention_value)
+        # This replay path consumes only the attention output, not the
+        # probabilities. Avoid materializing [B,H,Q,K] scores for dense replay.
+        # OPT already applies its attention scale to Q above, so cancel SDPA's
+        # default 1/sqrt(head_dim) factor by multiplying Q by sqrt(head_dim).
+        dropout_p = float(getattr(attn, "dropout", 0.0)) if block.training else 0.0
+        sdpa_query = query_states * math.sqrt(head_dim)
+        attn_output = F.scaled_dot_product_attention(
+            sdpa_query.contiguous(),
+            attention_key.contiguous(),
+            attention_value.contiguous(),
+            attn_mask=None if attention_mask is None else attention_mask.contiguous(),
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_heads * head_dim)
     attn_output = attn.out_proj(attn_output)
     attn_output = F.dropout(attn_output, p=float(getattr(block, "dropout", 0.0)), training=block.training)
@@ -1601,21 +1628,35 @@ def run_qwen2_block(
         attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
         attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
     else:
-        attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
         effective_attention_mask = attention_mask
         sliding_window = getattr(attn, "sliding_window", None)
         if sliding_window is not None and int(sliding_window) > 0:
             query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
             key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
             sliding_mask = key_positions <= (query_positions - int(sliding_window))
-            sliding_bias = torch.zeros_like(attn_weights).masked_fill(sliding_mask, torch.finfo(attn_weights.dtype).min)
-            effective_attention_mask = effective_attention_mask + sliding_bias if effective_attention_mask is not None else sliding_bias
-        if effective_attention_mask is not None:
-            attn_weights = attn_weights + effective_attention_mask
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            sliding_bias = torch.zeros(
+                (1, 1, seq_len, seq_len),
+                dtype=query_states.dtype,
+                device=hidden_states.device,
+            ).masked_fill(sliding_mask, torch.finfo(query_states.dtype).min)
+            effective_attention_mask = (
+                sliding_bias
+                if effective_attention_mask is None
+                else torch.minimum(effective_attention_mask, sliding_bias)
+            )
         dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
-        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
-        attn_output = torch.matmul(attn_weights, expanded_attention_value)
+        # Replay returns only hidden states/KV, so dense attention probabilities
+        # are dead intermediates. Pre-scale Q to preserve the module-specific
+        # scaling while using SDPA's memory-efficient implementation.
+        sdpa_query = query_states * (scaling * math.sqrt(head_dim))
+        attn_output = F.scaled_dot_product_attention(
+            sdpa_query.contiguous(),
+            expanded_attention_key.contiguous(),
+            expanded_attention_value.contiguous(),
+            attn_mask=None if effective_attention_mask is None else effective_attention_mask.contiguous(),
+            dropout_p=dropout_p if block.training else 0.0,
+            is_causal=False,
+        )
 
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, num_query_heads * head_dim)
     attn_output = attn.o_proj(attn_output)
@@ -1720,7 +1761,11 @@ def run_gemma3_block(
     scaling = float(getattr(attn, "scaling", head_dim ** -0.5))
     sliding_window = getattr(attn, "sliding_window", None)
 
+    softcap = getattr(attn, "attn_logit_softcapping", None)
+    dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
     if sparse_attention_indices is not None:
+        # Sparse replay explicitly operates on selected attention probabilities,
+        # so keep the explicit score/softmax path.
         sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_query_heads)
         selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
@@ -1733,35 +1778,62 @@ def run_gemma3_block(
             outside_window = sparse_attention_indices <= (query_positions - int(sliding_window))
             invalid_mask = invalid_mask | outside_window
         attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
+        if softcap is not None:
+            softcap_value = float(softcap)
+            attn_weights = torch.tanh(attn_weights / softcap_value) * softcap_value
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
+        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
+    elif softcap is None:
+        # Dense Gemma replay does not expose probabilities. SDPA is exact for the
+        # non-softcapped configuration and avoids a [B,H,Q,K] score tensor.
+        effective_attention_mask = attention_mask
+        if sliding_window is not None and int(sliding_window) > 0:
+            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            outside_window = key_positions <= (query_positions - int(sliding_window))
+            sliding_bias = torch.zeros(
+                (1, 1, seq_len, seq_len),
+                dtype=query_states.dtype,
+                device=hidden_states.device,
+            ).masked_fill(outside_window, torch.finfo(query_states.dtype).min)
+            effective_attention_mask = (
+                sliding_bias
+                if effective_attention_mask is None
+                else torch.minimum(effective_attention_mask, sliding_bias)
+            )
+        sdpa_query = query_states * (scaling * math.sqrt(head_dim))
+        attn_output = F.scaled_dot_product_attention(
+            sdpa_query.contiguous(),
+            expanded_attention_key.contiguous(),
+            expanded_attention_value.contiguous(),
+            attn_mask=None if effective_attention_mask is None else effective_attention_mask.contiguous(),
+            dropout_p=dropout_p if block.training else 0.0,
+            is_causal=False,
+        )
     else:
+        # SDPA cannot reproduce Gemma's tanh logit softcap because it is applied
+        # before softmax. Keep the dense eager path for this configuration.
         attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
         effective_attention_mask = attention_mask
         if sliding_window is not None and int(sliding_window) > 0:
             query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
             key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
             outside_window = key_positions <= (query_positions - int(sliding_window))
-            sliding_bias = torch.zeros_like(attn_weights).masked_fill(
-                outside_window, torch.finfo(attn_weights.dtype).min
-            )
+            sliding_bias = torch.zeros(
+                (1, 1, seq_len, seq_len), dtype=attn_weights.dtype, device=hidden_states.device
+            ).masked_fill(outside_window, torch.finfo(attn_weights.dtype).min)
             effective_attention_mask = (
-                effective_attention_mask + sliding_bias
-                if effective_attention_mask is not None
-                else sliding_bias
+                sliding_bias
+                if effective_attention_mask is None
+                else torch.minimum(effective_attention_mask, sliding_bias)
             )
         if effective_attention_mask is not None:
             attn_weights = attn_weights + effective_attention_mask
-
-    softcap = getattr(attn, "attn_logit_softcapping", None)
-    if softcap is not None:
-        softcap = float(softcap)
-        attn_weights = torch.tanh(attn_weights / softcap) * softcap
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
-    attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
-
-    if sparse_attention_indices is not None:
-        attn_output = (attn_weights.unsqueeze(-1) * selected_value).sum(dim=-2)
-    else:
+        softcap_value = float(softcap)
+        attn_weights = torch.tanh(attn_weights / softcap_value) * softcap_value
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=block.training)
         attn_output = torch.matmul(attn_weights, expanded_attention_value)
 
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(

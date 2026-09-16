@@ -227,6 +227,24 @@ class Gemma3Attention(nn.Module):
         self.is_sliding = self.sliding_window is not None
         self.is_causal = True
 
+    def _sliding_window_mask(
+        self,
+        *,
+        q_len: int,
+        kv_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if self.sliding_window is None or int(self.sliding_window) <= 0:
+            return None
+        # Queries occupy the final q_len positions after concatenating any
+        # cached prefix. Gemma's window is exclusive: distance < window.
+        query_positions = torch.arange(kv_len - q_len, kv_len, device=device)[:, None]
+        key_positions = torch.arange(kv_len, device=device)[None, :]
+        outside_window = key_positions <= (query_positions - int(self.sliding_window))
+        mask = torch.zeros((1, 1, q_len, kv_len), dtype=dtype, device=device)
+        return mask.masked_fill(outside_window.view(1, 1, q_len, kv_len), torch.finfo(dtype).min)
+
     def _apply_sliding_window_mask(
         self,
         attn_weights: torch.Tensor,
@@ -234,17 +252,15 @@ class Gemma3Attention(nn.Module):
         q_len: int,
         kv_len: int,
     ) -> torch.Tensor:
-        if self.sliding_window is None or int(self.sliding_window) <= 0:
-            return attn_weights
-        # Queries occupy the final q_len positions after concatenating any
-        # cached prefix. Gemma's window is exclusive: distance < window.
-        query_positions = torch.arange(kv_len - q_len, kv_len, device=attn_weights.device)[:, None]
-        key_positions = torch.arange(kv_len, device=attn_weights.device)[None, :]
-        outside_window = key_positions <= (query_positions - int(self.sliding_window))
-        return attn_weights.masked_fill(
-            outside_window.view(1, 1, q_len, kv_len),
-            torch.finfo(attn_weights.dtype).min,
+        sliding_mask = self._sliding_window_mask(
+            q_len=q_len,
+            kv_len=kv_len,
+            dtype=attn_weights.dtype,
+            device=attn_weights.device,
         )
+        if sliding_mask is None:
+            return attn_weights
+        return attn_weights + sliding_mask
 
     def forward(
         self,
@@ -276,19 +292,62 @@ class Gemma3Attention(nn.Module):
 
         expanded_key = repeat_kv(key_states, self.num_key_value_groups)
         expanded_value = repeat_kv(value_states, self.num_key_value_groups)
-        attn_weights = torch.matmul(query_states, expanded_key.transpose(2, 3)) * self.scaling
-        attn_weights = self._apply_sliding_window_mask(
-            attn_weights, q_len=q_len, kv_len=expanded_key.shape[-2]
-        )
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : expanded_key.shape[-2]]
-        if self.attn_logit_softcapping is not None:
-            softcap = float(self.attn_logit_softcapping)
-            attn_weights = torch.tanh(attn_weights / softcap) * softcap
+        kv_len = expanded_key.shape[-2]
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, expanded_value)
+        sliced_attention_mask = None
+        if attention_mask is not None:
+            sliced_attention_mask = attention_mask[:, :, :, :kv_len].contiguous()
+        sliding_mask = self._sliding_window_mask(
+            q_len=q_len,
+            kv_len=kv_len,
+            dtype=query_states.dtype,
+            device=query_states.device,
+        )
+        if sliding_mask is not None:
+            if sliced_attention_mask is None:
+                sliced_attention_mask = sliding_mask
+            else:
+                # Both masks are additive (0 for visible positions, a large
+                # negative value for masked positions). minimum() composes them
+                # without adding two dtype-min values and overflowing to -inf.
+                sliced_attention_mask = torch.minimum(sliced_attention_mask, sliding_mask)
+
+        # Gemma 3 can use the same fused/memory-efficient SDPA path as Qwen2
+        # whenever callers do not need attention probabilities and the model is
+        # not configured with attention-logit softcapping. SDPA has no hook for
+        # Gemma's tanh score softcap, so that configuration intentionally keeps
+        # the explicit eager path. output_attentions=True also stays eager.
+        can_use_sdpa = (
+            not output_attentions
+            and self.attn_logit_softcapping is None
+            and hasattr(F, "scaled_dot_product_attention")
+        )
+        if can_use_sdpa:
+            # SDPA's default scale is 1/sqrt(head_dim). Gemma uses
+            # query_pre_attn_scalar**-0.5, which is not guaranteed to equal it.
+            # Pre-scale Q so the resulting logits exactly use self.scaling while
+            # remaining compatible with torch 2.1 (no scale= dependency).
+            sdpa_query = query_states * (self.scaling * math.sqrt(self.head_dim))
+            attn_output = F.scaled_dot_product_attention(
+                sdpa_query.contiguous(),
+                expanded_key.contiguous(),
+                expanded_value.contiguous(),
+                attn_mask=sliced_attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=False,
+            )
+            attn_weights = None
+        else:
+            attn_weights = torch.matmul(query_states, expanded_key.transpose(2, 3)) * self.scaling
+            if sliced_attention_mask is not None:
+                attn_weights = attn_weights + sliced_attention_mask
+            if self.attn_logit_softcapping is not None:
+                softcap = float(self.attn_logit_softcapping)
+                attn_weights = torch.tanh(attn_weights / softcap) * softcap
+
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, expanded_value)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(
             bsz, q_len, self.num_heads * self.head_dim
         )

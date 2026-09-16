@@ -238,13 +238,42 @@ class Qwen2Attention(nn.Module):
         key_states_for_attn = repeat_kv(key_states, self.num_key_value_groups)
         value_states_for_attn = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states_for_attn.transpose(2, 3)) / math.sqrt(self.head_dim)
+        sliced_attention_mask = None
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : key_states_for_attn.shape[-2]]
+            sliced_attention_mask = attention_mask[:, :, :, : key_states_for_attn.shape[-2]].contiguous()
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states_for_attn)
+        # Generation never requests attention probabilities. The old compatibility
+        # path nevertheless materialized [B, H, Q, K] attention scores and then a
+        # float32 softmax copy. With long Memory discussions this can consume tens
+        # of GiB transiently even when the persistent KV cache is only a few GiB.
+        # PyTorch 2.1's SDPA dispatches to fused/memory-efficient CUDA kernels and
+        # avoids materializing that full per-head score matrix. Keep the explicit
+        # implementation only when callers actually request attention weights.
+        if not output_attentions and hasattr(F, "scaled_dot_product_attention"):
+            attn_output = F.scaled_dot_product_attention(
+                query_states.contiguous(),
+                key_states_for_attn.contiguous(),
+                value_states_for_attn.contiguous(),
+                attn_mask=sliced_attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=False,
+            )
+            attn_weights = None
+        else:
+            attn_weights = (
+                torch.matmul(query_states, key_states_for_attn.transpose(2, 3))
+                / math.sqrt(self.head_dim)
+            )
+            if sliced_attention_mask is not None:
+                attn_weights = attn_weights + sliced_attention_mask
+
+            attn_weights = nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(
+                attn_weights, p=self.attention_dropout, training=self.training
+            )
+            attn_output = torch.matmul(attn_weights, value_states_for_attn)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
