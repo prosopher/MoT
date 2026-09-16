@@ -18,6 +18,7 @@ from alg.mot.train import (
     align_cache_blocks_to_target_tokens,
     build_cross_token_alignment,
     collect_mot_balance_metrics,
+    extract_source_attention_topk_indices,
     translate_layer_window,
 )
 from core.common import TokenIDs
@@ -55,6 +56,95 @@ class ConstantTranslator(torch.nn.Module):
             dtype=layer_window_cache.dtype,
             device=layer_window_cache.device,
         )
+
+
+class _FakeAttentionLayer(torch.nn.Module):
+    def __init__(self, layer_idx: int, num_heads: int = 3) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.num_heads = num_heads
+
+    def forward(self, hidden_states, *, output_attentions=False, **_):
+        # Deterministic per-layer probabilities. Hidden-state evolution is
+        # independent of whether the caller retains the returned attention.
+        batch_size, seq_len = hidden_states.shape[:2]
+        base = torch.arange(
+            batch_size * self.num_heads * seq_len * seq_len,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ).reshape(batch_size, self.num_heads, seq_len, seq_len)
+        attn = torch.softmax(base / float(11 + self.layer_idx), dim=-1)
+        next_hidden = hidden_states + float(self.layer_idx + 1)
+        return (next_hidden, attn) if output_attentions else (next_hidden,)
+
+
+class _FakeRotaryDecoder(torch.nn.Module):
+    def __init__(self, num_layers: int) -> None:
+        super().__init__()
+        self.embed_tokens = torch.nn.Identity()
+        self.layers = torch.nn.ModuleList([_FakeAttentionLayer(idx) for idx in range(num_layers)])
+
+
+class _FakeRotaryCausalLM(torch.nn.Module):
+    def __init__(self, num_layers: int = 4) -> None:
+        super().__init__()
+        self.model = _FakeRotaryDecoder(num_layers)
+
+    def forward(self, input_ids, output_attentions=False, return_dict=True, **_):
+        hidden = input_ids.to(torch.float32).unsqueeze(-1)
+        attentions = []
+        for layer in self.model.layers:
+            outputs = layer(hidden, output_attentions=output_attentions)
+            hidden = outputs[0]
+            if output_attentions:
+                attentions.append(outputs[1])
+        if not return_dict:
+            return (hidden, tuple(attentions) if output_attentions else None)
+        return SimpleNamespace(
+            last_hidden_state=hidden,
+            attentions=tuple(attentions) if output_attentions else None,
+        )
+
+
+def test_mot_attention_topk_release_keeps_exact_indices() -> None:
+    model = _FakeRotaryCausalLM(num_layers=4).eval()
+    token_tensor = torch.tensor([[1, 3, 5, 7, 9]], dtype=torch.long)
+    token_ids = TokenIDs(token_tensor, model_id="tiny")
+    requested_layers = [0, 2, 3]
+    top_k = 3
+
+    with torch.no_grad():
+        baseline_outputs = model(
+            input_ids=token_tensor,
+            use_cache=False,
+            output_attentions=True,
+            return_dict=True,
+        )
+    baseline = []
+    for layer_idx in requested_layers:
+        shared = baseline_outputs.attentions[layer_idx].detach().mean(dim=1, keepdim=True)
+        baseline.append(torch.topk(shared, k=top_k, dim=-1).indices)
+
+    optimized = extract_source_attention_topk_indices(
+        model,
+        token_ids,
+        requested_layers,
+        source_model_id="Qwen/Qwen2-tiny",
+        top_k=top_k,
+    )
+
+    assert len(optimized) == len(baseline)
+    assert all(torch.equal(expected, actual) for expected, actual in zip(baseline, optimized))
+
+    # Hooks must be temporary; ordinary callers still receive full attentions.
+    with torch.no_grad():
+        after = model(
+            input_ids=token_tensor,
+            use_cache=False,
+            output_attentions=True,
+            return_dict=True,
+        )
+    assert all(attn is not None for attn in after.attentions)
 
 
 def test_c2c_terminal_alignment_alias_resolves_to_edge_specific_min_depth() -> None:

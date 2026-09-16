@@ -1185,6 +1185,71 @@ def extract_source_attention_topk_indices(
     }
     if model_family in {"opt", "qwen2", "llama", "gemma3"}:
         model_kwargs["attention_mask"] = torch.ones_like(context_token_ids.as_tensor())
+
+    # Qwen2/Qwen3, Llama 3.2, and Gemma 3 need the eager attention probabilities
+    # here: MoT's sparse replay is defined by top-k indices from those exact
+    # probabilities.  The normal output_attentions=True path, however, retains
+    # every layer's [B, H, Q, K] tensor in outputs.attentions until the full
+    # forward finishes.  Long multi-agent memories make that retention the
+    # dominant transient allocation even though only a compact top-k result from
+    # a few layers is needed.
+    #
+    # A decoder-layer forward hook lets the original eager computation run
+    # unchanged, performs the same mean->topk reduction immediately, and then
+    # replaces the returned attention tensor with None before the model stores it.
+    # Hidden states/attention outputs are untouched, so the model computation and
+    # selected indices are identical; only the lifetime of full attention weights
+    # is shortened from "whole model forward" to "one decoder layer".
+    captured_topk: Dict[int, torch.Tensor] = {}
+    hook_handles = []
+    decoder_layers = None
+    if model_family == "qwen2":
+        decoder_layers = require_qwen2_model(source_model).layers
+    elif model_family == "llama":
+        decoder_layers = require_llama_model(source_model).layers
+    elif model_family == "gemma3":
+        decoder_layers = require_gemma3_model(source_model).layers
+
+    if decoder_layers is not None:
+        requested_layers = set(int(layer_idx) for layer_idx in layer_indices)
+
+        def make_attention_release_hook(layer_idx: int):
+            def release_attention(_module, _inputs, output):
+                if not isinstance(output, tuple) or len(output) < 2:
+                    return output
+                layer_attn = output[1]
+                if layer_attn is None:
+                    return output
+                if layer_idx in requested_layers:
+                    shared_attn = layer_attn.detach().mean(dim=1, keepdim=True)
+                    seq_len = shared_attn.shape[-1]
+                    k = max(1, min(int(top_k), seq_len))
+                    captured_topk[layer_idx] = torch.topk(shared_attn, k=k, dim=-1).indices
+                # use_cache=False here, so output is normally (hidden, attention).
+                # Preserve any extra tuple entries defensively while dropping only
+                # the full attention-probability tensor.
+                return (output[0], None, *output[2:])
+
+            return release_attention
+
+        for layer_idx, decoder_layer in enumerate(decoder_layers):
+            hook_handles.append(decoder_layer.register_forward_hook(make_attention_release_hook(layer_idx)))
+
+        try:
+            with torch.no_grad():
+                source_model(**model_kwargs)
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        missing_layers = [layer_idx for layer_idx in layer_indices if int(layer_idx) not in captured_topk]
+        if missing_layers:
+            raise ValueError(f"Attention for source layers {missing_layers} is unavailable.")
+        return [captured_topk[int(layer_idx)] for layer_idx in layer_indices]
+
+    # Keep the existing generic path for model families whose decoder-layer
+    # output layout is different.  This is not on the Qwen3/Llama3.2/Gemma3
+    # multi-agent path and avoids broad changes unrelated to the observed OOM.
     with torch.no_grad():
         outputs = source_model(**model_kwargs)
     attentions = getattr(outputs, "attentions", None)
