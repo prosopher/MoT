@@ -154,19 +154,19 @@ def test_agent_runner_generation_seed_streams_are_agent_count_independent(monkey
 
     seeds2 = [
         runner2._set_generation_seed("persona", agent_index=0),
-        runner2._set_generation_seed("discussion", round_index=0, agent_index=0),
-        runner2._set_generation_seed("discussion", round_index=0, agent_index=1),
-        runner2._set_generation_seed("discussion", round_index=0, agent_index=1, attempt=1),
-        runner2._set_generation_seed("verification", round_index=0, agent_index=0),
-        runner2._set_generation_seed("verification", round_index=0, agent_index=1, attempt=1),
+        runner2._set_generation_seed("discussion", turn_index=0, agent_index=0),
+        runner2._set_generation_seed("discussion", turn_index=0, agent_index=1),
+        runner2._set_generation_seed("discussion", turn_index=0, agent_index=1, attempt=1),
+        runner2._set_generation_seed("verification", turn_index=0, agent_index=0),
+        runner2._set_generation_seed("verification", turn_index=0, agent_index=1, attempt=1),
     ]
     seeds6 = [
         runner6._set_generation_seed("persona", agent_index=0),
-        runner6._set_generation_seed("discussion", round_index=0, agent_index=0),
-        runner6._set_generation_seed("discussion", round_index=0, agent_index=1),
-        runner6._set_generation_seed("discussion", round_index=0, agent_index=1, attempt=1),
-        runner6._set_generation_seed("verification", round_index=0, agent_index=0),
-        runner6._set_generation_seed("verification", round_index=0, agent_index=1, attempt=1),
+        runner6._set_generation_seed("discussion", turn_index=0, agent_index=0),
+        runner6._set_generation_seed("discussion", turn_index=0, agent_index=1),
+        runner6._set_generation_seed("discussion", turn_index=0, agent_index=1, attempt=1),
+        runner6._set_generation_seed("verification", turn_index=0, agent_index=0),
+        runner6._set_generation_seed("verification", turn_index=0, agent_index=1, attempt=1),
     ]
 
     assert seeds2 == seeds6
@@ -256,9 +256,9 @@ def test_agent_runner_seed_coordinates_do_not_alias_at_large_offsets(monkeypatch
     ]
     seeds = [
         runner._set_generation_seed(
-            stream, round_index=round_index, agent_index=agent_index, attempt=attempt
+            stream, turn_index=turn_index, agent_index=agent_index, attempt=attempt
         )
-        for stream, round_index, agent_index, attempt in coordinates
+        for stream, turn_index, agent_index, attempt in coordinates
     ]
     assert len(seeds) == len(set(seeds))
 
@@ -707,8 +707,7 @@ def test_agent_runner_initial_semantic_mismatch_retries_before_commit() -> None:
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        max_rounds=2,
-        verification_max_retries=2,
+        max_turns=2,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -785,7 +784,8 @@ def test_agent_runner_supermajority_consensus_uses_latest_vote_per_agent_after_f
     )
 
     # The helper itself is a >66% supermajority over configured Agents. A missing
-    # vote is an abstention; round-boundary timing is enforced by the runner.
+    # vote is an abstention; orchestration gates calls to this helper until every
+    # configured Agent has completed its first verified Turn.
     assert runner._supermajority_consensus({"A": "Yes", "B": "Yes", "C": "Yes"}) == "Yes"
 
     # Supermajority is over unique Agents, not consecutive message history.
@@ -849,6 +849,78 @@ def test_agent_runner_supermajority_consensus_uses_latest_vote_per_agent_after_f
     assert (solution, answer, state) == ("Yes", "Yes", "revise")
 
 
+def test_agent_runner_final_majority_vote_is_used_when_supermajority_is_absent() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=5,
+        log_agents=False,
+    )
+    votes = {"A": "Yes", "B": "Yes", "C": "Yes", "D": "No", "E": "No"}
+
+    # 3/5 is not a >66% consensus, but it is the unique final majority.
+    assert runner._supermajority_consensus(votes) is None
+    answer, method = runner._majority_vote_with_random_tie(votes)
+    assert answer == "Yes"
+    assert method == "majority_vote"
+
+
+def test_agent_runner_max_turns_uses_majority_vote_instead_of_latest_draft() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=5,
+        max_turns=5,
+        log_agents=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._verify_response_semantics_with_model = lambda **kwargs: ("VALID", True)
+
+    responses = {
+        "A": "Final Solution: Yes",
+        "B": "[DISAGREE] Additional support.\nFinal Solution: Yes",
+        "C": "[DISAGREE] More support.\nFinal Solution: Yes",
+        "D": "[DISAGREE] Counterargument.\nFinal Solution: No",
+        "E": "[DISAGREE] Further counterargument.\nFinal Solution: No",
+    }
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            text = responses[agent.node_id]
+            return AgentGeneration(
+                agent_id=agent.node_id, prompt_text=prompt_text, text=text, raw_text=text,
+                generated_token_ids=[1], tokens_before=0, tokens_after=1,
+                tokens_prompt=1, tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    runner._update_peak_memory_breakdown = lambda: None
+
+    def fake_star_offload(*, source_agent, target_agent):
+        meta = {"edge_id": "edge", "offload_kind": "delta", "tokens_sent": 1,
+                "tokens_received": 1, "expected_delta_tokens": 1}
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_agent = fake_star_offload
+    result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    assert result.turns[-1].vote_counts == {"Yes": 3, "No": 2}
+    assert result.profile["consensus_reached"] is False
+    assert result.agent_messages[-1].solution == "No"
+    assert result.prediction == "Yes"
+    assert result.profile["final_decision_method"] == "majority_vote"
+    assert result.profile["final_decision_answer"] == "Yes"
+
+
 def test_agent_runner_stops_early_when_supermajority_consensus_is_reached() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
@@ -856,7 +928,7 @@ def test_agent_runner_stops_early_when_supermajority_consensus_is_reached() -> N
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        max_rounds=4,
+        max_turns=4,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -909,27 +981,27 @@ def test_agent_runner_stops_early_when_supermajority_consensus_is_reached() -> N
     assert len(result.agent_messages) == 2
     assert result.prediction == "Yes"
     assert result.profile["consensus_reached"] is True
-    assert result.profile["consensus_round"] == 1
+    assert result.profile["consensus_turn"] == 2
     assert result.profile["persona_generator"] == "expert"
     assert result.profile["response_generator"] == "simple"
     assert result.profile["discussion_paradigm"] == "memory"
-    assert result.profile["decision_protocol"] == "supermajority_consensus"
-    assert result.profile["requested_max_rounds"] == 4
+    assert result.profile["decision_protocol"] == "turn_supermajority_then_majority_vote"
+    assert result.profile["requested_max_turns"] == 4
     assert result.profile["num_agent_messages"] == 2
-    assert result.profile["completed_rounds"] == 1
-    assert len(result.rounds) == 1
-    assert result.rounds[0].consensus_answer == "Yes"
+    assert result.profile["completed_turns"] == 2
+    assert len(result.turns) == 2
+    assert result.turns[0].consensus_reached is False
+    assert result.turns[1].consensus_answer == "Yes"
 
 
-def test_agent_runner_same_answer_revision_supports_semantic_supermajority() -> None:
+def test_agent_runner_defers_supermajority_until_every_agent_participates_once() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=4,
-        max_rounds=2,
-        verification_max_retries=0,
+        max_turns=4,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -969,21 +1041,29 @@ def test_agent_runner_same_answer_revision_supports_semantic_supermajority() -> 
     runner._star_offload_to_agent = fake_star_offload
     result = runner.run(context="", question="Question?", gold_answers=["Yes"])
 
-    # All configured Agents must speak once before the first decision. A/B/C vote
-    # Yes and D votes No, so the unique-Agent >66% supermajority is 3/4 for Yes.
+    # A/B/C already form 3/4 = 75%, but consensus must not be evaluated before
+    # D completes the mandatory first participation pass. D speaks on Turn 4; only
+    # then is 3/4 > 66% accepted as the first eligible consensus.
     assert calls == ["A", "B", "C", "D"]
+    assert len(result.turns) == 4
+    assert result.turns[2].vote_counts == {"Yes": 3, "No": 0}
+    assert result.turns[2].consensus_reached is False
+    assert result.turns[3].vote_counts == {"Yes": 3, "No": 1}
+    assert result.turns[3].consensus_answer == "Yes"
     assert result.profile["consensus_reached"] is True
+    assert result.profile["consensus_turn"] == 4
+    assert result.profile["consensus_requires_full_initial_participation"] is True
     assert result.prediction == "Yes"
 
 
-def test_agent_runner_max_rounds_counts_mallm_rounds() -> None:
+def test_agent_runner_max_turns_counts_individual_agent_turns() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=4,
-        max_rounds=2,
+        max_turns=8,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -1024,18 +1104,18 @@ def test_agent_runner_max_rounds_counts_mallm_rounds() -> None:
     assert len(result.agent_messages) == 8
     assert result.profile["consensus_reached"] is False
     assert result.profile["num_agent_messages"] == 8
-    assert result.profile["completed_rounds"] == 2
-    assert len(result.rounds) == 2
+    assert result.profile["completed_turns"] == 8
+    assert len(result.turns) == 8
+    assert [turn.turn_index for turn in result.turns] == list(range(1, 9))
 
-def test_agent_runner_consensus_is_evaluated_only_after_full_round() -> None:
+def test_agent_runner_consensus_is_evaluated_after_every_turn() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=4,
-        max_rounds=2,
-        verification_max_retries=0,
+        max_turns=8,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -1044,18 +1124,15 @@ def test_agent_runner_consensus_is_evaluated_only_after_full_round() -> None:
     runner._verify_response_semantics_with_model = lambda **kwargs: ("VALID", True)
 
     calls = []
-    # Round 1 is tied 2:2. At the first agent message of Round 2, A changes
-    # from Yes to No, which would create a 3:1 supermajority if consensus were
-    # evaluated mid-round. Agents B/C/D must still speak before evaluation.
+    # The first four Turns leave a 2:2 split. On Turn 5, A changes from Yes
+    # to No, producing 3:1 for No. Turn-based consensus must stop immediately,
+    # before B/C/D take another turn.
     scripted = [
         ("A", "Final Solution: Yes"),
         ("B", "[DISAGREE]\nFinal Solution: No"),
         ("C", "[DISAGREE]\nFinal Solution: Yes"),
         ("D", "[DISAGREE]\nFinal Solution: No"),
         ("A", "[DISAGREE]\nFinal Solution: No"),
-        ("B", "[AGREE]\nFinal Solution: No"),
-        ("C", "[DISAGREE]\nFinal Solution: Yes"),
-        ("D", "[AGREE]\nFinal Solution: Yes"),
     ]
     cursor = {"i": 0}
 
@@ -1085,13 +1162,14 @@ def test_agent_runner_consensus_is_evaluated_only_after_full_round() -> None:
     runner._star_offload_to_agent = fake_star_offload
     result = runner.run(context="", question="Question?", gold_answers=["No"])
 
-    assert calls == ["A", "B", "C", "D", "A", "B", "C", "D"]
-    assert len(result.rounds) == 2
-    assert result.rounds[0].vote_counts == {"Yes": 2, "No": 2}
-    assert result.rounds[0].consensus_reached is False
-    # Round 2 also completes before the decision is evaluated.
-    assert result.rounds[1].vote_counts == {"Yes": 2, "No": 2}
-    assert result.profile["consensus_reached"] is False
+    assert calls == ["A", "B", "C", "D", "A"]
+    assert len(result.turns) == 5
+    assert result.turns[3].vote_counts == {"Yes": 2, "No": 2}
+    assert result.turns[3].consensus_reached is False
+    assert result.turns[4].vote_counts == {"Yes": 1, "No": 3}
+    assert result.turns[4].consensus_answer == "No"
+    assert result.profile["consensus_reached"] is True
+    assert result.profile["consensus_turn"] == 5
 
 
 def test_agent_runner_semantic_verifier_parsers_are_strict() -> None:
@@ -1239,8 +1317,7 @@ def test_agent_runner_final_solution_yes_is_committed_when_semantically_valid() 
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        max_rounds=1,
-        verification_max_retries=0,
+        max_turns=2,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -1286,7 +1363,8 @@ def test_agent_runner_final_solution_yes_is_committed_when_semantically_valid() 
     assert b.final_answer == "Yes"
     assert b.response_state == "revise"
     assert b.solution == "Yes"
-    assert result.prediction == "Yes"
+    assert result.turns[-1].vote_counts == {"Yes": 1, "No": 1}
+    assert result.profile["final_decision_method"] == "random_tie_break"
 
 
 def test_agent_runner_initial_proposal_retries_until_yes_no_is_explicit() -> None:
@@ -1296,8 +1374,7 @@ def test_agent_runner_initial_proposal_retries_until_yes_no_is_explicit() -> Non
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        max_rounds=2,
-        verification_max_retries=2,
+        max_turns=2,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -1310,7 +1387,7 @@ def test_agent_runner_initial_proposal_retries_until_yes_no_is_explicit() -> Non
     def fake_generate(agent):
         def generate(prompt_text: str) -> AgentGeneration:
             calls[agent.node_id] += 1
-            if agent.node_id == "A" and calls["A"] == 1:
+            if agent.node_id == "A" and calls["A"] <= 5:
                 text = "I cannot determine a final answer from the available information."
             elif agent.node_id == "A":
                 text = "The evidence supports the proposition.\nFinal Solution: Yes"
@@ -1347,15 +1424,16 @@ def test_agent_runner_initial_proposal_retries_until_yes_no_is_explicit() -> Non
     runner._star_offload_to_agent = fake_star_offload
     result = runner.run(context="", question="Question?", gold_answers=["Yes"])
 
-    assert calls == {"A": 2, "B": 1}
+    assert calls == {"A": 6, "B": 1}
     first = result.agent_messages[0]
     assert first.response.endswith("Final Solution: Yes")
     assert first.final_answer == "Yes"
-    assert first.verification_attempts == 1
+    assert first.verification_attempts == 5
     assert first.verification_passed is True
     assert first.verification_reason == "ok"
     assert result.prediction == "Yes"
-    assert result.profile["verification_retry_count"] == 1
+    assert result.profile["verification_retry_policy"] == "unbounded"
+    assert result.profile["verification_retry_count"] == 5
 
 
 def test_agent_runner_verification_retry_accepts_corrected_response() -> None:
@@ -1365,8 +1443,7 @@ def test_agent_runner_verification_retry_accepts_corrected_response() -> None:
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        max_rounds=2,
-        verification_max_retries=2,
+        max_turns=2,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -1381,7 +1458,7 @@ def test_agent_runner_verification_retry_accepts_corrected_response() -> None:
             calls[agent.node_id] += 1
             if agent.node_id == "A":
                 text = "Final Solution: Yes"
-            elif calls["B"] == 1:
+            elif calls["B"] <= 5:
                 text = "[AGREE]\nFinal Solution: No"
             else:
                 text = "[AGREE]\nFinal Solution: Yes"
@@ -1416,28 +1493,29 @@ def test_agent_runner_verification_retry_accepts_corrected_response() -> None:
     runner._star_offload_to_agent = fake_star_offload
     result = runner.run(context="", question="Question?", gold_answers=["Yes"])
 
-    assert calls == {"A": 1, "B": 2}
+    assert calls == {"A": 1, "B": 6}
     assert len(result.agent_messages) == 2
     corrected = result.agent_messages[1]
     assert corrected.response == "[AGREE]\nFinal Solution: Yes"
-    assert corrected.verification_attempts == 1
+    assert corrected.verification_attempts == 5
     assert corrected.verification_passed is True
     assert corrected.agreement_marker == "agree"
     assert corrected.final_answer == "Yes"
     assert corrected.response_state == "agree"
     assert result.profile["consensus_reached"] is True
-    assert result.profile["verification_retry_count"] == 1
+    assert result.profile["verification_retry_policy"] == "unbounded"
+    assert result.profile["verification_retry_count"] == 5
     assert result.profile["verification_failure_count"] == 0
 
 
-def test_agent_runner_returns_current_solution_when_max_rounds_end_without_consensus() -> None:
+def test_agent_runner_uses_random_tie_break_instead_of_last_draft_when_max_turns_end(monkeypatch) -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=4,
-        max_rounds=4,
+        max_turns=4,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {
@@ -1485,13 +1563,19 @@ def test_agent_runner_returns_current_solution_when_max_rounds_end_without_conse
         return target_agent, meta, False, source_agent, meta
 
     runner._star_offload_to_agent = fake_star_offload
+    monkeypatch.setattr("core.agent_runner.random.choice", lambda winners: "Yes")
     result = runner.run(context="", question="Question?", gold_answers=["Yes"])
 
-    assert calls == ["A", "B", "C", "D"] * 4
-    assert len(result.agent_messages) == 16
-    assert result.prediction == "No"
+    assert calls == ["A", "B", "C", "D"]
+    assert len(result.agent_messages) == 4
+    # The latest draft is No, but a tied final vote must use random tie-breaking
+    # instead of falling back to that latest draft.
+    assert result.agent_messages[-1].solution == "No"
+    assert result.prediction == "Yes"
     assert result.profile["consensus_reached"] is False
-    assert result.profile["consensus_round"] is None
+    assert result.profile["consensus_turn"] is None
+    assert result.profile["final_decision_method"] == "random_tie_break"
+    assert result.profile["final_decision_answer"] == "Yes"
 
 
 
@@ -1659,8 +1743,7 @@ def test_agent_runner_syntax_failure_retries_before_semantic_verifier() -> None:
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        max_rounds=1,
-        verification_max_retries=1,
+        max_turns=2,
         log_agents=False,
     )
     runner._generate_expert_personas = lambda context, question: {

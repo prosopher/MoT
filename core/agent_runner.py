@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import logging
+import random
 import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -110,7 +111,7 @@ class AgentRunnerConfig:
     alg: str
     checkpoint_dir_path: str = ""
     device: str = "auto"
-    max_rounds: int = 7
+    max_turns: int = 7
     generation_max_new_tokens: int = 1024
     generation_temperature: float = 1.0
     max_prompt_tokens: Optional[int] = None
@@ -119,7 +120,6 @@ class AgentRunnerConfig:
     log_max_chars: int = 600
     cache_mode: str = CACHE_MODE_RETAIN
     agent_count: Optional[int] = 3
-    verification_max_retries: int = 3
 
 
 @dataclass
@@ -182,8 +182,9 @@ class VerificationStageCounts:
 
 
 @dataclass
-class AgentRoundRecord:
-    round_index: int
+class AgentTurnRecord:
+    turn_index: int
+    agent_id: str
     agent_votes: Dict[str, str]
     vote_counts: Dict[str, int]
     consensus_reached: bool
@@ -198,7 +199,7 @@ class AgentRunnerResult:
     accuracy: float
     transcript: str
     agent_messages: List[AgentMessageRecord]
-    rounds: List[AgentRoundRecord]
+    turns: List[AgentTurnRecord]
     profile: Dict[str, Any]
     agent_ids: List[str]
     hub_agent_id: str
@@ -600,7 +601,7 @@ MALLM_SUPERMAJORITY_THRESHOLD = 0.66
 # state seen by otherwise-identical persona/response/verification calls. Stream
 # names are part of a stable cryptographic seed derivation below; never use
 # Python's process-randomized hash().
-_GENERATION_SEED_STREAMS = frozenset({"persona", "discussion", "verification"})
+_GENERATION_SEED_STREAMS = frozenset({"persona", "discussion", "verification", "tie_break"})
 
 
 MALLM_EXPERT_PERSONA_SYSTEM_PROMPT = """
@@ -642,7 +643,7 @@ class AgentRunner:
         ctx: Context,
         translator_pool,
         alg: str,
-        max_rounds: int = 7,
+        max_turns: int = 7,
         generation_max_new_tokens: int = 1024,
         generation_temperature: float = 1.0,
         max_prompt_tokens: Optional[int] = None,
@@ -651,7 +652,6 @@ class AgentRunner:
         log_max_chars: int = 600,
         cache_mode: str = CACHE_MODE_RETAIN,
         agent_count: Optional[int] = 3,
-        verification_max_retries: int = 3,
     ) -> None:
         total_nodes = len(ctx.nodes)
         if not _is_homogeneous_model_pool(ctx.nodes):
@@ -674,9 +674,9 @@ class AgentRunner:
         self.ctx = ctx
         self.translator_pool = translator_pool
         self.alg = resolved_alg
-        self.max_rounds = int(max_rounds)
-        if self.max_rounds < 1:
-            raise ValueError(f"max_rounds must be at least 1, got {self.max_rounds}")
+        self.max_turns = int(max_turns)
+        if self.max_turns < 1:
+            raise ValueError(f"max_turns must be at least 1, got {self.max_turns}")
         self.generation_max_new_tokens = int(generation_max_new_tokens)
         self.generation_temperature = float(generation_temperature)
         if self.generation_temperature < 0.0:
@@ -689,11 +689,6 @@ class AgentRunner:
         self.log_max_chars = max(80, int(log_max_chars))
         self.cache_mode = cache_mode
         self.agent_count = resolved_agent_count
-        self.verification_max_retries = int(verification_max_retries)
-        if self.verification_max_retries < 0:
-            raise ValueError(
-                f"verification_max_retries must be >= 0, got {self.verification_max_retries}"
-            )
         self.device = ctx.config.device
         self.cache_translator = KVCacheTranslationAdapter(ctx=ctx, translator_pool=translator_pool, alg=alg)
         self._canonical_model_node_id = ctx.nodes[0].id
@@ -742,9 +737,11 @@ class AgentRunner:
         self.agents = {agent.node_id: agent for agent in self.agent_sequence}
         self.agent_personas: Dict[str, Tuple[str, str]] = {}
         self._consensus_reached = False
-        self._consensus_round: Optional[int] = None
+        self._consensus_turn: Optional[int] = None
         self._consensus_answer: Optional[str] = None
         self._final_agent_votes: Dict[str, str] = {}
+        self._final_decision_method: Optional[str] = None
+        self._final_decision_answer: Optional[str] = None
         self._current_example_seed = self.seed
 
         # Backward-compatible aliases for older two-agent experiments/tests.
@@ -793,7 +790,7 @@ class AgentRunner:
             ctx=ctx,
             translator_pool=translator_pool,
             alg=resolved_alg,
-            max_rounds=config.max_rounds,
+            max_turns=config.max_turns,
             generation_max_new_tokens=config.generation_max_new_tokens,
             generation_temperature=config.generation_temperature,
             max_prompt_tokens=config.max_prompt_tokens,
@@ -802,33 +799,32 @@ class AgentRunner:
             log_max_chars=config.log_max_chars,
             cache_mode=config.cache_mode,
             agent_count=config.agent_count,
-            verification_max_retries=config.verification_max_retries,
         )
 
     def _set_generation_seed(
         self,
         stream: str,
         *,
-        round_index: int = 0,
+        turn_index: int = 0,
         agent_index: int = 0,
         attempt: int = 0,
     ) -> int:
         """Seed one logical generation independently of Agent Count.
 
         The seed is derived only from experiment-invariant coordinates:
-        base/example seed, stream, logical round, Agent offset, and retry index.
+        base/example seed, stream, logical turn, Agent offset, and retry index.
         Agent Count is deliberately absent.  A stable BLAKE2 digest avoids the
-        arithmetic collisions possible with ``round*k + agent*m + attempt`` and
+        arithmetic collisions possible with ``turn*k + agent*m + attempt`` and
         remains identical across Python processes/machines.
         """
         if stream not in _GENERATION_SEED_STREAMS:
             raise ValueError(f"Unknown generation seed stream: {stream!r}")
-        round_index = max(0, int(round_index))
+        turn_index = max(0, int(turn_index))
         agent_index = max(0, int(agent_index))
         attempt = max(0, int(attempt))
         material = (
             f"agent-runner-v2|base={int(self.seed)}|example={int(self._current_example_seed)}|"
-            f"stream={stream}|round={round_index}|agent={agent_index}|attempt={attempt}"
+            f"stream={stream}|turn={turn_index}|agent={agent_index}|attempt={attempt}"
         ).encode("utf-8")
         digest = hashlib.blake2b(material, digest_size=8, person=b"MALLMSeed").digest()
         seed = int.from_bytes(digest, byteorder="big", signed=False) & ((1 << 63) - 1)
@@ -1659,11 +1655,12 @@ class AgentRunner:
         """Return a >66% supermajority over each Agent's latest semantic vote.
 
         MALLM's ``SupermajorityConsensus`` uses a 0.66 threshold. AgentRunner
-        keeps the corrected unique-Agent voting semantics used by this project:
-        every Agent contributes at most one latest verified Yes/No stance and
-        consensus is evaluated only at a completed Round boundary. Per the
-        experiment requirement, the fraction must be *strictly greater* than
-        0.66. Invalid messages abstain (or retain that Agent's previous valid vote).
+        keeps one latest verified Yes/No stance per Agent. Once consensus evaluation
+        is enabled, the fraction is measured against the full configured Agent count
+        and must be *strictly greater* than 0.66. The orchestration layer intentionally
+        defers the first consensus evaluation until every configured Agent has completed
+        at least one verified turn. Only verified messages are committed, because invalid
+        generations are retried until they pass before the Agent's turn can complete.
         """
         valid_votes = {
             agent_id: answer
@@ -1681,22 +1678,72 @@ class AgentRunner:
             return "No"
         return None
 
-    def _evaluate_completed_round(
+    def _all_agents_have_participated(
+        self,
+        agent_votes: Dict[str, str],
+    ) -> bool:
+        """Return True only after every configured Agent has a verified vote."""
+        return all(agent.node_id in agent_votes for agent in self.agent_sequence)
+
+    def _majority_vote_with_random_tie(
+        self,
+        agent_votes: Dict[str, str],
+    ) -> Tuple[str, str]:
+        """Select the final answer after max_turns when no supermajority exists.
+
+        Each Agent contributes its latest verified Yes/No vote. A unique plurality
+        winner is returned as the majority-vote result. If the highest vote count
+        is tied, choose uniformly from the tied answers using the experiment's
+        deterministic seed stream so repeated runs remain reproducible.
+        """
+        valid_votes = [answer for answer in agent_votes.values() if answer in {"Yes", "No"}]
+        if not valid_votes:
+            raise RuntimeError("Cannot select a final answer: no verified agent votes are available")
+
+        vote_counts = {
+            "Yes": sum(answer == "Yes" for answer in valid_votes),
+            "No": sum(answer == "No" for answer in valid_votes),
+        }
+        max_count = max(vote_counts.values())
+        winners = [answer for answer, count in vote_counts.items() if count == max_count]
+        if len(winners) == 1:
+            return winners[0], "majority_vote"
+
+        self._set_generation_seed(
+            "tie_break",
+            turn_index=self.max_turns,
+            agent_index=0,
+            attempt=0,
+        )
+        return random.choice(winners), "random_tie_break"
+
+    def _evaluate_turn_consensus(
         self,
         *,
-        round_index: int,
+        turn_index: int,
+        agent_id: str,
         agent_votes: Dict[str, str],
-        rounds: List[AgentRoundRecord],
+        turns: List[AgentTurnRecord],
     ) -> Optional[str]:
-        """Evaluate Supermajority Consensus exactly once at a completed Round."""
-        consensus_answer = self._supermajority_consensus(agent_votes)
+        """Record a verified Turn and evaluate consensus once all Agents participated.
+
+        The first pass through the Agent sequence is a mandatory participation phase:
+        no consensus decision is attempted until every configured Agent has contributed
+        at least one verified Yes/No vote. Starting with the Turn that completes that
+        first pass, >66% Supermajority Consensus is evaluated after every verified Turn.
+        """
+        consensus_eligible = self._all_agents_have_participated(agent_votes)
+        consensus_answer = (
+            self._supermajority_consensus(agent_votes) if consensus_eligible else None
+        )
         vote_counts = {
             "Yes": sum(answer == "Yes" for answer in agent_votes.values()),
             "No": sum(answer == "No" for answer in agent_votes.values()),
         }
-        rounds.append(
-            AgentRoundRecord(
-                round_index=round_index,
+        turns.append(
+            AgentTurnRecord(
+                turn_index=turn_index,
+                agent_id=agent_id,
                 agent_votes=dict(agent_votes),
                 vote_counts=vote_counts,
                 consensus_reached=consensus_answer is not None,
@@ -1704,14 +1751,16 @@ class AgentRunner:
             )
         )
         self._consensus_reached = consensus_answer is not None
-        self._consensus_round = round_index if consensus_answer is not None else None
+        self._consensus_turn = turn_index if consensus_answer is not None else None
         self._consensus_answer = consensus_answer
         self._final_agent_votes = dict(agent_votes)
         if self.log_agents:
             logging.info(
-                "[AgentRunner][Round %d/%d] consensus | votes=%s | counts=%s | answer=%s",
-                round_index,
-                self.max_rounds,
+                "[AgentRunner][Turn %d/%d][Agent %s] consensus | eligible=%s | votes=%s | counts=%s | answer=%s",
+                turn_index,
+                self.max_turns,
+                agent_id,
+                consensus_eligible,
                 dict(agent_votes),
                 vote_counts,
                 consensus_answer or "none",
@@ -2144,12 +2193,12 @@ class AgentRunner:
         return f"{transcript}{clean_response}\n"
 
     @staticmethod
-    def extract_final_answer(transcript: str, fallback_response: str) -> str:
+    def extract_final_answer(transcript: str, selected_solution: str) -> str:
         del transcript
-        answer = AgentRunner._extract_strategyqa_answer(fallback_response)
+        answer = AgentRunner._extract_strategyqa_answer(selected_solution)
         if answer is not None:
             return answer
-        return postprocess_generated_answer((fallback_response or "").strip())
+        return postprocess_generated_answer((selected_solution or "").strip())
 
     @staticmethod
     def _preview_text(text: str, max_chars: int) -> str:
@@ -2233,8 +2282,8 @@ class AgentRunner:
         )
         logging.info(
             "\n[AgentRunner] ===== Example %s =====\n"
-            "  config   | mode=%s | alg=%s | agents=%s | discussion=memory | response=simple | decision=supermajority_consensus\n"
-            "  order    | %s per round | max_rounds=%s\n"
+            "  config   | mode=%s | alg=%s | agents=%s | discussion=memory | response=simple | decision=supermajority_then_majority_vote\n"
+            "  order    | %s cyclic | max_turns=%s\n"
             "  personas | %s\n"
             "  question | %s\n"
             "  gold     | %s",
@@ -2243,7 +2292,7 @@ class AgentRunner:
             self.alg,
             len(self.agent_sequence),
             agent_order,
-            self.max_rounds,
+            self.max_turns,
             persona_summary,
             self._preview_text(question, self.log_max_chars),
             list(gold_answers)[:3],
@@ -2253,18 +2302,17 @@ class AgentRunner:
         if not self.log_agents:
             return
         label = "?" if example_index is None else str(example_index)
-        agent_count = len(self.agent_sequence)
-        round_number = sequence_index // agent_count + 1
+        turn_number = sequence_index + 1
         logging.info(
-            "[AgentRunner][Example %s][Round %d/%d][Agent %s]\n"
+            "[AgentRunner][Example %s][Turn %d/%d][Agent %s]\n"
             "  route    | mode=%s | agent=%s | hub=%s | translated=%s(%s) | offload=%s(%s)\n"
             "  decision | state=%s | solution=%s\n"
             "  verify   | passed=%s | retries=%d | syntax=%s(%s; failures=%d) | semantic=%s(%s; failures=%d) | marker=%s | final_answer=%s | reason=%s\n"
             "  prompt   | %s\n"
             "  response | %s",
             label,
-            round_number,
-            self.max_rounds,
+            turn_number,
+            self.max_turns,
             record.agent_id,
             record.cache_mode,
             record.agent_id,
@@ -2604,24 +2652,20 @@ class AgentRunner:
         context: str,
         question: str,
     ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts]:
-        """Generate the first proposal with strict syntax -> semantic verification."""
+        """Generate the first proposal until strict syntax and semantics both pass.
+
+        Invalid attempts are rolled back to the exact pre-prompt KV prefix and
+        retried without a retry limit. No invalid response is ever accepted as a
+        fallback merely because a retry budget was exhausted.
+        """
         prompt = initial_prompt
         syntax_failures = 0
         semantic_failures = 0
         previous_response = ""
         reason = "not checked"
-        last_generation: Optional[AgentGeneration] = None
-        last_verification = StrategyQAVerificationResult(
-            passed=False,
-            syntax_passed=False,
-            syntax_reason="not checked",
-            semantic_passed=None,
-            semantic_reason="not run",
-            marker=None,
-            final_answer=None,
-        )
+        attempt = 0
 
-        for attempt in range(self.verification_max_retries + 1):
+        while True:
             if attempt > 0:
                 prompt = self.build_initial_verification_prompt(
                     agent.node_id,
@@ -2632,7 +2676,7 @@ class AgentRunner:
                 )
             self._set_generation_seed(
                 "discussion",
-                round_index=0,
+                turn_index=1,
                 agent_index=0,
                 attempt=attempt,
             )
@@ -2645,7 +2689,7 @@ class AgentRunner:
             if syntax.syntax_passed and syntax.final_answer is not None:
                 self._set_generation_seed(
                     "verification",
-                    round_index=0,
+                    turn_index=1,
                     agent_index=0,
                     attempt=attempt,
                 )
@@ -2688,16 +2732,7 @@ class AgentRunner:
             agent.truncate_kv_cache(generation.tokens_before)
             self._update_peak_memory_breakdown()
             previous_response = generation.text
-            last_generation = generation
-            last_verification = verification
-
-        assert last_generation is not None
-        return (
-            last_generation,
-            last_verification,
-            self.verification_max_retries,
-            VerificationStageCounts(syntax_failures, semantic_failures),
-        )
+            attempt += 1
 
     def _generate_verified_followup(
         self,
@@ -2709,33 +2744,23 @@ class AgentRunner:
         current_solution: str,
         current_answer: Optional[str],
         current_response: Optional[str],
-        round_index: int,
+        turn_index: int,
         agent_index: int,
     ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts]:
-        """Generate a follow-up with strict syntax -> semantic verification.
+        """Generate a follow-up until strict syntax and semantics both pass.
 
         Invalid attempts are rolled back to the exact pre-prompt KV prefix, so they
         never enter shared Memory or Supermajority Consensus. Corrective retries are
-        deterministically seeded by the retry index and therefore preserve
-        Agent-Count scaling invariants for common-prefix Agents.
+        unbounded and deterministically seeded by the retry index.
         """
         prompt = initial_prompt
         syntax_failures = 0
         semantic_failures = 0
         previous_response = ""
         reason = "not checked"
-        last_generation: Optional[AgentGeneration] = None
-        last_verification = StrategyQAVerificationResult(
-            passed=False,
-            syntax_passed=False,
-            syntax_reason="not checked",
-            semantic_passed=None,
-            semantic_reason="not run",
-            marker=None,
-            final_answer=None,
-        )
+        attempt = 0
 
-        for attempt in range(self.verification_max_retries + 1):
+        while True:
             if attempt > 0:
                 prompt = self.build_verification_prompt(
                     agent.node_id,
@@ -2749,7 +2774,7 @@ class AgentRunner:
 
             self._set_generation_seed(
                 "discussion",
-                round_index=round_index,
+                turn_index=turn_index,
                 agent_index=agent_index,
                 attempt=attempt,
             )
@@ -2777,9 +2802,8 @@ class AgentRunner:
                     agent.truncate_kv_cache(generation.tokens_before)
                     self._update_peak_memory_breakdown()
                     previous_response = generation.text
-                    last_generation = generation
-                    last_verification = verification
                     semantic_failures += 1
+                    attempt += 1
                     continue
 
                 # Deterministic semantic contract checks belong to stage 2. They
@@ -2792,7 +2816,7 @@ class AgentRunner:
                 else:
                     self._set_generation_seed(
                         "verification",
-                        round_index=round_index,
+                        turn_index=turn_index,
                         agent_index=agent_index,
                         attempt=attempt,
                     )
@@ -2839,24 +2863,15 @@ class AgentRunner:
             agent.truncate_kv_cache(generation.tokens_before)
             self._update_peak_memory_breakdown()
             previous_response = generation.text
-            last_generation = generation
-            last_verification = verification
+            attempt += 1
 
-        assert last_generation is not None
-        return (
-            last_generation,
-            last_verification,
-            self.verification_max_retries,
-            VerificationStageCounts(syntax_failures, semantic_failures),
-        )
-
-    def _run_offload_rounds(
+    def _run_offload_turns(
         self,
         *,
         transcript: str,
         initial_generation: AgentGeneration,
         agent_messages: List[AgentMessageRecord],
-        rounds: List[AgentRoundRecord],
+        turns: List[AgentTurnRecord],
         context: str,
         question: str,
         example_index: Optional[int],
@@ -2873,30 +2888,25 @@ class AgentRunner:
         agent_messages[0].solution = current_solution
         agent_messages[0].response_state = "draft"
 
-        # One latest semantic vote per Agent.  Consensus is intentionally *not*
-        # evaluated here: a Round is complete only after every configured Agent
-        # has had one agent message opportunity.
-        agent_votes: Dict[str, str] = {}
-        if current_answer in {"Yes", "No"}:
-            agent_votes[self.hub_agent.node_id] = current_answer
+        # Each Agent contributes at most one latest verified semantic vote. The
+        # initial proposal is Turn 1. The first pass through all configured Agents is
+        # mandatory: consensus is not evaluated until every Agent has completed one
+        # verified Turn. From that point onward, it is evaluated after every Turn.
+        agent_votes: Dict[str, str] = {self.hub_agent.node_id: current_answer}
         self._consensus_reached = False
-        self._consensus_round = None
+        self._consensus_turn = None
         self._consensus_answer = None
         self._final_agent_votes = dict(agent_votes)
+        self._evaluate_turn_consensus(
+            turn_index=1,
+            agent_id=self.hub_agent.node_id,
+            agent_votes=agent_votes,
+            turns=turns,
+        )
 
         agent_count = len(self.agent_sequence)
-        max_agent_messages = self.max_rounds * agent_count
-
-        # A single-Agent run completes Round 1 with the initial proposal itself.
-        if agent_count == 1:
-            self._evaluate_completed_round(
-                round_index=1,
-                agent_votes=agent_votes,
-                rounds=rounds,
-            )
-
         sequence_index = 1
-        while sequence_index < max_agent_messages and not self._consensus_reached:
+        while sequence_index < self.max_turns and not self._consensus_reached:
             current_source = self._agent_at_sequence(sequence_index - 1)
             current_target = self._agent_at_sequence(sequence_index)
             source_record = agent_messages[-1]
@@ -2939,7 +2949,7 @@ class AgentRunner:
                 context=context,
                 current_solution=current_solution,
             )
-            round_index = sequence_index // agent_count
+            turn_index = sequence_index + 1
             agent_index = sequence_index % agent_count
             generation, verification, verification_attempts, verification_stage_counts = self._generate_verified_followup(
                 agent=current_target,
@@ -2949,7 +2959,7 @@ class AgentRunner:
                 current_solution=current_solution,
                 current_answer=current_answer,
                 current_response=current_response,
-                round_index=round_index,
+                turn_index=turn_index,
                 agent_index=agent_index,
             )
 
@@ -2971,67 +2981,52 @@ class AgentRunner:
             record.agreement_marker = verification.marker
             record.final_answer = verification.final_answer
 
-            if verification.passed:
-                memory_tokens_after = self._commit_discussion_memory(
-                    agent=current_target,
-                    generation=generation,
-                    persona=self.agent_personas[current_target.node_id],
-                    context=context,
-                    question=question,
+            if not verification.passed:
+                raise RuntimeError(
+                    f"Internal error: unbounded verification returned an invalid response for agent {current_target.node_id}"
                 )
-                self._update_peak_memory_breakdown()
-                transcript = self._append_agent_message_to_transcript(
-                    transcript + generation.prompt_text,
-                    current_target.node_id,
-                    generation.text,
-                )
-                previous_solution = current_solution
-                previous_answer = current_answer
-                if verification.marker == "agree":
-                    current_solution = previous_solution
-                    current_answer = previous_answer
-                    response_state = "agree"
-                else:
-                    current_solution = str(verification.final_answer)
-                    current_answer = verification.final_answer
-                    response_state = "revise"
-                current_response = generation.text
-                record.memory_tokens_after = memory_tokens_after
-                record.solution = current_solution
-                record.response_state = response_state
 
-                if current_answer in {"Yes", "No"}:
-                    agent_votes[current_target.node_id] = current_answer
+            memory_tokens_after = self._commit_discussion_memory(
+                agent=current_target,
+                generation=generation,
+                persona=self.agent_personas[current_target.node_id],
+                context=context,
+                question=question,
+            )
+            self._update_peak_memory_breakdown()
+            transcript = self._append_agent_message_to_transcript(
+                transcript + generation.prompt_text,
+                current_target.node_id,
+                generation.text,
+            )
+            previous_solution = current_solution
+            previous_answer = current_answer
+            if verification.marker == "agree":
+                current_solution = previous_solution
+                current_answer = previous_answer
+                response_state = "agree"
             else:
-                # Reject an inconsistent agent message without mutating shared
-                # Memory, the current draft, or that Agent's last valid vote.
-                record.tokens_after = current_target.cache_seq_len
-                record.memory_tokens_after = current_target.cache_seq_len
-                record.solution = current_solution
-                record.response_state = "invalid"
-                logging.warning(
-                    "Agent %s response rejected after %d verification retries: %s",
-                    current_target.node_id,
-                    self.verification_max_retries,
-                    verification.reason,
-                )
+                current_solution = str(verification.final_answer)
+                current_answer = verification.final_answer
+                response_state = "revise"
+            current_response = generation.text
+            record.memory_tokens_after = memory_tokens_after
+            record.solution = current_solution
+            record.response_state = response_state
+
+            if current_answer in {"Yes", "No"}:
+                agent_votes[current_target.node_id] = current_answer
 
             agent_messages.append(record)
-
-            # A Round is exactly one ordered agent message from every Agent.
-            # Evaluate Supermajority Consensus once, and only once, at this boundary.
-            completed_round = (sequence_index + 1) % agent_count == 0
-            if completed_round:
-                round_number = sequence_index // agent_count + 1
-                self._evaluate_completed_round(
-                    round_index=round_number,
-                    agent_votes=agent_votes,
-                    rounds=rounds,
-                )
-
+            self._evaluate_turn_consensus(
+                turn_index=turn_index,
+                agent_id=current_target.node_id,
+                agent_votes=agent_votes,
+                turns=turns,
+            )
             sequence_index += 1
 
-            if not self._consensus_reached and sequence_index < max_agent_messages:
+            if not self._consensus_reached and sequence_index < self.max_turns:
                 next_target = self._agent_at_sequence(sequence_index)
                 if current_target.node_id != next_target.node_id:
                     self._prepare_outgoing_route_translation(
@@ -3051,48 +3046,59 @@ class AgentRunner:
             record=agent_messages[-1],
         )
 
-        # When a Round ends in a supermajority, return that consensus answer.
-        # If max_rounds expires without consensus, preserve the latest draft.
-        final_solution = self._consensus_answer if self._consensus_reached else current_solution
-        return transcript, str(final_solution or current_solution).strip()
+        # After every Agent has participated once, a >66% supermajority wins
+        # immediately after any subsequent completed Turn (including the Turn that
+        # completes first participation). If max_turns expires without one, select
+        # from the Agents' latest verified votes by
+        # majority; only an exact tie is resolved randomly. There is no response
+        # fallback path.
+        if self._consensus_reached:
+            final_solution = self._consensus_answer
+            self._final_decision_method = "supermajority_consensus"
+        else:
+            final_solution, self._final_decision_method = self._majority_vote_with_random_tie(
+                agent_votes
+            )
+        self._final_decision_answer = final_solution
+        return transcript, str(final_solution).strip()
 
-    def _run_retain_rounds(
+    def _run_retain_turns(
         self,
         *,
         transcript: str,
         initial_generation: AgentGeneration,
         agent_messages: List[AgentMessageRecord],
-        rounds: List[AgentRoundRecord],
+        turns: List[AgentTurnRecord],
         context: str,
         question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
-        return self._run_offload_rounds(
+        return self._run_offload_turns(
             transcript=transcript,
             initial_generation=initial_generation,
             agent_messages=agent_messages,
-            rounds=rounds,
+            turns=turns,
             context=context,
             question=question,
             example_index=example_index,
         )
 
-    def _run_free_rounds(
+    def _run_free_turns(
         self,
         *,
         transcript: str,
         initial_generation: AgentGeneration,
         agent_messages: List[AgentMessageRecord],
-        rounds: List[AgentRoundRecord],
+        turns: List[AgentTurnRecord],
         context: str,
         question: str,
         example_index: Optional[int],
     ) -> Tuple[str, str]:
-        return self._run_offload_rounds(
+        return self._run_offload_turns(
             transcript=transcript,
             initial_generation=initial_generation,
             agent_messages=agent_messages,
-            rounds=rounds,
+            turns=turns,
             context=context,
             question=question,
             example_index=example_index,
@@ -3113,9 +3119,11 @@ class AgentRunner:
         self._peak_cache_token_copies = 0
         self._peak_cache_residency = {}
         self._consensus_reached = False
-        self._consensus_round = None
+        self._consensus_turn = None
         self._consensus_answer = None
         self._final_agent_votes = {}
+        self._final_decision_method = None
+        self._final_decision_answer = None
         for agent in self.agent_sequence:
             agent.reset()
         self._pending_pretranslated_second_hops.clear()
@@ -3133,7 +3141,7 @@ class AgentRunner:
             agent_count=len(self.agent_sequence),
         )
         agent_messages: List[AgentMessageRecord] = []
-        rounds: List[AgentRoundRecord] = []
+        turns: List[AgentTurnRecord] = []
 
         # The first node is the HubAgent and starts from native Base Context + Prompt.
         # Its sampling stream must not depend on how many persona generations ran.
@@ -3151,13 +3159,7 @@ class AgentRunner:
             question=question,
         )
         if not initial_verification.passed:
-            # There is no prior valid solution to fall back to for the first
-            # proposal. Never commit a syntactically/semantically invalid draft to
-            # shared Memory just because the retry budget was exhausted.
-            raise RuntimeError(
-                "Initial proposal failed verification after "
-                f"{self.verification_max_retries} retries: {initial_verification.reason}"
-            )
+            raise RuntimeError("Internal error: unbounded initial verification returned an invalid response")
         initial_memory_tokens = self._commit_discussion_memory(
             agent=self.hub_agent,
             generation=generation,
@@ -3165,7 +3167,7 @@ class AgentRunner:
             context=context,
             question=question,
         )
-        if self.max_rounds * len(self.agent_sequence) > 1:
+        if self.max_turns > 1:
             next_target = self._agent_at_sequence(1)
             if self.hub_agent.node_id != next_target.node_id:
                 self._prepare_outgoing_route_translation(
@@ -3187,35 +3189,35 @@ class AgentRunner:
         record.verification_semantic_reason = initial_verification.semantic_reason
         record.agreement_marker = initial_verification.marker
         record.final_answer = initial_verification.final_answer
-        # The final closed-set solution is filled by _run_offload_rounds and is also
+        # The final closed-set solution is filled by _run_offload_turns and is also
         # used as the discussion's current draft.
         record.solution = None
         record.response_state = "draft"
         agent_messages.append(record)
 
-        last_response = generation.text
+        selected_solution = generation.text
         if self.cache_mode == CACHE_MODE_FREE:
-            transcript, last_response = self._run_free_rounds(
+            transcript, selected_solution = self._run_free_turns(
                 transcript=transcript,
                 initial_generation=generation,
                 agent_messages=agent_messages,
-                rounds=rounds,
+                turns=turns,
                 context=context,
                 question=question,
                 example_index=example_index,
             )
         else:
-            transcript, last_response = self._run_retain_rounds(
+            transcript, selected_solution = self._run_retain_turns(
                 transcript=transcript,
                 initial_generation=generation,
                 agent_messages=agent_messages,
-                rounds=rounds,
+                turns=turns,
                 context=context,
                 question=question,
                 example_index=example_index,
             )
 
-        prediction = self.extract_final_answer(transcript, last_response)
+        prediction = self.extract_final_answer(transcript, selected_solution)
         normalized_prediction = prediction.strip().lower()
         normalized_gold = {str(answer).strip().lower() for answer in gold_answers}
         accuracy = float(normalized_prediction in normalized_gold)
@@ -3227,7 +3229,7 @@ class AgentRunner:
             accuracy=accuracy,
             transcript=transcript,
             agent_messages=agent_messages,
-            rounds=rounds,
+            turns=turns,
             profile={},
             agent_ids=list(self.node_ids),
             hub_agent_id=self.hub_agent.node_id,
@@ -3296,29 +3298,33 @@ class AgentRunner:
             "latency_sec": float(latency_sec),
             "tokens": len(result.agent_messages) * max(1, self.generation_max_new_tokens),
             "num_agent_messages": len(result.agent_messages),
-            "completed_rounds": len(result.rounds),
-            "requested_max_rounds": self.max_rounds,
+            "completed_turns": len(result.turns),
+            "requested_max_turns": self.max_turns,
             "persona_generator": "expert",
             "response_generator": "simple",
             "discussion_paradigm": "memory",
-            "decision_protocol": "supermajority_consensus",
+            "decision_protocol": "turn_supermajority_then_majority_vote",
+            "consensus_requires_full_initial_participation": True,
             "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
             "supermajority_comparison": ">",
-            "verification_max_retries": self.verification_max_retries,
+            "verification_retry_policy": "unbounded",
             "verification_retry_count": sum(message.verification_attempts for message in result.agent_messages),
             "verification_failure_count": sum(1 for message in result.agent_messages if message.verification_passed is False),
             "consensus_reached": self._consensus_reached,
-            "consensus_round": self._consensus_round,
+            "consensus_turn": self._consensus_turn,
             "consensus_answer": self._consensus_answer,
-            "rounds": [
+            "final_decision_method": self._final_decision_method,
+            "final_decision_answer": self._final_decision_answer,
+            "turns": [
                 {
-                    "round_index": record.round_index,
+                    "turn_index": record.turn_index,
+                    "agent_id": record.agent_id,
                     "agent_votes": dict(record.agent_votes),
                     "vote_counts": dict(record.vote_counts),
                     "consensus_reached": record.consensus_reached,
                     "consensus_answer": record.consensus_answer,
                 }
-                for record in result.rounds
+                for record in result.turns
             ],
             "final_agent_votes": dict(self._final_agent_votes),
             "final_vote_counts": {
@@ -3342,6 +3348,6 @@ __all__ = [
     "AgentRunnerConfig",
     "AgentRunnerResult",
     "AgentMessageRecord",
-    "AgentRoundRecord",
+    "AgentTurnRecord",
     "KVCacheTranslationAdapter",
 ]

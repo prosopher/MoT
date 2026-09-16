@@ -80,13 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-eval-stream", nargs="?", const=True, default=False, type=_str_to_bool)
     parser.add_argument(
-        "--max-rounds",
-        dest="max_rounds",
+        "--max-turns",
+        dest="max_turns",
         type=int,
         default=7,
         help=(
-            "Maximum number of discussion rounds. Each round lets every Agent participate once in order; "
-            "Supermajority Consensus (>66%) is evaluated only after the full round completes."
+            "Maximum number of Agent turns. One verified Agent response is one turn; "
+            "the first pass requires every Agent to participate once before consensus "
+            "evaluation starts, then Supermajority Consensus (>66%) is evaluated after every turn."
         ),
     )
     parser.add_argument(
@@ -95,19 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help=(
             "Number of logical Agents in the discussion. MALLM experiments use 3 agents by default; "
-            "this remains independent of --max-rounds."
+            "this remains independent of --max-turns."
         ),
     )
     parser.add_argument("--generation-max-new-tokens", type=int, default=1024)
-    parser.add_argument(
-        "--verification-max-retries",
-        type=int,
-        default=3,
-        help=(
-            "Corrective retries for StrategyQA follow-ups whose [AGREE]/[DISAGREE] marker, "
-            "explicit Yes/No answer, and extracted solution are logically inconsistent."
-        ),
-    )
     parser.add_argument(
         "--generation-temperature",
         type=float,
@@ -150,12 +142,18 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
             agent_id: {"role": persona[0], "description": persona[1]}
             for agent_id, persona in result.personas.items()
         },
-        "decision_protocol": "supermajority_consensus",
+        "decision_protocol": "turn_supermajority_then_majority_vote",
+        "consensus_requires_full_initial_participation": result.profile.get(
+            "consensus_requires_full_initial_participation", True
+        ),
         "supermajority_threshold": result.profile.get("supermajority_threshold", MALLM_SUPERMAJORITY_THRESHOLD),
         "supermajority_comparison": result.profile.get("supermajority_comparison", ">"),
         "consensus_reached": result.profile.get("consensus_reached"),
-        "consensus_round": result.profile.get("consensus_round"),
-        "rounds": [asdict(round_record) for round_record in result.rounds],
+        "consensus_turn": result.profile.get("consensus_turn"),
+        "final_decision_method": result.profile.get("final_decision_method"),
+        "final_decision_answer": result.profile.get("final_decision_answer"),
+        "turns": [asdict(turn_record) for turn_record in result.turns],
+        "verification_retry_policy": result.profile.get("verification_retry_policy", "unbounded"),
         "verification_retry_count": result.profile.get("verification_retry_count", 0),
         "verification_failure_count": result.profile.get("verification_failure_count", 0),
         "cache_mode": result.cache_mode,
@@ -216,7 +214,7 @@ def main() -> None:
             alg=args.alg,
             checkpoint_dir_path=args.checkpoint_dir_path,
             device=args.device,
-            max_rounds=args.max_rounds,
+            max_turns=args.max_turns,
             generation_max_new_tokens=args.generation_max_new_tokens,
             generation_temperature=args.generation_temperature,
             max_prompt_tokens=args.max_prompt_tokens,
@@ -225,7 +223,6 @@ def main() -> None:
             log_agents=bool(args.log_agents),
             log_max_chars=args.log_max_chars,
             cache_mode=args.cache_mode,
-            verification_max_retries=args.verification_max_retries,
         )
     )
 
@@ -293,11 +290,12 @@ def main() -> None:
         "hub_agent_id": runner.hub_agent.node_id,
         "persona_generator": "expert",
         "response_generator": "simple",
-        "decision_protocol": "supermajority_consensus",
+        "decision_protocol": "turn_supermajority_then_majority_vote",
+        "consensus_requires_full_initial_participation": True,
         "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
         "supermajority_comparison": ">",
         "verification": {
-            "max_retries": args.verification_max_retries,
+            "retry_policy": "unbounded",
             "retry_count": sum(int(row.get("verification_retry_count", 0) or 0) for row in rows),
             "failure_count": sum(int(row.get("verification_failure_count", 0) or 0) for row in rows),
         },
