@@ -1687,36 +1687,7 @@ def _fake_past(seq_len: int):
     return ((key, value),)
 
 
-def test_cache_residency_snapshot_counts_live_cache_copies() -> None:
-    ctx = _ctx("tiny-a,tiny-a")
-    runner = AgentRunner(
-        ctx=ctx,
-        translator_pool=ctx.tp,
-        alg="mot",
-        agent_count=4,
-        log_agents=False,
-    )
-    runner.agents["A"].past_key_values = _fake_past(10)
-    runner.agents["B"].past_key_values = _fake_past(20)
-    runner.agents["B"].pretranslated_past_by_edge["B_to_A"] = _fake_past(20)
-    runner._pending_pretranslated_second_hops[("B", "C")] = (
-        "A_to_B",
-        _fake_past(30),
-        list(range(30)),
-    )
-
-    snapshot = runner._cache_residency_snapshot()
-
-    assert snapshot["resident_cache_count"] == 2
-    assert snapshot["resident_tokens"] == 30
-    assert snapshot["pretranslated_cache_count"] == 1
-    assert snapshot["pretranslated_tokens"] == 20
-    assert snapshot["pending_second_hop_count"] == 1
-    assert snapshot["pending_second_hop_tokens"] == 30
-    assert snapshot["total_cache_token_copies"] == 80
-
-
-def test_peak_cache_residency_is_tracked_without_cuda() -> None:
+def test_live_kv_cache_bytes_and_peak_track_actual_cache_storage() -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
@@ -1727,13 +1698,14 @@ def test_peak_cache_residency_is_tracked_without_cuda() -> None:
     )
     runner.agents["A"].past_key_values = _fake_past(12)
     runner._update_peak_memory_breakdown()
-    assert runner._peak_cache_residency["total_cache_token_copies"] == 12
+    assert runner._live_kv_cache_bytes() == 12 * 8
+    assert runner._peak_kv_cache_bytes == 12 * 8
 
     runner.agents["B"].past_key_values = _fake_past(16)
     runner.agents["A"].pretranslated_past_by_edge["A_to_B"] = _fake_past(12)
     runner._update_peak_memory_breakdown()
-    assert runner._peak_cache_residency["resident_cache_count"] == 2
-    assert runner._peak_cache_residency["total_cache_token_copies"] == 40
+    assert runner._live_kv_cache_bytes() == 40 * 8
+    assert runner._peak_kv_cache_bytes == 40 * 8
 
 
 def test_agent_runner_syntax_failure_retries_before_semantic_verifier() -> None:

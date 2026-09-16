@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 import importlib
 import time
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 import numpy as np
 
@@ -103,17 +103,82 @@ def _cuda_storage_bytes(
     return total
 
 
+def _iter_nested_tensors(value: Any, *, seen_objects: Optional[set] = None):
+    """Yield tensors from nested KV/cache containers without walking arbitrary objects.
+
+    Supports tuple/list/dict past_key_values as well as Transformers-style cache
+    objects exposing ``key_cache`` and ``value_cache``. Object identities are
+    deduplicated to avoid cycles; tensor storage deduplication happens separately.
+    """
+    if value is None:
+        return
+    if isinstance(value, torch.Tensor):
+        yield value
+        return
+
+    seen = seen_objects if seen_objects is not None else set()
+    object_id = id(value)
+    if object_id in seen:
+        return
+    seen.add(object_id)
+
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_nested_tensors(nested, seen_objects=seen)
+        return
+    if isinstance(value, (tuple, list, set)):
+        for nested in value:
+            yield from _iter_nested_tensors(nested, seen_objects=seen)
+        return
+
+    found_cache_attr = False
+    for attr_name in ("key_cache", "value_cache"):
+        if hasattr(value, attr_name):
+            found_cache_attr = True
+            yield from _iter_nested_tensors(getattr(value, attr_name), seen_objects=seen)
+    if found_cache_attr:
+        return
+
+
+def _cuda_nested_storage_bytes(
+    objects: Iterable[Any],
+    *,
+    device_index: int,
+    seen_storage_keys: Optional[set] = None,
+) -> int:
+    seen = seen_storage_keys if seen_storage_keys is not None else set()
+    seen_objects: set = set()
+    total = 0
+    for obj in objects:
+        for tensor in _iter_nested_tensors(obj, seen_objects=seen_objects):
+            if tensor.device.type != "cuda":
+                continue
+            tensor_device_index = torch.cuda.current_device() if tensor.device.index is None else tensor.device.index
+            if tensor_device_index != device_index:
+                continue
+            storage = tensor.untyped_storage()
+            key = (tensor_device_index, storage.data_ptr())
+            if key in seen:
+                continue
+            seen.add(key)
+            total += int(storage.nbytes())
+    return total
+
+
 def measure_gpu_memory_breakdown_bytes(
     device: str,
     *,
     models: Iterable[Any],
     translator_pool: Optional[Any],
+    kv_objects: Optional[Iterable[Any]] = None,
 ) -> Optional[GPUMemoryBreakdownBytes]:
-    """Partition current CUDA allocated memory into model, translator, and KV bytes.
+    """Measure persistent CUDA storage for model, translator, and KV/cache state.
 
-    Model and translator memory are measured from their unique CUDA tensor storages.
-    The remaining live CUDA allocation is attributed to KV/cache state. Callers sample
-    this only at stable points where temporary forward tensors have been released.
+    Unlike the old implementation, KV bytes are *not* inferred as
+    ``memory_allocated - model - translator``. That residual also contains unrelated
+    persistent tensors and can be dominated by allocator/forward artifacts. KV/cache
+    bytes are measured directly from the supplied cache objects and deduplicated by
+    underlying CUDA storage, matching the AgentRunner memory metric.
     """
     if not (torch.cuda.is_available() and str(device).startswith("cuda")):
         return None
@@ -133,8 +198,11 @@ def measure_gpu_memory_breakdown_bytes(
         device_index=device_index,
         seen_storage_keys=seen_storages,
     )
-    allocated_bytes = int(torch.cuda.memory_allocated(device_index))
-    kv_bytes = max(0, allocated_bytes - model_bytes - translator_bytes)
+    kv_bytes = _cuda_nested_storage_bytes(
+        list(kv_objects or ()),
+        device_index=device_index,
+        seen_storage_keys=seen_storages,
+    )
     return GPUMemoryBreakdownBytes(
         model_bytes=model_bytes,
         translator_bytes=translator_bytes,
@@ -188,23 +256,12 @@ class InferenceProfileAccumulator:
         def to_gib(value: Optional[int]) -> float:
             return float("nan") if value is None else float(value) / (1024 ** 3)
 
-        model_memory_gib = to_gib(self.model_memory_bytes)
-        translator_memory_gib = to_gib(self.translator_memory_bytes)
-        kv_memory_gib = to_gib(self.kv_memory_bytes)
-        component_values = [self.model_memory_bytes, self.translator_memory_bytes, self.kv_memory_bytes]
-        peak_memory_gib = (
-            float("nan")
-            if any(value is None for value in component_values)
-            else sum(int(value) for value in component_values if value is not None) / (1024 ** 3)
-        )
-
         return {
             "avg_latency_ms": avg_latency_ms,
             "throughput_tokens_per_sec": throughput_tokens_per_sec,
-            "model_memory_gib": model_memory_gib,
-            "translator_memory_gib": translator_memory_gib,
-            "kv_memory_gib": kv_memory_gib,
-            "peak_memory_gib": peak_memory_gib,
+            "model_memory_gib": to_gib(self.model_memory_bytes),
+            "translator_memory_gib": to_gib(self.translator_memory_bytes),
+            "kv_memory_gib": to_gib(self.kv_memory_bytes),
         }
 
 
@@ -252,6 +309,7 @@ class InferenceProfiler:
         fn: Callable[[], T],
         *,
         tokens: int,
+        kv_objects_getter: Optional[Callable[[T], Iterable[Any]]] = None,
     ) -> Tuple[T, Dict[str, Optional[float]]]:
         if self.enabled:
             torch.cuda.synchronize(self.device_index)
@@ -262,10 +320,12 @@ class InferenceProfiler:
             torch.cuda.synchronize(self.device_index)
         latency_sec = time.perf_counter() - started_at
 
+        kv_objects = () if kv_objects_getter is None else tuple(kv_objects_getter(result))
         measured = measure_gpu_memory_breakdown_bytes(
             self.device,
             models=self.models,
             translator_pool=self.translator_pool,
+            kv_objects=kv_objects,
         )
         return result, {
             "latency_sec": float(latency_sec),
@@ -978,7 +1038,6 @@ def summarize_openwebtext_named_losses(
         summary[f"{field_prefix}model_memory_gib"] = float(profile_summary.get("model_memory_gib", float("nan")))
         summary[f"{field_prefix}translator_memory_gib"] = float(profile_summary.get("translator_memory_gib", float("nan")))
         summary[f"{field_prefix}kv_memory_gib"] = float(profile_summary.get("kv_memory_gib", float("nan")))
-        summary[f"{field_prefix}peak_memory_gib"] = float(profile_summary.get("peak_memory_gib", float("nan")))
 
     if loss_delta_reference_name is not None:
         if loss_delta_reference_name == primary_name:
@@ -1243,12 +1302,14 @@ def evaluate_openwebtext_validation_loss_top_layers(
         translated_result, translated_profile = profiler.measure(
             run_translated_inference,
             tokens=profile_tokens,
+            kv_objects_getter=lambda result: (result[1],),
         )
         del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
             native_result, native_profile = profiler.measure(
                 run_native_inference,
                 tokens=profile_tokens,
+                kv_objects_getter=lambda result: (result[1],),
             )
             del native_result
         return (
@@ -1359,12 +1420,14 @@ def evaluate_openwebtext_validation_loss_replay(
         translated_result, translated_profile = profiler.measure(
             run_translated_inference,
             tokens=profile_tokens,
+            kv_objects_getter=lambda result: (result[1],),
         )
         del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
             native_result, native_profile = profiler.measure(
                 run_native_inference,
                 tokens=profile_tokens,
+                kv_objects_getter=lambda result: (result[1],),
             )
             del native_result
         return (
@@ -3363,15 +3426,18 @@ def build_openwebtext_profile_fields(row: Dict[str, float], *, prefix: str = "")
     throughput_value = row.get(f"{field_prefix}throughput_tokens_per_sec", float("nan"))
     throughput_text = _format_summary_throughput(throughput_value)
 
-    total_text = _format_summary_float(row.get(f"{field_prefix}peak_memory_gib", float("nan")))
     model_text = _format_summary_float(row.get(f"{field_prefix}model_memory_gib", float("nan")))
     translator_text = _format_summary_float(row.get(f"{field_prefix}translator_memory_gib", float("nan")))
     kv_text = _format_summary_float(row.get(f"{field_prefix}kv_memory_gib", float("nan")))
-    if total_text == "N/A":
-        peak_text = "N/A"
+    if "N/A" in {model_text, translator_text, kv_text}:
+        memory_text = "N/A"
     else:
-        peak_text = f"{total_text} GiB (M {model_text} / T {translator_text} / KV {kv_text})"
-    return latency_text, throughput_text, peak_text
+        total = sum(float(value) for value in (model_text, translator_text, kv_text))
+        memory_text = (
+            f"{total:.6f} GiB total "
+            f"(M {model_text} / T {translator_text} / KV {kv_text})"
+        )
+    return latency_text, throughput_text, memory_text
 
 def build_openwebtext_profile_cell(row: Dict[str, float], *, prefix: str = "") -> str:
     latency_text, throughput_text, peak_text = build_openwebtext_profile_fields(row, prefix=prefix)
@@ -3451,7 +3517,7 @@ def build_edge_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc | SQuAD | NewsQA | F1 | Loss | Latency | Throughput | GPU Peak Memory |",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU-Redux | Acc | SQuAD | NewsQA | F1 | Loss | Latency | Throughput | GPU Memory |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (Native) | N/A | "

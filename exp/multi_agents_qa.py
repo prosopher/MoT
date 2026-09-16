@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 from pathlib import Path
+import statistics
 import sys
 from typing import Any, Dict, List
 
@@ -134,7 +135,6 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
             "translator_gib": result.profile.get("translator_memory_gib"),
             "kv_gib": result.profile.get("kv_memory_gib"),
         },
-        "peak_cache_residency": result.profile.get("peak_cache_residency", {}),
         "latency_sec": result.profile.get("latency_sec"),
         "agent_ids": result.agent_ids,
         "hub_agent_id": result.hub_agent_id,
@@ -234,18 +234,32 @@ def main() -> None:
 
     rows: List[Dict[str, Any]] = []
     total_accuracy = 0.0
-    peak_memory_gib = {"model_gib": None, "translator_gib": None, "kv_gib": None}
-    peak_cache_residency: Dict[str, Any] = {}
+    memory_gib = {"model_gib": None, "translator_gib": None, "kv_gib": None}
+    kv_cache_samples_gib: List[float] = []
 
     selected_count = len(selected_examples)
     for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
-        result = runner.run(
-            context="",
-            question=example.input_text,
-            gold_answers=example.answers,
-            example_index=example_index,
-        )
+        try:
+            result = runner.run(
+                context="",
+                question=example.input_text,
+                gold_answers=example.answers,
+                example_index=example_index,
+            )
+        except torch.cuda.OutOfMemoryError as error:
+            oom_diagnostics: Dict[str, Any] = {
+                "cache_mode": args.cache_mode,
+                "agent_count": effective_agent_count,
+                "example_index": example_index,
+                "completed_examples": len(rows),
+                "error": str(error),
+            }
+            write_json(str(output_path / "oom_diagnostics.json"), oom_diagnostics)
+            raise
         total_accuracy += float(result.accuracy)
+        kv_cache_samples_gib.extend(
+            float(value) for value in result.profile.get("kv_cache_memory_samples_gib", [])
+        )
         for component_key, profile_key in (
             ("model_gib", "model_memory_gib"),
             ("translator_gib", "translator_memory_gib"),
@@ -254,15 +268,10 @@ def main() -> None:
             current_peak = result.profile.get(profile_key)
             if current_peak is None:
                 continue
-            previous_peak = peak_memory_gib[component_key]
-            peak_memory_gib[component_key] = (
+            previous_peak = memory_gib[component_key]
+            memory_gib[component_key] = (
                 float(current_peak) if previous_peak is None else max(float(previous_peak), float(current_peak))
             )
-        current_residency = result.profile.get("peak_cache_residency") or {}
-        if int(current_residency.get("total_cache_token_copies", 0) or 0) > int(
-            peak_cache_residency.get("total_cache_token_copies", 0) or 0
-        ):
-            peak_cache_residency = dict(current_residency)
         rows.append(_example_row(result, example, example_index=example_index))
         print(
             f"[{local_idx}/{selected_count} | example={example_index}] "
@@ -272,13 +281,8 @@ def main() -> None:
 
     count = len(rows)
     accuracy = total_accuracy / count if count else float("nan")
-    peak_memory_total_gib = (
-        float("nan")
-        if any(value is None for value in peak_memory_gib.values())
-        else sum(float(value) for value in peak_memory_gib.values() if value is not None)
-    )
-    peak_memory_for_log = {
-        key: float("nan") if value is None else float(value) for key, value in peak_memory_gib.items()
+    memory_for_log = {
+        key: float("nan") if value is None else float(value) for key, value in memory_gib.items()
     }
     metrics = {
         "algorithm": args.alg,
@@ -314,12 +318,18 @@ def main() -> None:
         },
         "count": count,
         "accuracy": accuracy,
-        "gpu_peak_memory_gib": {
-            "model_gib": peak_memory_gib["model_gib"],
-            "translator_gib": peak_memory_gib["translator_gib"],
-            "kv_gib": peak_memory_gib["kv_gib"],
+        "gpu_memory_gib": {
+            "model_gib": memory_gib["model_gib"],
+            "translator_gib": memory_gib["translator_gib"],
+            "kv_gib": memory_gib["kv_gib"],
         },
-        "peak_cache_residency": peak_cache_residency,
+        "kv_cache_memory_stats_gib": {
+            "sampling_basis": "stable_points_across_all_examples",
+            "sample_count": len(kv_cache_samples_gib),
+            "peak": max(kv_cache_samples_gib) if kv_cache_samples_gib else None,
+            "mean": statistics.mean(kv_cache_samples_gib) if kv_cache_samples_gib else None,
+            "median": statistics.median(kv_cache_samples_gib) if kv_cache_samples_gib else None,
+        },
         "examples": rows,
         "args": vars(args),
     }
@@ -329,11 +339,17 @@ def main() -> None:
     print("===== AgentRunner StrategyQA memory =====")
     print(f"Accuracy: {accuracy:.4f}")
     print(
-        "GPU Peak Memory: "
-        f"total={peak_memory_total_gib:.3f} GiB | "
-        f"model={peak_memory_for_log['model_gib']:.3f} GiB | "
-        f"translator={peak_memory_for_log['translator_gib']:.3f} GiB | "
-        f"kv={peak_memory_for_log['kv_gib']:.3f} GiB"
+        "GPU Memory: "
+        f"model={memory_for_log['model_gib']:.3f} GiB | "
+        f"translator={memory_for_log['translator_gib']:.3f} GiB | "
+        f"kv_cache={memory_for_log['kv_gib']:.3f} GiB"
+    )
+    kv_stats = metrics["kv_cache_memory_stats_gib"]
+    print(
+        "KV Cache Memory: "
+        f"peak={kv_stats['peak'] if kv_stats['peak'] is not None else float('nan'):.3f} GiB | "
+        f"mean={kv_stats['mean'] if kv_stats['mean'] is not None else float('nan'):.3f} GiB | "
+        f"median={kv_stats['median'] if kv_stats['median'] is not None else float('nan'):.3f} GiB"
     )
     print(f"Saved metrics: {metrics_path}")
 

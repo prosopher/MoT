@@ -97,12 +97,14 @@ def _evaluate_openwebtext_validation_loss_c2c(
         translated_result, translated_profile = profiler.measure(
             run_translated_inference,
             tokens=profile_tokens,
+            kv_objects_getter=lambda result: (result[1],),
         )
         del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
             native_result, native_profile = profiler.measure(
                 run_native_inference,
                 tokens=profile_tokens,
+                kv_objects_getter=lambda result: (result[1],),
             )
             del native_result
         return (

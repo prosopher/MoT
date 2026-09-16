@@ -206,17 +206,6 @@ class AgentRunnerResult:
     personas: Dict[str, Tuple[str, str]]
     cache_mode: str
 
-    @property
-    def peak_memory_gib(self) -> float:
-        values = [
-            self.profile.get("model_memory_gib"),
-            self.profile.get("translator_memory_gib"),
-            self.profile.get("kv_memory_gib"),
-        ]
-        if any(value is None for value in values):
-            return float("nan")
-        return sum(float(value) for value in values if value is not None)
-
 
 class KVCacheTranslationAdapter:
     """Algorithm-aware helper for pretranslated KV-cache handoff.
@@ -755,10 +744,11 @@ class AgentRunner:
         # then installed on the hub after the first hop updates the hub cache.
         self._pending_pretranslated_second_hops: Dict[Tuple[str, str], Tuple[str, PastKeyValues, List[int]]] = {}
         self._peak_memory_breakdown_bytes: Optional[GPUMemoryBreakdownBytes] = None
-        # Cache-residency diagnostics are tracked independently of CUDA so the
-        # reported KV peak can be interpreted in terms of live cache copies.
-        self._peak_cache_token_copies = 0
-        self._peak_cache_residency: Dict[str, Any] = {}
+        # Actual live KV/cache tensor storage, deduplicated by underlying storage.
+        # This is the authoritative KV-cache memory metric; unlike allocator
+        # residuals it does not include attention activations or CUDA workspaces.
+        self._peak_kv_cache_bytes = 0
+        self._kv_cache_memory_samples_bytes: List[int] = []
 
     @classmethod
     def from_checkpoint(cls, config: AgentRunnerConfig) -> "AgentRunner":
@@ -2207,52 +2197,82 @@ class AgentRunner:
             return clean
         return clean[: max(0, max_chars - 3)] + "..."
 
-    def _count_resident_cache_agents(self) -> int:
-        return sum(1 for agent in self.agent_sequence if agent.past_key_values is not None)
-
     def _agent_at_sequence(self, sequence_index: int) -> Agent:
         return self.agent_sequence[sequence_index % len(self.agent_sequence)]
 
-    def _cache_residency_snapshot(self) -> Dict[str, Any]:
-        resident = {
-            agent.node_id: int(agent.cache_seq_len)
-            for agent in self.agent_sequence
-            if agent.past_key_values is not None
-        }
-        pretranslated: Dict[str, int] = {}
+    @staticmethod
+    def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[str, Optional[int], int]:
+        storage = tensor.untyped_storage()
+        return (tensor.device.type, tensor.device.index, int(storage.data_ptr()))
+
+    @classmethod
+    def _past_storage_bytes(
+        cls,
+        past_key_values: Optional[PastKeyValues],
+        seen: set,
+        *,
+        device_index: Optional[int],
+    ) -> int:
+        if past_key_values is None:
+            return 0
+        total = 0
+        for key, value in past_key_values:
+            for tensor in (key, value):
+                if not isinstance(tensor, torch.Tensor):
+                    continue
+                if device_index is not None:
+                    if tensor.device.type != "cuda":
+                        continue
+                    tensor_device_index = torch.cuda.current_device() if tensor.device.index is None else tensor.device.index
+                    if tensor_device_index != device_index:
+                        continue
+                storage = tensor.untyped_storage()
+                storage_key = cls._tensor_storage_key(tensor)
+                if storage_key in seen:
+                    continue
+                seen.add(storage_key)
+                total += int(storage.nbytes())
+        return total
+
+    def _live_kv_cache_objects(self) -> List[PastKeyValues]:
+        objects: List[PastKeyValues] = []
         for agent in self.agent_sequence:
-            for edge_id, past in agent.pretranslated_past_by_edge.items():
-                pretranslated[f"{agent.node_id}:{edge_id}"] = int(get_past_seq_len(past))
-        pending = {
-            f"{source}->{target}:{edge_id}": int(get_past_seq_len(past))
-            for (source, target), (edge_id, past, _token_ids) in self._pending_pretranslated_second_hops.items()
-        }
-        total_token_copies = sum(resident.values()) + sum(pretranslated.values()) + sum(pending.values())
-        return {
-            "resident_agents": resident,
-            "resident_cache_count": len(resident),
-            "resident_tokens": sum(resident.values()),
-            "pretranslated_cache_count": len(pretranslated),
-            "pretranslated_tokens": sum(pretranslated.values()),
-            "pending_second_hop_count": len(pending),
-            "pending_second_hop_tokens": sum(pending.values()),
-            "total_cache_token_copies": int(total_token_copies),
-        }
+            if agent.past_key_values is not None:
+                objects.append(agent.past_key_values)
+            objects.extend(agent.pretranslated_past_by_edge.values())
+        objects.extend(
+            past for _edge_id, past, _token_ids in self._pending_pretranslated_second_hops.values()
+        )
+        return objects
+
+    def _live_kv_cache_bytes(self) -> int:
+        """Return CUDA bytes owned by all live AgentRunner KV/cache tensors.
+
+        Resident Agent KV, pretranslated edge KV, and pending second-hop KV are
+        counted exactly once by underlying storage on this runner's CUDA device.
+        On CUDA runs, CPU-offloaded cache tensors are intentionally excluded.
+        On CPU-only runs/tests, all cache storage is counted for diagnostics.
+        """
+        device_index: Optional[int] = None
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            device_obj = torch.device(self.device)
+            device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+        seen: set = set()
+        total = 0
+        for past in self._live_kv_cache_objects():
+            total += self._past_storage_bytes(past, seen, device_index=device_index)
+        return int(total)
 
     def _update_peak_memory_breakdown(self) -> None:
-        # Track logical cache residency at every stable sample point.  This is
-        # especially useful in cache_mode=free, where Agent Count should not imply
-        # one resident KV cache per logical Agent.
-        residency = self._cache_residency_snapshot()
-        total_token_copies = int(residency["total_cache_token_copies"])
-        if total_token_copies > self._peak_cache_token_copies:
-            self._peak_cache_token_copies = total_token_copies
-            self._peak_cache_residency = residency
+        live_kv_cache_bytes = self._live_kv_cache_bytes()
+        self._kv_cache_memory_samples_bytes.append(live_kv_cache_bytes)
+        self._peak_kv_cache_bytes = max(self._peak_kv_cache_bytes, live_kv_cache_bytes)
 
         measured = measure_gpu_memory_breakdown_bytes(
             self.device,
             models=self.ctx.tp.models.values(),
             translator_pool=self.translator_pool,
+            kv_objects=self._live_kv_cache_objects(),
         )
         if measured is None:
             return
@@ -3116,8 +3136,8 @@ class AgentRunner:
         self._current_example_seed = int(example_seed)
         set_seed(example_seed)
         self._peak_memory_breakdown_bytes = None
-        self._peak_cache_token_copies = 0
-        self._peak_cache_residency = {}
+        self._peak_kv_cache_bytes = 0
+        self._kv_cache_memory_samples_bytes = []
         self._consensus_reached = False
         self._consensus_turn = None
         self._consensus_answer = None
@@ -3127,6 +3147,10 @@ class AgentRunner:
         for agent in self.agent_sequence:
             agent.reset()
         self._pending_pretranslated_second_hops.clear()
+        # Release allocator cache from the previous example. Memory accounting
+        # itself is based only on Model, Translator, and live KV tensor storage.
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
         self.translator_pool.eval()
         for node in self.ctx.nodes:
             self.ctx.tp.get_model(node.id).eval()
@@ -3333,8 +3357,10 @@ class AgentRunner:
             },
             "model_memory_gib": None if peak_memory is None else peak_memory.model_bytes / (1024 ** 3),
             "translator_memory_gib": None if peak_memory is None else peak_memory.translator_bytes / (1024 ** 3),
-            "kv_memory_gib": None if peak_memory is None else peak_memory.kv_bytes / (1024 ** 3),
-            "peak_cache_residency": dict(self._peak_cache_residency),
+            "kv_memory_gib": self._peak_kv_cache_bytes / (1024 ** 3),
+            "kv_cache_memory_samples_gib": [
+                sample / (1024 ** 3) for sample in self._kv_cache_memory_samples_bytes
+            ],
         }
         return result
 

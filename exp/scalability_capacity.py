@@ -82,7 +82,7 @@ class Row:
     f1: float
     latency_ms: float
     throughput_toks: float
-    peak_memory_gib: float
+    memory_gib: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +101,8 @@ def normalize_header(name: str) -> str:
     key = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
     if key == "f1_avg":
         return "f1"
+    if key in {"gpu_memory", "gpu_peak_memory", "gpu_peak_memory_gib"}:
+        return "gpu_memory"
     return key
 
 
@@ -149,7 +151,7 @@ def parse_table(
 
     headers = [normalize_header(h) for h in raw_header]
     header_index = {name: idx for idx, name in enumerate(headers)}
-    required = ["method", "f1", "latency", "throughput", "gpu_peak_memory"]
+    required = ["method", "f1", "latency", "throughput", "gpu_memory"]
     if any(name not in header_index for name in required):
         return []
 
@@ -174,7 +176,7 @@ def parse_table(
                 f1=parse_number(cells[header_index["f1"]]),
                 latency_ms=parse_number(cells[header_index["latency"]]),
                 throughput_toks=parse_number(cells[header_index["throughput"]]),
-                peak_memory_gib=parse_number(cells[header_index["gpu_peak_memory"]]),
+                memory_gib=parse_number(cells[header_index["gpu_memory"]]),
             )
         )
     return parsed
@@ -230,8 +232,8 @@ def metric_value(row: Row, metric: str) -> float:
         return row.latency_ms
     if metric == "throughput_toks":
         return row.throughput_toks
-    if metric == "peak_memory_gib":
-        return row.peak_memory_gib
+    if metric == "memory_gib":
+        return row.memory_gib
     raise KeyError(metric)
 
 
@@ -447,10 +449,10 @@ def plot_all(rows: list[Row], output_dir: Path) -> list[Path]:
     outputs: list[Path] = []
     specs = [
         (
-            "peak_memory_f1",
-            "peak_memory_gib",
+            "memory_f1",
+            "memory_gib",
             "f1",
-            "Peak Memory (Bar, GiB)",
+            "GPU Memory (Bar, GiB)",
             "F1 (Line)",
         ),
         (

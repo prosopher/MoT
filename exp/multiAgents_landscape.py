@@ -160,22 +160,25 @@ def load_one_method_metrics(
             f"but --agent-count={expected_agent_count} was requested."
         )
 
-    gpu_peak_memory = payload.get("gpu_peak_memory_gib")
-    if not isinstance(gpu_peak_memory, dict):
-        raise KeyError(f"Missing 'gpu_peak_memory_gib' breakdown in {path}")
+    gpu_memory = payload.get("gpu_memory_gib")
+    if not isinstance(gpu_memory, dict):
+        # Backward compatibility with pre-simplification result files.
+        gpu_memory = payload.get("gpu_peak_memory_gib")
+    if not isinstance(gpu_memory, dict):
+        raise KeyError(f"Missing GPU memory metrics in {path}")
     memory_components = []
     for key in ("model_gib", "translator_gib", "kv_gib"):
-        value = gpu_peak_memory.get(key)
+        value = gpu_memory.get(key)
         if value is None:
-            raise KeyError(f"Missing 'gpu_peak_memory_gib.{key}' in {path}")
+            raise KeyError(f"Missing GPU memory component {key!r} in {path}")
         memory_components.append(float(value))
-    gpu_peak_memory_gib = sum(memory_components)
+    gpu_memory_gib = sum(memory_components)
 
     accuracy = _read_metric_value(payload, "accuracy", path)
 
-    if not math.isfinite(gpu_peak_memory_gib):
+    if not math.isfinite(gpu_memory_gib):
         raise ValueError(
-            f"{path} has non-finite gpu_peak_memory_gib: {gpu_peak_memory_gib}"
+            f"{path} has non-finite gpu_memory_gib: {gpu_memory_gib}"
         )
 
     return {
@@ -184,7 +187,7 @@ def load_one_method_metrics(
         "cache_mode": cache_mode,
         "agent_count": agent_count,
         "accuracy": accuracy,
-        "gpu_peak_memory_gib": gpu_peak_memory_gib,
+        "gpu_memory_gib": gpu_memory_gib,
         "metrics_path": str(path),
     }
 
@@ -343,7 +346,7 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
 
     for item in data:
         name = item["name"]
-        x = item["gpu_peak_memory_gib"]
+        x = item["gpu_memory_gib"]
         y = item["accuracy"]
 
         ax.scatter(
@@ -373,15 +376,15 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
 
     style_axes_common(ax)
 
-    ax.set_xlabel("Peak GPU Memory (GiB)", fontsize=20, fontweight="semibold")
+    ax.set_xlabel("GPU Memory: Model + Translator + KV (GiB)", fontsize=20, fontweight="semibold")
     ax.set_ylabel("Accuracy", fontsize=20, fontweight="semibold")
 
     ax.tick_params(axis="both", labelsize=20)
 
     x_values = [
-        d["gpu_peak_memory_gib"]
+        d["gpu_memory_gib"]
         for d in data
-        if math.isfinite(d["gpu_peak_memory_gib"])
+        if math.isfinite(d["gpu_memory_gib"])
     ]
     y_values = [
         d["accuracy"]
@@ -464,7 +467,7 @@ def main() -> None:
         print(
             f"  - {item['name']}: "
             f"Accuracy={item['accuracy']:.6f}, "
-            f"GPU={item['gpu_peak_memory_gib']:.6f} GiB, "
+            f"GPU={item['gpu_memory_gib']:.6f} GiB, "
             f"agent_count={item.get('agent_count')}, "
             f"path={item['metrics_path']}"
         )

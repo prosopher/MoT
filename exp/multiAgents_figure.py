@@ -108,7 +108,7 @@ def load_data_from_metrics(
     """Load metrics for existing folders only.
 
     The returned structure is:
-        data[agent_count][method] = {"accuracy": ..., "gpu_peak_memory_gib": ...}
+        data[agent_count][method] = {"accuracy": ..., "gpu_memory_gib": ...}
     """
 
     data: dict[int, dict[str, dict[str, float]]] = {}
@@ -151,19 +151,23 @@ def load_data_from_metrics(
                     f"folder implies {agent_count}, json says {json_agent_count}."
                 )
 
-            gpu_peak_memory = metrics.get("gpu_peak_memory_gib")
-            if not isinstance(gpu_peak_memory, dict):
-                raise KeyError(f"Missing 'gpu_peak_memory_gib' breakdown in {path}")
+            gpu_memory = metrics.get("gpu_memory_gib")
+            if not isinstance(gpu_memory, dict):
+                # Backward compatibility with pre-simplification result files.
+                gpu_memory = metrics.get("gpu_peak_memory_gib")
+            if not isinstance(gpu_memory, dict):
+                raise KeyError(f"Missing GPU memory metrics in {path}")
             memory_components = []
             for key in ("model_gib", "translator_gib", "kv_gib"):
-                value = gpu_peak_memory.get(key)
+                value = gpu_memory.get(key)
                 if value is None:
-                    raise KeyError(f"Missing 'gpu_peak_memory_gib.{key}' in {path}")
+                    raise KeyError(f"Missing GPU memory component {key!r} in {path}")
                 memory_components.append(float(value))
+            gpu_memory_gib = sum(memory_components)
 
             data.setdefault(agent_count, {})[method] = {
                 "accuracy": _read_metric_value(metrics, "accuracy", path),
-                "gpu_peak_memory_gib": sum(memory_components),
+                "gpu_memory_gib": gpu_memory_gib,
             }
             loaded_paths.append(path)
 
@@ -192,7 +196,7 @@ def compute_global_axis_limits(
     )
     global_memory_max = (
         max(
-            entry["gpu_peak_memory_gib"]
+            entry["gpu_memory_gib"]
             for agent_data in data.values()
             for entry in agent_data.values()
         )
@@ -358,7 +362,7 @@ def draw_agent_plot(
     bar_width = 0.56
 
     memory_values = [
-        agent_data[method]["gpu_peak_memory_gib"] for method in plotted_methods
+        agent_data[method]["gpu_memory_gib"] for method in plotted_methods
     ]
     accuracy_values = [agent_data[method]["accuracy"] for method in plotted_methods]
 
@@ -400,7 +404,7 @@ def draw_agent_plot(
     ax_mem.set_xticklabels([XTICK_LABELS[m] for m in plotted_methods])
 
     ax_mem.set_xlabel("")
-    ax_mem.set_ylabel("GPU Peak Memory (GiB)")
+    ax_mem.set_ylabel("GPU Memory: Model + Translator + KV (GiB)")
     ax_accuracy.set_ylabel("Accuracy")
 
     ax_mem.set_ylim(0.0, global_memory_max)
@@ -426,7 +430,7 @@ def draw_agent_plot(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create agent-wise Accuracy vs GPU Peak Memory plots from metrics json files."
+        description="Create agent-wise Accuracy vs GPU Memory plots from metrics json files."
     )
     parser.add_argument(
         "--metrics-root",

@@ -170,10 +170,18 @@ def evaluate_openwebtext_validation_loss_interlat(
                 max_new_tokens=generation_steps,
             )
 
-        translated_result, translated_profile = profiler.measure(run_translated_inference, tokens=profile_tokens)
+        translated_result, translated_profile = profiler.measure(
+            run_translated_inference,
+            tokens=profile_tokens,
+            kv_objects_getter=lambda result: (result[1],),
+        )
         del translated_result
         with temporarily_offload_module(translator_pool, train_config.device):
-            native_result, native_profile = profiler.measure(run_native_inference, tokens=profile_tokens)
+            native_result, native_profile = profiler.measure(
+                run_native_inference,
+                tokens=profile_tokens,
+                kv_objects_getter=lambda result: (result[1],),
+            )
             del native_result
         return (
             {"translated": translated_loss, "native": native_loss},
