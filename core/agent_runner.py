@@ -131,6 +131,7 @@ class AgentMessageRecord:
     tokens_after: int
     tokens_prompt: int
     tokens_completion: int
+    ttft_sec: Optional[float] = None
     cache_mode: str = CACHE_MODE_RETAIN
     is_hub: bool = False
     translated_edge_id: Optional[str] = None
@@ -2370,6 +2371,42 @@ class AgentRunner:
             accuracy,
         )
 
+    def _synchronize_ttft_device(self) -> None:
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            device_obj = torch.device(self.device)
+            device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+            torch.cuda.synchronize(device_index)
+
+    def _measure_ttft_phase(self, fn):
+        """Measure one required pre-first-token phase without changing its inputs.
+
+        Used only for cache translation/offload phases. Synchronization makes the
+        measured wall time belong to this phase rather than adjacent CUDA work.
+        Verification, logging, and memory-accounting work are intentionally not
+        measured as part of TTFT.
+        """
+        self._synchronize_ttft_device()
+        started_at = time.perf_counter()
+        result = fn()
+        self._synchronize_ttft_device()
+        return result, time.perf_counter() - started_at
+
+    def _generate_discussion_attempt(
+        self,
+        *,
+        agent: Agent,
+        prompt: str,
+        measure_ttft: bool,
+    ) -> Tuple[AgentGeneration, Optional[float]]:
+        """Generate one discussion attempt and optionally capture first-token time."""
+        previous_flag = bool(getattr(agent, "measure_first_token_ttft", False))
+        agent.measure_first_token_ttft = bool(measure_ttft)
+        try:
+            generation = agent.generate_response(prompt)
+        finally:
+            agent.measure_first_token_ttft = previous_flag
+        return generation, generation.first_token_ttft_sec if measure_ttft else None
+
     def _should_clear_source_after_offload(self, source_agent: Agent) -> bool:
         # In free mode, the non-hub agent that just transmitted its newly generated
         # cache delta is freed. The hub stays resident so it can always receive and
@@ -2671,7 +2708,7 @@ class AgentRunner:
         initial_prompt: str,
         context: str,
         question: str,
-    ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts]:
+    ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts, Optional[float]]:
         """Generate the first proposal until strict syntax and semantics both pass.
 
         Invalid attempts are rolled back to the exact pre-prompt KV prefix and
@@ -2684,6 +2721,7 @@ class AgentRunner:
         previous_response = ""
         reason = "not checked"
         attempt = 0
+        turn_generation_ttft_sec: Optional[float] = None
 
         while True:
             if attempt > 0:
@@ -2700,7 +2738,13 @@ class AgentRunner:
                 agent_index=0,
                 attempt=attempt,
             )
-            generation = agent.generate_response(prompt)
+            generation, measured_ttft = self._generate_discussion_attempt(
+                agent=agent,
+                prompt=prompt,
+                measure_ttft=attempt == 0,
+            )
+            if attempt == 0:
+                turn_generation_ttft_sec = measured_ttft
             self._update_peak_memory_breakdown()
 
             # Stage 1: deterministic syntax. Do not spend a semantic-verifier
@@ -2741,6 +2785,7 @@ class AgentRunner:
                         verification,
                         attempt,
                         VerificationStageCounts(syntax_failures, semantic_failures),
+                        turn_generation_ttft_sec,
                     )
                 semantic_failures += 1
                 reason = verification.reason
@@ -2766,7 +2811,7 @@ class AgentRunner:
         current_response: Optional[str],
         turn_index: int,
         agent_index: int,
-    ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts]:
+    ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts, Optional[float]]:
         """Generate a follow-up until strict syntax and semantics both pass.
 
         Invalid attempts are rolled back to the exact pre-prompt KV prefix, so they
@@ -2779,6 +2824,7 @@ class AgentRunner:
         previous_response = ""
         reason = "not checked"
         attempt = 0
+        turn_generation_ttft_sec: Optional[float] = None
 
         while True:
             if attempt > 0:
@@ -2798,7 +2844,13 @@ class AgentRunner:
                 agent_index=agent_index,
                 attempt=attempt,
             )
-            generation = agent.generate_response(prompt)
+            generation, measured_ttft = self._generate_discussion_attempt(
+                agent=agent,
+                prompt=prompt,
+                measure_ttft=attempt == 0,
+            )
+            if attempt == 0:
+                turn_generation_ttft_sec = measured_ttft
             self._update_peak_memory_breakdown()
 
             # Stage 1: deterministic syntax only. A malformed marker/final line
@@ -2870,6 +2922,7 @@ class AgentRunner:
                         verification,
                         attempt,
                         VerificationStageCounts(syntax_failures, semantic_failures),
+                        turn_generation_ttft_sec,
                     )
                 semantic_failures += 1
                 reason = verification.reason
@@ -2895,6 +2948,7 @@ class AgentRunner:
         context: str,
         question: str,
         example_index: Optional[int],
+        initial_pretranslation_sec: float = 0.0,
     ) -> Tuple[str, str]:
         # The verified first proposal has already passed syntax and semantic
         # consistency checks. Use the answer captured by verification rather than
@@ -2926,6 +2980,7 @@ class AgentRunner:
 
         agent_count = len(self.agent_sequence)
         sequence_index = 1
+        pending_pretranslation_sec = float(initial_pretranslation_sec)
         while sequence_index < self.max_turns and not self._consensus_reached:
             current_source = self._agent_at_sequence(sequence_index - 1)
             current_target = self._agent_at_sequence(sequence_index)
@@ -2934,16 +2989,22 @@ class AgentRunner:
             edge_id: Optional[str] = None
             incoming_offload_kind: Optional[str] = None
             tokens_received = 0
+            offload_sec = 0.0
             if current_source.node_id != current_target.node_id:
                 (
-                    record_offload_target,
-                    source_offload_meta,
-                    source_cache_cleared,
-                    incoming_from_agent,
-                    incoming_meta,
-                ) = self._star_offload_to_agent(
-                    source_agent=current_source,
-                    target_agent=current_target,
+                    (
+                        record_offload_target,
+                        source_offload_meta,
+                        source_cache_cleared,
+                        incoming_from_agent,
+                        incoming_meta,
+                    ),
+                    offload_sec,
+                ) = self._measure_ttft_phase(
+                    lambda: self._star_offload_to_agent(
+                        source_agent=current_source,
+                        target_agent=current_target,
+                    )
                 )
                 self._apply_offload_metadata_to_record(
                     source_record,
@@ -2971,7 +3032,13 @@ class AgentRunner:
             )
             turn_index = sequence_index + 1
             agent_index = sequence_index % agent_count
-            generation, verification, verification_attempts, verification_stage_counts = self._generate_verified_followup(
+            (
+                generation,
+                verification,
+                verification_attempts,
+                verification_stage_counts,
+                generation_ttft_sec,
+            ) = self._generate_verified_followup(
                 agent=current_target,
                 initial_prompt=prompt,
                 context=context,
@@ -2989,6 +3056,12 @@ class AgentRunner:
                 translated_offload_kind=incoming_offload_kind,
                 tokens_received=tokens_received,
             )
+            record.ttft_sec = (
+                None
+                if generation_ttft_sec is None
+                else float(pending_pretranslation_sec + offload_sec + generation_ttft_sec)
+            )
+            pending_pretranslation_sec = 0.0
             record.verification_attempts = verification_attempts
             record.verification_syntax_failures = verification_stage_counts.syntax_failures
             record.verification_semantic_failures = verification_stage_counts.semantic_failures
@@ -3049,9 +3122,11 @@ class AgentRunner:
             if not self._consensus_reached and sequence_index < self.max_turns:
                 next_target = self._agent_at_sequence(sequence_index)
                 if current_target.node_id != next_target.node_id:
-                    self._prepare_outgoing_route_translation(
-                        source_agent=current_target,
-                        logical_target_agent=next_target,
+                    _, pending_pretranslation_sec = self._measure_ttft_phase(
+                        lambda: self._prepare_outgoing_route_translation(
+                            source_agent=current_target,
+                            logical_target_agent=next_target,
+                        )
                     )
                     # Pretranslation materializes one or more full target-side KV
                     # caches. Measure immediately; the next handoff may consume or
@@ -3092,6 +3167,7 @@ class AgentRunner:
         context: str,
         question: str,
         example_index: Optional[int],
+        initial_pretranslation_sec: float = 0.0,
     ) -> Tuple[str, str]:
         return self._run_offload_turns(
             transcript=transcript,
@@ -3101,6 +3177,7 @@ class AgentRunner:
             context=context,
             question=question,
             example_index=example_index,
+            initial_pretranslation_sec=initial_pretranslation_sec,
         )
 
     def _run_free_turns(
@@ -3113,6 +3190,7 @@ class AgentRunner:
         context: str,
         question: str,
         example_index: Optional[int],
+        initial_pretranslation_sec: float = 0.0,
     ) -> Tuple[str, str]:
         return self._run_offload_turns(
             transcript=transcript,
@@ -3122,6 +3200,7 @@ class AgentRunner:
             context=context,
             question=question,
             example_index=example_index,
+            initial_pretranslation_sec=initial_pretranslation_sec,
         )
 
     def _run_example_impl(
@@ -3176,6 +3255,7 @@ class AgentRunner:
             initial_verification,
             initial_verification_attempts,
             initial_verification_stage_counts,
+            initial_generation_ttft_sec,
         ) = self._generate_verified_initial(
             agent=self.hub_agent,
             initial_prompt=transcript,
@@ -3191,16 +3271,20 @@ class AgentRunner:
             context=context,
             question=question,
         )
+        initial_pretranslation_sec = 0.0
         if self.max_turns > 1:
             next_target = self._agent_at_sequence(1)
             if self.hub_agent.node_id != next_target.node_id:
-                self._prepare_outgoing_route_translation(
-                    source_agent=self.hub_agent,
-                    logical_target_agent=next_target,
+                _, initial_pretranslation_sec = self._measure_ttft_phase(
+                    lambda: self._prepare_outgoing_route_translation(
+                        source_agent=self.hub_agent,
+                        logical_target_agent=next_target,
+                    )
                 )
         self._update_peak_memory_breakdown()
         transcript = self._append_agent_message_to_transcript(transcript, self.hub_agent.node_id, generation.text)
         record = self._agent_message_record(generation)
+        record.ttft_sec = initial_generation_ttft_sec
         record.memory_tokens_after = initial_memory_tokens
         record.verification_attempts = initial_verification_attempts
         record.verification_syntax_failures = initial_verification_stage_counts.syntax_failures
@@ -3229,6 +3313,7 @@ class AgentRunner:
                 context=context,
                 question=question,
                 example_index=example_index,
+                initial_pretranslation_sec=initial_pretranslation_sec,
             )
         else:
             transcript, selected_solution = self._run_retain_turns(
@@ -3239,6 +3324,7 @@ class AgentRunner:
                 context=context,
                 question=question,
                 example_index=example_index,
+                initial_pretranslation_sec=initial_pretranslation_sec,
             )
 
         prediction = self.extract_final_answer(transcript, selected_solution)
@@ -3318,8 +3404,20 @@ class AgentRunner:
             torch.cuda.synchronize(device_index)
         latency_sec = time.perf_counter() - started_at
         peak_memory = self._peak_memory_breakdown_bytes
+        turn_ttft_sec = [
+            float(message.ttft_sec)
+            for message in result.agent_messages
+            if message.ttft_sec is not None
+        ]
+        example_ttft_sec = (
+            sum(turn_ttft_sec) / len(turn_ttft_sec) if turn_ttft_sec else None
+        )
         result.profile = {
             "latency_sec": float(latency_sec),
+            "turn_ttft_sec": turn_ttft_sec,
+            "example_ttft_sec": example_ttft_sec,
+            "ttft_includes_offload_translation": True,
+            "ttft_excludes_verification_retries": True,
             "tokens": len(result.agent_messages) * max(1, self.generation_max_new_tokens),
             "num_agent_messages": len(result.agent_messages),
             "completed_turns": len(result.turns),

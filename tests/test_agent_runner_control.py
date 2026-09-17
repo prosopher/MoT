@@ -1784,3 +1784,120 @@ def test_agent_runner_syntax_failure_retries_before_semantic_verifier() -> None:
     assert b.verification_syntax_passed is True
     assert b.verification_semantic_passed is True
     assert b.verification_passed is True
+
+
+def test_agent_ttft_measurement_does_not_change_generation_result() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    model = ctx.tp.get_model("A")
+
+    baseline = Agent(
+        node_id="A",
+        model=model,
+        device="cpu",
+        max_new_tokens=3,
+        temperature=0.0,
+    )
+    measured = Agent(
+        node_id="A",
+        model=model,
+        device="cpu",
+        max_new_tokens=3,
+        temperature=0.0,
+    )
+    measured.measure_first_token_ttft = True
+
+    baseline_generation = baseline.generate_response("abc")
+    measured_generation = measured.generate_response("abc")
+
+    assert measured_generation.generated_token_ids == baseline_generation.generated_token_ids
+    assert measured_generation.text == baseline_generation.text
+    assert baseline_generation.first_token_ttft_sec is None
+    assert measured_generation.first_token_ttft_sec is not None
+    assert measured_generation.first_token_ttft_sec >= 0.0
+
+
+def test_agent_runner_ttft_includes_route_cost_and_excludes_verification_retries() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        max_turns=2,
+        log_agents=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._verify_response_semantics_with_model = lambda **kwargs: ("VALID", True)
+    runner._update_peak_memory_breakdown = lambda: None
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+
+    phase_times = iter([0.2, 0.3])  # next-turn pretranslation, then offload/replay
+
+    def fake_measure_phase(fn):
+        result = fn()
+        return result, next(phase_times)
+
+    runner._measure_ttft_phase = fake_measure_phase
+
+    calls = {"A": 0, "B": 0}
+    measurement_flags = []
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            calls[agent.node_id] += 1
+            measurement_flags.append((agent.node_id, calls[agent.node_id], agent.measure_first_token_ttft))
+            if agent.node_id == "A":
+                text = "Final Solution: Yes"
+                first_token_ttft = 0.1
+            elif calls["B"] == 1:
+                # Force one corrective verification retry. Its first-token latency
+                # belongs to the Turn; the retry below must not be added again.
+                text = "[AGREE]\nFinal Solution: No"
+                first_token_ttft = 0.4
+            else:
+                text = "[AGREE]\nFinal Solution: Yes"
+                first_token_ttft = 99.0
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+                first_token_ttft_sec=first_token_ttft,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+
+    def fake_star_offload(*, source_agent, target_agent):
+        meta = {
+            "edge_id": "edge",
+            "offload_kind": "delta",
+            "tokens_sent": 1,
+            "tokens_received": 1,
+            "expected_delta_tokens": 1,
+        }
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_agent = fake_star_offload
+    result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    assert calls == {"A": 1, "B": 2}
+    assert measurement_flags == [
+        ("A", 1, True),
+        ("B", 1, True),
+        ("B", 2, False),
+    ]
+    assert result.agent_messages[0].ttft_sec == pytest.approx(0.1)
+    assert result.agent_messages[1].ttft_sec == pytest.approx(0.2 + 0.3 + 0.4)
+    assert result.profile["turn_ttft_sec"] == pytest.approx([0.1, 0.9])
+    assert result.profile["example_ttft_sec"] == pytest.approx(0.5)
+    assert result.profile["ttft_includes_offload_translation"] is True
+    assert result.profile["ttft_excludes_verification_retries"] is True

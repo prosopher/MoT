@@ -136,6 +136,7 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
             "kv_gib": result.profile.get("kv_memory_gib"),
         },
         "latency_sec": result.profile.get("latency_sec"),
+        "ttft_sec": result.profile.get("example_ttft_sec"),
         "agent_ids": result.agent_ids,
         "hub_agent_id": result.hub_agent_id,
         "personas": {
@@ -236,6 +237,7 @@ def main() -> None:
     total_accuracy = 0.0
     memory_gib = {"model_gib": None, "translator_gib": None, "kv_gib": None}
     kv_cache_samples_gib: List[float] = []
+    example_ttft_sec: List[float] = []
 
     selected_count = len(selected_examples)
     for local_idx, (example_index, example) in enumerate(selected_examples, start=1):
@@ -260,6 +262,8 @@ def main() -> None:
         kv_cache_samples_gib.extend(
             float(value) for value in result.profile.get("kv_cache_memory_samples_gib", [])
         )
+        if result.profile.get("example_ttft_sec") is not None:
+            example_ttft_sec.append(float(result.profile["example_ttft_sec"]))
         for component_key, profile_key in (
             ("model_gib", "model_memory_gib"),
             ("translator_gib", "translator_memory_gib"),
@@ -318,6 +322,13 @@ def main() -> None:
         },
         "count": count,
         "accuracy": accuracy,
+        "ttft_sec": statistics.mean(example_ttft_sec) if example_ttft_sec else None,
+        "ttft_definition": {
+            "example": "mean of all Turn TTFT values in the Example",
+            "benchmark": "mean of all Example TTFT values",
+            "includes": ["KV pretranslation", "KV offload/replay", "prompt prefill to first generated token"],
+            "excludes": ["verification retry attempts", "verification model time", "logging", "memory metric sampling"],
+        },
         "gpu_memory_gib": {
             "model_gib": memory_gib["model_gib"],
             "translator_gib": memory_gib["translator_gib"],
@@ -338,6 +349,12 @@ def main() -> None:
 
     print("===== AgentRunner StrategyQA memory =====")
     print(f"Accuracy: {accuracy:.4f}")
+    benchmark_ttft = metrics["ttft_sec"]
+    print(
+        "TTFT: "
+        f"{benchmark_ttft if benchmark_ttft is not None else float('nan'):.4f} sec "
+        "(Benchmark mean of Example mean Turn TTFTs; verification retries excluded)"
+    )
     print(
         "GPU Memory: "
         f"model={memory_for_log['model_gib']:.3f} GiB | "

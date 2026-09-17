@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import time
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -21,6 +22,7 @@ class AgentGeneration:
     tokens_after: int
     tokens_prompt: int
     tokens_completion: int
+    first_token_ttft_sec: Optional[float] = None
 
     @property
     def generated_tokens(self) -> int:
@@ -79,6 +81,10 @@ class Agent:
         # so offload can slice an already-translated cache without translating at handoff time.
         self.pretranslated_past_by_edge: Dict[str, PastKeyValues] = {}
         self.pretranslated_token_ids_by_edge: Dict[str, List[int]] = {}
+        # Enabled only for the first discussion attempt of a logical Turn. The
+        # runner uses this to measure prompt-prefill -> first-token latency without
+        # changing generate_response() inputs, RNG state, or decoding behavior.
+        self.measure_first_token_ttft = False
         self.model.eval()
 
     @property
@@ -314,6 +320,19 @@ class Agent:
     @torch.inference_mode()
     def generate_response(self, prompt_text: str) -> AgentGeneration:
         tokens_before = self.cache_seq_len
+        ttft_started_at: Optional[float] = None
+        first_token_ttft_sec: Optional[float] = None
+        if self.measure_first_token_ttft:
+            # Synchronize only when TTFT is requested so queued work from an
+            # earlier phase is not charged to model prefill. This does not alter
+            # inputs, RNG state, or arithmetic. next_token.item() below already
+            # synchronizes the first sampled token back to the host.
+            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                device_obj = torch.device(self.device)
+                device_index = torch.cuda.current_device() if device_obj.index is None else device_obj.index
+                torch.cuda.synchronize(device_index)
+            ttft_started_at = time.perf_counter()
+
         current_past, current_token_ids, tokens_prompt = self._prefill_prompt(prompt_text)
         generated_token_ids: List[int] = []
         terminal_token_id: Optional[int] = None
@@ -345,6 +364,8 @@ class Agent:
                 next_token_tensor = next_token_logits.argmax(dim=-1, keepdim=True)
             next_token = TokenIDs(next_token_tensor, model_id=current_token_ids.model_id)
             next_token_id = int(next_token.item())
+            if ttft_started_at is not None and first_token_ttft_sec is None:
+                first_token_ttft_sec = time.perf_counter() - ttft_started_at
 
             if next_token_id in eos_token_ids:
                 # Keep the model's turn terminator in the resident cache.  For chat
@@ -444,6 +465,7 @@ class Agent:
             tokens_after=self.cache_seq_len,
             tokens_prompt=tokens_prompt,
             tokens_completion=len(generated_token_ids),
+            first_token_ttft_sec=first_token_ttft_sec,
         )
 
 
