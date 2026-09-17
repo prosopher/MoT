@@ -1659,7 +1659,7 @@ def test_agent_runner_prepares_second_hop_when_first_hop_is_zero_delta(monkeypat
 
     seen = {}
 
-    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
         seen["source"] = source_agent.node_id
         seen["target"] = target_agent.node_id
         seen["tokens"] = list(source_token_ids)
@@ -1928,11 +1928,12 @@ def test_retain_direct_handoff_translates_only_missing_delta(monkeypatch) -> Non
 
     seen = {}
 
-    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
         seen["source"] = source_agent.node_id
         seen["target"] = target_agent.node_id
         seen["past_tokens"] = get_past_seq_len(source_past_key_values)
         seen["token_ids"] = list(source_token_ids)
+        seen["kwargs"] = dict(kwargs)
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
         return edge.id, source_past_key_values
 
@@ -1942,6 +1943,8 @@ def test_retain_direct_handoff_translates_only_missing_delta(monkeypatch) -> Non
 
     assert seen["past_tokens"] == 4
     assert seen["token_ids"] == source_ids[6:]
+    assert list(seen["kwargs"]["retain_source_full_token_ids"]) == source_ids
+    assert seen["kwargs"]["retain_target_prefix_past_key_values"] is target.past_key_values
     metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=target)
     assert metadata["tokens_sent"] == 4
     assert target.cache_token_ids == source_ids
@@ -1967,9 +1970,10 @@ def test_free_direct_handoff_preserves_full_translation_then_delta_offload(monke
 
     seen = {}
 
-    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
         seen["past_tokens"] = get_past_seq_len(source_past_key_values)
         seen["token_ids"] = list(source_token_ids)
+        seen["kwargs"] = dict(kwargs)
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
         return edge.id, source_past_key_values
 
@@ -1979,6 +1983,7 @@ def test_free_direct_handoff_preserves_full_translation_then_delta_offload(monke
 
     assert seen["past_tokens"] == 10
     assert seen["token_ids"] == source_ids
+    assert seen["kwargs"] == {}
     metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=target)
     assert metadata["tokens_sent"] == 4
     assert target.cache_token_ids == source_ids
@@ -2006,13 +2011,14 @@ def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -
 
     seen = []
 
-    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
         seen.append(
             (
                 source_agent.node_id,
                 target_agent.node_id,
                 get_past_seq_len(source_past_key_values),
                 list(source_token_ids),
+                dict(kwargs),
             )
         )
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
@@ -2023,8 +2029,12 @@ def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -
     runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
 
     # B->hub translates only 6..9; future hub->C translates only 4..9.
-    assert seen[0][2:] == (4, source_ids[6:])
-    assert seen[1][2:] == (6, source_ids[4:])
+    assert seen[0][2:4] == (4, source_ids[6:])
+    assert seen[1][2:4] == (6, source_ids[4:])
+    assert list(seen[0][4]["retain_source_full_token_ids"]) == source_ids
+    assert seen[0][4]["retain_target_prefix_past_key_values"] is hub.past_key_values
+    assert list(seen[1][4]["retain_source_full_token_ids"]) == source_ids
+    assert seen[1][4]["retain_target_prefix_past_key_values"] is target.past_key_values
 
     _, first_meta, source_cleared, _, second_meta = runner._star_offload_to_agent(
         source_agent=source,
@@ -2059,13 +2069,14 @@ def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> 
 
     seen = []
 
-    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
         seen.append(
             (
                 source_agent.node_id,
                 target_agent.node_id,
                 get_past_seq_len(source_past_key_values),
                 list(source_token_ids),
+                dict(kwargs),
             )
         )
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
@@ -2077,8 +2088,10 @@ def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> 
 
     # Free mode retains the original behavior: both physical translations see
     # the entire source/future-hub cache, then offload slices the missing delta.
-    assert seen[0][2:] == (10, source_ids)
-    assert seen[1][2:] == (10, source_ids)
+    assert seen[0][2:4] == (10, source_ids)
+    assert seen[1][2:4] == (10, source_ids)
+    assert seen[0][4] == {}
+    assert seen[1][4] == {}
 
     _, first_meta, source_cleared, _, second_meta = runner._star_offload_to_agent(
         source_agent=source,

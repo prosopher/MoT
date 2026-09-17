@@ -262,6 +262,10 @@ class KVCacheTranslationAdapter:
         target_agent: Agent,
         source_past_key_values: PastKeyValues,
         source_token_ids: Sequence[int],
+        # Retain-only option: full source token ledger for MoT sparse top-k.
+        retain_source_full_token_ids: Optional[Sequence[int]] = None,
+        # Retain-only option: resident target KV prefix for MoT delta replay.
+        retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
     ) -> Tuple[str, PastKeyValues]:
         """Translate the provided source KV span into the target model space.
 
@@ -293,11 +297,20 @@ class KVCacheTranslationAdapter:
             model_id=target_agent.model.id,
             device=target_agent.device,
         )
+        retain_source_full_context_token_ids = None
+        if retain_source_full_token_ids is not None:
+            retain_source_full_context_token_ids = self._build_token_ids(
+                retain_source_full_token_ids,
+                model_id=source_agent.model.id,
+                device=source_agent.device,
+            )
         translated_past = self._build_algorithm_translated_past(
             edge=edge,
             source_past_key_values=source_past_key_values,
             source_context_token_ids=source_context_token_ids,
             target_context_token_ids=target_context_token_ids,
+            retain_source_full_context_token_ids=retain_source_full_context_token_ids,
+            retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
         )
         translated_tokens = get_past_seq_len(translated_past)
         if translated_tokens != source_tokens:
@@ -315,6 +328,10 @@ class KVCacheTranslationAdapter:
         source_past_key_values: PastKeyValues,
         source_context_token_ids: TokenIDs,
         target_context_token_ids: TokenIDs,
+        # Retain-only option: full source token ledger for MoT sparse top-k.
+        retain_source_full_context_token_ids: Optional[TokenIDs] = None,
+        # Retain-only option: resident target KV prefix for MoT delta replay.
+        retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
     ) -> PastKeyValues:
         tgt_spec = self.ctx.tp.get_model_spec(edge.tgt_id)
         target_model = self.ctx.tp.get_model(edge.tgt_id)
@@ -332,6 +349,8 @@ class KVCacheTranslationAdapter:
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
                 tgt_spec=tgt_spec,
+                retain_source_full_context_token_ids=retain_source_full_context_token_ids,
+                retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
             )
             return translated_past
 
@@ -490,11 +509,18 @@ class KVCacheTranslationAdapter:
                 "cached": True,
             }
 
+        retain_kwargs: Dict[str, Any] = {}
+        if prefix_tokens:
+            retain_kwargs = {
+                "retain_source_full_token_ids": source_token_ids,
+                "retain_target_prefix_past_key_values": target_agent.past_key_values,
+            }
         edge_id, translated_past = self.build_pretranslated_past_for_edge(
             source_agent=source_agent,
             target_agent=target_agent,
             source_past_key_values=translated_source_past,
             source_token_ids=translated_token_ids,
+            **retain_kwargs,
         )
         source_agent.set_pretranslated_cache(
             edge_id=edge_id,
@@ -2523,11 +2549,18 @@ class AgentRunner:
                 second_source_past = slice_past_suffix(future_hub_past, second_prefix_tokens)
                 second_source_token_ids = second_source_token_ids[second_prefix_tokens:]
 
+        second_retain_kwargs: Dict[str, Any] = {}
+        if self.cache_mode == CACHE_MODE_RETAIN and second_prefix_tokens > 0:
+            second_retain_kwargs = {
+                "retain_source_full_token_ids": list(source_agent.cache_token_ids),
+                "retain_target_prefix_past_key_values": logical_target_agent.past_key_values,
+            }
         second_edge_id, second_target_past = self.cache_translator.build_pretranslated_past_for_edge(
             source_agent=self.hub_agent,
             target_agent=logical_target_agent,
             source_past_key_values=second_source_past,
             source_token_ids=second_source_token_ids,
+            **second_retain_kwargs,
         )
         self._pending_pretranslated_second_hops[(source_agent.node_id, logical_target_agent.node_id)] = (
             second_edge_id,

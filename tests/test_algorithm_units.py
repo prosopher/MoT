@@ -17,9 +17,12 @@ from alg.mot.train import (
     align_sparse_attention_indices_to_target_tokens,
     align_cache_blocks_to_target_tokens,
     build_cross_token_alignment,
+    build_replayed_target_past,
+    build_causal_attention_mask,
     collect_mot_balance_metrics,
     extract_source_attention_topk_indices,
     translate_layer_window,
+    _build_rotary_input_hidden_states,
 )
 from core.common import TokenIDs
 from core.model_spec import ModelSpec
@@ -388,3 +391,106 @@ def test_mot_aligns_source_cache_before_translator() -> None:
     assert torch.allclose(translator.key_input.flatten(), torch.tensor([5.0, 9.0]))
     assert torch.equal(translated_key, translator.key_input)
     assert translated_value.shape == translated_key.shape
+
+
+class _FloatEmbedding(torch.nn.Module):
+    def forward(self, token_ids):
+        return token_ids.to(torch.float32).unsqueeze(-1)
+
+
+def test_mot_retain_rotary_inputs_keep_absolute_positions_and_prefix_mask() -> None:
+    decoder = SimpleNamespace(embed_tokens=_FloatEmbedding())
+    token_ids = TokenIDs(torch.tensor([[11, 12]], dtype=torch.long), model_id="tiny")
+    hidden, position_ids, attention_mask, position_embeddings = _build_rotary_input_hidden_states(
+        decoder,
+        token_ids,
+        retain_prefix_length=3,
+    )
+
+    assert position_embeddings is None
+    assert position_ids.tolist() == [[3, 4]]
+    assert tuple(attention_mask.shape) == (1, 1, 2, 5)
+    # Query at absolute position 3 can see prefix 0..2 and itself, but not pos 4.
+    assert torch.all(attention_mask[0, 0, 0, :4] == 0)
+    assert attention_mask[0, 0, 0, 4] < 0
+    # Query at absolute position 4 can see all existing keys.
+    assert torch.all(attention_mask[0, 0, 1] == 0)
+
+
+def test_mot_retain_sparse_topk_uses_full_source_but_replays_delta_queries(monkeypatch) -> None:
+    import alg.mot.train as mot_train
+
+    source_delta = TokenIDs(torch.tensor([[30, 31]], dtype=torch.long), model_id="same")
+    target_delta = TokenIDs(torch.tensor([[30, 31]], dtype=torch.long), model_id="same")
+    source_full = TokenIDs(torch.tensor([[10, 11, 12, 30, 31]], dtype=torch.long), model_id="same")
+    prefix_past = tuple(
+        (
+            torch.zeros(1, 1, 3, 2),
+            torch.zeros(1, 1, 3, 2),
+        )
+        for _ in range(2)
+    )
+    source_delta_past = tuple(
+        (
+            torch.zeros(1, 1, 2, 2),
+            torch.zeros(1, 1, 2, 2),
+        )
+        for _ in range(2)
+    )
+
+    source_model = SimpleNamespace(id="same")
+    target_model = SimpleNamespace(id="same")
+    fake_ctx = SimpleNamespace(
+        nodes=[SimpleNamespace(id="A", model_id="same"), SimpleNamespace(id="B", model_id="same")],
+        tp=SimpleNamespace(get_model_spec=lambda _node: ModelSpec(model_id="same", num_layers=2, hidden_size=2, num_heads=1, head_dim=2)),
+        cm=SimpleNamespace(
+            get_src_layer_indices=lambda _edge: [0],
+            get_tgt_layer_indices=lambda _edge: [0],
+        ),
+        config=SimpleNamespace(topk_sparse_attn=2, num_bottom_full_attn=0),
+    )
+
+    seen = {}
+
+    def fake_sparse(model, context_token_ids, **kwargs):
+        del model, kwargs
+        seen["sparse_context"] = context_token_ids.as_tensor().clone()
+        # Full-context query rows 0..4. Keep absolute key indices deliberately.
+        indices = torch.tensor([[[[0, 0], [0, 1], [1, 2], [0, 3], [1, 4]]]], dtype=torch.long)
+        return [indices.clone(), indices.clone()]
+
+    def fake_translate(**kwargs):
+        past = kwargs["past_key_values"]
+        seen["translated_source_tokens"] = past[0][0].shape[2]
+        # [batch, seq, translated_layers, hidden]
+        return torch.zeros(1, 2, 1, 2), torch.zeros(1, 2, 1, 2)
+
+    def fake_replay(**kwargs):
+        seen["replay_sparse"] = kwargs["sparse_attention_indices"]
+        seen["replay_prefix"] = kwargs["retain_target_prefix_past_key_values"]
+        return source_delta_past
+
+    monkeypatch.setattr(mot_train, "build_extrapolated_sparse_attention_indices", fake_sparse)
+    monkeypatch.setattr(mot_train, "translate_layer_window", fake_translate)
+    monkeypatch.setattr(mot_train, "replay_target_prefill_with_injected_window", fake_replay)
+
+    replayed, _ = build_replayed_target_past(
+        fake_ctx,
+        source_past_key_values=source_delta_past,
+        source_context_token_ids=source_delta,
+        target_context_token_ids=target_delta,
+        source_model=source_model,
+        target_model=target_model,
+        src_node_id="A",
+        tgt_node_id="B",
+        tgt_spec=ModelSpec(model_id="same", num_layers=2, hidden_size=2, num_heads=1, head_dim=2),
+        retain_source_full_context_token_ids=source_full,
+        retain_target_prefix_past_key_values=prefix_past,
+    )
+
+    assert torch.equal(seen["sparse_context"], source_full.as_tensor())
+    assert seen["translated_source_tokens"] == 2
+    # Only delta query rows (absolute positions 3,4) remain; key indices stay absolute.
+    assert seen["replay_sparse"][0].tolist() == [[[[0, 3], [1, 4]]]]
+    assert seen["replay_prefix"] is prefix_past
+    assert replayed is source_delta_past

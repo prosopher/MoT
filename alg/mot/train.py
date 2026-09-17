@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from core.common import build_step_pasts_and_batches, ensure_token_ids_model
+from core.agent import get_past_seq_len
 from core.config import Config
 from core.channel_manager import (
     Channel,
@@ -748,13 +749,38 @@ def build_replayed_target_past(
     src_node_id: str,
     tgt_node_id: str,
     tgt_spec: ModelSpec,
+    # Retain-only option: full source token ledger used to compute sparse top-k
+    # on the original context while translating only the missing KV suffix.
+    retain_source_full_context_token_ids: Optional[TokenIDs] = None,
+    # Retain-only option: resident target prefix KV used to replay the delta at
+    # its original absolute positions and condition it on the existing cache.
+    retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
 ) -> Tuple[PastKeyValues, PastKeyValues]:
     edge_id = f"{src_node_id}_to_{tgt_node_id}"
     node_model_ids = {node.id: node.model_id for node in ctx.nodes}
     src_spec = ctx.tp.get_model_spec(src_node_id)
+    retain_prefix_tokens = (
+        0
+        if retain_target_prefix_past_key_values is None
+        else get_past_seq_len(retain_target_prefix_past_key_values)
+    )
+    sparse_context_token_ids = (
+        source_context_token_ids
+        if retain_source_full_context_token_ids is None
+        else retain_source_full_context_token_ids
+    )
+    if retain_source_full_context_token_ids is not None:
+        expected_full_tokens = retain_prefix_tokens + int(source_context_token_ids.shape[1])
+        if int(retain_source_full_context_token_ids.shape[1]) != expected_full_tokens:
+            raise ValueError(
+                "Retain MoT source context mismatch: "
+                f"full_tokens={int(retain_source_full_context_token_ids.shape[1])} "
+                f"prefix_tokens={retain_prefix_tokens} delta_tokens={int(source_context_token_ids.shape[1])}"
+            )
+
     sparse_attention_indices = build_extrapolated_sparse_attention_indices(
         source_model,
-        source_context_token_ids,
+        sparse_context_token_ids,
         source_layer_indices=ctx.cm.get_src_layer_indices(edge_id),
         target_layer_indices=ctx.cm.get_tgt_layer_indices(edge_id),
         num_source_layers=src_spec.num_layers,
@@ -762,6 +788,11 @@ def build_replayed_target_past(
         source_model_id=node_model_ids.get(src_node_id),
         top_k=ctx.config.topk_sparse_attn,
     )
+    if retain_source_full_context_token_ids is not None:
+        sparse_attention_indices = [
+            sparse_idx[:, :, retain_prefix_tokens:, :]
+            for sparse_idx in sparse_attention_indices
+        ]
 
     needs_token_alignment = (
         source_model.id != target_model.id
@@ -772,6 +803,10 @@ def build_replayed_target_past(
         )
     )
     alignment_weights = None
+    if retain_source_full_context_token_ids is not None and needs_token_alignment:
+        raise ValueError(
+            "Retain MoT incremental replay currently requires source/target delta token grids to match."
+        )
     if needs_token_alignment:
         alignment_weights, target_to_source, source_to_target = build_cross_token_alignment(
             source_model=source_model,
@@ -812,6 +847,7 @@ def build_replayed_target_past(
         tgt_spec=tgt_spec,
         sparse_attention_indices=sparse_attention_indices,
         num_bottom_full_attn=ctx.config.num_bottom_full_attn,
+        retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
     )
     return mixed_target_past, translated_window_past
 
@@ -1115,13 +1151,22 @@ def build_opt_input_hidden_states(
 def _build_rotary_input_hidden_states(
     decoder_model: nn.Module,
     token_ids: TokenIDs,
+    *,
+    # Retain-only option: resident prefix length used as the absolute RoPE offset.
+    retain_prefix_length: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
     if token_ids.ndim != 2:
         raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
     batch_size, seq_len = token_ids.shape
-    position_ids = torch.arange(seq_len, device=token_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    position_offset = 0 if retain_prefix_length is None else int(retain_prefix_length)
+    position_ids = torch.arange(
+        position_offset,
+        position_offset + seq_len,
+        device=token_ids.device,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(batch_size, -1)
     hidden_states = decoder_model.embed_tokens(token_ids.as_tensor())
-    attention_mask = build_causal_attention_mask(hidden_states)
+    attention_mask = build_causal_attention_mask(hidden_states, retain_prefix_length=retain_prefix_length)
 
     position_embeddings = None
     rotary_emb = getattr(decoder_model, "rotary_emb", None)
@@ -1136,33 +1181,56 @@ def _build_rotary_input_hidden_states(
 def build_qwen2_input_hidden_states(
     model: Model,
     token_ids: TokenIDs,
+    *,
+    # Retain-only option: resident prefix length used for absolute positions/mask.
+    retain_prefix_length: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-    return _build_rotary_input_hidden_states(require_qwen2_model(model), token_ids)
+    return _build_rotary_input_hidden_states(
+        require_qwen2_model(model),
+        token_ids,
+        retain_prefix_length=retain_prefix_length,
+    )
 
 
 def build_llama_input_hidden_states(
     model: Model,
     token_ids: TokenIDs,
+    *,
+    # Retain-only option: resident prefix length used for absolute positions/mask.
+    retain_prefix_length: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
     # Llama 3.2 uses the same embedding/position inputs as the Qwen rotary
     # decoder path, but keep family validation explicit.
-    return _build_rotary_input_hidden_states(require_llama_model(model), token_ids)
+    return _build_rotary_input_hidden_states(
+        require_llama_model(model),
+        token_ids,
+        retain_prefix_length=retain_prefix_length,
+    )
 
 
 def build_gemma3_input_hidden_states(
     model: Model,
     token_ids: TokenIDs,
+    *,
+    # Retain-only option: resident prefix length used for absolute positions/mask.
+    retain_prefix_length: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
     decoder = require_gemma3_model(model)
     if token_ids.ndim != 2:
         raise ValueError(f"token_ids must have shape [batch, seq], got {tuple(token_ids.shape)}")
     batch_size, seq_len = token_ids.shape
-    position_ids = torch.arange(seq_len, device=token_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    position_offset = 0 if retain_prefix_length is None else int(retain_prefix_length)
+    position_ids = torch.arange(
+        position_offset,
+        position_offset + seq_len,
+        device=token_ids.device,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(batch_size, -1)
     # Gemma3ScaledWordEmbedding applies the model-required sqrt(hidden_size)
     # scaling internally. RoPE is layer-specific (local vs global), so unlike
     # Llama/Qwen it must be computed by each attention module during replay.
     hidden_states = decoder.embed_tokens(token_ids.as_tensor())
-    attention_mask = build_causal_attention_mask(hidden_states)
+    attention_mask = build_causal_attention_mask(hidden_states, retain_prefix_length=retain_prefix_length)
     return hidden_states, position_ids, attention_mask, None
 
 
@@ -1376,9 +1444,21 @@ def gather_sparse_sequence_vectors(sequence: torch.Tensor, sparse_attention_indi
     return gathered.view(batch_size, num_heads, target_len, top_k, head_dim)
 
 
-def build_sparse_query_mask(sparse_attention_indices: torch.Tensor, seq_len: int, num_heads: int) -> torch.Tensor:
+def build_sparse_query_mask(
+    sparse_attention_indices: torch.Tensor,
+    seq_len: int,
+    num_heads: int,
+    *,
+    # Retain-only option: absolute query-position offset for delta replay.
+    retain_query_position_offset: Optional[int] = None,
+) -> torch.Tensor:
     sparse_attention_indices = expand_sparse_attention_indices(sparse_attention_indices, num_heads)
-    query_positions = torch.arange(seq_len, device=sparse_attention_indices.device).view(1, 1, seq_len, 1)
+    query_offset = 0 if retain_query_position_offset is None else int(retain_query_position_offset)
+    query_positions = torch.arange(
+        query_offset,
+        query_offset + seq_len,
+        device=sparse_attention_indices.device,
+    ).view(1, 1, seq_len, 1)
     return sparse_attention_indices > query_positions
 
 
@@ -1622,6 +1702,8 @@ def run_qwen2_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    # Retain-only option: resident target KV for this layer.
+    retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if (injected_key is None) != (injected_value is None):
         raise ValueError("injected_key and injected_value must be provided together.")
@@ -1663,19 +1745,38 @@ def run_qwen2_block(
         rotary_emb = getattr(attn, "rotary_emb", None)
         if rotary_emb is None:
             raise ValueError("Qwen replay requires rotary embeddings from the decoder or layer self-attention.")
-        try:
-            cos, sin = rotary_emb(native_like_value, seq_len=seq_len)
-        except TypeError:
-            cos, sin = rotary_emb(native_like_value, position_ids)
+        if retain_prefix_present is not None:
+            try:
+                cos, sin = rotary_emb(native_like_value, position_ids=position_ids)
+            except TypeError:
+                cos, sin = rotary_emb(native_like_value, position_ids)
+        else:
+            try:
+                cos, sin = rotary_emb(native_like_value, seq_len=seq_len)
+            except TypeError:
+                cos, sin = rotary_emb(native_like_value, position_ids)
         query_states, native_like_key = apply_rotary_pos_emb(query_states, native_like_key, cos, sin, position_ids)
 
-    attention_key = native_like_key if injected_key is None else injected_key
-    attention_value = native_like_value if injected_value is None else injected_value
-    if tuple(attention_key.shape) != expected_cache_shape:
+    current_attention_key = native_like_key if injected_key is None else injected_key
+    current_attention_value = native_like_value if injected_value is None else injected_value
+    if tuple(current_attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for rotary GQA layer replay: "
-            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
+            f"expected {expected_cache_shape}, got {tuple(current_attention_key.shape)}"
         )
+    retain_prefix_length = 0
+    if retain_prefix_present is not None:
+        prefix_key, prefix_value = retain_prefix_present
+        if prefix_key.shape != prefix_value.shape:
+            raise ValueError("Retain prefix key/value must have identical shapes.")
+        if prefix_key.shape[:2] != current_attention_key.shape[:2] or prefix_key.shape[3] != current_attention_key.shape[3]:
+            raise ValueError("Retain prefix KV shape is incompatible with current rotary replay KV.")
+        retain_prefix_length = int(prefix_key.shape[2])
+        attention_key = torch.cat((prefix_key, current_attention_key), dim=2)
+        attention_value = torch.cat((prefix_value, current_attention_value), dim=2)
+    else:
+        attention_key = current_attention_key
+        attention_value = current_attention_value
 
     expanded_attention_key = repeat_key_value_heads(attention_key, num_key_value_groups)
     expanded_attention_value = repeat_key_value_heads(attention_value, num_key_value_groups)
@@ -1686,7 +1787,12 @@ def run_qwen2_block(
         selected_key = gather_sparse_sequence_vectors(expanded_attention_key, sparse_attention_indices)
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
-        invalid_mask = build_sparse_query_mask(sparse_attention_indices, seq_len=seq_len, num_heads=num_query_heads)
+        invalid_mask = build_sparse_query_mask(
+            sparse_attention_indices,
+            seq_len=seq_len,
+            num_heads=num_query_heads,
+            retain_query_position_offset=(retain_prefix_length if retain_prefix_present is not None else None),
+        )
         attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
         attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         dropout_p = float(getattr(attn, "attention_dropout", getattr(attn, "dropout", 0.0)))
@@ -1696,11 +1802,16 @@ def run_qwen2_block(
         effective_attention_mask = attention_mask
         sliding_window = getattr(attn, "sliding_window", None)
         if sliding_window is not None and int(sliding_window) > 0:
-            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
-            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            total_kv_len = retain_prefix_length + seq_len
+            query_positions = torch.arange(
+                retain_prefix_length,
+                total_kv_len,
+                device=hidden_states.device,
+            ).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(total_kv_len, device=hidden_states.device).view(1, 1, 1, total_kv_len)
             sliding_mask = key_positions <= (query_positions - int(sliding_window))
             sliding_bias = torch.zeros(
-                (1, 1, seq_len, seq_len),
+                (1, 1, seq_len, total_kv_len),
                 dtype=query_states.dtype,
                 device=hidden_states.device,
             ).masked_fill(sliding_mask, torch.finfo(query_states.dtype).min)
@@ -1744,6 +1855,8 @@ def run_llama_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    # Retain-only option: resident target KV for this layer.
+    retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     # Llama 3.2's attention/MLP block is structurally identical for the fields
     # consumed by the Qwen2-family replay helper. Llama-specific RoPE lives on
@@ -1757,6 +1870,7 @@ def run_llama_block(
         sparse_attention_indices=sparse_attention_indices,
         injected_key=injected_key,
         injected_value=injected_value,
+        retain_prefix_present=retain_prefix_present,
     )
 
 
@@ -1769,6 +1883,8 @@ def run_gemma3_block(
     sparse_attention_indices: Optional[torch.Tensor] = None,
     injected_key: Optional[torch.Tensor] = None,
     injected_value: Optional[torch.Tensor] = None,
+    # Retain-only option: resident target KV for this layer.
+    retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Replay one Gemma 3 text block with an optional translated KV cache.
 
@@ -1813,13 +1929,26 @@ def run_gemma3_block(
         query_states, native_like_key, cos, sin, position_ids
     )
 
-    attention_key = native_like_key if injected_key is None else injected_key
-    attention_value = native_like_value if injected_value is None else injected_value
-    if tuple(attention_key.shape) != expected_cache_shape:
+    current_attention_key = native_like_key if injected_key is None else injected_key
+    current_attention_value = native_like_value if injected_value is None else injected_value
+    if tuple(current_attention_key.shape) != expected_cache_shape:
         raise ValueError(
             "Attention cache shape mismatch for Gemma3 replay: "
-            f"expected {expected_cache_shape}, got {tuple(attention_key.shape)}"
+            f"expected {expected_cache_shape}, got {tuple(current_attention_key.shape)}"
         )
+    retain_prefix_length = 0
+    if retain_prefix_present is not None:
+        prefix_key, prefix_value = retain_prefix_present
+        if prefix_key.shape != prefix_value.shape:
+            raise ValueError("Retain prefix key/value must have identical shapes.")
+        if prefix_key.shape[:2] != current_attention_key.shape[:2] or prefix_key.shape[3] != current_attention_key.shape[3]:
+            raise ValueError("Retain prefix KV shape is incompatible with current Gemma3 replay KV.")
+        retain_prefix_length = int(prefix_key.shape[2])
+        attention_key = torch.cat((prefix_key, current_attention_key), dim=2)
+        attention_value = torch.cat((prefix_value, current_attention_value), dim=2)
+    else:
+        attention_key = current_attention_key
+        attention_value = current_attention_value
 
     expanded_attention_key = repeat_key_value_heads(attention_key, num_key_value_groups)
     expanded_attention_value = repeat_key_value_heads(attention_value, num_key_value_groups)
@@ -1836,10 +1965,17 @@ def run_gemma3_block(
         selected_value = gather_sparse_sequence_vectors(expanded_attention_value, sparse_attention_indices)
         attn_weights = (query_states.unsqueeze(-2) * selected_key).sum(dim=-1) * scaling
         invalid_mask = build_sparse_query_mask(
-            sparse_attention_indices, seq_len=seq_len, num_heads=num_query_heads
+            sparse_attention_indices,
+            seq_len=seq_len,
+            num_heads=num_query_heads,
+            retain_query_position_offset=(retain_prefix_length if retain_prefix_present is not None else None),
         )
         if sliding_window is not None and int(sliding_window) > 0:
-            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
+            query_positions = torch.arange(
+                retain_prefix_length,
+                retain_prefix_length + seq_len,
+                device=hidden_states.device,
+            ).view(1, 1, seq_len, 1)
             outside_window = sparse_attention_indices <= (query_positions - int(sliding_window))
             invalid_mask = invalid_mask | outside_window
         attn_weights = attn_weights.masked_fill(invalid_mask, torch.finfo(attn_weights.dtype).min)
@@ -1854,11 +1990,16 @@ def run_gemma3_block(
         # non-softcapped configuration and avoids a [B,H,Q,K] score tensor.
         effective_attention_mask = attention_mask
         if sliding_window is not None and int(sliding_window) > 0:
-            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
-            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            total_kv_len = retain_prefix_length + seq_len
+            query_positions = torch.arange(
+                retain_prefix_length,
+                total_kv_len,
+                device=hidden_states.device,
+            ).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(total_kv_len, device=hidden_states.device).view(1, 1, 1, total_kv_len)
             outside_window = key_positions <= (query_positions - int(sliding_window))
             sliding_bias = torch.zeros(
-                (1, 1, seq_len, seq_len),
+                (1, 1, seq_len, total_kv_len),
                 dtype=query_states.dtype,
                 device=hidden_states.device,
             ).masked_fill(outside_window, torch.finfo(query_states.dtype).min)
@@ -1882,11 +2023,16 @@ def run_gemma3_block(
         attn_weights = torch.matmul(query_states, expanded_attention_key.transpose(-1, -2)) * scaling
         effective_attention_mask = attention_mask
         if sliding_window is not None and int(sliding_window) > 0:
-            query_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, seq_len, 1)
-            key_positions = torch.arange(seq_len, device=hidden_states.device).view(1, 1, 1, seq_len)
+            total_kv_len = retain_prefix_length + seq_len
+            query_positions = torch.arange(
+                retain_prefix_length,
+                total_kv_len,
+                device=hidden_states.device,
+            ).view(1, 1, seq_len, 1)
+            key_positions = torch.arange(total_kv_len, device=hidden_states.device).view(1, 1, 1, total_kv_len)
             outside_window = key_positions <= (query_positions - int(sliding_window))
             sliding_bias = torch.zeros(
-                (1, 1, seq_len, seq_len), dtype=attn_weights.dtype, device=hidden_states.device
+                (1, 1, seq_len, total_kv_len), dtype=attn_weights.dtype, device=hidden_states.device
             ).masked_fill(outside_window, torch.finfo(attn_weights.dtype).min)
             effective_attention_mask = (
                 sliding_bias
@@ -1947,16 +2093,25 @@ def apply_rotary_pos_emb(
     return query_embed, key_embed
 
 
-def build_causal_attention_mask(hidden_states: torch.Tensor) -> torch.Tensor:
+def build_causal_attention_mask(
+    hidden_states: torch.Tensor,
+    *,
+    # Retain-only option: number of resident KV positions preceding this delta.
+    retain_prefix_length: Optional[int] = None,
+) -> torch.Tensor:
     batch_size, seq_len, _ = hidden_states.shape
-    mask = torch.full(
-        (seq_len, seq_len),
-        fill_value=torch.finfo(hidden_states.dtype).min,
+    prefix_len = 0 if retain_prefix_length is None else int(retain_prefix_length)
+    total_kv_len = prefix_len + seq_len
+    query_positions = torch.arange(prefix_len, total_kv_len, device=hidden_states.device)[:, None]
+    key_positions = torch.arange(total_kv_len, device=hidden_states.device)[None, :]
+    masked = key_positions > query_positions
+    mask = torch.zeros(
+        (seq_len, total_kv_len),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    mask = torch.triu(mask, diagonal=1)
-    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+    mask = mask.masked_fill(masked, torch.finfo(hidden_states.dtype).min)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, total_kv_len)
 
 
 def replay_target_prefill_with_injected_window(
@@ -1970,6 +2125,9 @@ def replay_target_prefill_with_injected_window(
     sparse_attention_indices: Optional[List[torch.Tensor]] = None,
     num_bottom_full_attn: int = 3,
     cache_injected_window: bool = False,
+    # Retain-only option: resident target KV prefix. When provided, only the
+    # delta tokens are replayed while attending to this prefix at every layer.
+    retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
 ) -> PastKeyValues:
     ensure_token_ids_model(target_model, context_token_ids)
     injected_window = blocks_to_partial_past_key_values(
@@ -1993,7 +2151,19 @@ def replay_target_prefill_with_injected_window(
             f"got {len(sparse_attention_indices)} vs {tgt_spec.num_layers}"
         )
 
+    retain_prefix_length = 0
+    if retain_target_prefix_past_key_values is not None:
+        if len(retain_target_prefix_past_key_values) != tgt_spec.num_layers:
+            raise ValueError(
+                "Retain target prefix layer count mismatch: "
+                f"prefix_layers={len(retain_target_prefix_past_key_values)} target_layers={tgt_spec.num_layers}"
+            )
+        retain_prefix_length = get_past_seq_len(retain_target_prefix_past_key_values)
+
     model_family = resolve_target_model_family(target_model, target_model_id=target_model_id)
+    if retain_target_prefix_past_key_values is not None and model_family not in {"qwen2", "llama", "gemma3"}:
+        raise ValueError("Retain MoT incremental replay is supported for Qwen/Llama/Gemma3 rotary models only.")
+
     if model_family == "gpt2":
         transformer = require_gpt2_transformer(target_model)
         target_blocks = transformer.h
@@ -2010,7 +2180,9 @@ def replay_target_prefill_with_injected_window(
             sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
+            retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            del retain_prefix_present
             return run_gpt2_block(
                 block,
                 hidden_states,
@@ -2036,7 +2208,9 @@ def replay_target_prefill_with_injected_window(
             sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
+            retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+            del retain_prefix_present
             return run_opt_block(
                 block,
                 hidden_states,
@@ -2052,7 +2226,11 @@ def replay_target_prefill_with_injected_window(
         target_blocks = qwen_model.layers
 
         def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-            return build_qwen2_input_hidden_states(target_model, context_token_ids)
+            return build_qwen2_input_hidden_states(
+                target_model,
+                context_token_ids,
+                retain_prefix_length=(retain_prefix_length if retain_target_prefix_past_key_values is not None else None),
+            )
 
         def run_block(
             block: nn.Module,
@@ -2063,6 +2241,7 @@ def replay_target_prefill_with_injected_window(
             sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
+            retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
             return run_qwen2_block(
                 block,
@@ -2073,6 +2252,7 @@ def replay_target_prefill_with_injected_window(
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
+                retain_prefix_present=retain_prefix_present,
             )
 
     elif model_family == "llama":
@@ -2080,7 +2260,11 @@ def replay_target_prefill_with_injected_window(
         target_blocks = llama_model.layers
 
         def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-            return build_llama_input_hidden_states(target_model, context_token_ids)
+            return build_llama_input_hidden_states(
+                target_model,
+                context_token_ids,
+                retain_prefix_length=(retain_prefix_length if retain_target_prefix_past_key_values is not None else None),
+            )
 
         def run_block(
             block: nn.Module,
@@ -2091,6 +2275,7 @@ def replay_target_prefill_with_injected_window(
             sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
+            retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
             return run_llama_block(
                 block,
@@ -2101,6 +2286,7 @@ def replay_target_prefill_with_injected_window(
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
+                retain_prefix_present=retain_prefix_present,
             )
 
     elif model_family == "gemma3":
@@ -2108,7 +2294,11 @@ def replay_target_prefill_with_injected_window(
         target_blocks = gemma_model.layers
 
         def build_initial_hidden_states() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-            return build_gemma3_input_hidden_states(target_model, context_token_ids)
+            return build_gemma3_input_hidden_states(
+                target_model,
+                context_token_ids,
+                retain_prefix_length=(retain_prefix_length if retain_target_prefix_past_key_values is not None else None),
+            )
 
         def run_block(
             block: nn.Module,
@@ -2119,6 +2309,7 @@ def replay_target_prefill_with_injected_window(
             sparse_attention_indices: Optional[torch.Tensor],
             injected_key: Optional[torch.Tensor] = None,
             injected_value: Optional[torch.Tensor] = None,
+            retain_prefix_present: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
             return run_gemma3_block(
                 block,
@@ -2128,6 +2319,7 @@ def replay_target_prefill_with_injected_window(
                 sparse_attention_indices=sparse_attention_indices,
                 injected_key=injected_key,
                 injected_value=injected_value,
+                retain_prefix_present=retain_prefix_present,
             )
 
     else:
@@ -2141,6 +2333,11 @@ def replay_target_prefill_with_injected_window(
         # Keep the lowest num_bottom_full_attn native-only layers exact: do not sparsify their attention.
         return None if layer_idx < num_bottom_full_attn else layer_sparse_attention_indices[layer_idx]
 
+    def retain_prefix_for_layer(layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if retain_target_prefix_past_key_values is None:
+            return None
+        return retain_target_prefix_past_key_values[layer_idx]
+
     if torch.is_grad_enabled():
         with torch.no_grad():
             hidden_states, position_ids, attention_mask, position_embeddings = build_initial_hidden_states()
@@ -2152,6 +2349,7 @@ def replay_target_prefill_with_injected_window(
                     attention_mask,
                     position_embeddings,
                     native_sparse_attention_for_layer(lower_idx),
+                    retain_prefix_present=retain_prefix_for_layer(lower_idx),
                 )
                 rebuilt_past.append((present[0].detach(), present[1].detach()))
         hidden_states = hidden_states.detach()
@@ -2165,6 +2363,7 @@ def replay_target_prefill_with_injected_window(
                 attention_mask,
                 position_embeddings,
                 native_sparse_attention_for_layer(lower_idx),
+                retain_prefix_present=retain_prefix_for_layer(lower_idx),
             )
             rebuilt_past.append(present)
 
@@ -2178,6 +2377,7 @@ def replay_target_prefill_with_injected_window(
                 attention_mask,
                 position_embeddings,
                 native_sparse_attention_for_layer(native_layer_idx),
+                retain_prefix_present=retain_prefix_for_layer(native_layer_idx),
             )
             rebuilt_past.append(present)
         hidden_states, present = run_block(
@@ -2189,6 +2389,7 @@ def replay_target_prefill_with_injected_window(
             layer_sparse_attention_indices[layer_idx],
             injected_present[0],
             injected_present[1],
+            retain_prefix_present=retain_prefix_for_layer(layer_idx),
         )
         # run_block uses injected_key/injected_value for attention, but returns the
         # native-like KV cache that should be used by training/loss paths. Heatmap
@@ -2205,6 +2406,7 @@ def replay_target_prefill_with_injected_window(
             attention_mask,
             position_embeddings,
             native_sparse_attention_for_layer(upper_idx),
+            retain_prefix_present=retain_prefix_for_layer(upper_idx),
         )
         rebuilt_past.append(present)
 
