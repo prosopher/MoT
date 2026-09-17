@@ -4,7 +4,7 @@ import json
 import pytest
 import torch
 
-from core.agent import Agent, AgentGeneration
+from core.agent import Agent, AgentGeneration, get_past_seq_len
 from core.agent_runner import AgentRunner, AgentMessageRecord
 from core.context import Context
 
@@ -1901,3 +1901,192 @@ def test_agent_runner_ttft_includes_route_cost_and_excludes_verification_retries
     assert result.profile["example_ttft_sec"] == pytest.approx(0.5)
     assert result.profile["ttft_includes_offload_translation"] is True
     assert result.profile["ttft_excludes_verification_retries"] is True
+
+
+def _install_fake_cache(agent, token_ids):
+    token_ids = list(token_ids)
+    agent.past_key_values = _fake_past(len(token_ids))
+    agent.cache_token_ids = token_ids
+    agent.invalidate_pretranslated_caches()
+
+
+def test_retain_direct_handoff_translates_only_missing_delta(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    source = runner.hub_agent
+    target = runner.agents["B"]
+    source_ids = list(range(10))
+    _install_fake_cache(source, source_ids)
+    _install_fake_cache(target, source_ids[:6])
+
+    seen = {}
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+        seen["source"] = source_agent.node_id
+        seen["target"] = target_agent.node_id
+        seen["past_tokens"] = get_past_seq_len(source_past_key_values)
+        seen["token_ids"] = list(source_token_ids)
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, source_past_key_values
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+
+    assert seen["past_tokens"] == 4
+    assert seen["token_ids"] == source_ids[6:]
+    metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=target)
+    assert metadata["tokens_sent"] == 4
+    assert target.cache_token_ids == source_ids
+    assert target.cache_seq_len == 10
+    assert cleared is False
+
+
+def test_free_direct_handoff_preserves_full_translation_then_delta_offload(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="free",
+        log_agents=False,
+    )
+    source = runner.hub_agent
+    target = runner.agents["B"]
+    source_ids = list(range(10))
+    _install_fake_cache(source, source_ids)
+    _install_fake_cache(target, source_ids[:6])
+
+    seen = {}
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+        seen["past_tokens"] = get_past_seq_len(source_past_key_values)
+        seen["token_ids"] = list(source_token_ids)
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, source_past_key_values
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+
+    assert seen["past_tokens"] == 10
+    assert seen["token_ids"] == source_ids
+    metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=target)
+    assert metadata["tokens_sent"] == 4
+    assert target.cache_token_ids == source_ids
+    assert target.cache_seq_len == 10
+    assert cleared is False  # hub is intentionally retained in free mode
+
+
+def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=3,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    hub = runner.hub_agent
+    source = runner.agents["B"]
+    target = runner.agents["C"]
+    source_ids = list(range(10))
+    _install_fake_cache(source, source_ids)
+    _install_fake_cache(hub, source_ids[:6])
+    _install_fake_cache(target, source_ids[:4])
+
+    seen = []
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+        seen.append(
+            (
+                source_agent.node_id,
+                target_agent.node_id,
+                get_past_seq_len(source_past_key_values),
+                list(source_token_ids),
+            )
+        )
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, source_past_key_values
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+
+    # B->hub translates only 6..9; future hub->C translates only 4..9.
+    assert seen[0][2:] == (4, source_ids[6:])
+    assert seen[1][2:] == (6, source_ids[4:])
+
+    _, first_meta, source_cleared, _, second_meta = runner._star_offload_to_agent(
+        source_agent=source,
+        target_agent=target,
+    )
+    assert first_meta["tokens_sent"] == 4
+    assert second_meta["tokens_sent"] == 6
+    assert hub.cache_token_ids == source_ids
+    assert target.cache_token_ids == source_ids
+    assert hub.cache_seq_len == 10
+    assert target.cache_seq_len == 10
+    assert source_cleared is False
+
+
+def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=3,
+        cache_mode="free",
+        log_agents=False,
+    )
+    hub = runner.hub_agent
+    source = runner.agents["B"]
+    target = runner.agents["C"]
+    source_ids = list(range(10))
+    _install_fake_cache(source, source_ids)
+    _install_fake_cache(hub, source_ids[:6])
+    _install_fake_cache(target, source_ids[:4])
+
+    seen = []
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids):
+        seen.append(
+            (
+                source_agent.node_id,
+                target_agent.node_id,
+                get_past_seq_len(source_past_key_values),
+                list(source_token_ids),
+            )
+        )
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, source_past_key_values
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+
+    # Free mode retains the original behavior: both physical translations see
+    # the entire source/future-hub cache, then offload slices the missing delta.
+    assert seen[0][2:] == (10, source_ids)
+    assert seen[1][2:] == (10, source_ids)
+
+    _, first_meta, source_cleared, _, second_meta = runner._star_offload_to_agent(
+        source_agent=source,
+        target_agent=target,
+    )
+    assert first_meta["tokens_sent"] == 4
+    assert second_meta["tokens_sent"] == 6
+    assert hub.cache_token_ids == source_ids
+    assert target.cache_token_ids == source_ids
+    assert target.cache_seq_len == 10
+    assert source_cleared is True

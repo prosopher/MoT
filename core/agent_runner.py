@@ -263,11 +263,11 @@ class KVCacheTranslationAdapter:
         source_past_key_values: PastKeyValues,
         source_token_ids: Sequence[int],
     ) -> Tuple[str, PastKeyValues]:
-        """Translate an already-built source cache into the target model space.
+        """Translate the provided source KV span into the target model space.
 
-        This is used immediately after an Agent cache changes, never inside
-        offload_cache(). The returned full target-side cache can later be sliced
-        by token-id delta during the physical handoff.
+        Free mode passes the full source cache. Retain mode may pass only the
+        target-missing suffix. Translation itself remains algorithm-owned; this
+        adapter only controls which source span is presented to it.
         """
         token_ids = list(source_token_ids)
         source_tokens = get_past_seq_len(source_past_key_values)
@@ -442,12 +442,18 @@ class KVCacheTranslationAdapter:
 
 
     @torch.inference_mode()
-    def refresh_pretranslated_cache(self, *, source_agent: Agent, target_agent: Agent) -> Dict[str, Any]:
-        """Prepare the full translated target-side cache for source_agent -> target_agent.
+    def refresh_pretranslated_cache(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        prefix_tokens: int = 0,
+    ) -> Dict[str, Any]:
+        """Prepare translated KV for the source suffix beginning at ``prefix_tokens``.
 
-        This is the only place where the selected algorithm translates a resident
-        Agent cache. offload_cache() must not call the translator; it only slices
-        this prepared cache according to the token-id delta computed by the runner.
+        ``prefix_tokens=0`` preserves the original full-cache translation used by
+        cache_mode=free.  Retain mode passes the target resident-prefix length so
+        only the missing source KV suffix is translated before handoff.
         """
         if source_agent.past_key_values is None:
             raise ValueError(f"Source agent {source_agent.node_id} has no KV cache to pretranslate.")
@@ -459,31 +465,46 @@ class KVCacheTranslationAdapter:
                 f"token_ids={len(source_token_ids)} past_tokens={source_tokens}"
             )
 
+        prefix_tokens = int(prefix_tokens)
+        if prefix_tokens < 0 or prefix_tokens >= source_tokens:
+            raise ValueError(
+                f"Invalid pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
+                f"prefix_tokens={prefix_tokens} source_tokens={source_tokens}"
+            )
+
+        translated_source_past = source_agent.past_key_values
+        translated_token_ids = source_token_ids
+        if prefix_tokens:
+            translated_source_past = slice_past_suffix(source_agent.past_key_values, prefix_tokens)
+            translated_token_ids = source_token_ids[prefix_tokens:]
+
         edge = self._get_edge(source_agent.node_id, target_agent.node_id)
         edge_id = edge.id
         cached_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
         cached_past = source_agent.pretranslated_past_by_edge.get(edge_id)
-        if cached_past is not None and cached_ids == source_token_ids:
+        if cached_past is not None and cached_ids == translated_token_ids:
             return {
                 "edge_id": edge_id,
-                "prepared_tokens": source_tokens,
+                "prepared_tokens": len(translated_token_ids),
+                "prefix_tokens": prefix_tokens,
                 "cached": True,
             }
 
         edge_id, translated_past = self.build_pretranslated_past_for_edge(
             source_agent=source_agent,
             target_agent=target_agent,
-            source_past_key_values=source_agent.past_key_values,
-            source_token_ids=source_token_ids,
+            source_past_key_values=translated_source_past,
+            source_token_ids=translated_token_ids,
         )
         source_agent.set_pretranslated_cache(
             edge_id=edge_id,
             past_key_values=translated_past,
-            cache_token_ids=source_token_ids,
+            cache_token_ids=translated_token_ids,
         )
         return {
             "edge_id": edge_id,
-            "prepared_tokens": source_tokens,
+            "prepared_tokens": len(translated_token_ids),
+            "prefix_tokens": prefix_tokens,
             "cached": False,
         }
 
@@ -507,13 +528,21 @@ class KVCacheTranslationAdapter:
                 "Refresh the source Agent's outbound translation immediately after its cache changes "
                 "and before calling offload_cache()."
             )
-        if translated_token_ids != source_token_ids:
+
+        # Free mode stores a full translated cache and slices it at handoff.
+        # Retain mode stores only source[prefix_tokens:] because the target already
+        # owns the resident prefix.  Accept exactly those two representations.
+        if translated_token_ids == source_token_ids:
+            translated_piece = slice_past_suffix(translated_full_past, prefix_tokens)
+        elif translated_token_ids == source_token_ids[prefix_tokens:]:
+            translated_piece = translated_full_past
+        else:
             raise RuntimeError(
                 f"Stale pretranslated cache for {edge_id}: "
-                f"prepared_tokens={len(translated_token_ids)} current_tokens={len(source_token_ids)}"
+                f"prepared_tokens={len(translated_token_ids)} current_tokens={len(source_token_ids)} "
+                f"prefix_tokens={prefix_tokens}"
             )
 
-        translated_piece = slice_past_suffix(translated_full_past, prefix_tokens)
         target_piece_tokens = get_past_seq_len(translated_piece)
         if target_piece_tokens != expected_delta_tokens:
             raise ValueError(
@@ -539,9 +568,9 @@ class KVCacheTranslationAdapter:
     ) -> Tuple[PastKeyValues, Dict[str, Any]]:
         """Replay a pretranslated KV delta into target_agent.
 
-        No translation is performed here. The translated full cache must already
-        exist on source_agent.pretranslated_past_by_edge; offload_cache() only
-        slices the missing suffix and concatenates it to the target cache.
+        No translation is performed here. A prepared full cache (free) or translated
+        missing suffix (retain) must already exist on source_agent; offload_cache()
+        selects that delta representation and concatenates it to the target cache.
         """
         translated_piece, piece_meta = self._slice_pretranslated_cache_piece(
             source_agent=source_agent,
@@ -2429,7 +2458,7 @@ class AgentRunner:
         source_is_hub = source_agent.node_id == self.hub_agent.node_id
         target_is_hub = logical_target_agent.node_id == self.hub_agent.node_id
         if source_is_hub or target_is_hub:
-            _, expected_delta_tokens, _ = self._build_missing_cache_delta(
+            prefix_tokens, expected_delta_tokens, _ = self._build_missing_cache_delta(
                 source_agent=source_agent,
                 target_agent=logical_target_agent,
             )
@@ -2438,6 +2467,7 @@ class AgentRunner:
             self.cache_translator.refresh_pretranslated_cache(
                 source_agent=source_agent,
                 target_agent=logical_target_agent,
+                prefix_tokens=(prefix_tokens if self.cache_mode == CACHE_MODE_RETAIN else 0),
             )
             return
 
@@ -2458,13 +2488,17 @@ class AgentRunner:
             self.cache_translator.refresh_pretranslated_cache(
                 source_agent=source_agent,
                 target_agent=self.hub_agent,
+                prefix_tokens=(prefix_tokens if self.cache_mode == CACHE_MODE_RETAIN else 0),
             )
-            first_edge = self.cache_translator._get_edge(source_agent.node_id, self.hub_agent.node_id)
-            first_full_hub_past = source_agent.pretranslated_past_by_edge[first_edge.id]
-            first_delta_piece = slice_past_suffix(first_full_hub_past, prefix_tokens)
+            first_delta_piece, _ = self.cache_translator._slice_pretranslated_cache_piece(
+                source_agent=source_agent,
+                target_agent=self.hub_agent,
+                prefix_tokens=prefix_tokens,
+                expected_delta_tokens=expected_delta_tokens,
+            )
             if get_past_seq_len(first_delta_piece) != expected_delta_tokens:
                 raise ValueError(
-                    f"Prepared source->hub delta length mismatch on {first_edge.id}: "
+                    f"Prepared source->hub delta length mismatch on {source_agent.node_id}->{self.hub_agent.node_id}: "
                     f"expected_delta_tokens={expected_delta_tokens} "
                     f"piece_tokens={get_past_seq_len(first_delta_piece)}"
                 )
@@ -2473,17 +2507,32 @@ class AgentRunner:
             else:
                 future_hub_past = _concat_past_key_values(self.hub_agent.past_key_values, first_delta_piece)
 
-        # Second physical hop: future hub -> logical target.
-        second_edge_id, second_full_target_past = self.cache_translator.build_pretranslated_past_for_edge(
+        # Second physical hop: future hub -> logical target.  Free keeps the
+        # original full-cache pretranslation path unchanged.  Retain translates
+        # only the logical target's missing suffix.
+        second_source_past = future_hub_past
+        second_source_token_ids = list(source_agent.cache_token_ids)
+        if self.cache_mode == CACHE_MODE_RETAIN:
+            second_prefix_tokens, second_delta_tokens, _ = self._build_missing_cache_delta(
+                source_agent=source_agent,
+                target_agent=logical_target_agent,
+            )
+            if second_delta_tokens == 0:
+                return
+            if second_prefix_tokens:
+                second_source_past = slice_past_suffix(future_hub_past, second_prefix_tokens)
+                second_source_token_ids = second_source_token_ids[second_prefix_tokens:]
+
+        second_edge_id, second_target_past = self.cache_translator.build_pretranslated_past_for_edge(
             source_agent=self.hub_agent,
             target_agent=logical_target_agent,
-            source_past_key_values=future_hub_past,
-            source_token_ids=source_agent.cache_token_ids,
+            source_past_key_values=second_source_past,
+            source_token_ids=second_source_token_ids,
         )
         self._pending_pretranslated_second_hops[(source_agent.node_id, logical_target_agent.node_id)] = (
             second_edge_id,
-            second_full_target_past,
-            list(source_agent.cache_token_ids),
+            second_target_past,
+            second_source_token_ids,
         )
 
     def _build_missing_cache_delta(
@@ -2648,28 +2697,54 @@ class AgentRunner:
         # installs that prepared cache after the hub receives the first hop.
         pending_key = (source_agent.node_id, target_agent.node_id)
         pending_second_hop = self._pending_pretranslated_second_hops.pop(pending_key, None)
-        if pending_second_hop is None:
-            raise RuntimeError(
-                f"Missing pretranslated second-hop cache for {source_agent.node_id}->"
-                f"{self.hub_agent.node_id}->{target_agent.node_id}."
-            )
 
         first_meta, source_cleared = self._offload_delta_hop(
             source_agent=source_agent,
             target_agent=self.hub_agent,
         )
 
-        second_edge_id, second_full_target_past, second_token_ids = pending_second_hop
-        if list(self.hub_agent.cache_token_ids) != list(second_token_ids):
-            raise RuntimeError(
-                f"Prepared second-hop cache is stale for {second_edge_id}: "
-                f"prepared_tokens={len(second_token_ids)} hub_tokens={len(self.hub_agent.cache_token_ids)}"
-            )
-        self.hub_agent.set_pretranslated_cache(
-            edge_id=second_edge_id,
-            past_key_values=second_full_target_past,
-            cache_token_ids=second_token_ids,
+        second_prefix_tokens, second_delta_tokens, _ = self._build_missing_cache_delta(
+            source_agent=self.hub_agent,
+            target_agent=target_agent,
         )
+        if self.cache_mode == CACHE_MODE_FREE:
+            # Preserve the original free-mode behavior exactly: the pending second
+            # hop is a full translated hub cache regardless of the target prefix.
+            if pending_second_hop is None:
+                raise RuntimeError(
+                    f"Missing pretranslated second-hop cache for {source_agent.node_id}->"
+                    f"{self.hub_agent.node_id}->{target_agent.node_id}."
+                )
+            second_edge_id, second_target_past, second_token_ids = pending_second_hop
+            expected_prepared_ids = list(self.hub_agent.cache_token_ids)
+            if list(second_token_ids) != expected_prepared_ids:
+                raise RuntimeError(
+                    f"Prepared second-hop cache is stale for {second_edge_id}: "
+                    f"prepared_tokens={len(second_token_ids)} expected_tokens={len(expected_prepared_ids)}"
+                )
+            self.hub_agent.set_pretranslated_cache(
+                edge_id=second_edge_id,
+                past_key_values=second_target_past,
+                cache_token_ids=second_token_ids,
+            )
+        elif second_delta_tokens > 0:
+            if pending_second_hop is None:
+                raise RuntimeError(
+                    f"Missing pretranslated second-hop cache for {source_agent.node_id}->"
+                    f"{self.hub_agent.node_id}->{target_agent.node_id}."
+                )
+            second_edge_id, second_target_past, second_token_ids = pending_second_hop
+            expected_prepared_ids = list(self.hub_agent.cache_token_ids)[second_prefix_tokens:]
+            if list(second_token_ids) != expected_prepared_ids:
+                raise RuntimeError(
+                    f"Prepared second-hop cache is stale for {second_edge_id}: "
+                    f"prepared_tokens={len(second_token_ids)} expected_tokens={len(expected_prepared_ids)}"
+                )
+            self.hub_agent.set_pretranslated_cache(
+                edge_id=second_edge_id,
+                past_key_values=second_target_past,
+                cache_token_ids=second_token_ids,
+            )
         second_meta, _ = self._offload_delta_hop(
             source_agent=self.hub_agent,
             target_agent=target_agent,
