@@ -14,11 +14,11 @@ def _render_qwen_chat_prompt(agent, user_content: str):
     return AgentRunner._render_chat_prompt(agent, user_content, continuation=False)
 
 
-def _ctx(model_ids: str) -> Context:
+def _ctx(model_ids: str, model_directions: str = "A_to_B") -> Context:
     return Context(
         SimpleNamespace(
             model_ids=model_ids,
-            model_directions="A_to_B",
+            model_directions=model_directions,
             device="cpu",
             dtype="float32",
         )
@@ -282,20 +282,123 @@ def test_agent_runner_retries_duplicate_or_corrupted_expert_personas() -> None:
     )
 
 
-def test_agent_runner_rejects_heterogeneous_model_pool() -> None:
-    ctx = _ctx("tiny-a,tiny-b")
+def test_agent_runner_heterogeneous_virtual_agents_repeat_physical_model_pattern() -> None:
+    ctx = _ctx("tiny-a,tiny-b", "all")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=6,
+        log_agents=False,
+    )
 
-    with pytest.raises(ValueError, match="homogeneous-model control experiment"):
-        AgentRunner(
-            ctx=ctx,
-            translator_pool=ctx.tp,
-            alg="mot",
-            agent_count=2,
-            log_agents=False,
-        )
+    assert [agent.model.id for agent in runner.agent_sequence] == [
+        "tiny-a",
+        "tiny-b",
+        "tiny-a",
+        "tiny-b",
+        "tiny-a",
+        "tiny-b",
+    ]
+    assert runner.logical_to_physical_node_id == {
+        "A": "A",
+        "B": "B",
+        "C": "A",
+        "D": "B",
+        "E": "A",
+        "F": "B",
+    }
+    assert runner.cache_translator._get_edge("C", "B").id == "A_to_B"
+    assert runner.cache_translator._get_edge("B", "C").id == "B_to_A"
+    assert runner.cache_translator._get_edge("C", "A").id == "A_to_A"
 
 
-def test_agent_runner_rejects_heterogeneous_checkpoint_before_loading_models(tmp_path, monkeypatch) -> None:
+def test_agent_runner_heterogeneous_same_model_handoff_is_identity() -> None:
+    ctx = _ctx("tiny-a,tiny-b", "all")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=3,
+        log_agents=False,
+    )
+    source = runner.agents["C"]
+    target = runner.agents["A"]
+    source_past = _fake_past(5)
+    edge_id, translated = runner.cache_translator.build_pretranslated_past_for_edge(
+        source_agent=source,
+        target_agent=target,
+        source_past_key_values=source_past,
+        source_token_ids=[2, 3, 4, 5, 6],
+    )
+    assert edge_id == "A_to_A"
+    assert translated is source_past
+
+
+def test_heterogeneous_retain_delta_uses_target_token_grid() -> None:
+    class SourceTokenizer:
+        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
+            del add_special_tokens, kwargs
+            ids = [ord(ch) + 10 for ch in text]
+            tensor = torch.tensor([ids], dtype=torch.long)
+            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
+
+        def decode(self, token_ids, **kwargs):
+            del kwargs
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            return "".join(chr(int(token_id) - 10) for token_id in token_ids)
+
+    class TargetTokenizer:
+        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
+            del add_special_tokens, kwargs
+            ids = [value for ch in text for value in (ord(ch) + 100, ord(ch) + 200)]
+            tensor = torch.tensor([ids], dtype=torch.long)
+            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
+
+        def decode(self, token_ids, **kwargs):
+            del kwargs
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            return "".join(chr(int(token_ids[idx]) - 100) for idx in range(0, len(token_ids), 2))
+
+    ctx = _ctx("tiny-a,tiny-b", "all")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    source = runner.agents["A"]
+    target = runner.agents["B"]
+    source.model.tokenizer = SourceTokenizer()
+    target.model.tokenizer = TargetTokenizer()
+
+    source.cache_token_ids = [ord(ch) + 10 for ch in "abc"]
+    source.past_key_values = _fake_past(3)
+    target.cache_token_ids = [value for ch in "ab" for value in (ord(ch) + 100, ord(ch) + 200)]
+    target.past_key_values = _fake_past(4)
+
+    projected = runner.cache_translator.project_source_token_ids_to_target(
+        source_agent=source,
+        target_agent=target,
+        source_token_ids=source.cache_token_ids,
+        target_prefix_token_ids=target.cache_token_ids,
+    )
+    assert projected[:4] == target.cache_token_ids
+    assert len(projected) == 6
+    prefix_tokens, delta_tokens, prefix_matched = runner._build_missing_cache_delta(
+        source_agent=source,
+        target_agent=target,
+    )
+    assert prefix_tokens == 4
+    assert delta_tokens == 2
+    assert prefix_matched is True
+
+
+def test_agent_runner_accepts_heterogeneous_mot_checkpoint(tmp_path, monkeypatch) -> None:
     import json
     from core.agent_runner import AgentRunnerConfig
 
@@ -303,24 +406,28 @@ def test_agent_runner_rejects_heterogeneous_checkpoint_before_loading_models(tmp
         json.dumps(
             {
                 "model_ids": "tiny-a,tiny-b",
-                "model_directions": "A_to_B",
+                "model_directions": "all",
             }
         )
     )
+    loaded_ctx = _ctx("tiny-a,tiny-b", "all")
+    fake_module = SimpleNamespace(
+        load_translator_pool_from_checkpoint=lambda **kwargs: (loaded_ctx, loaded_ctx.tp)
+    )
+    monkeypatch.setattr("core.agent_runner.importlib.import_module", lambda _name: fake_module)
 
-    def fail_if_loader_is_reached(*args, **kwargs):
-        raise AssertionError("checkpoint loader should not be reached for heterogeneous AgentRunner control")
-
-    monkeypatch.setattr("core.agent_runner.importlib.import_module", fail_if_loader_is_reached)
-
-    with pytest.raises(ValueError, match="heterogeneous checkpoints"):
-        AgentRunner.from_checkpoint(
-            AgentRunnerConfig(
-                alg="mot",
-                checkpoint_dir_path=str(tmp_path),
-                device="cpu",
-            )
+    runner = AgentRunner.from_checkpoint(
+        AgentRunnerConfig(
+            alg="mot",
+            checkpoint_dir_path=str(tmp_path),
+            device="cpu",
+            agent_count=4,
+            log_agents=False,
         )
+    )
+    assert [agent.model.id for agent in runner.agent_sequence] == [
+        "tiny-a", "tiny-b", "tiny-a", "tiny-b"
+    ]
 
 
 def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides() -> None:
