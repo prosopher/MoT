@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from core.common import build_step_pasts_and_batches
+from core.common import build_step_pasts_and_batches, extract_receiver_aligned_sharer_past
 from core.config import Config
 from core.context import Context
 from core.translator_pool import TranslatorPool
@@ -419,10 +419,15 @@ def run_train(ctx: Context) -> Path:
 
             total_direction_loss = 0.0
             for edge in edges:
-                _, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                target_context_token_ids, prompt_token_ids, label_token_ids = batches_by_node_id[edge.tgt_id]
+                aligned_source_past = extract_receiver_aligned_sharer_past(
+                    receiver_context_token_ids=target_context_token_ids,
+                    receiver_model=ctx.tp.get_model(edge.tgt_id),
+                    sharer_model=ctx.tp.get_model(edge.src_id),
+                )
                 translated_past = translate_layers(
                     translator_pool=translator_pool,
-                    past_key_values=past_by_node_id[edge.src_id],
+                    past_key_values=aligned_source_past,
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),

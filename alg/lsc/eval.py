@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from core.context import Context
+from core.common import extract_receiver_aligned_sharer_past
 from core.eval_util import *
 from alg.lsc.train import translate_layers
 
@@ -19,9 +20,14 @@ def _build_logit_edge_artifacts(
     translator_pool,
 ) -> LogitEvalEdgeArtifacts:
 
+    aligned_source_past = extract_receiver_aligned_sharer_past(
+        receiver_context_token_ids=target_context_token_ids,
+        receiver_model=ctx.tp.get_model(edge.tgt_id),
+        sharer_model=ctx.tp.get_model(edge.src_id),
+    )
     translated_past = translate_layers(
         translator_pool=translator_pool,
-        past_key_values=past_by_node_id[edge.src_id],
+        past_key_values=aligned_source_past,
         src_node_id=edge.src_id,
         tgt_node_id=edge.tgt_id,
         tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
@@ -103,9 +109,14 @@ def evaluate_generation_dataset(
                 prompt_token_ids = target_inputs["prompt_token_ids"]
                 seed_token = target_inputs["seed_token"]
 
+                aligned_source_past = extract_receiver_aligned_sharer_past(
+                    receiver_context_token_ids=target_inputs["context_token_ids"],
+                    receiver_model=target_model,
+                    sharer_model=ctx.tp.get_model(edge.src_id),
+                )
                 translated_past = translate_layers(
                     translator_pool=translator_pool,
-                    past_key_values=past_by_node_id[edge.src_id],
+                    past_key_values=aligned_source_past,
                     src_node_id=edge.src_id,
                     tgt_node_id=edge.tgt_id,
                     tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
@@ -192,23 +203,44 @@ def run_eval(
 
     logging.info("Preparing validation dataloader for OpenWebText/validation")
 
-    def build_translated_target_past_fn(*, edge: Edge, past_by_node_id) -> PastKeyValues:
+    def build_translated_target_past_fn(
+        *,
+        edge: Edge,
+        target_context_token_ids: TokenIDs,
+        past_by_node_id,
+        **_,
+    ) -> PastKeyValues:
+        aligned_source_past = extract_receiver_aligned_sharer_past(
+            receiver_context_token_ids=target_context_token_ids,
+            receiver_model=ctx.tp.get_model(edge.tgt_id),
+            sharer_model=ctx.tp.get_model(edge.src_id),
+        )
         return translate_layers(
             translator_pool=translator_pool,
-            past_key_values=past_by_node_id[edge.src_id],
+            past_key_values=aligned_source_past,
             src_node_id=edge.src_id,
             tgt_node_id=edge.tgt_id,
             tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
         )
 
-    def build_visualization_pasts_fn(*, edge: Edge, past_by_node_id, **_) -> Dict[str, PastKeyValues]:
-        source_past = past_by_node_id[edge.src_id]
+    def build_visualization_pasts_fn(
+        *,
+        edge: Edge,
+        target_context_token_ids: TokenIDs,
+        past_by_node_id,
+        **_,
+    ) -> Dict[str, PastKeyValues]:
+        aligned_source_past = extract_receiver_aligned_sharer_past(
+            receiver_context_token_ids=target_context_token_ids,
+            receiver_model=ctx.tp.get_model(edge.tgt_id),
+            sharer_model=ctx.tp.get_model(edge.src_id),
+        )
         target_past = past_by_node_id[edge.tgt_id]
         return build_openwebtext_tsne_named_pasts(
-            source_top_past_key_values=source_past,
+            source_top_past_key_values=aligned_source_past,
             translated_past_key_values=translate_layers(
                 translator_pool=translator_pool,
-                past_key_values=source_past,
+                past_key_values=aligned_source_past,
                 src_node_id=edge.src_id,
                 tgt_node_id=edge.tgt_id,
                 tgt_spec=ctx.tp.get_model_spec(edge.tgt_id),
@@ -216,7 +248,7 @@ def run_eval(
             target_top_past_key_values=target_past,
         )
 
-    openwebtext_loss_results = evaluate_openwebtext_validation_loss(
+    openwebtext_loss_results = evaluate_openwebtext_validation_loss_with_context_tokens(
         ctx=ctx,
         eval_config=eval_config,
         translator_pool=translator_pool,

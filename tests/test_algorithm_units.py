@@ -12,6 +12,7 @@ from alg.interlat.train import (
 )
 from alg.kvcomm.train import KVCommSelectionTranslator, _resolve_candidate_target_layers, target_to_source_layer_map
 from alg.lsc.train import blocks_to_past_key_values
+import alg.lsc.eval as lsc_eval
 from alg.mot.train import (
     MixtureOfTranslators,
     align_sparse_attention_indices_to_target_tokens,
@@ -24,7 +25,8 @@ from alg.mot.train import (
     translate_layer_window,
     _build_rotary_input_hidden_states,
 )
-from core.common import TokenIDs
+from core.common import TokenIDs, extract_receiver_aligned_sharer_past
+from core.model import Model
 from core.model_spec import ModelSpec
 from core.channel_manager import Channel
 from core.topology import Edge, Node, get_translator_id
@@ -59,6 +61,126 @@ class ConstantTranslator(torch.nn.Module):
             dtype=layer_window_cache.dtype,
             device=layer_window_cache.device,
         )
+
+
+class _AlignmentTokenizer:
+    def __init__(self, *, decode_map, encode_map, special_ids=None) -> None:
+        self.decode_map = {int(key): value for key, value in decode_map.items()}
+        self.encode_map = {str(key): list(value) for key, value in encode_map.items()}
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.bos_token_id = 2
+        self.unk_token_id = 3
+        self.all_special_ids = list(special_ids or [0, 1, 2, 3])
+
+    def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+        del skip_special_tokens, clean_up_tokenization_spaces
+        return "".join(self.decode_map.get(int(token_id), f"<{int(token_id)}>") for token_id in token_ids)
+
+    def encode(self, text, add_special_tokens=False, return_tensors=None):
+        del add_special_tokens, return_tensors
+        return list(self.encode_map.get(text, [self.unk_token_id]))
+
+    def convert_tokens_to_ids(self, token_text):
+        candidates = self.encode_map.get(token_text)
+        if not candidates:
+            return self.unk_token_id
+        return int(candidates[0])
+
+
+class _PastOnlyLM(torch.nn.Module):
+    def __init__(self, *, num_layers=2, num_heads=1, head_dim=2) -> None:
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    def forward(self, input_ids, use_cache=True, **_):
+        del use_cache
+        batch_size, seq_len = input_ids.shape
+        past = []
+        values = input_ids.to(torch.float32).view(batch_size, 1, seq_len, 1)
+        values = values.expand(batch_size, self.num_heads, seq_len, self.head_dim).contiguous()
+        for layer_idx in range(self.num_layers):
+            key = values + float(layer_idx)
+            value = values + float(100 + layer_idx)
+            past.append((key, value))
+        return SimpleNamespace(past_key_values=tuple(past))
+
+
+def _build_cross_tokenizer_test_models():
+    receiver_tokenizer = _AlignmentTokenizer(
+        decode_map={10: "ab", 11: "c", 12: "def", 0: "<pad>", 1: "<eos>", 2: "<bos>", 3: "<unk>"},
+        encode_map={"ab": [10], "c": [11], "def": [12]},
+    )
+    sharer_tokenizer = _AlignmentTokenizer(
+        decode_map={20: "a", 21: "ab", 22: "c", 23: "d", 24: "def", 0: "<pad>", 1: "<eos>", 2: "<bos>", 3: "<unk>"},
+        encode_map={"ab": [20, 21], "c": [22], "def": [23, 24]},
+    )
+    receiver_model = Model("receiver", _PastOnlyLM(), receiver_tokenizer)
+    sharer_model = Model("sharer", _PastOnlyLM(), sharer_tokenizer)
+    return receiver_model, sharer_model
+
+
+def test_cross_tokenizer_alignment_uses_receiver_length_and_c2c_longest_rule() -> None:
+    receiver_model, sharer_model = _build_cross_tokenizer_test_models()
+    receiver_tokens = TokenIDs(torch.tensor([[10, 11, 12]]), model_id=receiver_model.id)
+
+    aligned_past = extract_receiver_aligned_sharer_past(
+        receiver_context_token_ids=receiver_tokens,
+        receiver_model=receiver_model,
+        sharer_model=sharer_model,
+    )
+
+    # "ab" -> [20, 21] selects 21 because its decoded text covers more of the
+    # receiver token; "def" analogously selects 24. Most importantly, the
+    # resulting sharer KV has exactly the receiver's three token positions.
+    expected_ids = torch.tensor([21.0, 22.0, 24.0])
+    assert aligned_past[0][0].shape[2] == 3
+    assert torch.equal(aligned_past[0][0][0, 0, :, 0], expected_ids)
+
+
+def test_lsc_logit_eval_aligns_cross_tokenized_source_to_target_length(monkeypatch) -> None:
+    receiver_model, sharer_model = _build_cross_tokenizer_test_models()
+    receiver_tokens = TokenIDs(torch.tensor([[10, 11, 12]]), model_id=receiver_model.id)
+    source_tokens = TokenIDs(torch.tensor([[20, 21, 22, 23, 24]]), model_id=sharer_model.id)
+
+    with torch.no_grad():
+        native_target_past = receiver_model(input_ids=receiver_tokens.as_tensor(), use_cache=True).past_key_values
+        mismatched_source_past = sharer_model(input_ids=source_tokens.as_tensor(), use_cache=True).past_key_values
+
+    class _TP:
+        def get_model(self, node_id):
+            return {"A": sharer_model, "B": receiver_model}[node_id]
+
+        def get_model_spec(self, node_id):
+            del node_id
+            return ModelSpec(model_id="receiver", num_layers=2, hidden_size=2, num_heads=1, head_dim=2)
+
+    ctx = SimpleNamespace(tp=_TP())
+    edge = Edge(id="A_to_B", src_id="A", tgt_id="B")
+    seen = {}
+
+    def fake_translate_layers(*, past_key_values, **_):
+        seen["source_seq_len"] = past_key_values[0][0].shape[2]
+        return past_key_values
+
+    monkeypatch.setattr(lsc_eval, "translate_layers", fake_translate_layers)
+
+    artifacts = lsc_eval._build_logit_edge_artifacts(
+        ctx=ctx,
+        edge=edge,
+        source_context_token_ids=source_tokens,
+        target_context_token_ids=receiver_tokens,
+        past_by_node_id={"A": mismatched_source_past, "B": native_target_past},
+        translator_pool=object(),
+    )
+
+    assert mismatched_source_past[0][0].shape[2] == 5
+    assert native_target_past[0][0].shape[2] == 3
+    assert seen["source_seq_len"] == 3
+    assert artifacts.translated_past_key_values[0][0].shape == native_target_past[0][0].shape
+    assert torch.isfinite(torch.tensor(artifacts.cosine_value))
 
 
 class _FakeAttentionLayer(torch.nn.Module):
