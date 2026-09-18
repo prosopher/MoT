@@ -400,7 +400,7 @@ def test_heterogeneous_retain_delta_uses_target_token_grid() -> None:
 
 
 
-def test_heterogeneous_free_pretranslation_uses_same_prefix_preserving_target_grid_at_handoff() -> None:
+def test_heterogeneous_handoff_uses_mot_canonical_target_grid_and_lcp() -> None:
     class SourceTokenizer:
         def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
             del add_special_tokens, kwargs
@@ -425,9 +425,6 @@ def test_heterogeneous_free_pretranslation_uses_same_prefix_preserving_target_gr
 
         def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
             del add_special_tokens, kwargs
-            # Deliberately make tokenization non-compositional at the prefix
-            # boundary: encode("abcd") starts with one merged "ab" token, while
-            # encode("a") + encode("bcd") has separate "a" and "b" tokens.
             if text == "abcd":
                 ids = [100, 103, 104]
             elif text == "a":
@@ -470,7 +467,7 @@ def test_heterogeneous_free_pretranslation_uses_same_prefix_preserving_target_gr
 
     source.cache_token_ids = [ord(ch) for ch in "abcd"]
     source.past_key_values = _fake_past(4)
-    target.cache_token_ids = [101]  # existing target-grid prefix for text "a"
+    target.cache_token_ids = [101]  # resident non-canonical prefix for text "a"
     target.past_key_values = _fake_past(1)
 
     seen = {}
@@ -488,21 +485,26 @@ def test_heterogeneous_free_pretranslation_uses_same_prefix_preserving_target_gr
         prefix_tokens=0,
     )
 
-    # The old buggy path prepared canonical encode("abcd") == [100,103,104].
-    # The handoff path preserved target prefix [101] and projected
-    # [101,102,103,104], so the two grids disagreed. Preparation must use the
-    # latter from the start even in free mode.
-    assert seen["projected"] == [101, 102, 103, 104]
-    assert source.pretranslated_token_ids_by_edge["A_to_B"] == [101, 102, 103, 104]
-    assert meta["prepared_tokens"] == 4
+    # AgentRunner now delegates full-text retokenization to MoT. The canonical
+    # target grid is encode("abcd") == [100,103,104], not the old
+    # prefix-preserving [101,102,103,104] grid.
+    assert seen["projected"] == [100, 103, 104]
+    assert source.pretranslated_token_ids_by_edge["A_to_B"] == [100, 103, 104]
+    assert meta["prepared_tokens"] == 3
 
-    translated_piece, _ = runner.cache_translator._slice_pretranslated_cache_piece(
+    prefix_tokens, delta_tokens, prefix_matched = runner._build_missing_cache_delta(
         source_agent=source,
         target_agent=target,
-        prefix_tokens=1,
-        expected_delta_tokens=3,
     )
-    assert get_past_seq_len(translated_piece) == 3
+    assert prefix_tokens == 0
+    assert delta_tokens == 3
+    assert prefix_matched is False
+
+    # The resident [101] token is not part of the canonical target-token LCP, so
+    # handoff discards it and installs the canonical MoT grid exactly.
+    runner._offload_delta_hop(source_agent=source, target_agent=target)
+    assert target.cache_token_ids == [100, 103, 104]
+    assert target.cache_seq_len == 3
 
 
 def test_agent_runner_accepts_heterogeneous_mot_checkpoint(tmp_path, monkeypatch) -> None:
