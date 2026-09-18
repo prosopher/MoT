@@ -398,6 +398,113 @@ def test_heterogeneous_retain_delta_uses_target_token_grid() -> None:
     assert prefix_matched is True
 
 
+
+
+def test_heterogeneous_free_pretranslation_uses_same_prefix_preserving_target_grid_at_handoff() -> None:
+    class SourceTokenizer:
+        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
+            del add_special_tokens, kwargs
+            ids = [ord(ch) for ch in text]
+            tensor = torch.tensor([ids], dtype=torch.long)
+            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
+
+        def decode(self, token_ids, **kwargs):
+            del kwargs
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            return "".join(chr(int(token_id)) for token_id in token_ids)
+
+    class BoundaryMergingTargetTokenizer:
+        _pieces = {
+            100: "ab",
+            101: "a",
+            102: "b",
+            103: "c",
+            104: "d",
+        }
+
+        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
+            del add_special_tokens, kwargs
+            # Deliberately make tokenization non-compositional at the prefix
+            # boundary: encode("abcd") starts with one merged "ab" token, while
+            # encode("a") + encode("bcd") has separate "a" and "b" tokens.
+            if text == "abcd":
+                ids = [100, 103, 104]
+            elif text == "a":
+                ids = [101]
+            elif text == "bcd":
+                ids = [102, 103, 104]
+            else:
+                ids = []
+                idx = 0
+                while idx < len(text):
+                    if text.startswith("ab", idx):
+                        ids.append(100)
+                        idx += 2
+                    else:
+                        reverse = {piece: token_id for token_id, piece in self._pieces.items() if len(piece) == 1}
+                        ids.append(reverse[text[idx]])
+                        idx += 1
+            tensor = torch.tensor([ids], dtype=torch.long)
+            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
+
+        def decode(self, token_ids, **kwargs):
+            del kwargs
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.tolist()
+            return "".join(self._pieces[int(token_id)] for token_id in token_ids)
+
+    ctx = _ctx("tiny-a,tiny-b", "all")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="free",
+        log_agents=False,
+    )
+    source = runner.agents["A"]
+    target = runner.agents["B"]
+    source.model.tokenizer = SourceTokenizer()
+    target.model.tokenizer = BoundaryMergingTargetTokenizer()
+
+    source.cache_token_ids = [ord(ch) for ch in "abcd"]
+    source.past_key_values = _fake_past(4)
+    target.cache_token_ids = [101]  # existing target-grid prefix for text "a"
+    target.past_key_values = _fake_past(1)
+
+    seen = {}
+
+    def fake_build_pretranslated_past_for_edge(**kwargs):
+        projected = list(kwargs["target_context_token_ids_override"])
+        seen["projected"] = projected
+        return "A_to_B", _fake_past(len(projected))
+
+    runner.cache_translator.build_pretranslated_past_for_edge = fake_build_pretranslated_past_for_edge
+
+    meta = runner.cache_translator.refresh_pretranslated_cache(
+        source_agent=source,
+        target_agent=target,
+        prefix_tokens=0,
+    )
+
+    # The old buggy path prepared canonical encode("abcd") == [100,103,104].
+    # The handoff path preserved target prefix [101] and projected
+    # [101,102,103,104], so the two grids disagreed. Preparation must use the
+    # latter from the start even in free mode.
+    assert seen["projected"] == [101, 102, 103, 104]
+    assert source.pretranslated_token_ids_by_edge["A_to_B"] == [101, 102, 103, 104]
+    assert meta["prepared_tokens"] == 4
+
+    translated_piece, _ = runner.cache_translator._slice_pretranslated_cache_piece(
+        source_agent=source,
+        target_agent=target,
+        prefix_tokens=1,
+        expected_delta_tokens=3,
+    )
+    assert get_past_seq_len(translated_piece) == 3
+
+
 def test_agent_runner_accepts_heterogeneous_mot_checkpoint(tmp_path, monkeypatch) -> None:
     import json
     from core.agent_runner import AgentRunnerConfig

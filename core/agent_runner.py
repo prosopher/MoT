@@ -310,7 +310,15 @@ class KVCacheTranslationAdapter:
                 f"{source_agent.node_id}->{target_agent.node_id}: target cache text is not a prefix of source cache text."
             )
         suffix_text = source_text[len(prefix_text):]
-        return prefix_ids + self._encode_cache_text(target_agent, suffix_text)
+        projected_ids = prefix_ids + self._encode_cache_text(target_agent, suffix_text)
+        projected_text = self._decode_cache_ids(target_agent.model.tokenizer, projected_ids)
+        if projected_text != source_text:
+            raise ValueError(
+                f"Cross-tokenization did not preserve the logical cache text on "
+                f"{source_agent.node_id}->{target_agent.node_id}: "
+                f"source_chars={len(source_text)} projected_chars={len(projected_text)}"
+            )
+        return projected_ids
 
     @staticmethod
     def _build_token_ids(
@@ -571,28 +579,57 @@ class KVCacheTranslationAdapter:
             )
 
         prefix_tokens = int(prefix_tokens)
-        if prefix_tokens < 0 or prefix_tokens >= source_tokens:
+        if prefix_tokens < 0:
             raise ValueError(
-                f"Invalid pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
-                f"prefix_tokens={prefix_tokens} source_tokens={source_tokens}"
+                f"Invalid negative pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
+                f"prefix_tokens={prefix_tokens}"
             )
 
         edge = self._get_edge(source_agent.node_id, target_agent.node_id)
         cross_model = source_agent.model.id != target_agent.model.id
         if cross_model:
-            target_prefix_ids = (
-                target_agent.cache_token_ids[:prefix_tokens]
-                if prefix_tokens
+            # Cross-tokenization must use one stable target-token grid from
+            # preparation through handoff. Even cache_mode=free can replay into a
+            # target (notably the hub) that already owns a resident KV prefix.
+            # Tokenizing the whole source text here and then preserving the target
+            # prefix later is not equivalent for BPE/SentencePiece tokenizers:
+            #   encode(full_text) != prefix_ids + encode(text_after_prefix)
+            # around a token boundary. That produced stale-cache mismatches such
+            # as prepared=413 vs current=409 for the exact same logical text.
+            resident_target_prefix_ids = (
+                list(target_agent.cache_token_ids)
+                if target_agent.past_key_values is not None
                 else []
             )
+            resident_target_prefix_tokens = len(resident_target_prefix_ids)
+            if prefix_tokens not in {0, resident_target_prefix_tokens}:
+                raise ValueError(
+                    f"Cross-model pretranslation prefix is not aligned with the resident target cache on "
+                    f"{source_agent.node_id}->{target_agent.node_id}: "
+                    f"requested_prefix_tokens={prefix_tokens} "
+                    f"resident_target_tokens={resident_target_prefix_tokens}"
+                )
             projected_target_ids = self.project_source_token_ids_to_target(
                 source_agent=source_agent,
                 target_agent=target_agent,
                 source_token_ids=source_token_ids,
-                target_prefix_token_ids=target_prefix_ids,
+                target_prefix_token_ids=(resident_target_prefix_ids or None),
             )
+            if len(projected_target_ids) < resident_target_prefix_tokens:
+                raise ValueError(
+                    f"Projected target cache is shorter than its preserved prefix on "
+                    f"{source_agent.node_id}->{target_agent.node_id}: "
+                    f"projected_tokens={len(projected_target_ids)} "
+                    f"resident_target_tokens={resident_target_prefix_tokens}"
+                )
             edge_id = edge.id
-            prepared_target_ids = projected_target_ids[prefix_tokens:]
+            # free stores the full target-grid cache and slices it at handoff;
+            # retain stores only the already-missing target-grid suffix.
+            prepared_target_ids = (
+                projected_target_ids[resident_target_prefix_tokens:]
+                if prefix_tokens
+                else projected_target_ids
+            )
             cached_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
             cached_past = source_agent.pretranslated_past_by_edge.get(edge_id)
             if cached_past is not None and cached_ids == prepared_target_ids:
@@ -611,7 +648,7 @@ class KVCacheTranslationAdapter:
                 target_context_token_ids_override=projected_target_ids,
             )
             translated_past = (
-                slice_past_suffix(translated_full_past, prefix_tokens)
+                slice_past_suffix(translated_full_past, resident_target_prefix_tokens)
                 if prefix_tokens
                 else translated_full_past
             )
@@ -626,6 +663,14 @@ class KVCacheTranslationAdapter:
                 "prefix_tokens": prefix_tokens,
                 "cached": False,
             }
+
+        # Preserve the original homogeneous-grid validation. Only heterogeneous
+        # target-prefix counts can legitimately differ from source token counts.
+        if prefix_tokens >= source_tokens:
+            raise ValueError(
+                f"Invalid pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
+                f"prefix_tokens={prefix_tokens} source_tokens={source_tokens}"
+            )
 
         translated_source_past = source_agent.past_key_values
         translated_token_ids = source_token_ids
@@ -2994,6 +3039,11 @@ class AgentRunner:
                 source_agent=self.hub_agent,
                 target_agent=target_agent,
                 source_token_ids=self.hub_agent.cache_token_ids,
+                target_prefix_token_ids=(
+                    target_agent.cache_token_ids
+                    if target_agent.past_key_values is not None
+                    else None
+                ),
             )
             if list(second_token_ids) != expected_prepared_ids:
                 raise RuntimeError(
