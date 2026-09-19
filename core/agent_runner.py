@@ -36,6 +36,7 @@ SUPPORTED_CACHE_MODES = (CACHE_MODE_RETAIN, CACHE_MODE_FREE)
 
 SUPPORTED_ALGS = ("mot", "interlat", "lsc", "c2c-pr", "kvcomm")
 RETAIN_ONLY_ALGS = ("interlat", "lsc", "c2c-pr", "kvcomm")
+HETEROGENEOUS_AGENT_ALGS = ("mot", "lsc", "c2c-pr")
 TRAIN_MODULE_BY_ALG = {
     "mot": "alg.mot.train",
     "interlat": "alg.interlat.train",
@@ -103,19 +104,6 @@ def _concat_past_key_values(prefix: Optional[PastKeyValues], suffix: PastKeyValu
             )
         )
     return tuple(concatenated)
-
-
-def _slice_past_prefix(past_key_values: PastKeyValues, seq_len: int) -> PastKeyValues:
-    """Return the first ``seq_len`` KV positions without mutating the owner."""
-    seq_len = int(seq_len)
-    if seq_len < 0 or seq_len > get_past_seq_len(past_key_values):
-        raise ValueError(
-            f"Invalid KV prefix slice: requested={seq_len} current={get_past_seq_len(past_key_values)}"
-        )
-    return tuple(
-        (key[:, :, :seq_len, :], value[:, :, :seq_len, :])
-        for key, value in past_key_values
-    )
 
 
 
@@ -242,8 +230,8 @@ class KVCacheTranslationAdapter:
         self.alg = normalize_agent_runner_alg(alg)
         self.edge_map = build_edge_map(ctx.edges)
         self._canonical_edge = next(iter(ctx.edges), None)
-        self.logical_to_physical_node_id = dict(logical_to_physical_node_id or {})
         self._homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
+        self.logical_to_physical_node_id = dict(logical_to_physical_node_id or {})
 
     def _physical_node_id(self, logical_node_id: str) -> str:
         return self.logical_to_physical_node_id.get(logical_node_id, logical_node_id)
@@ -255,58 +243,21 @@ class KVCacheTranslationAdapter:
         edge = self.edge_map.get(edge_id)
         if edge is not None:
             return edge
-        if not self._homogeneous_model_pool and physical_src_id == physical_tgt_id:
-            # Heterogeneous virtual Agents can map to the same physical model
-            # (A/C/E... or B/D/F...). Their KV representation is already in the
-            # correct model space, so this handoff is an exact identity transfer.
-            return Edge(id=edge_id, src_id=physical_src_id, tgt_id=physical_tgt_id)
         if self._homogeneous_model_pool and self._canonical_edge is not None:
-            # Preserve the original homogeneous control behavior exactly: one
-            # trained direction is reused for every logical virtual-Agent edge.
+            # Preserve the original homogeneous control path exactly: every logical
+            # handoff uses the checkpoint's canonical trained direction.
             return self._canonical_edge
+        if physical_src_id == physical_tgt_id:
+            # In a heterogeneous virtual-agent cycle, two logical Agents can map
+            # to the same physical model (for example Hub A and logical Agent C).
+            # No cross-model translator is required for that physical hop.
+            return Edge(id=edge_id, src_id=physical_src_id, tgt_id=physical_tgt_id)
         raise ValueError(
             f"Missing translator edge {edge_id!r} for logical handoff "
-            f"{src_node_id}->{tgt_node_id}. Available physical edges: {sorted(self.edge_map)}"
+            f"{src_node_id}->{tgt_node_id}. Train the heterogeneous checkpoint with "
+            f"the required model directions (for two-way alternation, use --model-directions all). "
+            f"Available edges: {sorted(self.edge_map)}"
         )
-
-    @staticmethod
-    def _common_token_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
-        limit = min(len(left), len(right))
-        idx = 0
-        while idx < limit and int(left[idx]) == int(right[idx]):
-            idx += 1
-        return idx
-
-    def project_source_token_ids_to_target(
-        self,
-        *,
-        source_agent: Agent,
-        target_agent: Agent,
-        source_token_ids: Sequence[int],
-        target_prefix_token_ids: Optional[Sequence[int]] = None,
-    ) -> List[int]:
-        """Return MoT's canonical full-text target tokenization for this cache."""
-        del target_prefix_token_ids  # kept only for compatibility; canonical MoT tokenization ignores resident prefixes.
-        source_ids = list(source_token_ids)
-        if source_agent.model.id == target_agent.model.id:
-            return source_ids
-
-        # Cross-tokenization belongs to MoT. Reuse its existing canonical
-        # full-text retokenizer in the reverse direction (source -> target); do
-        # not duplicate tokenizer rules in AgentRunner or change MoT train/eval.
-        from alg.mot.train import _retokenize_target_context_row_for_source
-
-        source_context_token_ids = self._build_token_ids(
-            source_ids,
-            model_id=source_agent.model.id,
-            device=source_agent.device,
-        )
-        target_context_token_ids = _retokenize_target_context_row_for_source(
-            source_model=target_agent.model,
-            target_model=source_agent.model,
-            target_context_token_ids=source_context_token_ids,
-        )
-        return target_context_token_ids.as_tensor()[0].detach().cpu().tolist()
 
     @staticmethod
     def _build_token_ids(
@@ -323,6 +274,58 @@ class KVCacheTranslationAdapter:
             model_id=model_id,
         )
 
+    def _retokenize_context_for_target(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        source_token_ids: Sequence[int],
+    ) -> TokenIDs:
+        source_context_token_ids = self._build_token_ids(
+            source_token_ids,
+            model_id=source_agent.model.id,
+            device=source_agent.device,
+        )
+        if source_agent.model.id == target_agent.model.id:
+            return self._build_token_ids(
+                source_token_ids,
+                model_id=target_agent.model.id,
+                device=target_agent.device,
+            )
+        if self.alg == "mot":
+            from alg.mot.train import retokenize_agent_runner_context
+        elif self.alg == "lsc":
+            from alg.lsc.train import retokenize_agent_runner_context
+        elif self.alg == "c2c-pr":
+            from alg.c2c.train import retokenize_agent_runner_context
+        else:
+            raise ValueError(
+                f"Heterogeneous AgentRunner cross-tokenization is not defined for alg={self.alg!r}. "
+                f"Supported algorithms: {HETEROGENEOUS_AGENT_ALGS}."
+            )
+        return retokenize_agent_runner_context(
+            source_model=source_agent.model,
+            target_model=target_agent.model,
+            source_context_token_ids=source_context_token_ids,
+        )
+
+    def target_token_ids_for_source(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        source_token_ids: Optional[Sequence[int]] = None,
+    ) -> List[int]:
+        source_ids = list(source_agent.cache_token_ids if source_token_ids is None else source_token_ids)
+        if not source_ids:
+            return []
+        target_context_token_ids = self._retokenize_context_for_target(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            source_token_ids=source_ids,
+        )
+        return [int(token_id) for token_id in target_context_token_ids.squeeze(0).detach().cpu().tolist()]
+
     @torch.inference_mode()
     def build_pretranslated_past_for_edge(
         self,
@@ -335,13 +338,12 @@ class KVCacheTranslationAdapter:
         retain_source_full_token_ids: Optional[Sequence[int]] = None,
         # Retain-only option: resident target KV prefix for MoT delta replay.
         retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
-        target_context_token_ids_override: Optional[Sequence[int]] = None,
-    ) -> Tuple[str, PastKeyValues]:
-        """Translate the provided source KV span into the target model space.
+    ) -> Tuple[str, PastKeyValues, List[int]]:
+        """Translate a source KV span and return its target-tokenizer ledger.
 
-        Free mode passes the full source cache. Retain mode may pass only the
-        target-missing suffix. Translation itself remains algorithm-owned; this
-        adapter only controls which source span is presented to it.
+        AgentRunner controls routing only. Cross-tokenization and target-grid KV
+        construction are delegated to the selected algorithm. Homogeneous runs
+        keep the original token grid and translation path unchanged.
         """
         token_ids = list(source_token_ids)
         source_tokens = get_past_seq_len(source_past_key_values)
@@ -359,48 +361,44 @@ class KVCacheTranslationAdapter:
             model_id=source_agent.model.id,
             device=source_agent.device,
         )
-        target_ids = (
-            list(target_context_token_ids_override)
-            if target_context_token_ids_override is not None
-            else self.project_source_token_ids_to_target(
-                source_agent=source_agent,
-                target_agent=target_agent,
-                source_token_ids=token_ids,
+        target_context_token_ids = self._retokenize_context_for_target(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            source_token_ids=token_ids,
+        )
+        target_token_ids = [
+            int(token_id)
+            for token_id in target_context_token_ids.squeeze(0).detach().cpu().tolist()
+        ]
+
+        # Same-physical-model hops only occur in heterogeneous virtual-agent
+        # cycles (e.g. A and C both use Llama). They require no translator.
+        if not self._homogeneous_model_pool and edge.src_id == edge.tgt_id:
+            translated_past = source_past_key_values
+        else:
+            retain_source_full_context_token_ids = None
+            if retain_source_full_token_ids is not None:
+                retain_source_full_context_token_ids = self._build_token_ids(
+                    retain_source_full_token_ids,
+                    model_id=source_agent.model.id,
+                    device=source_agent.device,
+                )
+            translated_past = self._build_algorithm_translated_past(
+                edge=edge,
+                source_past_key_values=source_past_key_values,
+                source_context_token_ids=source_context_token_ids,
+                target_context_token_ids=target_context_token_ids,
+                retain_source_full_context_token_ids=retain_source_full_context_token_ids,
+                retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
             )
-        )
-        target_context_token_ids = self._build_token_ids(
-            target_ids,
-            model_id=target_agent.model.id,
-            device=target_agent.device,
-        )
-        if edge.src_id == edge.tgt_id:
-            # Exact identity transfer between virtual Agents backed by the same
-            # physical model. This bypasses translator/channel code entirely.
-            return edge_id, source_past_key_values
-        retain_source_full_context_token_ids = None
-        if retain_source_full_token_ids is not None:
-            retain_source_full_context_token_ids = self._build_token_ids(
-                retain_source_full_token_ids,
-                model_id=source_agent.model.id,
-                device=source_agent.device,
-            )
-        translated_past = self._build_algorithm_translated_past(
-            edge=edge,
-            source_past_key_values=source_past_key_values,
-            source_context_token_ids=source_context_token_ids,
-            target_context_token_ids=target_context_token_ids,
-            retain_source_full_context_token_ids=retain_source_full_context_token_ids,
-            retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
-        )
         translated_tokens = get_past_seq_len(translated_past)
-        expected_target_tokens = len(target_ids)
-        if translated_tokens != expected_target_tokens:
+        if translated_tokens != len(target_token_ids):
             raise ValueError(
                 f"Pretranslated cache length mismatch on {edge_id}: "
-                f"source_tokens={source_tokens} target_tokens={expected_target_tokens} "
+                f"source_tokens={source_tokens} target_tokens={len(target_token_ids)} "
                 f"translated_tokens={translated_tokens}"
             )
-        return edge_id, translated_past
+        return edge_id, translated_past, target_token_ids
 
     @torch.inference_mode()
     def _build_algorithm_translated_past(
@@ -437,6 +435,18 @@ class KVCacheTranslationAdapter:
             return translated_past
 
         if self.alg == "lsc":
+            if source_context_token_ids.model_id != target_context_token_ids.model_id:
+                from alg.lsc.train import build_agent_runner_translated_past
+
+                return build_agent_runner_translated_past(
+                    translator_pool=self.translator_pool,
+                    target_context_token_ids=target_context_token_ids,
+                    source_model=self.ctx.tp.get_model(edge.src_id),
+                    target_model=target_model,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
+                    tgt_spec=tgt_spec,
+                )
             from alg.lsc.train import translate_layers
 
             return translate_layers(
@@ -484,6 +494,19 @@ class KVCacheTranslationAdapter:
             return translated_past
 
         if self.alg == "c2c-pr":
+            if source_context_token_ids.model_id != target_context_token_ids.model_id:
+                from alg.c2c.train import build_agent_runner_translated_past
+
+                return build_agent_runner_translated_past(
+                    translator_pool=self.translator_pool,
+                    train_config=self.ctx.config,
+                    target_context_token_ids=target_context_token_ids,
+                    source_model=self.ctx.tp.get_model(edge.src_id),
+                    target_model=target_model,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
+                    tgt_spec=tgt_spec,
+                )
             from alg.c2c.train import translate_top_layers
 
             source_tokens = get_past_seq_len(source_past_key_values)
@@ -506,12 +529,6 @@ class KVCacheTranslationAdapter:
                 base_past_key_values=native_target_past,
                 translated_top_past_key_values=translated_top_past,
             )
-            translated_tokens = get_past_seq_len(translated_past)
-            if translated_tokens != source_tokens:
-                raise ValueError(
-                    f"C2C-PR translated cache length mismatch on {edge.id}: "
-                    f"source_tokens={source_tokens} translated_tokens={translated_tokens}"
-                )
             return translated_past
 
         if self.alg == "kvcomm":
@@ -550,11 +567,13 @@ class KVCacheTranslationAdapter:
         target_agent: Agent,
         prefix_tokens: int = 0,
     ) -> Dict[str, Any]:
-        """Prepare translated KV for the source suffix beginning at ``prefix_tokens``.
+        """Prepare target-grid KV for the source context missing at target.
 
-        ``prefix_tokens=0`` preserves the original full-cache translation used by
-        cache_mode=free.  Retain mode passes the target resident-prefix length so
-        only the missing source KV suffix is translated before handoff.
+        Homogeneous runs retain the original suffix-translation path. For a
+        heterogeneous handoff the selected algorithm builds the full target-grid
+        cache first; retain mode then stores only the target-grid missing suffix.
+        This keeps Free/Retain ownership semantics unchanged without making
+        AgentRunner responsible for cross-tokenization.
         """
         if source_agent.past_key_values is None:
             raise ValueError(f"Source agent {source_agent.node_id} has no KV cache to pretranslate.")
@@ -567,97 +586,71 @@ class KVCacheTranslationAdapter:
             )
 
         prefix_tokens = int(prefix_tokens)
-        if prefix_tokens < 0:
-            raise ValueError(
-                f"Invalid negative pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
-                f"prefix_tokens={prefix_tokens}"
-            )
-
+        cross_tokenizer = source_agent.model.id != target_agent.model.id
         edge = self._get_edge(source_agent.node_id, target_agent.node_id)
-        cross_model = source_agent.model.id != target_agent.model.id
-        if cross_model:
-            # Use MoT's canonical full-text target tokenization. AgentRunner only
-            # decides how much of an already-resident target cache can be reused.
-            projected_target_ids = self.project_source_token_ids_to_target(
+        edge_id = edge.id
+
+        if cross_tokenizer:
+            full_target_ids = self.target_token_ids_for_source(
                 source_agent=source_agent,
                 target_agent=target_agent,
                 source_token_ids=source_token_ids,
             )
-            resident_target_ids = (
-                list(target_agent.cache_token_ids)
-                if target_agent.past_key_values is not None
-                else []
-            )
-            reusable_prefix_tokens = self._common_token_prefix_length(
-                resident_target_ids,
-                projected_target_ids,
-            )
-            if prefix_tokens not in {0, reusable_prefix_tokens}:
+            if prefix_tokens < 0 or prefix_tokens >= len(full_target_ids):
                 raise ValueError(
-                    f"Cross-model pretranslation prefix is not the canonical reusable prefix on "
-                    f"{source_agent.node_id}->{target_agent.node_id}: "
-                    f"requested_prefix_tokens={prefix_tokens} "
-                    f"canonical_prefix_tokens={reusable_prefix_tokens}"
+                    f"Invalid target-grid pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
+                    f"prefix_tokens={prefix_tokens} target_tokens={len(full_target_ids)}"
                 )
-
-            edge_id = edge.id
-            # free stores the full canonical target-grid cache and slices it at
-            # handoff; retain stores only the suffix after the canonical LCP.
-            prepared_target_ids = (
-                projected_target_ids[reusable_prefix_tokens:]
-                if prefix_tokens
-                else projected_target_ids
-            )
+            prepared_ids = full_target_ids[prefix_tokens:] if prefix_tokens else full_target_ids
             cached_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
             cached_past = source_agent.pretranslated_past_by_edge.get(edge_id)
-            if cached_past is not None and cached_ids == prepared_target_ids:
+            if cached_past is not None and cached_ids == prepared_ids:
                 return {
                     "edge_id": edge_id,
-                    "prepared_tokens": len(prepared_target_ids),
+                    "prepared_tokens": len(prepared_ids),
                     "prefix_tokens": prefix_tokens,
                     "cached": True,
                 }
 
-            edge_id, translated_full_past = self.build_pretranslated_past_for_edge(
+            edge_id, full_target_past, translated_target_ids = self.build_pretranslated_past_for_edge(
                 source_agent=source_agent,
                 target_agent=target_agent,
                 source_past_key_values=source_agent.past_key_values,
                 source_token_ids=source_token_ids,
-                target_context_token_ids_override=projected_target_ids,
             )
+            if translated_target_ids != full_target_ids:
+                raise RuntimeError(
+                    f"Algorithm target-token ledger changed during translation on {edge_id}."
+                )
             translated_past = (
-                slice_past_suffix(translated_full_past, reusable_prefix_tokens)
+                slice_past_suffix(full_target_past, prefix_tokens)
                 if prefix_tokens
-                else translated_full_past
+                else full_target_past
             )
             source_agent.set_pretranslated_cache(
                 edge_id=edge_id,
                 past_key_values=translated_past,
-                cache_token_ids=prepared_target_ids,
+                cache_token_ids=prepared_ids,
             )
             return {
                 "edge_id": edge_id,
-                "prepared_tokens": len(prepared_target_ids),
+                "prepared_tokens": len(prepared_ids),
                 "prefix_tokens": prefix_tokens,
                 "cached": False,
             }
 
-        # Preserve the original homogeneous-grid validation. Only heterogeneous
-        # target-prefix counts can legitimately differ from source token counts.
-        if prefix_tokens >= source_tokens:
+        # Original homogeneous/same-tokenizer path.
+        if prefix_tokens < 0 or prefix_tokens >= source_tokens:
             raise ValueError(
                 f"Invalid pretranslation prefix for {source_agent.node_id}->{target_agent.node_id}: "
                 f"prefix_tokens={prefix_tokens} source_tokens={source_tokens}"
             )
-
         translated_source_past = source_agent.past_key_values
         translated_token_ids = source_token_ids
         if prefix_tokens:
             translated_source_past = slice_past_suffix(source_agent.past_key_values, prefix_tokens)
             translated_token_ids = source_token_ids[prefix_tokens:]
 
-        edge = self._get_edge(source_agent.node_id, target_agent.node_id)
-        edge_id = edge.id
         cached_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
         cached_past = source_agent.pretranslated_past_by_edge.get(edge_id)
         if cached_past is not None and cached_ids == translated_token_ids:
@@ -674,7 +667,7 @@ class KVCacheTranslationAdapter:
                 "retain_source_full_token_ids": source_token_ids,
                 "retain_target_prefix_past_key_values": target_agent.past_key_values,
             }
-        edge_id, translated_past = self.build_pretranslated_past_for_edge(
+        edge_id, translated_past, target_token_ids = self.build_pretranslated_past_for_edge(
             source_agent=source_agent,
             target_agent=target_agent,
             source_past_key_values=translated_source_past,
@@ -684,11 +677,11 @@ class KVCacheTranslationAdapter:
         source_agent.set_pretranslated_cache(
             edge_id=edge_id,
             past_key_values=translated_past,
-            cache_token_ids=translated_token_ids,
+            cache_token_ids=target_token_ids,
         )
         return {
             "edge_id": edge_id,
-            "prepared_tokens": len(translated_token_ids),
+            "prepared_tokens": len(target_token_ids),
             "prefix_tokens": prefix_tokens,
             "cached": False,
         }
@@ -705,11 +698,9 @@ class KVCacheTranslationAdapter:
         edge_id = edge.id
         translated_full_past = source_agent.pretranslated_past_by_edge.get(edge_id)
         translated_token_ids = source_agent.pretranslated_token_ids_by_edge.get(edge_id)
-        source_token_ids = list(source_agent.cache_token_ids)
-        projected_target_token_ids = self.project_source_token_ids_to_target(
+        full_target_token_ids = self.target_token_ids_for_source(
             source_agent=source_agent,
             target_agent=target_agent,
-            source_token_ids=source_token_ids,
         )
 
         if translated_full_past is None or translated_token_ids is None:
@@ -719,17 +710,16 @@ class KVCacheTranslationAdapter:
                 "and before calling offload_cache()."
             )
 
-        # Free mode stores a full translated cache and slices it at handoff.
-        # Retain mode stores only source[prefix_tokens:] because the target already
-        # owns the resident prefix.  Accept exactly those two representations.
-        if translated_token_ids == projected_target_token_ids:
+        # Free mode stores the full target-grid cache and slices it at handoff.
+        # Retain mode may already store only the target-grid missing suffix.
+        if translated_token_ids == full_target_token_ids:
             translated_piece = slice_past_suffix(translated_full_past, prefix_tokens)
-        elif translated_token_ids == projected_target_token_ids[prefix_tokens:]:
+        elif translated_token_ids == full_target_token_ids[prefix_tokens:]:
             translated_piece = translated_full_past
         else:
             raise RuntimeError(
                 f"Stale pretranslated cache for {edge_id}: "
-                f"prepared_tokens={len(translated_token_ids)} current_target_tokens={len(projected_target_token_ids)} "
+                f"prepared_tokens={len(translated_token_ids)} target_tokens={len(full_target_token_ids)} "
                 f"prefix_tokens={prefix_tokens}"
             )
 
@@ -769,19 +759,22 @@ class KVCacheTranslationAdapter:
             expected_delta_tokens=expected_delta_tokens,
         )
 
-        if target_agent.past_key_values is None:
+        if target_agent.past_key_values is None or not delta_prefix_matched:
+            # A heterogeneous tokenizer may invalidate the old target token prefix
+            # after the source context grows. When that happens, translated_piece
+            # is the full target-grid cache (prefix_tokens == 0) and must replace,
+            # not concatenate with, the stale resident target cache.
             replayed_target_past = translated_piece
         else:
             replayed_target_past = _concat_past_key_values(target_agent.past_key_values, translated_piece)
 
         source_piece_tokens = int(piece_meta.get("piece_source_tokens", 0))
         target_piece_tokens = int(piece_meta.get("piece_target_tokens", 0))
-        target_cache_token_ids = self.project_source_token_ids_to_target(
-            source_agent=source_agent,
-            target_agent=target_agent,
-            source_token_ids=source_agent.cache_token_ids,
-        )
         return replayed_target_past, {
+            "_target_cache_token_ids": self.target_token_ids_for_source(
+                source_agent=source_agent,
+                target_agent=target_agent,
+            ),
             "mode": "offload",
             "offload_kind": OFFLOAD_KIND_DELTA,
             "edge_id": piece_meta.get("edge_id"),
@@ -792,7 +785,6 @@ class KVCacheTranslationAdapter:
             "target_tokens_after_replay": get_past_seq_len(replayed_target_past),
             "expected_delta_tokens": int(expected_delta_tokens),
             "delta_prefix_matched": bool(delta_prefix_matched),
-            "target_cache_token_ids": target_cache_token_ids,
         }
 
 
@@ -869,13 +861,20 @@ class AgentRunner:
         agent_count: Optional[int] = 3,
     ) -> None:
         total_nodes = len(ctx.nodes)
-        homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
         resolved_alg = normalize_agent_runner_alg(alg)
-        if not homogeneous_model_pool and resolved_alg != "mot":
+        homogeneous_model_pool = _is_homogeneous_model_pool(ctx.nodes)
+        if not homogeneous_model_pool and resolved_alg not in HETEROGENEOUS_AGENT_ALGS:
             raise ValueError(
-                "Heterogeneous virtual-Agent pools are currently supported only for alg='mot', "
-                "whose replay path provides cross-tokenizer KV alignment."
+                f"Heterogeneous AgentRunner is not defined for alg={resolved_alg!r}. "
+                f"Supported algorithms: {HETEROGENEOUS_AGENT_ALGS}."
             )
+        if homogeneous_model_pool:
+            physical_models = {id(ctx.tp.get_model(node.id)) for node in ctx.nodes}
+            if len(physical_models) != 1:
+                raise RuntimeError(
+                    "Homogeneous AgentRunner requires checkpoint nodes with the same model_id "
+                    "to share one physical Model instance."
+                )
         if cache_mode not in SUPPORTED_CACHE_MODES:
             raise ValueError(f"Unsupported cache_mode={cache_mode!r}; expected one of {SUPPORTED_CACHE_MODES}")
         if resolved_alg in RETAIN_ONLY_ALGS and cache_mode != CACHE_MODE_RETAIN:
@@ -901,42 +900,32 @@ class AgentRunner:
         self.cache_mode = cache_mode
         self.agent_count = resolved_agent_count
         self.device = ctx.config.device
-        self._canonical_model_node_id = ctx.nodes[0].id
         self._homogeneous_model_pool = homogeneous_model_pool
+        self._canonical_model_node_id = ctx.nodes[0].id
 
-        if homogeneous_model_pool:
-            # Preserve the original homogeneous control exactly: every virtual
-            # Agent is backed by the one shared physical model instance.
-            model_id = ctx.nodes[0].model_id
-            self.active_nodes = [
-                Node(id=index_to_node_id(index), model_id=model_id)
-                for index in range(self.agent_count)
-            ]
-            self.logical_to_physical_node_id = {
-                node.id: self._canonical_model_node_id for node in self.active_nodes
-            }
-        else:
-            # Repeat the trained heterogeneous physical-model pattern over any
-            # requested number of logical Agents: A=model0, B=model1, C=model0...
-            self.active_nodes = [
-                Node(
-                    id=index_to_node_id(index),
-                    model_id=ctx.nodes[index % total_nodes].model_id,
-                )
-                for index in range(self.agent_count)
-            ]
-            self.logical_to_physical_node_id = {
-                node.id: ctx.nodes[index % total_nodes].id
-                for index, node in enumerate(self.active_nodes)
-            }
-
+        # Logical Agents are independent of checkpoint-node count. Homogeneous
+        # checkpoints preserve the original single-physical-model behavior. For a
+        # heterogeneous checkpoint, logical Agents cycle through checkpoint nodes:
+        # A->A, B->B, C->A, D->B, ... for a two-model pool.
+        self.logical_to_physical_node_id: Dict[str, str] = {}
+        self.active_nodes: List[Node] = []
+        for index in range(self.agent_count):
+            logical_node_id = index_to_node_id(index)
+            if homogeneous_model_pool:
+                physical_node = ctx.nodes[0]
+            else:
+                physical_node = ctx.nodes[index % total_nodes]
+            self.logical_to_physical_node_id[logical_node_id] = physical_node.id
+            self.active_nodes.append(
+                Node(id=logical_node_id, model_id=physical_node.model_id)
+            )
+        self.node_ids = [node.id for node in self.active_nodes]
         self.cache_translator = KVCacheTranslationAdapter(
             ctx=ctx,
             translator_pool=translator_pool,
             alg=alg,
             logical_to_physical_node_id=self.logical_to_physical_node_id,
         )
-        self.node_ids = [node.id for node in self.active_nodes]
         # Stop behavior must be Agent-Count invariant.  Using one stop string per
         # active agent made the exact same completion terminate differently when
         # scaling, e.g. "\nAgent C:" was a stop only when C existed.  A generic
@@ -1006,9 +995,10 @@ class AgentRunner:
             raise FileNotFoundError(f"Train config not found: {train_config_path}")
         train_payload = read_json(train_config_path)
         all_nodes, all_edges = build_nodes_and_edges(train_payload["model_ids"], train_payload["model_directions"])
-        if not _is_homogeneous_model_pool(all_nodes) and resolved_alg != "mot":
+        if not _is_homogeneous_model_pool(all_nodes) and resolved_alg not in HETEROGENEOUS_AGENT_ALGS:
             raise ValueError(
-                "Heterogeneous AgentRunner checkpoints are currently supported only for alg='mot'."
+                f"Heterogeneous AgentRunner is not defined for alg={resolved_alg!r}. "
+                f"Supported algorithms: {HETEROGENEOUS_AGENT_ALGS}."
             )
         resolve_agent_count(config.agent_count, len(all_nodes))
 
@@ -2036,6 +2026,21 @@ class AgentRunner:
         memory_content = self._memory_speaker_text(persona, response)
         del context, question
 
+        # A shared Memory KV prefix must represent the same underlying text on
+        # every physical model.  In a heterogeneous pool, rendering this entry
+        # with the speaking model's chat template leaks model-specific control
+        # syntax (for example Qwen <|im_start|> markers or Llama header tokens)
+        # into the shared history.  Cross-token translation would then faithfully
+        # carry that *source-model* syntax onto the target token grid, producing a
+        # mixed-template prefix that the next model was never trained to continue.
+        # Keep heterogeneous shared memory model-neutral; each target model still
+        # renders its dynamic per-turn control prompt with its own chat template.
+        # Homogeneous runs intentionally preserve the original MALLM rendering.
+        if not self._homogeneous_model_pool:
+            if include_base:
+                return f"{MALLM_MEMORY_HEADER}\n{memory_content}\n"
+            return f"\n{memory_content}\n"
+
         # SimpleResponseGenerator appends the exact header below to its SYSTEM
         # prompt when memory is present, then appends agent-memory messages. In
         # Agent.get_discussion_history, another agent's agent message is a USER
@@ -2686,22 +2691,17 @@ class AgentRunner:
 
         # First physical hop: source non-hub -> hub.  If it is a no-op, the
         # future hub cache is simply its current resident cache.
-        prefix_tokens, expected_delta_tokens, _ = self._build_missing_cache_delta(
+        prefix_tokens, expected_delta_tokens, first_prefix_matched = self._build_missing_cache_delta(
             source_agent=source_agent,
             target_agent=self.hub_agent,
         )
-        first_hop_cross_model = source_agent.model.id != self.hub_agent.model.id
         if expected_delta_tokens == 0:
             if self.hub_agent.past_key_values is None:
                 raise RuntimeError(
                     f"Zero-delta route {source_agent.node_id}->{self.hub_agent.node_id} "
                     "requires a resident hub cache."
                 )
-            future_hub_past = (
-                _slice_past_prefix(self.hub_agent.past_key_values, prefix_tokens)
-                if first_hop_cross_model and self.hub_agent.cache_seq_len > prefix_tokens
-                else self.hub_agent.past_key_values
-            )
+            future_hub_past = self.hub_agent.past_key_values
         else:
             self.cache_translator.refresh_pretranslated_cache(
                 source_agent=source_agent,
@@ -2720,96 +2720,106 @@ class AgentRunner:
                     f"expected_delta_tokens={expected_delta_tokens} "
                     f"piece_tokens={get_past_seq_len(first_delta_piece)}"
                 )
-            if self.hub_agent.past_key_values is None:
+            if self.hub_agent.past_key_values is None or not first_prefix_matched:
+                # Cross-tokenizer re-tokenization can invalidate the hub's old
+                # token prefix. In that fallback, first_delta_piece is already the
+                # full hub-grid cache and must replace (not append to) the stale
+                # resident hub cache. This mirrors the actual first-hop handoff in
+                # offload_cache().
                 future_hub_past = first_delta_piece
             else:
-                hub_prefix_past = (
-                    _slice_past_prefix(self.hub_agent.past_key_values, prefix_tokens)
-                    if first_hop_cross_model and self.hub_agent.cache_seq_len > prefix_tokens
-                    else self.hub_agent.past_key_values
-                )
-                future_hub_past = _concat_past_key_values(hub_prefix_past, first_delta_piece)
+                future_hub_past = _concat_past_key_values(self.hub_agent.past_key_values, first_delta_piece)
 
-        # Second physical hop: future hub -> logical target. The homogeneous
-        # branch below is the original path. Heterogeneous mode keeps the same
-        # Free/Retain ownership semantics, but prepares the cache on the target
-        # tokenizer grid before storing the pending second hop.
-        if self._homogeneous_model_pool:
-            second_source_past = future_hub_past
-            second_source_token_ids = list(source_agent.cache_token_ids)
-            if self.cache_mode == CACHE_MODE_RETAIN:
-                second_prefix_tokens, second_delta_tokens, _ = self._build_missing_cache_delta(
-                    source_agent=source_agent,
+        # Second physical hop: future hub -> logical target. The future hub cache
+        # must use the hub model's token grid even when the original non-hub
+        # source uses another tokenizer.
+        future_hub_token_ids = self.cache_translator.target_token_ids_for_source(
+            source_agent=source_agent,
+            target_agent=self.hub_agent,
+        )
+        if len(future_hub_token_ids) != get_past_seq_len(future_hub_past):
+            raise ValueError(
+                f"Future hub cache/token mismatch on {source_agent.node_id}->{self.hub_agent.node_id}: "
+                f"token_ids={len(future_hub_token_ids)} past_tokens={get_past_seq_len(future_hub_past)}"
+            )
+
+        second_full_target_ids = self.cache_translator.target_token_ids_for_source(
+            source_agent=self.hub_agent,
+            target_agent=logical_target_agent,
+            source_token_ids=future_hub_token_ids,
+        )
+        target_existing_ids = (
+            list(logical_target_agent.cache_token_ids)
+            if logical_target_agent.past_key_values is not None
+            else []
+        )
+        cross_second_hop = self.hub_agent.model.id != logical_target_agent.model.id
+        second_prefix_matched = (
+            not target_existing_ids
+            or second_full_target_ids[: len(target_existing_ids)] == target_existing_ids
+        )
+        if target_existing_ids and not second_prefix_matched and not cross_second_hop:
+            raise ValueError(
+                f"Cannot prepare second-hop delta because target cache is not a prefix on its own token grid "
+                f"for {self.hub_agent.node_id}->{logical_target_agent.node_id}."
+            )
+        # Cross-tokenizer re-tokenization can change the previous end boundary.
+        # Such a prefix cannot be reused exactly, so prepare a full replacement.
+        second_prefix_tokens = (
+            len(target_existing_ids)
+            if self.cache_mode == CACHE_MODE_RETAIN and second_prefix_matched
+            else 0
+        )
+        second_delta_tokens = len(second_full_target_ids) - second_prefix_tokens
+        if self.cache_mode == CACHE_MODE_RETAIN and second_delta_tokens == 0:
+            return
+
+        if cross_second_hop:
+            # Cross-tokenizer retain builds the algorithm's full target-grid cache
+            # and slices only the already-resident target prefix.
+            second_edge_id, full_second_target_past, prepared_full_ids = (
+                self.cache_translator.build_pretranslated_past_for_edge(
+                    source_agent=self.hub_agent,
                     target_agent=logical_target_agent,
+                    source_past_key_values=future_hub_past,
+                    source_token_ids=future_hub_token_ids,
                 )
-                if second_delta_tokens == 0:
-                    return
-                if second_prefix_tokens:
-                    second_source_past = slice_past_suffix(future_hub_past, second_prefix_tokens)
-                    second_source_token_ids = second_source_token_ids[second_prefix_tokens:]
-
+            )
+            if prepared_full_ids != second_full_target_ids:
+                raise RuntimeError(f"Prepared second-hop token ledger changed on {second_edge_id}.")
+            second_target_past = (
+                slice_past_suffix(full_second_target_past, second_prefix_tokens)
+                if second_prefix_tokens
+                else full_second_target_past
+            )
+            second_prepared_ids = second_full_target_ids[second_prefix_tokens:]
+        else:
+            # Same-tokenizer path preserves the existing efficient suffix translation.
+            second_source_past = future_hub_past
+            second_source_token_ids = future_hub_token_ids
+            if second_prefix_tokens:
+                second_source_past = slice_past_suffix(future_hub_past, second_prefix_tokens)
+                second_source_token_ids = future_hub_token_ids[second_prefix_tokens:]
             second_retain_kwargs: Dict[str, Any] = {}
             if self.cache_mode == CACHE_MODE_RETAIN and second_prefix_tokens > 0:
                 second_retain_kwargs = {
-                    "retain_source_full_token_ids": list(source_agent.cache_token_ids),
+                    "retain_source_full_token_ids": future_hub_token_ids,
                     "retain_target_prefix_past_key_values": logical_target_agent.past_key_values,
                 }
-            second_edge_id, second_target_past = self.cache_translator.build_pretranslated_past_for_edge(
-                source_agent=self.hub_agent,
-                target_agent=logical_target_agent,
-                source_past_key_values=second_source_past,
-                source_token_ids=second_source_token_ids,
-                **second_retain_kwargs,
-            )
-            prepared_second_token_ids = second_source_token_ids
-        else:
-            future_hub_token_ids = self.cache_translator.project_source_token_ids_to_target(
-                source_agent=source_agent,
-                target_agent=self.hub_agent,
-                source_token_ids=source_agent.cache_token_ids,
-            )
-            if len(future_hub_token_ids) != get_past_seq_len(future_hub_past):
-                raise ValueError(
-                    f"Future hub cache/token mismatch: token_ids={len(future_hub_token_ids)} "
-                    f"past_tokens={get_past_seq_len(future_hub_past)}"
+            second_edge_id, second_target_past, second_prepared_ids = (
+                self.cache_translator.build_pretranslated_past_for_edge(
+                    source_agent=self.hub_agent,
+                    target_agent=logical_target_agent,
+                    source_past_key_values=second_source_past,
+                    source_token_ids=second_source_token_ids,
+                    **second_retain_kwargs,
                 )
-
-            target_prefix_ids = (
-                list(logical_target_agent.cache_token_ids)
-                if logical_target_agent.past_key_values is not None
-                else []
             )
-            projected_target_ids = self.cache_translator.project_source_token_ids_to_target(
-                source_agent=self.hub_agent,
-                target_agent=logical_target_agent,
-                source_token_ids=future_hub_token_ids,
-            )
-            second_prefix_tokens = self.cache_translator._common_token_prefix_length(
-                target_prefix_ids,
-                projected_target_ids,
-            )
-            second_delta_tokens = len(projected_target_ids) - second_prefix_tokens
-            if self.cache_mode == CACHE_MODE_RETAIN and second_delta_tokens == 0:
-                return
-
-            second_edge_id, second_full_target_past = self.cache_translator.build_pretranslated_past_for_edge(
-                source_agent=self.hub_agent,
-                target_agent=logical_target_agent,
-                source_past_key_values=future_hub_past,
-                source_token_ids=future_hub_token_ids,
-                target_context_token_ids_override=projected_target_ids,
-            )
-            if self.cache_mode == CACHE_MODE_RETAIN and second_prefix_tokens:
-                second_target_past = slice_past_suffix(second_full_target_past, second_prefix_tokens)
-                prepared_second_token_ids = projected_target_ids[second_prefix_tokens:]
-            else:
-                second_target_past = second_full_target_past
-                prepared_second_token_ids = projected_target_ids
 
         self._pending_pretranslated_second_hops[(source_agent.node_id, logical_target_agent.node_id)] = (
             second_edge_id,
             second_target_past,
-            prepared_second_token_ids,
+            second_prepared_ids,
         )
 
     def _build_missing_cache_delta(
@@ -2837,38 +2847,42 @@ class AgentRunner:
                 f"token_ids={len(target_agent.cache_token_ids)} past_tokens={get_past_seq_len(target_agent.past_key_values)}"
             )
 
-        source_ids = list(source_agent.cache_token_ids)
+        # Compare both caches on the target model's token grid. Homogeneous runs
+        # produce the exact same IDs as before; heterogeneous runs obtain this
+        # projection from the algorithm-owned cross-tokenizer helper.
+        source_ids_on_target_grid = self.cache_translator.target_token_ids_for_source(
+            source_agent=source_agent,
+            target_agent=target_agent,
+        )
         target_ids = list(target_agent.cache_token_ids) if target_agent.past_key_values is not None else []
-        if source_agent.model.id != target_agent.model.id:
-            source_on_target_grid = self.cache_translator.project_source_token_ids_to_target(
-                source_agent=source_agent,
-                target_agent=target_agent,
-                source_token_ids=source_ids,
-            )
-            prefix_tokens = self.cache_translator._common_token_prefix_length(
-                target_ids,
-                source_on_target_grid,
-            )
-            prefix_matched = prefix_tokens == len(target_ids)
-            expected_delta_tokens = len(source_on_target_grid) - prefix_tokens
+        if not target_ids:
+            prefix_tokens = 0
+            prefix_matched = True
+        elif source_ids_on_target_grid[: len(target_ids)] == target_ids:
+            prefix_tokens = len(target_ids)
+            prefix_matched = True
+        elif source_agent.model.id != target_agent.model.id:
+            # Re-tokenizing a longer cross-tokenizer context is not guaranteed to
+            # preserve the previous target-token prefix: a tokenizer can merge or
+            # split tokens across the old end-of-context boundary. In that case no
+            # target KV prefix is exactly reusable. Fall back to the algorithm's
+            # full target-grid translation and replace the resident target cache at
+            # handoff. Same-tokenizer mismatches remain errors below because they
+            # indicate a real shared-context invariant violation.
+            prefix_tokens = 0
+            prefix_matched = False
         else:
-            if not target_ids:
-                prefix_tokens = 0
-                prefix_matched = True
-            elif source_ids[: len(target_ids)] == target_ids:
-                prefix_tokens = len(target_ids)
-                prefix_matched = True
-            else:
-                raise ValueError(
-                    f"Cannot offload a token-id delta because target cache is not a prefix of source cache "
-                    f"on {source_agent.node_id}->{target_agent.node_id}: "
-                    f"source_tokens={len(source_ids)} target_tokens={len(target_ids)}"
-                )
-            expected_delta_tokens = len(source_ids) - prefix_tokens
+            raise ValueError(
+                f"Cannot offload a token-id delta because target cache is not a prefix of the source context "
+                f"on the target token grid for {source_agent.node_id}->{target_agent.node_id}: "
+                f"source_target_grid_tokens={len(source_ids_on_target_grid)} target_tokens={len(target_ids)}"
+            )
+
+        expected_delta_tokens = len(source_ids_on_target_grid) - prefix_tokens
         if expected_delta_tokens < 0:
             raise ValueError(
                 f"Invalid negative KV delta on {source_agent.node_id}->{target_agent.node_id}: "
-                f"source_tokens={len(source_ids)} target_prefix_tokens={prefix_tokens}"
+                f"source_target_grid_tokens={len(source_ids_on_target_grid)} target_prefix_tokens={prefix_tokens}"
             )
         # A zero-length delta is valid. It occurs naturally when an agent message is
         # rejected by Verification and the source Agent is rolled back to the same
@@ -2891,12 +2905,10 @@ class AgentRunner:
             expected_delta_tokens=expected_delta_tokens,
             delta_prefix_matched=delta_prefix_matched,
         )
-        # The target ledger must stay on the target tokenizer grid. This is an
-        # exact copy in homogeneous mode and a retokenized logical-memory ledger
-        # for heterogeneous handoffs.
-        target_cache_token_ids = metadata.pop("target_cache_token_ids", None)
-        if target_cache_token_ids is None:
-            target_cache_token_ids = list(source_agent.cache_token_ids)
+        # After replay, the target owns the source context represented on the
+        # target model's own token grid. The adapter obtains that ledger via the
+        # selected algorithm's cross-tokenizer helper.
+        target_cache_token_ids = metadata.pop("_target_cache_token_ids")
         target_agent.set_replayed_cache(
             translated_past,
             cache_token_ids=target_cache_token_ids,
@@ -2926,15 +2938,6 @@ class AgentRunner:
             source_agent=source_agent,
             target_agent=target_agent,
         )
-        if (
-            source_agent.model.id != target_agent.model.id
-            and target_agent.past_key_values is not None
-            and target_agent.cache_seq_len > target_tokens_before_replay
-        ):
-            # Canonical full-text retokenization can change the token boundary at
-            # the handoff point. Reuse only the exact token-ID LCP and discard the
-            # non-canonical resident suffix before installing the canonical replay.
-            target_agent.truncate_kv_cache(target_tokens_before_replay)
         if expected_delta_tokens == 0:
             # No replay/translation is necessary: target already owns the exact
             # logical prefix represented by source.  In free mode the non-hub
@@ -3018,10 +3021,9 @@ class AgentRunner:
                     f"{self.hub_agent.node_id}->{target_agent.node_id}."
                 )
             second_edge_id, second_target_past, second_token_ids = pending_second_hop
-            expected_prepared_ids = self.cache_translator.project_source_token_ids_to_target(
+            expected_prepared_ids = self.cache_translator.target_token_ids_for_source(
                 source_agent=self.hub_agent,
                 target_agent=target_agent,
-                source_token_ids=self.hub_agent.cache_token_ids,
             )
             if list(second_token_ids) != expected_prepared_ids:
                 raise RuntimeError(
@@ -3040,12 +3042,10 @@ class AgentRunner:
                     f"{self.hub_agent.node_id}->{target_agent.node_id}."
                 )
             second_edge_id, second_target_past, second_token_ids = pending_second_hop
-            projected_hub_ids = self.cache_translator.project_source_token_ids_to_target(
+            expected_prepared_ids = self.cache_translator.target_token_ids_for_source(
                 source_agent=self.hub_agent,
                 target_agent=target_agent,
-                source_token_ids=self.hub_agent.cache_token_ids,
-            )
-            expected_prepared_ids = projected_hub_ids[second_prefix_tokens:]
+            )[second_prefix_tokens:]
             if list(second_token_ids) != expected_prepared_ids:
                 raise RuntimeError(
                     f"Prepared second-hop cache is stale for {second_edge_id}: "

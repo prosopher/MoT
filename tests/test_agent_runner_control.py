@@ -14,11 +14,11 @@ def _render_qwen_chat_prompt(agent, user_content: str):
     return AgentRunner._render_chat_prompt(agent, user_content, continuation=False)
 
 
-def _ctx(model_ids: str, model_directions: str = "A_to_B") -> Context:
+def _ctx(model_ids: str) -> Context:
     return Context(
         SimpleNamespace(
             model_ids=model_ids,
-            model_directions=model_directions,
+            model_directions="A_to_B",
             device="cpu",
             dtype="float32",
         )
@@ -282,8 +282,15 @@ def test_agent_runner_retries_duplicate_or_corrupted_expert_personas() -> None:
     )
 
 
-def test_agent_runner_heterogeneous_virtual_agents_repeat_physical_model_pattern() -> None:
-    ctx = _ctx("tiny-a,tiny-b", "all")
+def test_agent_runner_heterogeneous_virtual_agents_cycle_checkpoint_models() -> None:
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
@@ -293,165 +300,117 @@ def test_agent_runner_heterogeneous_virtual_agents_repeat_physical_model_pattern
     )
 
     assert [agent.model.id for agent in runner.agent_sequence] == [
-        "tiny-a",
-        "tiny-b",
-        "tiny-a",
-        "tiny-b",
-        "tiny-a",
-        "tiny-b",
+        "tiny-a", "tiny-b", "tiny-a", "tiny-b", "tiny-a", "tiny-b"
     ]
     assert runner.logical_to_physical_node_id == {
-        "A": "A",
-        "B": "B",
-        "C": "A",
-        "D": "B",
-        "E": "A",
-        "F": "B",
+        "A": "A", "B": "B", "C": "A", "D": "B", "E": "A", "F": "B"
     }
-    assert runner.cache_translator._get_edge("C", "B").id == "A_to_B"
-    assert runner.cache_translator._get_edge("B", "C").id == "B_to_A"
-    assert runner.cache_translator._get_edge("C", "A").id == "A_to_A"
+    assert runner.agent_sequence[0].model is runner.agent_sequence[2].model
+    assert runner.agent_sequence[1].model is runner.agent_sequence[3].model
+    assert runner.agent_sequence[0].model is not runner.agent_sequence[1].model
+    assert runner.cache_translator._get_edge("C", "D").id == "A_to_B"
+    assert runner.cache_translator._get_edge("D", "C").id == "B_to_A"
+    assert runner.cache_translator._get_edge("A", "C").id == "A_to_A"
 
 
-def test_agent_runner_heterogeneous_same_model_handoff_is_identity() -> None:
-    ctx = _ctx("tiny-a,tiny-b", "all")
-    runner = AgentRunner(
-        ctx=ctx,
-        translator_pool=ctx.tp,
-        alg="mot",
-        agent_count=3,
-        log_agents=False,
+def test_agent_runner_heterogeneous_delta_uses_target_token_grid(monkeypatch) -> None:
+    from core.common import TokenIDs
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
     )
-    source = runner.agents["C"]
-    target = runner.agents["A"]
-    source_past = _fake_past(5)
-    edge_id, translated = runner.cache_translator.build_pretranslated_past_for_edge(
-        source_agent=source,
-        target_agent=target,
-        source_past_key_values=source_past,
-        source_token_ids=[2, 3, 4, 5, 6],
-    )
-    assert edge_id == "A_to_A"
-    assert translated is source_past
-
-
-def test_heterogeneous_retain_delta_uses_target_token_grid() -> None:
-    class SourceTokenizer:
-        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
-            del add_special_tokens, kwargs
-            ids = [ord(ch) + 10 for ch in text]
-            tensor = torch.tensor([ids], dtype=torch.long)
-            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
-
-        def decode(self, token_ids, **kwargs):
-            del kwargs
-            if isinstance(token_ids, torch.Tensor):
-                token_ids = token_ids.tolist()
-            return "".join(chr(int(token_id) - 10) for token_id in token_ids)
-
-    class TargetTokenizer:
-        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
-            del add_special_tokens, kwargs
-            ids = [value for ch in text for value in (ord(ch) + 100, ord(ch) + 200)]
-            tensor = torch.tensor([ids], dtype=torch.long)
-            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
-
-        def decode(self, token_ids, **kwargs):
-            del kwargs
-            if isinstance(token_ids, torch.Tensor):
-                token_ids = token_ids.tolist()
-            return "".join(chr(int(token_ids[idx]) - 100) for idx in range(0, len(token_ids), 2))
-
-    ctx = _ctx("tiny-a,tiny-b", "all")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
         alg="mot",
         agent_count=2,
-        cache_mode="retain",
         log_agents=False,
     )
-    source = runner.agents["A"]
-    target = runner.agents["B"]
-    source.model.tokenizer = SourceTokenizer()
-    target.model.tokenizer = TargetTokenizer()
-
-    source.cache_token_ids = [ord(ch) + 10 for ch in "abc"]
+    source, target = runner.agent_sequence
     source.past_key_values = _fake_past(3)
-    target.cache_token_ids = [value for ch in "ab" for value in (ord(ch) + 100, ord(ch) + 200)]
-    target.past_key_values = _fake_past(4)
+    source.cache_token_ids = [1, 2, 3]
+    target.past_key_values = _fake_past(1)
+    target.cache_token_ids = [91]
 
-    projected = runner.cache_translator.project_source_token_ids_to_target(
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        assert source_model.id == "tiny-a"
+        assert target_model.id == "tiny-b"
+        assert source_context_token_ids.squeeze(0).tolist() == [1, 2, 3]
+        return TokenIDs(torch.tensor([[91, 92]], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+    prefix_tokens, delta_tokens, matched = runner._build_missing_cache_delta(
         source_agent=source,
         target_agent=target,
-        source_token_ids=source.cache_token_ids,
-        target_prefix_token_ids=target.cache_token_ids,
     )
-    assert projected[:4] == target.cache_token_ids
-    assert len(projected) == 6
-    prefix_tokens, delta_tokens, prefix_matched = runner._build_missing_cache_delta(
+    assert (prefix_tokens, delta_tokens, matched) == (1, 1, True)
+
+
+@pytest.mark.parametrize("cache_mode", ["free", "retain"])
+def test_agent_runner_heterogeneous_prefix_mismatch_replaces_full_target_cache(monkeypatch, cache_mode) -> None:
+    from core.common import TokenIDs
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode=cache_mode,
+        log_agents=False,
+    )
+    target = runner.hub_agent       # tiny-a
+    source = runner.agents["B"]    # tiny-b
+    source.past_key_values = _fake_past(3)
+    source.cache_token_ids = [1, 2, 3]
+    target.past_key_values = _fake_past(1)
+    target.cache_token_ids = [77]   # deliberately not a prefix after re-tokenization
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        assert source_model.id == "tiny-b"
+        assert target_model.id == "tiny-a"
+        assert source_context_token_ids.squeeze(0).tolist() == [1, 2, 3]
+        return TokenIDs(torch.tensor([[91, 92]], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+    monkeypatch.setattr(
+        runner.cache_translator,
+        "_build_algorithm_translated_past",
+        lambda **kwargs: _fake_past(2),
+    )
+
+    prefix_tokens, delta_tokens, matched = runner._build_missing_cache_delta(
         source_agent=source,
         target_agent=target,
     )
-    assert prefix_tokens == 4
-    assert delta_tokens == 2
-    assert prefix_matched is True
+    assert (prefix_tokens, delta_tokens, matched) == (0, 2, False)
+
+    runner._prepare_outgoing_route_translation(
+        source_agent=source,
+        logical_target_agent=target,
+    )
+    metadata, _ = runner._offload_delta_hop(source_agent=source, target_agent=target)
+
+    assert metadata["delta_prefix_matched"] is False
+    assert metadata["tokens_sent"] == 2
+    assert target.cache_token_ids == [91, 92]
+    assert target.cache_seq_len == 2
 
 
-
-
-def test_heterogeneous_handoff_uses_mot_canonical_target_grid_and_lcp() -> None:
-    class SourceTokenizer:
-        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
-            del add_special_tokens, kwargs
-            ids = [ord(ch) for ch in text]
-            tensor = torch.tensor([ids], dtype=torch.long)
-            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
-
-        def decode(self, token_ids, **kwargs):
-            del kwargs
-            if isinstance(token_ids, torch.Tensor):
-                token_ids = token_ids.tolist()
-            return "".join(chr(int(token_id)) for token_id in token_ids)
-
-    class BoundaryMergingTargetTokenizer:
-        _pieces = {
-            100: "ab",
-            101: "a",
-            102: "b",
-            103: "c",
-            104: "d",
-        }
-
-        def __call__(self, text, return_tensors=None, add_special_tokens=False, **kwargs):
-            del add_special_tokens, kwargs
-            if text == "abcd":
-                ids = [100, 103, 104]
-            elif text == "a":
-                ids = [101]
-            elif text == "bcd":
-                ids = [102, 103, 104]
-            else:
-                ids = []
-                idx = 0
-                while idx < len(text):
-                    if text.startswith("ab", idx):
-                        ids.append(100)
-                        idx += 2
-                    else:
-                        reverse = {piece: token_id for token_id, piece in self._pieces.items() if len(piece) == 1}
-                        ids.append(reverse[text[idx]])
-                        idx += 1
-            tensor = torch.tensor([ids], dtype=torch.long)
-            return SimpleNamespace(input_ids=tensor if return_tensors == "pt" else ids)
-
-        def decode(self, token_ids, **kwargs):
-            del kwargs
-            if isinstance(token_ids, torch.Tensor):
-                token_ids = token_ids.tolist()
-            return "".join(self._pieces[int(token_id)] for token_id in token_ids)
-
-    ctx = _ctx("tiny-a,tiny-b", "all")
+def test_agent_runner_same_tokenizer_prefix_mismatch_still_raises() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
@@ -460,54 +419,70 @@ def test_heterogeneous_handoff_uses_mot_canonical_target_grid_and_lcp() -> None:
         cache_mode="free",
         log_agents=False,
     )
-    source = runner.agents["A"]
-    target = runner.agents["B"]
-    source.model.tokenizer = SourceTokenizer()
-    target.model.tokenizer = BoundaryMergingTargetTokenizer()
-
-    source.cache_token_ids = [ord(ch) for ch in "abcd"]
-    source.past_key_values = _fake_past(4)
-    target.cache_token_ids = [101]  # resident non-canonical prefix for text "a"
+    source, target = runner.agent_sequence
+    source.past_key_values = _fake_past(2)
+    source.cache_token_ids = [1, 2]
     target.past_key_values = _fake_past(1)
+    target.cache_token_ids = [99]
 
-    seen = {}
+    with pytest.raises(ValueError, match="target cache is not a prefix"):
+        runner._build_missing_cache_delta(source_agent=source, target_agent=target)
 
-    def fake_build_pretranslated_past_for_edge(**kwargs):
-        projected = list(kwargs["target_context_token_ids_override"])
-        seen["projected"] = projected
-        return "A_to_B", _fake_past(len(projected))
 
-    runner.cache_translator.build_pretranslated_past_for_edge = fake_build_pretranslated_past_for_edge
+def test_agent_runner_heterogeneous_retain_replays_target_grid_suffix(monkeypatch) -> None:
+    from core.common import TokenIDs
 
-    meta = runner.cache_translator.refresh_pretranslated_cache(
-        source_agent=source,
-        target_agent=target,
-        prefix_tokens=0,
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    source, target = runner.agent_sequence
+    source.past_key_values = _fake_past(3)
+    source.cache_token_ids = [1, 2, 3]
+    target.past_key_values = _fake_past(1)
+    target.cache_token_ids = [91]
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        assert source_model.id == "tiny-a"
+        assert target_model.id == "tiny-b"
+        assert source_context_token_ids.squeeze(0).tolist() == [1, 2, 3]
+        return TokenIDs(torch.tensor([[91, 92]], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+    monkeypatch.setattr(
+        runner.cache_translator,
+        "_build_algorithm_translated_past",
+        lambda **kwargs: _fake_past(2),
     )
 
-    # AgentRunner now delegates full-text retokenization to MoT. The canonical
-    # target grid is encode("abcd") == [100,103,104], not the old
-    # prefix-preserving [101,102,103,104] grid.
-    assert seen["projected"] == [100, 103, 104]
-    assert source.pretranslated_token_ids_by_edge["A_to_B"] == [100, 103, 104]
-    assert meta["prepared_tokens"] == 3
-
-    prefix_tokens, delta_tokens, prefix_matched = runner._build_missing_cache_delta(
+    runner._prepare_outgoing_route_translation(
         source_agent=source,
-        target_agent=target,
+        logical_target_agent=target,
     )
-    assert prefix_tokens == 0
-    assert delta_tokens == 3
-    assert prefix_matched is False
+    edge = runner.cache_translator._get_edge(source.node_id, target.node_id)
+    assert source.pretranslated_token_ids_by_edge[edge.id] == [92]
+    assert get_past_seq_len(source.pretranslated_past_by_edge[edge.id]) == 1
 
-    # The resident [101] token is not part of the canonical target-token LCP, so
-    # handoff discards it and installs the canonical MoT grid exactly.
-    runner._offload_delta_hop(source_agent=source, target_agent=target)
-    assert target.cache_token_ids == [100, 103, 104]
-    assert target.cache_seq_len == 3
+    metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=target)
+    assert metadata["tokens_sent"] == 1
+    assert target.cache_token_ids == [91, 92]
+    assert target.cache_seq_len == 2
+    assert cleared is False
 
 
-def test_agent_runner_accepts_heterogeneous_mot_checkpoint(tmp_path, monkeypatch) -> None:
+def test_agent_runner_loads_heterogeneous_checkpoint_and_cycles_models(tmp_path, monkeypatch) -> None:
     import json
     from core.agent_runner import AgentRunnerConfig
 
@@ -519,11 +494,18 @@ def test_agent_runner_accepts_heterogeneous_mot_checkpoint(tmp_path, monkeypatch
             }
         )
     )
-    loaded_ctx = _ctx("tiny-a,tiny-b", "all")
-    fake_module = SimpleNamespace(
-        load_translator_pool_from_checkpoint=lambda **kwargs: (loaded_ctx, loaded_ctx.tp)
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
     )
-    monkeypatch.setattr("core.agent_runner.importlib.import_module", lambda _name: fake_module)
+    fake_train_module = SimpleNamespace(
+        load_translator_pool_from_checkpoint=lambda **kwargs: (ctx, ctx.tp)
+    )
+    monkeypatch.setattr("core.agent_runner.importlib.import_module", lambda _name: fake_train_module)
 
     runner = AgentRunner.from_checkpoint(
         AgentRunnerConfig(
@@ -537,6 +519,18 @@ def test_agent_runner_accepts_heterogeneous_mot_checkpoint(tmp_path, monkeypatch
     assert [agent.model.id for agent in runner.agent_sequence] == [
         "tiny-a", "tiny-b", "tiny-a", "tiny-b"
     ]
+
+
+def test_agent_runner_rejects_heterogeneous_pool_for_algorithm_without_cross_tokenization() -> None:
+    ctx = _ctx("tiny-a,tiny-b")
+    with pytest.raises(ValueError, match="Heterogeneous AgentRunner is not defined"):
+        AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="interlat",
+            agent_count=2,
+            log_agents=False,
+        )
 
 
 def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides() -> None:
@@ -1879,7 +1873,7 @@ def test_agent_runner_prepares_second_hop_when_first_hop_is_zero_delta(monkeypat
         seen["source"] = source_agent.node_id
         seen["target"] = target_agent.node_id
         seen["tokens"] = list(source_token_ids)
-        return "A_to_B", source_past_key_values
+        return "A_to_B", source_past_key_values, list(source_token_ids)
 
     monkeypatch.setattr(runner.cache_translator, "refresh_pretranslated_cache", fail_refresh)
     monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
@@ -2151,7 +2145,7 @@ def test_retain_direct_handoff_translates_only_missing_delta(monkeypatch) -> Non
         seen["token_ids"] = list(source_token_ids)
         seen["kwargs"] = dict(kwargs)
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
-        return edge.id, source_past_key_values
+        return edge.id, source_past_key_values, list(source_token_ids)
 
     monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
 
@@ -2191,7 +2185,7 @@ def test_free_direct_handoff_preserves_full_translation_then_delta_offload(monke
         seen["token_ids"] = list(source_token_ids)
         seen["kwargs"] = dict(kwargs)
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
-        return edge.id, source_past_key_values
+        return edge.id, source_past_key_values, list(source_token_ids)
 
     monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
 
@@ -2238,7 +2232,7 @@ def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -
             )
         )
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
-        return edge.id, source_past_key_values
+        return edge.id, source_past_key_values, list(source_token_ids)
 
     monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
 
@@ -2296,7 +2290,7 @@ def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> 
             )
         )
         edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
-        return edge.id, source_past_key_values
+        return edge.id, source_past_key_values, list(source_token_ids)
 
     monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
 
@@ -2319,3 +2313,127 @@ def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> 
     assert target.cache_token_ids == source_ids
     assert target.cache_seq_len == 10
     assert source_cleared is True
+
+
+@pytest.mark.parametrize("cache_mode", ["free", "retain"])
+def test_heterogeneous_nonhub_route_prefix_mismatch_prepares_future_hub_as_replacement(
+    monkeypatch, cache_mode
+) -> None:
+    """B(Qwen)->Hub A(Llama)->C(Llama) must not append a full fallback cache.
+
+    Cross-tokenization can invalidate the resident hub prefix. The first-hop
+    fallback then prepares a full A-grid cache. Second-hop pretranslation must
+    model the future hub as that replacement cache, not old_hub + full_cache.
+    """
+    from core.common import TokenIDs
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=4,
+        cache_mode=cache_mode,
+        log_agents=False,
+    )
+    hub = runner.hub_agent          # logical A -> physical tiny-a
+    source = runner.agents["B"]    # physical tiny-b
+    logical_target = runner.agents["C"]  # physical tiny-a, non-hub
+
+    source.past_key_values = _fake_past(3)
+    source.cache_token_ids = [1, 2, 3]
+    hub.past_key_values = _fake_past(1)
+    hub.cache_token_ids = [77]      # deliberately stale after B->A retokenization
+    logical_target.past_key_values = None
+    logical_target.cache_token_ids = []
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        assert source_model.id == "tiny-b"
+        assert target_model.id == "tiny-a"
+        assert source_context_token_ids.squeeze(0).tolist() == [1, 2, 3]
+        return TokenIDs(torch.tensor([[91, 92]], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+    monkeypatch.setattr(
+        runner.cache_translator,
+        "_build_algorithm_translated_past",
+        lambda **kwargs: _fake_past(2),
+    )
+
+    # Before the fix this raised with past_tokens=1+2=3 while token_ids=2.
+    runner._prepare_outgoing_route_translation(
+        source_agent=source,
+        logical_target_agent=logical_target,
+    )
+
+    pending = runner._pending_pretranslated_second_hops[("B", "C")]
+    _edge_id, second_hop_past, second_hop_ids = pending
+    assert get_past_seq_len(second_hop_past) == 2
+    assert second_hop_ids == [91, 92]
+
+
+def test_heterogeneous_shared_memory_is_model_neutral_across_chat_templates() -> None:
+    class ExplodingChatTokenizer:
+        def __init__(self, marker: str) -> None:
+            self.chat_template = f"template-{marker}"
+            self.marker = marker
+            self.calls = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            return f"<{self.marker}>{messages[-1]['content']}</{self.marker}>"
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_agents=False,
+    )
+    llama_like = ExplodingChatTokenizer("llama-control")
+    qwen_like = ExplodingChatTokenizer("qwen-control")
+    fake_a = SimpleNamespace(model=SimpleNamespace(tokenizer=llama_like))
+    fake_b = SimpleNamespace(model=SimpleNamespace(tokenizer=qwen_like))
+
+    first = runner._render_memory_entry(
+        agent=fake_a,
+        persona=("Historian", "Checks chronology."),
+        response="Final Solution: No",
+        context="",
+        question="Question?",
+        include_base=True,
+    )
+    later = runner._render_memory_entry(
+        agent=fake_b,
+        persona=("Reviewer", "Checks reasoning."),
+        response="[DISAGREE] Correction. Final Solution: Yes",
+        context="",
+        question="Question?",
+        include_base=False,
+    )
+
+    assert first == (
+        "This is the discussion to the current point: \n"
+        "Historian: Final Solution: No\n"
+    )
+    assert later == "\nReviewer: [DISAGREE] Correction. Final Solution: Yes\n"
+    # Heterogeneous shared memory must never embed either model's control syntax.
+    assert llama_like.calls == 0
+    assert qwen_like.calls == 0
+    assert "llama-control" not in first + later
+    assert "qwen-control" not in first + later

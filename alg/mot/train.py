@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from core.common import build_step_pasts_and_batches, ensure_token_ids_model
+from core.common import TokenIDs, build_step_pasts_and_batches, ensure_token_ids_model
 from core.agent import get_past_seq_len
 from core.config import Config
 from core.channel_manager import (
@@ -22,6 +22,7 @@ from core.channel_manager import (
 from core.channel_profiler import ChannelProfiler, load_channel_profile_config
 from core.context import Context
 from core.translator_pool import TranslatorPool
+from core.model import Model
 from core.model_spec import ModelSpec
 from core.train_util import *
 from core.topology import get_translator_id
@@ -473,6 +474,29 @@ def translate_layer_window(
     translated_key, translated_value = ctx.tp.translators[translator_id](key_block, value_block)
     return translated_key, translated_value
 
+
+
+def retokenize_agent_runner_context(
+    *,
+    source_model: Model,
+    target_model: Model,
+    source_context_token_ids: TokenIDs,
+) -> TokenIDs:
+    """Retokenize one AgentRunner cache ledger onto the target model grid.
+
+    Cross-tokenization belongs to MoT rather than AgentRunner. The source cache
+    is decoded without dropping special tokens and then encoded by the target
+    tokenizer without injecting any new special tokens. AgentRunner only passes
+    model-tagged token IDs and consumes the returned target-grid ledger.
+    """
+    ensure_token_ids_model(source_model, source_context_token_ids)
+    if source_context_token_ids.ndim != 2 or source_context_token_ids.shape[0] != 1:
+        raise ValueError("AgentRunner MoT retokenization expects a single batch row.")
+    source_ids = source_context_token_ids.as_tensor()[0].detach().cpu().tolist()
+    text = _decode_token_ids(source_model.tokenizer, [int(token_id) for token_id in source_ids])
+    encoded = target_model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    target_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+    return TokenIDs(target_ids, model_id=target_model.id).to(target_model.device)
 
 
 def _decode_token_ids(tokenizer, token_ids: List[int]) -> str:

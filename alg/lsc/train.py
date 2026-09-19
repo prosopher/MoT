@@ -7,10 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from core.common import build_step_pasts_and_batches, extract_receiver_aligned_sharer_past
+from core.common import TokenIDs, build_step_pasts_and_batches, ensure_token_ids_model, extract_receiver_aligned_sharer_past
 from core.config import Config
 from core.context import Context
 from core.translator_pool import TranslatorPool
+from core.model import Model
 from core.model_spec import ModelSpec
 from core.train_util import *
 
@@ -257,6 +258,53 @@ def translate_blocks(
     tgt_translator = translator_pool.translators[node_model_ids[tgt_node_id]]
     shared_cache = src_translator.to_shared(key_block, value_block)
     return tgt_translator.from_shared(shared_cache)
+
+
+def retokenize_agent_runner_context(
+    *,
+    source_model: Model,
+    target_model: Model,
+    source_context_token_ids: TokenIDs,
+) -> TokenIDs:
+    """Return the target-tokenizer representation of an AgentRunner cache."""
+    ensure_token_ids_model(source_model, source_context_token_ids)
+    if source_context_token_ids.ndim != 2 or source_context_token_ids.shape[0] != 1:
+        raise ValueError("AgentRunner LSC retokenization expects a single batch row.")
+    source_ids = source_context_token_ids.as_tensor()[0].detach().cpu().tolist()
+    try:
+        text = source_model.tokenizer.decode(
+            source_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
+    except TypeError:
+        text = source_model.tokenizer.decode(source_ids, skip_special_tokens=False)
+    encoded = target_model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    target_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+    return TokenIDs(target_ids, model_id=target_model.id).to(target_model.device)
+
+
+def build_agent_runner_translated_past(
+    *,
+    translator_pool: TranslatorPool,
+    target_context_token_ids: TokenIDs,
+    source_model: Model,
+    target_model: Model,
+    src_node_id: str,
+    tgt_node_id: str,
+    tgt_spec: ModelSpec,
+):
+    """Build target-grid LSC KV using LSC's trained cross-token alignment."""
+    aligned_source_past = extract_receiver_aligned_sharer_past(
+        receiver_context_token_ids=target_context_token_ids,
+        receiver_model=target_model,
+        sharer_model=source_model,
+    )
+    return translate_layers(
+        translator_pool=translator_pool,
+        past_key_values=aligned_source_past,
+        src_node_id=src_node_id,
+        tgt_node_id=tgt_node_id,
+        tgt_spec=tgt_spec,
+    )
 
 
 def translate_layers(

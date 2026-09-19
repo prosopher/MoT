@@ -295,7 +295,6 @@ def main() -> None:
         "agent_count": len(runner.agent_sequence),
         "requested_agent_count": args.agent_count,
         "agent_ids": runner.node_ids,
-        "agent_model_ids": {agent.node_id: agent.model.id for agent in runner.agent_sequence},
         "hub_agent_id": runner.hub_agent.node_id,
         "persona_generator": "expert",
         "response_generator": "simple",
