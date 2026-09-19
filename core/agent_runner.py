@@ -2753,12 +2753,18 @@ class AgentRunner:
             if logical_target_agent.past_key_values is not None
             else []
         )
+        cross_first_hop = source_agent.model.id != self.hub_agent.model.id
         cross_second_hop = self.hub_agent.model.id != logical_target_agent.model.id
         second_prefix_matched = (
             not target_existing_ids
             or second_full_target_ids[: len(target_existing_ids)] == target_existing_ids
         )
-        if target_existing_ids and not second_prefix_matched and not cross_second_hop:
+        if (
+            target_existing_ids
+            and not second_prefix_matched
+            and not cross_second_hop
+            and not cross_first_hop
+        ):
             raise ValueError(
                 f"Cannot prepare second-hop delta because target cache is not a prefix on its own token grid "
                 f"for {self.hub_agent.node_id}->{logical_target_agent.node_id}."
@@ -2827,6 +2833,7 @@ class AgentRunner:
         *,
         source_agent: Agent,
         target_agent: Agent,
+        allow_same_model_replacement: bool = False,
     ) -> Tuple[int, int, bool]:
         """Return token-only metadata for the source suffix absent from target_agent.
 
@@ -2861,14 +2868,20 @@ class AgentRunner:
         elif source_ids_on_target_grid[: len(target_ids)] == target_ids:
             prefix_tokens = len(target_ids)
             prefix_matched = True
-        elif source_agent.model.id != target_agent.model.id:
+        elif source_agent.model.id != target_agent.model.id or allow_same_model_replacement:
             # Re-tokenizing a longer cross-tokenizer context is not guaranteed to
             # preserve the previous target-token prefix: a tokenizer can merge or
             # split tokens across the old end-of-context boundary. In that case no
-            # target KV prefix is exactly reusable. Fall back to the algorithm's
-            # full target-grid translation and replace the resident target cache at
-            # handoff. Same-tokenizer mismatches remain errors below because they
-            # indicate a real shared-context invariant violation.
+            # target KV prefix is exactly reusable.
+            #
+            # A same-model replacement is allowed only for the second physical hop
+            # of a non-hub -> hub -> non-hub route when the hub context was rebuilt
+            # from a different tokenizer on the first hop. Although hub and final
+            # target share a tokenizer, the newly rebuilt hub token grid can differ
+            # at the old end boundary from the target's stale retained prefix. The
+            # full future-hub cache is then the exact same-model representation and
+            # must replace, rather than append to, that stale prefix. Direct
+            # same-model/homogeneous mismatches still remain errors.
             prefix_tokens = 0
             prefix_matched = False
         else:
@@ -2926,6 +2939,7 @@ class AgentRunner:
         *,
         source_agent: Agent,
         target_agent: Agent,
+        allow_same_model_replacement: bool = False,
     ) -> Tuple[Dict[str, Any], bool]:
         """Run one physical star-topology offload hop.
 
@@ -2937,6 +2951,7 @@ class AgentRunner:
         target_tokens_before_replay, expected_delta_tokens, delta_prefix_matched = self._build_missing_cache_delta(
             source_agent=source_agent,
             target_agent=target_agent,
+            allow_same_model_replacement=allow_same_model_replacement,
         )
         if expected_delta_tokens == 0:
             # No replay/translation is necessary: target already owns the exact
@@ -3008,9 +3023,11 @@ class AgentRunner:
             target_agent=self.hub_agent,
         )
 
-        second_prefix_tokens, second_delta_tokens, _ = self._build_missing_cache_delta(
+        allow_second_hop_replacement = source_agent.model.id != self.hub_agent.model.id
+        second_prefix_tokens, second_delta_tokens, second_prefix_matched = self._build_missing_cache_delta(
             source_agent=self.hub_agent,
             target_agent=target_agent,
+            allow_same_model_replacement=allow_second_hop_replacement,
         )
         if self.cache_mode == CACHE_MODE_FREE:
             # Preserve the original free-mode behavior exactly: the pending second
@@ -3059,6 +3076,7 @@ class AgentRunner:
         second_meta, _ = self._offload_delta_hop(
             source_agent=self.hub_agent,
             target_agent=target_agent,
+            allow_same_model_replacement=allow_second_hop_replacement,
         )
         return self.hub_agent, first_meta, source_cleared, self.hub_agent, second_meta
 
