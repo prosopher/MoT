@@ -272,9 +272,7 @@ def retokenize_agent_runner_context(
         raise ValueError("AgentRunner LSC retokenization expects a single batch row.")
     source_ids = source_context_token_ids.as_tensor()[0].detach().cpu().tolist()
     try:
-        text = source_model.tokenizer.decode(
-            source_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-        )
+        text = source_model.tokenizer.decode(source_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
     except TypeError:
         text = source_model.tokenizer.decode(source_ids, skip_special_tokens=False)
     encoded = target_model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
