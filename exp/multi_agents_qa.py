@@ -318,17 +318,11 @@ def main() -> None:
             "end_example": args.end_example,
             "max_examples": args.max_examples,
             "loaded_example_count": len(examples),
-            "selected_example_indices": [example_index for example_index, _ in selected_examples],
+            "selected_example_ids": [example.id for _, example in selected_examples],
         },
         "count": count,
         "accuracy": accuracy,
         "ttft_sec": statistics.mean(example_ttft_sec) if example_ttft_sec else None,
-        "ttft_definition": {
-            "example": "mean of all Turn TTFT values in the Example",
-            "benchmark": "mean of all Example TTFT values",
-            "includes": ["KV pretranslation", "KV offload/replay", "prompt prefill to first generated token"],
-            "excludes": ["verification retry attempts", "verification model time", "logging", "memory metric sampling"],
-        },
         "gpu_memory_gib": {
             "model_gib": memory_gib["model_gib"],
             "translator_gib": memory_gib["translator_gib"],
