@@ -332,6 +332,9 @@ class KVCacheTranslationAdapter:
         source_token_ids: Sequence[int],
         # Retain-only option: full source token ledger for MoT sparse top-k.
         retain_source_full_token_ids: Optional[Sequence[int]] = None,
+        # Retain-only option: full source KV used to reconstruct MoT's translated
+        # attention prefix at injected layers while replaying only the delta.
+        retain_source_full_past_key_values: Optional[PastKeyValues] = None,
         # Retain-only option: resident target KV prefix for MoT delta replay.
         retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
     ) -> Tuple[str, PastKeyValues, List[int]]:
@@ -369,6 +372,7 @@ class KVCacheTranslationAdapter:
                 source_context_token_ids=source_context_token_ids,
                 target_context_token_ids=target_context_token_ids,
                 retain_source_full_context_token_ids=retain_source_full_context_token_ids,
+                retain_source_full_past_key_values=retain_source_full_past_key_values,
                 retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
             )
         translated_tokens = get_past_seq_len(translated_past)
@@ -389,6 +393,8 @@ class KVCacheTranslationAdapter:
         target_context_token_ids: TokenIDs,
         # Retain-only option: full source token ledger for MoT sparse top-k.
         retain_source_full_context_token_ids: Optional[TokenIDs] = None,
+        # Retain-only option: full source KV used by MoT incremental replay.
+        retain_source_full_past_key_values: Optional[PastKeyValues] = None,
         # Retain-only option: resident target KV prefix for MoT delta replay.
         retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
     ) -> PastKeyValues:
@@ -409,6 +415,7 @@ class KVCacheTranslationAdapter:
                 tgt_node_id=edge.tgt_id,
                 tgt_spec=tgt_spec,
                 retain_source_full_context_token_ids=retain_source_full_context_token_ids,
+                retain_source_full_past_key_values=retain_source_full_past_key_values,
                 retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
             )
             return translated_past
@@ -597,7 +604,11 @@ class KVCacheTranslationAdapter:
             return {"edge_id":edge_id,"prepared_tokens":len(translated_token_ids),"prefix_tokens":prefix_tokens,"cached":True}
         retain_kwargs: Dict[str,Any]={}
         if prefix_tokens:
-            retain_kwargs={"retain_source_full_token_ids":source_token_ids,"retain_target_prefix_past_key_values":target_agent.past_key_values}
+            retain_kwargs={
+                "retain_source_full_token_ids": source_token_ids,
+                "retain_source_full_past_key_values": source_agent.past_key_values,
+                "retain_target_prefix_past_key_values": target_agent.past_key_values,
+            }
         edge_id, translated_past, target_token_ids = self.build_pretranslated_past_for_edge(
             source_agent=source_agent,target_agent=target_agent,source_past_key_values=translated_source_past,
             source_token_ids=translated_token_ids,**retain_kwargs
@@ -2658,6 +2669,7 @@ class AgentRunner:
             if self.cache_mode == CACHE_MODE_RETAIN and second_prefix_tokens > 0:
                 second_retain_kwargs = {
                     "retain_source_full_token_ids": future_hub_token_ids,
+                    "retain_source_full_past_key_values": future_hub_past,
                     "retain_target_prefix_past_key_values": logical_target_agent.past_key_values,
                 }
             second_edge_id, second_target_past, second_prepared_ids = (

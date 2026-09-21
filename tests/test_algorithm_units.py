@@ -547,8 +547,8 @@ def test_mot_retain_sparse_topk_uses_full_source_but_replays_delta_queries(monke
     source_full = TokenIDs(torch.tensor([[10, 11, 12, 30, 31]], dtype=torch.long), model_id="same")
     prefix_past = tuple(
         (
-            torch.zeros(1, 1, 3, 2),
-            torch.zeros(1, 1, 3, 2),
+            torch.ones(1, 1, 3, 2),
+            torch.ones(1, 1, 3, 2),
         )
         for _ in range(2)
     )
@@ -556,6 +556,13 @@ def test_mot_retain_sparse_topk_uses_full_source_but_replays_delta_queries(monke
         (
             torch.zeros(1, 1, 2, 2),
             torch.zeros(1, 1, 2, 2),
+        )
+        for _ in range(2)
+    )
+    source_full_past = tuple(
+        (
+            torch.zeros(1, 1, 5, 2),
+            torch.zeros(1, 1, 5, 2),
         )
         for _ in range(2)
     )
@@ -583,13 +590,15 @@ def test_mot_retain_sparse_topk_uses_full_source_but_replays_delta_queries(monke
 
     def fake_translate(**kwargs):
         past = kwargs["past_key_values"]
-        seen["translated_source_tokens"] = past[0][0].shape[2]
+        seq_len = past[0][0].shape[2]
+        seen["translated_source_tokens"] = seq_len
         # [batch, seq, translated_layers, hidden]
-        return torch.zeros(1, 2, 1, 2), torch.zeros(1, 2, 1, 2)
+        return torch.full((1, seq_len, 1, 2), 7.0), torch.full((1, seq_len, 1, 2), 8.0)
 
     def fake_replay(**kwargs):
         seen["replay_sparse"] = kwargs["sparse_attention_indices"]
         seen["replay_prefix"] = kwargs["retain_target_prefix_past_key_values"]
+        seen["replay_injected_prefix"] = kwargs["retain_target_prefix_injected_window_past_key_values"]
         return source_delta_past
 
     monkeypatch.setattr(mot_train, "build_extrapolated_sparse_attention_indices", fake_sparse)
@@ -607,12 +616,73 @@ def test_mot_retain_sparse_topk_uses_full_source_but_replays_delta_queries(monke
         tgt_node_id="B",
         tgt_spec=ModelSpec(model_id="same", num_layers=2, hidden_size=2, num_heads=1, head_dim=2),
         retain_source_full_context_token_ids=source_full,
+        retain_source_full_past_key_values=source_full_past,
         retain_target_prefix_past_key_values=prefix_past,
     )
 
     assert torch.equal(seen["sparse_context"], source_full.as_tensor())
-    assert seen["translated_source_tokens"] == 2
+    assert seen["translated_source_tokens"] == 5
     # Only delta query rows (absolute positions 3,4) remain; key indices stay absolute.
     assert seen["replay_sparse"][0].tolist() == [[[[0, 3], [1, 4]]]]
     assert seen["replay_prefix"] is prefix_past
+    assert seen["replay_injected_prefix"][0][0].shape[2] == 3
+    assert torch.all(seen["replay_prefix"][0][0] == 1.0)
+    assert torch.all(seen["replay_injected_prefix"][0][0] == 7.0)
+    assert torch.all(seen["replay_injected_prefix"][0][1] == 8.0)
     assert replayed is source_delta_past
+
+
+def test_mot_retain_replay_uses_translated_prefix_only_at_injected_layers(monkeypatch) -> None:
+    import alg.mot.train as mot_train
+
+    target_model = SimpleNamespace(id="same")
+    context_ids = TokenIDs(torch.tensor([[30, 31]], dtype=torch.long), model_id="same")
+    tgt_spec = ModelSpec(model_id="same", num_layers=2, hidden_size=2, num_heads=1, head_dim=2)
+    native_prefix = (
+        (torch.full((1, 1, 3, 2), 10.0), torch.full((1, 1, 3, 2), 10.5)),
+        (torch.full((1, 1, 3, 2), 11.0), torch.full((1, 1, 3, 2), 11.5)),
+    )
+    translated_prefix = (
+        (torch.full((1, 1, 3, 2), 99.0), torch.full((1, 1, 3, 2), 98.0)),
+    )
+    injected_key = torch.full((1, 2, 1, 2), 7.0)
+    injected_value = torch.full((1, 2, 1, 2), 8.0)
+    layer0, layer1 = object(), object()
+    decoder = SimpleNamespace(layers=[layer0, layer1])
+    seen = []
+
+    monkeypatch.setattr(mot_train, "resolve_target_model_family", lambda *args, **kwargs: "qwen2")
+    monkeypatch.setattr(mot_train, "require_qwen2_model", lambda _model: decoder)
+
+    def fake_inputs(_model, _tokens, retain_prefix_length=None):
+        assert retain_prefix_length == 3
+        hidden = torch.zeros(1, 2, 2)
+        pos = torch.tensor([[3, 4]], dtype=torch.long)
+        mask = torch.zeros(1, 1, 2, 5)
+        return hidden, pos, mask, None
+
+    def fake_run(block, hidden_states, **kwargs):
+        prefix = kwargs["retain_prefix_present"]
+        seen.append((block, float(prefix[0].mean().item()), float(prefix[1].mean().item())))
+        present = (torch.zeros(1, 1, 2, 2), torch.zeros(1, 1, 2, 2))
+        return hidden_states, present
+
+    monkeypatch.setattr(mot_train, "build_qwen2_input_hidden_states", fake_inputs)
+    monkeypatch.setattr(mot_train, "run_qwen2_block", fake_run)
+
+    replayed = mot_train.replay_target_prefill_with_injected_window(
+        target_model=target_model,
+        context_token_ids=context_ids,
+        target_layer_indices=[1],
+        injected_key_block=injected_key,
+        injected_value_block=injected_value,
+        tgt_spec=tgt_spec,
+        sparse_attention_indices=None,
+        num_bottom_full_attn=0,
+        retain_target_prefix_past_key_values=native_prefix,
+        retain_target_prefix_injected_window_past_key_values=translated_prefix,
+    )
+
+    assert len(replayed) == 2
+    assert seen[0] == (layer0, 10.0, 10.5)
+    assert seen[1] == (layer1, 99.0, 98.0)

@@ -1958,6 +1958,7 @@ def test_retain_direct_handoff_translates_only_missing_delta(monkeypatch) -> Non
     assert seen["past_tokens"] == 4
     assert seen["token_ids"] == source_ids[6:]
     assert list(seen["kwargs"]["retain_source_full_token_ids"]) == source_ids
+    assert seen["kwargs"]["retain_source_full_past_key_values"] is source.past_key_values
     assert seen["kwargs"]["retain_target_prefix_past_key_values"] is target.past_key_values
     metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=target)
     assert metadata["tokens_sent"] == 4
@@ -2046,8 +2047,10 @@ def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -
     assert seen[0][2:4] == (4, source_ids[6:])
     assert seen[1][2:4] == (6, source_ids[4:])
     assert list(seen[0][4]["retain_source_full_token_ids"]) == source_ids
+    assert seen[0][4]["retain_source_full_past_key_values"] is source.past_key_values
     assert seen[0][4]["retain_target_prefix_past_key_values"] is hub.past_key_values
     assert list(seen[1][4]["retain_source_full_token_ids"]) == source_ids
+    assert get_past_seq_len(seen[1][4]["retain_source_full_past_key_values"]) == len(source_ids)
     assert seen[1][4]["retain_target_prefix_past_key_values"] is target.past_key_values
 
     _, first_meta, source_cleared, _, second_meta = runner._star_offload_to_agent(

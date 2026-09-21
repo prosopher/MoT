@@ -776,6 +776,10 @@ def build_replayed_target_past(
     # Retain-only option: full source token ledger used to compute sparse top-k
     # on the original context while translating only the missing KV suffix.
     retain_source_full_context_token_ids: Optional[TokenIDs] = None,
+    # Retain-only option: full source KV. MoT needs this to reconstruct the
+    # translated/injected prefix used by a full replay at translated layers while
+    # still replaying only the missing target delta.
+    retain_source_full_past_key_values: Optional[PastKeyValues] = None,
     # Retain-only option: resident target prefix KV used to replay the delta at
     # its original absolute positions and condition it on the existing cache.
     retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
@@ -801,6 +805,16 @@ def build_replayed_target_past(
                 f"full_tokens={int(retain_source_full_context_token_ids.shape[1])} "
                 f"prefix_tokens={retain_prefix_tokens} delta_tokens={int(source_context_token_ids.shape[1])}"
             )
+        if retain_source_full_past_key_values is None:
+            raise ValueError("Retain MoT incremental replay requires the full source KV prefix.")
+        full_source_past_tokens = get_past_seq_len(retain_source_full_past_key_values)
+        if full_source_past_tokens != expected_full_tokens:
+            raise ValueError(
+                "Retain MoT full source KV mismatch: "
+                f"past_tokens={full_source_past_tokens} expected_full_tokens={expected_full_tokens}"
+            )
+    elif retain_source_full_past_key_values is not None:
+        raise ValueError("retain_source_full_past_key_values requires retain_source_full_context_token_ids.")
 
     sparse_attention_indices = build_extrapolated_sparse_attention_indices(
         source_model,
@@ -847,13 +861,42 @@ def build_replayed_target_past(
             for sparse_indices in sparse_attention_indices
         ]
 
-    translated_key, translated_value = translate_layer_window(
-        ctx=ctx,
-        past_key_values=source_past_key_values,
-        src_node_id=src_node_id,
-        tgt_node_id=tgt_node_id,
-        token_alignment_weights=alignment_weights,
-    )
+    retain_injected_prefix_past: Optional[PastKeyValues] = None
+    if retain_source_full_past_key_values is not None:
+        # Translate the same full source window as Free, then split it into the
+        # resident prefix and missing delta. The translator is token-wise across
+        # sequence positions, but using the identical full-shape call also avoids
+        # shape-dependent floating-point drift between Free and Retain.
+        translated_full_key, translated_full_value = translate_layer_window(
+            ctx=ctx,
+            past_key_values=retain_source_full_past_key_values,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
+            token_alignment_weights=alignment_weights,
+        )
+        translated_prefix_key = translated_full_key[:, :retain_prefix_tokens]
+        translated_prefix_value = translated_full_value[:, :retain_prefix_tokens]
+        translated_key = translated_full_key[:, retain_prefix_tokens:]
+        translated_value = translated_full_value[:, retain_prefix_tokens:]
+        if translated_key.shape[1] != source_context_token_ids.shape[1]:
+            raise ValueError(
+                "Retain MoT translated delta length mismatch: "
+                f"translated_delta={translated_key.shape[1]} source_delta={source_context_token_ids.shape[1]}"
+            )
+        retain_injected_prefix_past = blocks_to_partial_past_key_values(
+            key_block=translated_prefix_key,
+            value_block=translated_prefix_value,
+            num_heads=tgt_spec.num_key_value_heads,
+            head_dim=tgt_spec.head_dim,
+        )
+    else:
+        translated_key, translated_value = translate_layer_window(
+            ctx=ctx,
+            past_key_values=source_past_key_values,
+            src_node_id=src_node_id,
+            tgt_node_id=tgt_node_id,
+            token_alignment_weights=alignment_weights,
+        )
 
     translated_window_past = blocks_to_partial_past_key_values(
         key_block=translated_key,
@@ -872,6 +915,7 @@ def build_replayed_target_past(
         sparse_attention_indices=sparse_attention_indices,
         num_bottom_full_attn=ctx.config.num_bottom_full_attn,
         retain_target_prefix_past_key_values=retain_target_prefix_past_key_values,
+        retain_target_prefix_injected_window_past_key_values=retain_injected_prefix_past,
     )
     return mixed_target_past, translated_window_past
 
@@ -2152,6 +2196,9 @@ def replay_target_prefill_with_injected_window(
     # Retain-only option: resident target KV prefix. When provided, only the
     # delta tokens are replayed while attending to this prefix at every layer.
     retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
+    # Retain-only MoT auxiliary prefix: translated KV for the injected target
+    # layers. Native layers continue to use retain_target_prefix_past_key_values.
+    retain_target_prefix_injected_window_past_key_values: Optional[PastKeyValues] = None,
 ) -> PastKeyValues:
     ensure_token_ids_model(target_model, context_token_ids)
     injected_window = blocks_to_partial_past_key_values(
@@ -2183,6 +2230,21 @@ def replay_target_prefill_with_injected_window(
                 f"prefix_layers={len(retain_target_prefix_past_key_values)} target_layers={tgt_spec.num_layers}"
             )
         retain_prefix_length = get_past_seq_len(retain_target_prefix_past_key_values)
+    if retain_target_prefix_injected_window_past_key_values is not None:
+        if retain_target_prefix_past_key_values is None:
+            raise ValueError("Injected retain prefix requires a resident native target prefix.")
+        if len(retain_target_prefix_injected_window_past_key_values) != len(target_layer_indices):
+            raise ValueError(
+                "Retain injected prefix layer count mismatch: "
+                f"injected_prefix_layers={len(retain_target_prefix_injected_window_past_key_values)} "
+                f"translated_layers={len(target_layer_indices)}"
+            )
+        injected_prefix_tokens = get_past_seq_len(retain_target_prefix_injected_window_past_key_values)
+        if injected_prefix_tokens != retain_prefix_length:
+            raise ValueError(
+                "Retain injected/native prefix length mismatch: "
+                f"injected_prefix_tokens={injected_prefix_tokens} native_prefix_tokens={retain_prefix_length}"
+            )
 
     model_family = resolve_target_model_family(target_model, target_model_id=target_model_id)
     if retain_target_prefix_past_key_values is not None and model_family not in {"qwen2", "llama", "gemma3"}:
@@ -2357,10 +2419,23 @@ def replay_target_prefill_with_injected_window(
         # Keep the lowest num_bottom_full_attn native-only layers exact: do not sparsify their attention.
         return None if layer_idx < num_bottom_full_attn else layer_sparse_attention_indices[layer_idx]
 
+    translated_prefix_by_layer = (
+        {}
+        if retain_target_prefix_injected_window_past_key_values is None
+        else {
+            layer_idx: retain_target_prefix_injected_window_past_key_values[offset]
+            for offset, layer_idx in enumerate(target_layer_indices)
+        }
+    )
+
     def retain_prefix_for_layer(layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if retain_target_prefix_past_key_values is None:
             return None
-        return retain_target_prefix_past_key_values[layer_idx]
+        # A Free full replay attends with translated/injected KV at the selected
+        # layers, while the cache it returns for later model generation is native-
+        # like KV. Retain must preserve that distinction: translated prefix for
+        # replay attention, native prefix everywhere else.
+        return translated_prefix_by_layer.get(layer_idx, retain_target_prefix_past_key_values[layer_idx])
 
     if torch.is_grad_enabled():
         with torch.no_grad():
