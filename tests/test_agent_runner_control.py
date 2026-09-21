@@ -2179,3 +2179,105 @@ def test_heterogeneous_retain_second_same_model_hop_replaces_stale_prefix_after_
     assert second_meta["delta_prefix_matched"] is False
     assert target.cache_token_ids == [91,92]
     assert target.cache_seq_len == 2
+
+
+def test_followup_retry_receives_exact_semantic_failure_diagnostic(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        max_turns=2,
+        log_agents=False,
+    )
+    agent = runner.agent_sequence[1]
+    runner.agent_personas = {
+        item.node_id: (f"Expert {item.node_id}", "Useful expert.") for item in runner.agent_sequence
+    }
+    runner._update_peak_memory_breakdown = lambda: None
+
+    responses = iter([
+        "[AGREE] The reasoning supports No.\nFinal Solution: Yes",
+        "[AGREE] The reasoning supports Yes.\nFinal Solution: Yes",
+    ])
+
+    def fake_generate(prompt_text: str) -> AgentGeneration:
+        text = next(responses)
+        return AgentGeneration(
+            agent_id=agent.node_id,
+            prompt_text=prompt_text,
+            text=text,
+            raw_text=text,
+            generated_token_ids=[1],
+            tokens_before=0,
+            tokens_after=1,
+            tokens_prompt=1,
+            tokens_completion=1,
+        )
+
+    agent.generate_response = fake_generate
+    semantic_results = iter([
+        ("stance=No; final=Yes", False),
+        ("stance=Yes; agree_consistent", True),
+    ])
+    runner._verify_response_semantics_with_model = lambda **kwargs: next(semantic_results)
+
+    seen_reasons = []
+    original_builder = runner.build_verification_prompt
+
+    def capture_retry_prompt(*args, **kwargs):
+        seen_reasons.append(kwargs["reason"])
+        return original_builder(*args, **kwargs)
+
+    runner.build_verification_prompt = capture_retry_prompt
+    generation, verification, attempts, counts, _ = runner._generate_verified_followup(
+        agent=agent,
+        initial_prompt="initial",
+        context="",
+        question="Question?",
+        current_solution="Yes",
+        current_answer="Yes",
+        current_response="Final Solution: Yes",
+        turn_index=2,
+        agent_index=1,
+    )
+
+    assert attempts == 1
+    assert counts.semantic_failures == 1
+    assert seen_reasons == ["stance=No; final=Yes"]
+    assert verification.passed is True
+    assert generation.text.startswith("[AGREE]")
+
+
+def test_semantic_verifier_uses_small_closed_verdict_generation_budget(monkeypatch) -> None:
+    import core.agent_runner as agent_runner_module
+
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        generation_max_new_tokens=256,
+        log_agents=False,
+    )
+    runner._update_peak_memory_breakdown = lambda: None
+    captured = {}
+
+    class FakeVerifierAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def generate_response(self, prompt):
+            return SimpleNamespace(text="SUPPORTS_YES")
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr(agent_runner_module, "Agent", FakeVerifierAgent)
+    raw = runner._run_semantic_verifier_prompt(agent=runner.agent_sequence[0], prompt="verifier prompt")
+
+    assert raw == "SUPPORTS_YES"
+    assert captured["max_new_tokens"] == 32
+    assert captured["temperature"] == 0.0

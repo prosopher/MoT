@@ -1682,7 +1682,7 @@ class AgentRunner:
             node_id=f"verifier-{agent.node_id}",
             model=agent.model,
             device=self.device,
-            max_new_tokens=self.generation_max_new_tokens,
+            max_new_tokens=min(self.generation_max_new_tokens, 32),
             max_prompt_tokens=self.max_prompt_tokens,
             temperature=0.0,
         )
@@ -2969,7 +2969,7 @@ class AgentRunner:
                     agent_index=0,
                     attempt=attempt,
                 )
-                _semantic_raw, semantic_passed = self._verify_response_semantics_with_model(
+                semantic_detail, semantic_passed = self._verify_response_semantics_with_model(
                     agent=agent,
                     context=context,
                     question=question,
@@ -2980,7 +2980,7 @@ class AgentRunner:
                 semantic_reason = (
                     "ok"
                     if semantic_passed is True
-                    else "semantic verifier rejected internally inconsistent initial reasoning"
+                    else (semantic_detail or "semantic verifier rejected internally inconsistent initial reasoning")
                 )
                 verification = StrategyQAVerificationResult(
                     passed=semantic_passed is True,
@@ -3104,7 +3104,7 @@ class AgentRunner:
                         agent_index=agent_index,
                         attempt=attempt,
                     )
-                    _semantic_raw, semantic_passed = self._verify_response_semantics_with_model(
+                    semantic_detail, semantic_passed = self._verify_response_semantics_with_model(
                         agent=agent,
                         context=context,
                         question=question,
@@ -3117,7 +3117,7 @@ class AgentRunner:
                     semantic_reason = (
                         "ok"
                         if semantic_passed is True
-                        else "semantic verifier rejected marker/reasoning/final-answer consistency"
+                        else (semantic_detail or "semantic verifier rejected marker/reasoning/final-answer consistency")
                     )
                 verification = StrategyQAVerificationResult(
                     passed=semantic_passed is True,
