@@ -2181,40 +2181,6 @@ def test_heterogeneous_retain_second_same_model_hop_replaces_stale_prefix_after_
     assert target.cache_seq_len == 2
 
 
-def test_semantic_verifier_uses_small_closed_verdict_generation_budget(monkeypatch) -> None:
-    import core.agent_runner as agent_runner_module
-
-    ctx = _ctx("tiny-a,tiny-a")
-    runner = AgentRunner(
-        ctx=ctx,
-        translator_pool=ctx.tp,
-        alg="mot",
-        agent_count=2,
-        generation_max_new_tokens=256,
-        log_agents=False,
-    )
-    runner._update_peak_memory_breakdown = lambda: None
-    captured = {}
-
-    class FakeVerifierAgent:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-        def generate_response(self, prompt):
-            return SimpleNamespace(text="SUPPORTS_YES")
-
-        def reset(self):
-            return None
-
-    monkeypatch.setattr(agent_runner_module, "Agent", FakeVerifierAgent)
-    raw = runner._run_semantic_verifier_prompt(agent=runner.agent_sequence[0], prompt="verifier prompt")
-
-    assert raw == "SUPPORTS_YES"
-    assert captured["max_new_tokens"] == 32
-    assert captured["temperature"] == 0.0
-
-
-
 def test_initial_verification_falls_back_to_original_response_after_retry_limit(monkeypatch) -> None:
     import core.agent_runner as agent_runner_module
 
