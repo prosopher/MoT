@@ -23,6 +23,7 @@ def build_eval_parser():
         dest="default_config_path",
         default="configs/eval.json",
     )
+    parser.add_argument("--dtype", default=None)
     add_dataclass_arguments(
         parser,
         EvalConfig,
@@ -59,6 +60,7 @@ def main() -> None:
     ctx, translator_pool, *extra = build_eval_context(
         args.alg,
         eval_config,
+        dtype_override=args.dtype,
     )
     log_path = eval_module.run_eval(
         ctx,

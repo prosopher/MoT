@@ -1994,6 +1994,7 @@ def load_train_config_from_checkpoint(
 def build_eval_context(
     alg: str,
     eval_config: EvalConfig,
+    dtype_override: Optional[str] = None,
 ):
     if eval_config.checkpoint_dir_path is None:
         raise ValueError("EvalConfig.checkpoint_dir_path must be set before build_eval_context.")
@@ -2015,10 +2016,13 @@ def build_eval_context(
     except AttributeError as exc:
         raise AttributeError(f"{module_name} does not define load_translator_pool_from_checkpoint") from exc
 
-    return load_from_checkpoint(
-        checkpoint_dir_path=checkpoint_dir_path,
-        device_override=eval_config.device,
-    )
+    load_kwargs = {
+        "checkpoint_dir_path": checkpoint_dir_path,
+        "device_override": eval_config.device,
+    }
+    if dtype_override is not None:
+        load_kwargs["dtype_override"] = dtype_override
+    return load_from_checkpoint(**load_kwargs)
 
 def resolve_latest_checkpoint_dir_for_alg(
     alg: str,
