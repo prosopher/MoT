@@ -882,6 +882,26 @@ class AgentRunner:
         # precomputed right after the source generation, before any offload starts,
         # then installed on the hub after the first hop updates the hub cache.
         self._pending_pretranslated_second_hops: Dict[Tuple[str, str], Tuple[str, PastKeyValues, List[int]]] = {}
+        # Retain+MoT invariant bookkeeping. A non-hub Agent appends its own new
+        # Memory entry natively after generation. Once that entry has reached the
+        # hub, the same suffix must be replayed back from the hub so the retained
+        # cache matches the prefix a future Free full replay would construct.
+        self._retain_pending_self_refresh_prefix_tokens: Dict[str, int] = {}
+        # A Retain source refresh is deliberately deferred until the *next* target
+        # has finished generation/verification.  Mutating the just-offloaded source
+        # during source->hub->target routing can perturb the current target path.
+        # Store the exact hub-history length at handoff so a hub target may generate
+        # temporary prompt/completion KV before the refresh is applied.
+        self._retain_deferred_self_refresh_hub_tokens: Dict[str, int] = {}
+        # MoT replay is mathematically causal, but full-vs-incremental replay can
+        # take different CUDA/SDPA/sparse-top-k floating-point paths.  Retain keeps
+        # each non-hub cache and therefore preserves the historical replay chunk
+        # boundaries used to build it.  Free drops the KV tensors, so retain only
+        # these tiny token-count checkpoints and reconstruct a future non-hub cache
+        # with the same chunking.  This keeps Free/Retain numerically aligned
+        # without retaining per-agent KV in Free.  Cross-tokenizer routes keep the
+        # existing replacement behavior and do not use these same-grid checkpoints.
+        self._mot_replay_boundaries_by_agent: Dict[str, List[int]] = {}
         self._peak_memory_breakdown_bytes: Optional[GPUMemoryBreakdownBytes] = None
         # Actual live KV/cache tensor storage, deduplicated by underlying storage.
         # This is the authoritative KV-cache memory metric; unlike allocator
@@ -2011,6 +2031,22 @@ class AgentRunner:
             include_base=memory_prefix_len == 0,
         )
         agent.append_context_text(memory_text)
+        # This Memory suffix is one historical MoT reconstruction chunk for the
+        # speaking non-hub Agent. Retain canonicalizes it from the hub after the
+        # outgoing handoff; Free keeps only this integer boundary so a later
+        # reconstruction can replay the same chunking without retaining KV.
+        self._record_mot_replay_boundary(agent)
+        if (
+            self.cache_mode == CACHE_MODE_RETAIN
+            and self.alg == "mot"
+            and agent.node_id != self.hub_agent.node_id
+        ):
+            # The appended Memory suffix was produced by an ordinary native model
+            # forward. Free will later reconstruct that same historical suffix via
+            # hub->Agent MoT replay. Remember the exact pre-entry prefix so that,
+            # after this new Memory reaches the hub, Retain can canonicalize only
+            # the new suffix and keep future delta replay mathematically aligned.
+            self._retain_pending_self_refresh_prefix_tokens[agent.node_id] = memory_prefix_len
         return agent.cache_seq_len
 
     @staticmethod
@@ -2581,9 +2617,43 @@ class AgentRunner:
             )
             if expected_delta_tokens == 0:
                 return
+            # The hub is resident in both cache modes.  Whenever it is the
+            # physical target, the translated suffix must be replayed against the
+            # exact resident hub prefix that it will be concatenated to.  Building
+            # a full translated cache and slicing its suffix conditions that suffix
+            # on a reconstructed prefix instead, which makes Free diverge from
+            # Retain on the very next agent.  Non-hub Free targets remain full
+            # translations because Free does not retain their caches across turns.
+            if (
+                self.cache_mode == CACHE_MODE_FREE
+                and self.alg == "mot"
+                and source_is_hub
+                and not target_is_hub
+                and self._homogeneous_model_pool
+                and source_agent.model.id == logical_target_agent.model.id
+                and logical_target_agent.past_key_values is None
+            ):
+                edge_id, rebuilt_past, rebuilt_ids = self._build_free_mot_target_with_historical_chunks(
+                    source_agent=source_agent,
+                    target_agent=logical_target_agent,
+                    source_past_key_values=source_agent.past_key_values,
+                    source_token_ids=source_agent.cache_token_ids,
+                )
+                source_agent.set_pretranslated_cache(
+                    edge_id=edge_id,
+                    past_key_values=rebuilt_past,
+                    cache_token_ids=rebuilt_ids,
+                )
+                return
+
+            prepare_prefix_tokens = (
+                prefix_tokens
+                if self.cache_mode == CACHE_MODE_RETAIN or target_is_hub
+                else 0
+            )
             self.cache_translator.refresh_pretranslated_cache(
                 source_agent=source_agent, target_agent=logical_target_agent,
-                prefix_tokens=(prefix_tokens if self.cache_mode == CACHE_MODE_RETAIN else 0),
+                prefix_tokens=prepare_prefix_tokens,
             )
             return
 
@@ -2597,9 +2667,12 @@ class AgentRunner:
                 )
             future_hub_past = self.hub_agent.past_key_values
         else:
+            # First physical hop always enters the resident hub, even in Free.
+            # Replay only the missing suffix against that exact hub prefix so the
+            # delta has the same semantics in Free and Retain.
             self.cache_translator.refresh_pretranslated_cache(
                 source_agent=source_agent, target_agent=self.hub_agent,
-                prefix_tokens=(prefix_tokens if self.cache_mode == CACHE_MODE_RETAIN else 0),
+                prefix_tokens=prefix_tokens,
             )
             first_delta_piece, _ = self.cache_translator._slice_pretranslated_cache_piece(
                 source_agent=source_agent, target_agent=self.hub_agent,
@@ -2649,7 +2722,22 @@ class AgentRunner:
         if self.cache_mode == CACHE_MODE_RETAIN and second_delta_tokens == 0:
             return
 
-        if cross_second_hop:
+        if (
+            self.cache_mode == CACHE_MODE_FREE
+            and self.alg == "mot"
+            and self._homogeneous_model_pool
+            and not cross_second_hop
+            and logical_target_agent.past_key_values is None
+        ):
+            second_edge_id, second_target_past, second_prepared_ids = (
+                self._build_free_mot_target_with_historical_chunks(
+                    source_agent=self.hub_agent,
+                    target_agent=logical_target_agent,
+                    source_past_key_values=future_hub_past,
+                    source_token_ids=future_hub_token_ids,
+                )
+            )
+        elif cross_second_hop:
             second_edge_id, full_second_target_past, prepared_full_ids = (
                 self.cache_translator.build_pretranslated_past_for_edge(
                     source_agent=self.hub_agent, target_agent=logical_target_agent,
@@ -2761,6 +2849,315 @@ class AgentRunner:
                 cleared = True
         return metadata, cleared
 
+    @staticmethod
+    def _slice_past_prefix(past_key_values: PastKeyValues, end_seq_idx: int) -> PastKeyValues:
+        end_seq_idx = max(0, int(end_seq_idx))
+        return tuple(
+            (
+                key[:, :, :end_seq_idx, :].contiguous(),
+                value[:, :, :end_seq_idx, :].contiguous(),
+            )
+            for key, value in past_key_values
+        )
+
+    @staticmethod
+    def _slice_past_range(
+        past_key_values: PastKeyValues,
+        start_seq_idx: int,
+        end_seq_idx: int,
+    ) -> PastKeyValues:
+        start_seq_idx = max(0, int(start_seq_idx))
+        end_seq_idx = max(start_seq_idx, int(end_seq_idx))
+        return tuple(
+            (
+                key[:, :, start_seq_idx:end_seq_idx, :].contiguous(),
+                value[:, :, start_seq_idx:end_seq_idx, :].contiguous(),
+            )
+            for key, value in past_key_values
+        )
+
+    def _record_mot_replay_boundary(self, agent: Agent) -> None:
+        """Remember one homogeneous MoT replay checkpoint without retaining KV.
+
+        Retain physically preserves the cache assembled at these boundaries. Free
+        releases non-hub KV, but keeping the integer boundaries lets a later Free
+        reconstruction replay the same chunks in the same order.  The bookkeeping
+        is intentionally same-tokenizer only; heterogeneous token boundaries can
+        change when a longer context is retokenized and continue to use the existing
+        full-replacement path.
+        """
+        if self.alg != "mot" or agent.node_id == self.hub_agent.node_id:
+            return
+        if not self._homogeneous_model_pool:
+            return
+        if agent.past_key_values is None:
+            return
+        boundary = int(agent.cache_seq_len)
+        if boundary <= 0:
+            return
+        boundaries = self._mot_replay_boundaries_by_agent.setdefault(agent.node_id, [])
+        if boundaries and boundary < boundaries[-1]:
+            raise ValueError(
+                f"Non-monotonic MoT replay boundary for {agent.node_id}: "
+                f"previous={boundaries[-1]} new={boundary}"
+            )
+        if not boundaries or boundary != boundaries[-1]:
+            boundaries.append(boundary)
+
+    @torch.inference_mode()
+    def _build_free_mot_target_with_historical_chunks(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        source_past_key_values: PastKeyValues,
+        source_token_ids: Sequence[int],
+    ) -> Tuple[str, PastKeyValues, List[int]]:
+        """Rebuild a freed homogeneous MoT target using Retain's chunk history.
+
+        Free owns no resident non-hub KV between turns.  A one-shot replay of a long
+        context is mathematically equivalent to Retain's historical incremental
+        replays, but it is not numerically identical on GPU because SDPA and sparse
+        top-k extraction can take shape-dependent floating-point paths.  Replaying
+        the old checkpoints first, then the current missing suffix, reproduces the
+        exact partitioning Retain used while still retaining no per-agent KV.
+        """
+        if self.cache_mode != CACHE_MODE_FREE or self.alg != "mot":
+            raise ValueError("Historical chunk reconstruction is Free+MoT only.")
+        if not self._homogeneous_model_pool or source_agent.model.id != target_agent.model.id:
+            raise ValueError("Historical chunk reconstruction requires a homogeneous token grid.")
+        if target_agent.past_key_values is not None:
+            raise ValueError("Free historical reconstruction requires an empty non-hub target cache.")
+
+        full_ids = list(source_token_ids)
+        full_tokens = get_past_seq_len(source_past_key_values)
+        if len(full_ids) != full_tokens:
+            raise ValueError(
+                f"Historical Free rebuild source ledger mismatch for {source_agent.node_id}->{target_agent.node_id}: "
+                f"token_ids={len(full_ids)} past_tokens={full_tokens}"
+            )
+        if full_tokens <= 0:
+            raise ValueError("Historical Free rebuild requires a non-empty source cache.")
+
+        old_boundaries = list(self._mot_replay_boundaries_by_agent.get(target_agent.node_id, []))
+        for idx, boundary in enumerate(old_boundaries):
+            if boundary <= 0 or boundary > full_tokens:
+                raise ValueError(
+                    f"Invalid historical MoT replay boundary for {target_agent.node_id}: "
+                    f"boundary={boundary} source_tokens={full_tokens}"
+                )
+            if idx and boundary <= old_boundaries[idx - 1]:
+                raise ValueError(
+                    f"Historical MoT replay boundaries must be strictly increasing for {target_agent.node_id}: "
+                    f"{old_boundaries}"
+                )
+
+        replay_ends = list(old_boundaries)
+        if not replay_ends or replay_ends[-1] != full_tokens:
+            replay_ends.append(full_tokens)
+
+        accumulated_past: Optional[PastKeyValues] = None
+        accumulated_ids: List[int] = []
+        previous_end = 0
+        edge_id: Optional[str] = None
+
+        for end in replay_ends:
+            if end <= previous_end:
+                continue
+            source_prefix_past = self._slice_past_prefix(source_past_key_values, end)
+            source_prefix_ids = full_ids[:end]
+            if previous_end == 0:
+                edge_id, chunk_past, chunk_ids = self.cache_translator.build_pretranslated_past_for_edge(
+                    source_agent=source_agent,
+                    target_agent=target_agent,
+                    source_past_key_values=source_prefix_past,
+                    source_token_ids=source_prefix_ids,
+                )
+                accumulated_past = chunk_past
+                accumulated_ids = list(chunk_ids)
+            else:
+                assert accumulated_past is not None
+                source_delta_past = self._slice_past_range(
+                    source_past_key_values, previous_end, end
+                )
+                source_delta_ids = full_ids[previous_end:end]
+                edge_id, chunk_past, chunk_ids = self.cache_translator.build_pretranslated_past_for_edge(
+                    source_agent=source_agent,
+                    target_agent=target_agent,
+                    source_past_key_values=source_delta_past,
+                    source_token_ids=source_delta_ids,
+                    retain_source_full_token_ids=source_prefix_ids,
+                    retain_source_full_past_key_values=source_prefix_past,
+                    retain_target_prefix_past_key_values=accumulated_past,
+                )
+                accumulated_past = _concat_past_key_values(accumulated_past, chunk_past)
+                accumulated_ids.extend(chunk_ids)
+            previous_end = end
+
+        if edge_id is None or accumulated_past is None:
+            raise RuntimeError("Historical Free MoT rebuild produced no target cache.")
+        expected_ids = self.cache_translator.target_token_ids_for_source(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            source_token_ids=full_ids,
+        )
+        if accumulated_ids != expected_ids:
+            raise RuntimeError(
+                f"Historical Free MoT rebuild token ledger changed on {edge_id}: "
+                f"rebuilt={len(accumulated_ids)} expected={len(expected_ids)}"
+            )
+        if get_past_seq_len(accumulated_past) != len(accumulated_ids):
+            raise RuntimeError(
+                f"Historical Free MoT rebuild cache/token mismatch on {edge_id}: "
+                f"past={get_past_seq_len(accumulated_past)} token_ids={len(accumulated_ids)}"
+            )
+        return edge_id, accumulated_past, accumulated_ids
+
+    def _queue_retain_nonhub_source_cache_refresh(self, source_agent: Agent) -> None:
+        """Defer one Retain+MoT source refresh until the current target has generated.
+
+        The source Memory must first reach the hub, but refreshing the source *inside*
+        the physical handoff is too early: source/hub/target share the same physical
+        model in homogeneous runs and the current target path must remain completely
+        untouched until its generation and verification are finished.
+        """
+        if self.cache_mode != CACHE_MODE_RETAIN or self.alg != "mot":
+            return
+        if source_agent.node_id == self.hub_agent.node_id:
+            return
+        if source_agent.node_id not in self._retain_pending_self_refresh_prefix_tokens:
+            return
+        if self.hub_agent.past_key_values is None:
+            raise RuntimeError(
+                f"Retain MoT deferred refresh requires a resident hub cache for {source_agent.node_id}."
+            )
+        hub_tokens = int(self.hub_agent.cache_seq_len)
+        if hub_tokens != len(self.hub_agent.cache_token_ids):
+            raise ValueError("Hub cache/token ledger mismatch while scheduling Retain self-refresh.")
+        self._retain_deferred_self_refresh_hub_tokens[source_agent.node_id] = hub_tokens
+
+    @torch.inference_mode()
+    def _refresh_retain_nonhub_source_cache_from_hub(
+        self,
+        source_agent: Agent,
+        *,
+        hub_context_tokens: Optional[int] = None,
+    ) -> None:
+        """Canonicalize one non-hub Retain cache after the next target has generated.
+
+        A non-hub speaker appends its own Memory entry through a native forward,
+        whereas a future Free reconstruction of that historical suffix uses the
+        hub->Agent MoT replay.  Replace only that native suffix after it has reached
+        the hub.  ``hub_context_tokens`` freezes the source history at the physical
+        handoff point, so a hub target may subsequently append a temporary generation
+        without changing the refresh input.
+        """
+        if self.cache_mode != CACHE_MODE_RETAIN or self.alg != "mot":
+            return
+        if source_agent.node_id == self.hub_agent.node_id:
+            return
+        prefix_tokens = self._retain_pending_self_refresh_prefix_tokens.pop(source_agent.node_id, None)
+        self._retain_deferred_self_refresh_hub_tokens.pop(source_agent.node_id, None)
+        if prefix_tokens is None:
+            return
+        if source_agent.past_key_values is None or self.hub_agent.past_key_values is None:
+            raise RuntimeError(
+                f"Retain MoT self-refresh requires resident source/hub caches for {source_agent.node_id}."
+            )
+
+        full_hub_tokens = int(self.hub_agent.cache_seq_len)
+        if full_hub_tokens != len(self.hub_agent.cache_token_ids):
+            raise ValueError("Hub cache/token ledger mismatch during Retain self-refresh.")
+        if hub_context_tokens is None:
+            hub_context_tokens = full_hub_tokens
+        hub_context_tokens = int(hub_context_tokens)
+        if hub_context_tokens < 0 or hub_context_tokens > full_hub_tokens:
+            raise ValueError(
+                f"Invalid hub snapshot length during Retain self-refresh for {source_agent.node_id}: "
+                f"snapshot={hub_context_tokens} current={full_hub_tokens}"
+            )
+        hub_source_ids = list(self.hub_agent.cache_token_ids[:hub_context_tokens])
+        hub_source_past = self._slice_past_prefix(self.hub_agent.past_key_values, hub_context_tokens)
+
+        prefix_tokens = int(prefix_tokens)
+        current_ids = list(source_agent.cache_token_ids)
+        full_target_ids = self.cache_translator.target_token_ids_for_source(
+            source_agent=self.hub_agent,
+            target_agent=source_agent,
+            source_token_ids=hub_source_ids,
+        )
+        if prefix_tokens < 0 or prefix_tokens > len(current_ids):
+            raise ValueError(
+                f"Invalid Retain self-refresh prefix for {source_agent.node_id}: "
+                f"prefix_tokens={prefix_tokens} current_tokens={len(current_ids)}"
+            )
+
+        # Cross-tokenization can change a token boundary at the old end of context.
+        # In that case there is no exact target-grid prefix to reuse, matching the
+        # existing heterogeneous full-replacement fallback. Keep retokenization
+        # algorithm-owned through KVCacheTranslationAdapter.
+        cross_tokenizer = self.hub_agent.model.id != source_agent.model.id
+        prefix_matched = (
+            prefix_tokens <= len(full_target_ids)
+            and current_ids[:prefix_tokens] == full_target_ids[:prefix_tokens]
+        )
+        if cross_tokenizer or not prefix_matched:
+            edge_id, full_target_past, prepared_ids = self.cache_translator.build_pretranslated_past_for_edge(
+                source_agent=self.hub_agent,
+                target_agent=source_agent,
+                source_past_key_values=hub_source_past,
+                source_token_ids=hub_source_ids,
+            )
+            if prepared_ids != full_target_ids:
+                raise RuntimeError(f"Retain self-refresh target ledger changed on {edge_id}.")
+            source_agent.set_replayed_cache(full_target_past, cache_token_ids=full_target_ids)
+            return
+
+        if prefix_tokens == len(full_target_ids):
+            prefix_past = self._slice_past_prefix(source_agent.past_key_values, prefix_tokens)
+            source_agent.set_replayed_cache(prefix_past, cache_token_ids=full_target_ids)
+            return
+
+        if prefix_tokens > len(hub_source_ids):
+            raise ValueError(
+                f"Retain self-refresh source prefix exceeds hub snapshot for {source_agent.node_id}: "
+                f"prefix_tokens={prefix_tokens} hub_tokens={len(hub_source_ids)}"
+            )
+
+        target_prefix_past = self._slice_past_prefix(source_agent.past_key_values, prefix_tokens)
+        hub_delta_past = slice_past_suffix(hub_source_past, prefix_tokens)
+        hub_delta_ids = hub_source_ids[prefix_tokens:]
+        edge_id, refreshed_delta_past, refreshed_delta_ids = (
+            self.cache_translator.build_pretranslated_past_for_edge(
+                source_agent=self.hub_agent,
+                target_agent=source_agent,
+                source_past_key_values=hub_delta_past,
+                source_token_ids=hub_delta_ids,
+                retain_source_full_token_ids=hub_source_ids,
+                retain_source_full_past_key_values=hub_source_past,
+                retain_target_prefix_past_key_values=target_prefix_past,
+            )
+        )
+        expected_delta_ids = full_target_ids[prefix_tokens:]
+        if refreshed_delta_ids != expected_delta_ids:
+            raise RuntimeError(
+                f"Retain self-refresh delta ledger changed on {edge_id}: "
+                f"prepared={len(refreshed_delta_ids)} expected={len(expected_delta_ids)}"
+            )
+        refreshed_past = _concat_past_key_values(target_prefix_past, refreshed_delta_past)
+        source_agent.set_replayed_cache(refreshed_past, cache_token_ids=full_target_ids)
+
+    def _flush_retain_nonhub_source_cache_refreshes(self) -> None:
+        """Apply deferred source refreshes only after target generation/verification."""
+        if not self._retain_deferred_self_refresh_hub_tokens:
+            return
+        pending = list(self._retain_deferred_self_refresh_hub_tokens.items())
+        for node_id, hub_context_tokens in pending:
+            self._refresh_retain_nonhub_source_cache_from_hub(
+                self.agents[node_id],
+                hub_context_tokens=hub_context_tokens,
+            )
+
     def _offload_delta_hop(
         self,
         *,
@@ -2836,6 +3233,8 @@ class AgentRunner:
                 source_agent=source_agent,
                 target_agent=target_agent,
             )
+            if target_is_hub and not source_is_hub:
+                self._queue_retain_nonhub_source_cache_refresh(source_agent)
             return target_agent, offload_meta, cleared, source_agent, offload_meta
 
         # Non-hub -> non-hub is never direct in the star topology. The physical
@@ -2849,6 +3248,7 @@ class AgentRunner:
             source_agent=source_agent,
             target_agent=self.hub_agent,
         )
+        self._queue_retain_nonhub_source_cache_refresh(source_agent)
 
         allow_second_hop_replacement = source_agent.model.id != self.hub_agent.model.id
         second_prefix_tokens, second_delta_tokens, second_prefix_matched = self._build_missing_cache_delta(
@@ -3351,6 +3751,11 @@ class AgentRunner:
                 incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
                 tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
                 del incoming_from_agent
+                # The incoming cache itself is one replay chunk in Retain. Record
+                # its end position in both modes; Free may have no KV left by the
+                # time this logical Agent is revisited, but it can reconstruct the
+                # same numerical path from these boundaries.
+                self._record_mot_replay_boundary(current_target)
 
             self._update_peak_memory_breakdown()
             self._log_agent(
@@ -3384,6 +3789,11 @@ class AgentRunner:
                 turn_index=turn_index,
                 agent_index=agent_index,
             )
+
+            # A Retain+MoT refresh belongs to the *previous* non-hub speaker and
+            # exists only to make its cache canonical for a future cycle.  Do not
+            # let it participate in the current handoff/generation path.
+            self._flush_retain_nonhub_source_cache_refreshes()
 
             record = self._agent_message_record(
                 generation,
@@ -3561,6 +3971,9 @@ class AgentRunner:
         for agent in self.agent_sequence:
             agent.reset()
         self._pending_pretranslated_second_hops.clear()
+        self._retain_pending_self_refresh_prefix_tokens.clear()
+        self._retain_deferred_self_refresh_hub_tokens.clear()
+        self._mot_replay_boundaries_by_agent.clear()
         # Release allocator cache from the previous example. Memory accounting
         # itself is based only on Model, Translator, and live KV tensor storage.
         if torch.cuda.is_available() and str(self.device).startswith("cuda"):

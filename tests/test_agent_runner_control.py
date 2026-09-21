@@ -2006,6 +2006,108 @@ def test_free_direct_handoff_preserves_full_translation_then_delta_offload(monke
     assert cleared is False  # hub is intentionally retained in free mode
 
 
+def test_free_nonhub_to_hub_pretranslation_uses_resident_hub_prefix(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="free",
+        log_agents=False,
+    )
+    hub = runner.hub_agent
+    source = runner.agents["B"]
+    source_ids = list(range(10))
+    _install_fake_cache(source, source_ids)
+    _install_fake_cache(hub, source_ids[:6])
+
+    seen = {}
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
+        seen["past_tokens"] = get_past_seq_len(source_past_key_values)
+        seen["token_ids"] = list(source_token_ids)
+        seen["kwargs"] = dict(kwargs)
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, source_past_key_values, list(source_token_ids)
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=hub)
+
+    assert seen["past_tokens"] == 4
+    assert seen["token_ids"] == source_ids[6:]
+    assert list(seen["kwargs"]["retain_source_full_token_ids"]) == source_ids
+    assert seen["kwargs"]["retain_source_full_past_key_values"] is source.past_key_values
+    assert seen["kwargs"]["retain_target_prefix_past_key_values"] is hub.past_key_values
+
+    metadata, cleared = runner._offload_delta_hop(source_agent=source, target_agent=hub)
+    assert metadata["tokens_sent"] == 4
+    assert hub.cache_token_ids == source_ids
+    assert hub.cache_seq_len == 10
+    assert cleared is True
+
+
+def test_free_and_retain_prepare_identical_nonhub_to_hub_mot_delta(monkeypatch) -> None:
+    prepared = {}
+
+    for mode in ("free", "retain"):
+        ctx = _ctx("tiny-a,tiny-a")
+        runner = AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="mot",
+            agent_count=3,
+            cache_mode=mode,
+            log_agents=False,
+        )
+        hub = runner.hub_agent
+        source = runner.agents["B"]
+        target = runner.agents["C"]
+        source_ids = list(range(10))
+        _install_fake_cache(source, source_ids)
+        _install_fake_cache(hub, source_ids[:6])
+        # Free normally has an empty upcoming non-hub target; Retain may keep one.
+        # Keeping C empty in both isolates the physical B->hub hop that must be
+        # mathematically identical across cache modes.
+        target.clear_kv_cache()
+
+        seen = []
+
+        def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
+            seen.append({
+                "src": source_agent.node_id,
+                "dst": target_agent.node_id,
+                "past_tokens": get_past_seq_len(source_past_key_values),
+                "token_ids": list(source_token_ids),
+                "full_ids": list(kwargs.get("retain_source_full_token_ids", [])),
+                "full_past_tokens": (
+                    get_past_seq_len(kwargs["retain_source_full_past_key_values"])
+                    if kwargs.get("retain_source_full_past_key_values") is not None else 0
+                ),
+                "target_prefix_tokens": (
+                    get_past_seq_len(kwargs["retain_target_prefix_past_key_values"])
+                    if kwargs.get("retain_target_prefix_past_key_values") is not None else 0
+                ),
+            })
+            edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+            return edge.id, source_past_key_values, list(source_token_ids)
+
+        monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+        runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+        prepared[mode] = seen[0]
+
+    assert prepared["free"] == prepared["retain"] == {
+        "src": "B",
+        "dst": "A",
+        "past_tokens": 4,
+        "token_ids": [6, 7, 8, 9],
+        "full_ids": list(range(10)),
+        "full_past_tokens": 10,
+        "target_prefix_tokens": 6,
+    }
+
+
 def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
@@ -2066,7 +2168,7 @@ def test_retain_two_hop_route_translates_each_physical_delta_only(monkeypatch) -
     assert source_cleared is False
 
 
-def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> None:
+def test_free_two_hop_route_conditions_first_delta_on_resident_hub_prefix(monkeypatch) -> None:
     ctx = _ctx("tiny-a,tiny-a")
     runner = AgentRunner(
         ctx=ctx,
@@ -2103,11 +2205,14 @@ def test_free_two_hop_route_keeps_full_translation_on_both_hops(monkeypatch) -> 
 
     runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
 
-    # Free mode retains the original behavior: both physical translations see
-    # the entire source/future-hub cache, then offload slices the missing delta.
-    assert seen[0][2:4] == (10, source_ids)
+    # The first physical hop enters the resident hub, so Free must compute the
+    # missing suffix against the exact hub prefix just like Retain.  The second
+    # hop still sees the full future hub because a Free non-hub target is rebuilt.
+    assert seen[0][2:4] == (4, source_ids[6:])
+    assert list(seen[0][4]["retain_source_full_token_ids"]) == source_ids
+    assert seen[0][4]["retain_source_full_past_key_values"] is source.past_key_values
+    assert seen[0][4]["retain_target_prefix_past_key_values"] is hub.past_key_values
     assert seen[1][2:4] == (10, source_ids)
-    assert seen[0][4] == {}
     assert seen[1][4] == {}
 
     _, first_meta, source_cleared, _, second_meta = runner._star_offload_to_agent(
@@ -2298,3 +2403,190 @@ def test_followup_verification_falls_back_to_original_response_after_retry_limit
     assert verification.final_answer == "Yes"
     assert "using original response" in verification.reason
     assert counts.semantic_failures == 3
+
+
+def test_retain_mot_self_refresh_replaces_only_native_memory_suffix(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    hub = runner.hub_agent
+    source = runner.agents["B"]
+    prefix_tokens = 3
+    full_ids = [10, 11, 12, 20, 21]
+
+    def valued_past(values):
+        values = torch.tensor(values, dtype=torch.float32).view(1, 1, -1, 1)
+        return tuple((values.clone(), values.clone()) for _ in range(2))
+
+    # Hub already received B's new Memory and therefore owns the canonical source
+    # representation for the complete five-token history.
+    hub.past_key_values = valued_past([1, 2, 3, 4, 5, 6, 7])
+    hub.cache_token_ids = list(full_ids) + [30, 31]
+    # B's old prefix is canonical, but its newest Memory suffix was appended by a
+    # normal native forward and deliberately differs from the MoT replay suffix.
+    source.past_key_values = valued_past([31, 32, 33, 70, 71])
+    source.cache_token_ids = list(full_ids)
+    runner._retain_pending_self_refresh_prefix_tokens[source.node_id] = prefix_tokens
+
+    monkeypatch.setattr(
+        runner.cache_translator,
+        "target_token_ids_for_source",
+        lambda **kwargs: list(full_ids),
+    )
+    seen = {}
+
+    def fake_build(**kwargs):
+        seen["source_tokens"] = list(kwargs["source_token_ids"])
+        seen["full_tokens"] = list(kwargs["retain_source_full_token_ids"])
+        seen["prefix_len"] = get_past_seq_len(kwargs["retain_target_prefix_past_key_values"])
+        return "A_to_B", valued_past([90, 91]), full_ids[prefix_tokens:]
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._refresh_retain_nonhub_source_cache_from_hub(source, hub_context_tokens=len(full_ids))
+
+    assert seen == {
+        "source_tokens": full_ids[prefix_tokens:],
+        "full_tokens": full_ids,
+        "prefix_len": prefix_tokens,
+    }
+    assert source.cache_token_ids == full_ids
+    key = source.past_key_values[0][0].reshape(-1).tolist()
+    assert key == [31.0, 32.0, 33.0, 90.0, 91.0]
+    assert source.node_id not in runner._retain_pending_self_refresh_prefix_tokens
+
+
+def test_retain_mot_self_refresh_is_deferred_past_current_handoff(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    source = runner.agents["B"]
+    target = runner.hub_agent
+    order = []
+    _install_fake_cache(target, [1, 2, 3])
+    runner._retain_pending_self_refresh_prefix_tokens[source.node_id] = 1
+
+    def fake_offload(*, source_agent, target_agent, **kwargs):
+        del kwargs
+        order.append(("offload", source_agent.node_id, target_agent.node_id))
+        return {"edge_id": "B_to_A", "tokens_sent": 1, "expected_delta_tokens": 1}, False
+
+    def fake_refresh(agent, *, hub_context_tokens=None):
+        order.append(("refresh", agent.node_id, hub_context_tokens))
+        runner._retain_deferred_self_refresh_hub_tokens.pop(agent.node_id, None)
+        runner._retain_pending_self_refresh_prefix_tokens.pop(agent.node_id, None)
+
+    monkeypatch.setattr(runner, "_offload_delta_hop", fake_offload)
+    monkeypatch.setattr(runner, "_refresh_retain_nonhub_source_cache_from_hub", fake_refresh)
+
+    runner._star_offload_to_agent(source_agent=source, target_agent=target)
+
+    # The physical handoff only schedules refresh.  No retained source mutation is
+    # allowed until the next target's generation/verification has finished.
+    assert order == [("offload", "B", "A")]
+    assert runner._retain_deferred_self_refresh_hub_tokens == {"B": 3}
+
+    runner._flush_retain_nonhub_source_cache_refreshes()
+    assert order == [("offload", "B", "A"), ("refresh", "B", 3)]
+
+
+def test_free_mot_revisit_rebuilds_historical_retain_chunks(monkeypatch) -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="free",
+        log_agents=False,
+    )
+    hub = runner.hub_agent
+    target = runner.agents["B"]
+    source_ids = list(range(10))
+    _install_fake_cache(hub, source_ids)
+    target.clear_kv_cache()
+    # B's retained counterpart was historically built as:
+    #   full [0:3] -> incremental [3:5] -> current incremental [5:10].
+    runner._mot_replay_boundaries_by_agent[target.node_id] = [3, 5]
+
+    seen = []
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
+        seen.append({
+            "ids": list(source_token_ids),
+            "past_tokens": get_past_seq_len(source_past_key_values),
+            "full_ids": list(kwargs.get("retain_source_full_token_ids", [])),
+            "full_past_tokens": (
+                get_past_seq_len(kwargs["retain_source_full_past_key_values"])
+                if kwargs.get("retain_source_full_past_key_values") is not None else 0
+            ),
+            "target_prefix_tokens": (
+                get_past_seq_len(kwargs["retain_target_prefix_past_key_values"])
+                if kwargs.get("retain_target_prefix_past_key_values") is not None else 0
+            ),
+        })
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, _fake_past(len(source_token_ids)), list(source_token_ids)
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=hub, logical_target_agent=target)
+
+    assert seen == [
+        {
+            "ids": [0, 1, 2],
+            "past_tokens": 3,
+            "full_ids": [],
+            "full_past_tokens": 0,
+            "target_prefix_tokens": 0,
+        },
+        {
+            "ids": [3, 4],
+            "past_tokens": 2,
+            "full_ids": [0, 1, 2, 3, 4],
+            "full_past_tokens": 5,
+            "target_prefix_tokens": 3,
+        },
+        {
+            "ids": [5, 6, 7, 8, 9],
+            "past_tokens": 5,
+            "full_ids": source_ids,
+            "full_past_tokens": 10,
+            "target_prefix_tokens": 5,
+        },
+    ]
+
+    _, incoming_meta, _, _, _ = runner._star_offload_to_agent(source_agent=hub, target_agent=target)
+    assert incoming_meta["tokens_sent"] == 10
+    assert target.cache_token_ids == source_ids
+    assert target.cache_seq_len == 10
+
+
+def test_mot_replay_boundaries_survive_free_cache_clear() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        cache_mode="free",
+        log_agents=False,
+    )
+    target = runner.agents["B"]
+    _install_fake_cache(target, [1, 2, 3])
+    runner._record_mot_replay_boundary(target)
+    target.clear_kv_cache()
+    assert target.past_key_values is None
+    assert runner._mot_replay_boundaries_by_agent[target.node_id] == [3]
