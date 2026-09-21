@@ -1446,7 +1446,7 @@ def test_agent_runner_initial_proposal_retries_until_yes_no_is_explicit() -> Non
     assert first.verification_passed is True
     assert first.verification_reason == "ok"
     assert result.prediction == "Yes"
-    assert result.profile["verification_retry_policy"] == "unbounded"
+    assert result.profile["verification_retry_policy"] == "max_100_then_original_response_fallback"
     assert result.profile["verification_retry_count"] == 5
 
 
@@ -1517,7 +1517,7 @@ def test_agent_runner_verification_retry_accepts_corrected_response() -> None:
     assert corrected.final_answer == "Yes"
     assert corrected.response_state == "agree"
     assert result.profile["consensus_reached"] is True
-    assert result.profile["verification_retry_policy"] == "unbounded"
+    assert result.profile["verification_retry_policy"] == "max_100_then_original_response_fallback"
     assert result.profile["verification_retry_count"] == 5
     assert result.profile["verification_failure_count"] == 0
 
@@ -2281,3 +2281,120 @@ def test_semantic_verifier_uses_small_closed_verdict_generation_budget(monkeypat
     assert raw == "SUPPORTS_YES"
     assert captured["max_new_tokens"] == 32
     assert captured["temperature"] == 0.0
+
+
+
+def test_initial_verification_falls_back_to_original_response_after_retry_limit(monkeypatch) -> None:
+    import core.agent_runner as agent_runner_module
+
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_agents=False,
+    )
+    agent = runner.hub_agent
+    runner._update_peak_memory_breakdown = lambda: None
+    runner._verify_response_semantics_with_model = lambda **kwargs: ("always reject", False)
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 2)
+
+    calls = []
+    responses = [
+        "The final answer is Yes.",
+        "Retry one still says Yes.",
+        "Retry two still says Yes.",
+    ]
+
+    def fake_generate(prompt_text: str) -> AgentGeneration:
+        text = responses[len(calls)]
+        calls.append(text)
+        return AgentGeneration(
+            agent_id=agent.node_id,
+            prompt_text=prompt_text,
+            text=text,
+            raw_text=text,
+            generated_token_ids=[len(calls)],
+            tokens_before=0,
+            tokens_after=1,
+            tokens_prompt=1,
+            tokens_completion=1,
+        )
+
+    agent.generate_response = fake_generate
+    generation, verification, attempts, counts, _ = runner._generate_verified_initial(
+        agent=agent,
+        initial_prompt="initial",
+        context="",
+        question="Question?",
+    )
+
+    assert len(calls) == 3  # original + two retries
+    assert attempts == 2
+    assert generation.text == responses[0]
+    assert verification.passed is False
+    assert verification.final_answer == "Yes"
+    assert "using original response" in verification.reason
+    assert counts.syntax_failures == 3
+
+
+def test_followup_verification_falls_back_to_original_response_after_retry_limit(monkeypatch) -> None:
+    import core.agent_runner as agent_runner_module
+
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        log_agents=False,
+    )
+    agent = runner.agent_sequence[1]
+    runner._update_peak_memory_breakdown = lambda: None
+    runner._verify_response_semantics_with_model = lambda **kwargs: ("stance=No; final=Yes", False)
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 2)
+
+    calls = []
+    responses = [
+        "[AGREE] Original response.\nFinal Solution: Yes",
+        "[AGREE] Retry one.\nFinal Solution: Yes",
+        "[AGREE] Retry two.\nFinal Solution: Yes",
+    ]
+
+    def fake_generate(prompt_text: str) -> AgentGeneration:
+        text = responses[len(calls)]
+        calls.append(text)
+        return AgentGeneration(
+            agent_id=agent.node_id,
+            prompt_text=prompt_text,
+            text=text,
+            raw_text=text,
+            generated_token_ids=[len(calls)],
+            tokens_before=0,
+            tokens_after=1,
+            tokens_prompt=1,
+            tokens_completion=1,
+        )
+
+    agent.generate_response = fake_generate
+    generation, verification, attempts, counts, _ = runner._generate_verified_followup(
+        agent=agent,
+        initial_prompt="initial",
+        context="",
+        question="Question?",
+        current_solution="Yes",
+        current_answer="Yes",
+        current_response="Final Solution: Yes",
+        turn_index=2,
+        agent_index=1,
+    )
+
+    assert len(calls) == 3  # original + two retries
+    assert attempts == 2
+    assert generation.text == responses[0]
+    assert verification.passed is False
+    assert verification.marker == "agree"
+    assert verification.final_answer == "Yes"
+    assert "using original response" in verification.reason
+    assert counts.semantic_failures == 3

@@ -154,7 +154,9 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
         "final_decision_method": result.profile.get("final_decision_method"),
         "final_decision_answer": result.profile.get("final_decision_answer"),
         "turns": [asdict(turn_record) for turn_record in result.turns],
-        "verification_retry_policy": result.profile.get("verification_retry_policy", "unbounded"),
+        "verification_retry_policy": result.profile.get(
+            "verification_retry_policy", "max_100_then_original_response_fallback"
+        ),
         "verification_retry_count": result.profile.get("verification_retry_count", 0),
         "verification_failure_count": result.profile.get("verification_failure_count", 0),
         "cache_mode": result.cache_mode,

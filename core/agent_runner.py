@@ -33,6 +33,7 @@ from core.train_util import get_train_config_path
 CACHE_MODE_RETAIN = "retain"
 CACHE_MODE_FREE = "free"
 SUPPORTED_CACHE_MODES = (CACHE_MODE_RETAIN, CACHE_MODE_FREE)
+VERIFICATION_MAX_RETRIES = 100
 
 SUPPORTED_ALGS = ("mot", "interlat", "lsc", "c2c-pr", "kvcomm")
 RETAIN_ONLY_ALGS = ("interlat", "lsc", "c2c-pr", "kvcomm")
@@ -2913,6 +2914,50 @@ class AgentRunner:
         record.tokens_sent = tokens_sent
         record.tokens_sent_check_passed = self._tokens_sent_check_passed(record, offload_meta)
 
+    @staticmethod
+    def _verification_fallback_result(
+        *,
+        original_verification: StrategyQAVerificationResult,
+        original_response: str,
+        current_answer: Optional[str] = None,
+    ) -> StrategyQAVerificationResult:
+        """Describe an exhausted-retry fallback without pretending it verified.
+
+        The original response is used verbatim.  We recover only the closed-set
+        Yes/No metadata needed by the discussion controller; the response itself
+        is never rewritten.  A follow-up with no recoverable answer preserves the
+        current answer, while an initial proposal must contain some recoverable
+        Yes/No conclusion in order for StrategyQA discussion to continue.
+        """
+        fallback_answer = (
+            original_verification.final_answer
+            or AgentRunner._extract_strategyqa_answer(original_response)
+            or current_answer
+        )
+        fallback_marker = (
+            original_verification.marker
+            or AgentRunner._extract_agreement_marker(original_response)
+        )
+        suffix = (
+            f"verification retry limit ({VERIFICATION_MAX_RETRIES}) exhausted; "
+            "using original response"
+        )
+        syntax_reason = original_verification.syntax_reason
+        semantic_reason = original_verification.semantic_reason
+        if original_verification.syntax_passed:
+            semantic_reason = f"{semantic_reason}; {suffix}"
+        else:
+            syntax_reason = f"{syntax_reason}; {suffix}"
+        return StrategyQAVerificationResult(
+            passed=False,
+            syntax_passed=original_verification.syntax_passed,
+            syntax_reason=syntax_reason,
+            semantic_passed=original_verification.semantic_passed,
+            semantic_reason=semantic_reason,
+            marker=fallback_marker,
+            final_answer=fallback_answer,
+        )
+
     def _generate_verified_initial(
         self,
         *,
@@ -2921,11 +2966,11 @@ class AgentRunner:
         context: str,
         question: str,
     ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts, Optional[float]]:
-        """Generate the first proposal until strict syntax and semantics both pass.
+        """Generate the first proposal with at most 100 corrective retries.
 
-        Invalid attempts are rolled back to the exact pre-prompt KV prefix and
-        retried without a retry limit. No invalid response is ever accepted as a
-        fallback merely because a retry budget was exhausted.
+        Invalid attempts are rolled back to the exact pre-prompt KV prefix. If all
+        retries fail, the original (attempt-0) response is used verbatim as the
+        fallback rather than accepting one of the corrective retry generations.
         """
         prompt = initial_prompt
         syntax_failures = 0
@@ -2934,6 +2979,8 @@ class AgentRunner:
         reason = "not checked"
         attempt = 0
         turn_generation_ttft_sec: Optional[float] = None
+        original_generation: Optional[AgentGeneration] = None
+        original_verification: Optional[StrategyQAVerificationResult] = None
 
         while True:
             if attempt > 0:
@@ -3006,10 +3053,32 @@ class AgentRunner:
                 verification = syntax
                 reason = syntax.reason
 
+            if attempt == 0:
+                original_generation = generation
+                original_verification = verification
             agent.truncate_kv_cache(generation.tokens_before)
             self._update_peak_memory_breakdown()
             previous_response = generation.text
             attempt += 1
+            if attempt > VERIFICATION_MAX_RETRIES:
+                if original_generation is None or original_verification is None:
+                    raise RuntimeError("initial verification fallback lost the original response")
+                fallback_verification = self._verification_fallback_result(
+                    original_verification=original_verification,
+                    original_response=original_generation.text,
+                )
+                if fallback_verification.final_answer not in {"Yes", "No"}:
+                    raise RuntimeError(
+                        "Verification retries exhausted and the original initial response has no "
+                        "recoverable Yes/No answer for fallback."
+                    )
+                return (
+                    original_generation,
+                    fallback_verification,
+                    VERIFICATION_MAX_RETRIES,
+                    VerificationStageCounts(syntax_failures, semantic_failures),
+                    turn_generation_ttft_sec,
+                )
 
     def _generate_verified_followup(
         self,
@@ -3024,11 +3093,11 @@ class AgentRunner:
         turn_index: int,
         agent_index: int,
     ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts, Optional[float]]:
-        """Generate a follow-up until strict syntax and semantics both pass.
+        """Generate a follow-up with at most 100 corrective retries.
 
         Invalid attempts are rolled back to the exact pre-prompt KV prefix, so they
-        never enter shared Memory or Supermajority Consensus. Corrective retries are
-        unbounded and deterministically seeded by the retry index.
+        never enter shared Memory or Supermajority Consensus. If all retries fail,
+        the original (attempt-0) response is used verbatim as the fallback.
         """
         prompt = initial_prompt
         syntax_failures = 0
@@ -3037,6 +3106,8 @@ class AgentRunner:
         reason = "not checked"
         attempt = 0
         turn_generation_ttft_sec: Optional[float] = None
+        original_generation: Optional[AgentGeneration] = None
+        original_verification: Optional[StrategyQAVerificationResult] = None
 
         while True:
             if attempt > 0:
@@ -3085,9 +3156,27 @@ class AgentRunner:
                     reason = verification.reason
                     agent.truncate_kv_cache(generation.tokens_before)
                     self._update_peak_memory_breakdown()
+                    if attempt == 0:
+                        original_generation = generation
+                        original_verification = verification
                     previous_response = generation.text
                     semantic_failures += 1
                     attempt += 1
+                    if attempt > VERIFICATION_MAX_RETRIES:
+                        if original_generation is None or original_verification is None:
+                            raise RuntimeError("follow-up verification fallback lost the original response")
+                        fallback_verification = self._verification_fallback_result(
+                            original_verification=original_verification,
+                            original_response=original_generation.text,
+                            current_answer=current_answer,
+                        )
+                        return (
+                            original_generation,
+                            fallback_verification,
+                            VERIFICATION_MAX_RETRIES,
+                            VerificationStageCounts(syntax_failures, semantic_failures),
+                            turn_generation_ttft_sec,
+                        )
                     continue
 
                 # Deterministic semantic contract checks belong to stage 2. They
@@ -3145,10 +3234,28 @@ class AgentRunner:
 
             # Do not let an invalid control prompt/response contaminate Memory.
             # Restore exactly the KV prefix that existed before this attempt.
+            if attempt == 0:
+                original_generation = generation
+                original_verification = verification
             agent.truncate_kv_cache(generation.tokens_before)
             self._update_peak_memory_breakdown()
             previous_response = generation.text
             attempt += 1
+            if attempt > VERIFICATION_MAX_RETRIES:
+                if original_generation is None or original_verification is None:
+                    raise RuntimeError("follow-up verification fallback lost the original response")
+                fallback_verification = self._verification_fallback_result(
+                    original_verification=original_verification,
+                    original_response=original_generation.text,
+                    current_answer=current_answer,
+                )
+                return (
+                    original_generation,
+                    fallback_verification,
+                    VERIFICATION_MAX_RETRIES,
+                    VerificationStageCounts(syntax_failures, semantic_failures),
+                    turn_generation_ttft_sec,
+                )
 
     def _run_offload_turns(
         self,
@@ -3286,9 +3393,9 @@ class AgentRunner:
             record.agreement_marker = verification.marker
             record.final_answer = verification.final_answer
 
-            if not verification.passed:
+            if verification.final_answer not in {"Yes", "No"}:
                 raise RuntimeError(
-                    f"Internal error: unbounded verification returned an invalid response for agent {current_target.node_id}"
+                    f"Verification/fallback did not provide a usable Yes/No answer for agent {current_target.node_id}"
                 )
 
             memory_tokens_after = self._commit_discussion_memory(
@@ -3474,8 +3581,8 @@ class AgentRunner:
             context=context,
             question=question,
         )
-        if not initial_verification.passed:
-            raise RuntimeError("Internal error: unbounded initial verification returned an invalid response")
+        if initial_verification.final_answer not in {"Yes", "No"}:
+            raise RuntimeError("Initial verification/fallback did not provide a usable Yes/No answer")
         initial_memory_tokens = self._commit_discussion_memory(
             agent=self.hub_agent,
             generation=generation,
@@ -3641,7 +3748,7 @@ class AgentRunner:
             "consensus_requires_full_initial_participation": True,
             "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
             "supermajority_comparison": ">",
-            "verification_retry_policy": "unbounded",
+            "verification_retry_policy": "max_100_then_original_response_fallback",
             "verification_retry_count": sum(message.verification_attempts for message in result.agent_messages),
             "verification_failure_count": sum(1 for message in result.agent_messages if message.verification_passed is False),
             "consensus_reached": self._consensus_reached,
