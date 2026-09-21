@@ -4,6 +4,7 @@ import argparse
 from dataclasses import asdict
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 from typing import Any, Dict, List
 
@@ -20,6 +21,19 @@ from core.strategyqa_dataset import (
     StrategyQAExample,
     load_strategyqa_examples,
 )
+
+
+def _git_commit_hash() -> str | None:
+    """Return the commit SHA of the experiment code, or None outside Git."""
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip() or None
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
 
 
 def _str_to_bool(value) -> bool:
@@ -291,6 +305,7 @@ def main() -> None:
         key: float("nan") if value is None else float(value) for key, value in memory_gib.items()
     }
     metrics = {
+        "git_commit_hash": _git_commit_hash(),
         "algorithm": args.alg,
         "cache_mode": args.cache_mode,
         "discussion": "memory",
