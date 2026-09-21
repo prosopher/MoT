@@ -785,6 +785,7 @@ def build_translator_pool(
 def load_translator_pool_from_checkpoint(
     checkpoint_dir_path: str,
     device_override: Optional[str] = None,
+    dtype_override: Optional[str] = None,
 ) -> Tuple[
     Context,
     TranslatorPool,
@@ -799,6 +800,8 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = device_override
+    if dtype_override is not None:
+        config.dtype = dtype_override
     ctx = Context(config)
     translator_pool = build_translator_pool(ctx)
     load_translator_checkpoints(checkpoint_dir_path_obj, translator_pool)

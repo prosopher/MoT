@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--dtype", default="bfloat16")
 
     parser.add_argument(
         "--data-dir",
@@ -231,6 +232,7 @@ def main() -> None:
             alg=args.alg,
             checkpoint_dir_path=args.checkpoint_dir_path,
             device=args.device,
+            dtype=args.dtype,
             max_turns=args.max_turns,
             generation_max_new_tokens=args.generation_max_new_tokens,
             generation_temperature=args.generation_temperature,

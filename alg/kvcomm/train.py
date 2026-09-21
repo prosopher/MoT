@@ -705,6 +705,7 @@ def run_train(ctx: Context) -> Path:
 def load_translator_pool_from_checkpoint(
     checkpoint_dir_path: str,
     device_override: Optional[str] = None,
+    dtype_override: Optional[str] = None,
 ) -> Tuple[Context, TranslatorPool]:
     checkpoint_dir_path_obj = Path(checkpoint_dir_path)
     if not checkpoint_dir_path_obj.exists():
@@ -715,6 +716,8 @@ def load_translator_pool_from_checkpoint(
     config = TrainConfig(**read_json(train_config_path))
     if device_override is not None:
         config.device = resolve_device(device_override)
+    if dtype_override is not None:
+        config.dtype = dtype_override
     config.output_path = str(checkpoint_dir_path_obj)
     ctx = Context(config)
     translator_pool = load_kvcomm_translator_checkpoints(ctx)

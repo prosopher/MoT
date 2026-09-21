@@ -113,6 +113,7 @@ class AgentRunnerConfig:
     alg: str
     checkpoint_dir_path: str = ""
     device: str = "auto"
+    dtype: Optional[str] = None
     max_turns: int = 7
     generation_max_new_tokens: int = 1024
     generation_temperature: float = 1.0
@@ -908,10 +909,13 @@ class AgentRunner:
         resolve_agent_count(config.agent_count, len(all_nodes))
 
         train_mod = importlib.import_module(TRAIN_MODULE_BY_ALG[resolved_alg])
-        loaded = train_mod.load_translator_pool_from_checkpoint(
-            checkpoint_dir_path=config.checkpoint_dir_path,
-            device_override=resolve_device(config.device),
-        )
+        load_kwargs = {
+            "checkpoint_dir_path": config.checkpoint_dir_path,
+            "device_override": resolve_device(config.device),
+        }
+        if config.dtype is not None:
+            load_kwargs["dtype_override"] = config.dtype
+        loaded = train_mod.load_translator_pool_from_checkpoint(**load_kwargs)
         ctx, translator_pool, *_ = loaded
         set_seed(config.seed)
         return cls(
