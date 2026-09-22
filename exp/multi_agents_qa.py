@@ -14,7 +14,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.agent_runner import AgentRunner, AgentRunnerConfig, MALLM_SUPERMAJORITY_THRESHOLD
+from core.agent_runner import (
+    AgentRunner,
+    AgentRunnerConfig,
+    MALLM_SUPERMAJORITY_THRESHOLD,
+    VERIFICATION_MAX_RETRIES,
+)
 from core.common import setup_logging, write_json
 from core.strategyqa_dataset import (
     STRATEGYQA_DEFAULT_DATA_DIR,
@@ -162,6 +167,11 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
         "consensus_requires_full_initial_participation": result.profile.get(
             "consensus_requires_full_initial_participation", True
         ),
+        "consensus_participation_scope": result.profile.get(
+            "consensus_participation_scope", "non_failed_agents"
+        ),
+        "failed_agent_ids": result.profile.get("failed_agent_ids", []),
+        "active_agent_ids": result.profile.get("active_agent_ids", result.agent_ids),
         "supermajority_threshold": result.profile.get("supermajority_threshold", MALLM_SUPERMAJORITY_THRESHOLD),
         "supermajority_comparison": result.profile.get("supermajority_comparison", ">"),
         "consensus_reached": result.profile.get("consensus_reached"),
@@ -170,7 +180,7 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
         "final_decision_answer": result.profile.get("final_decision_answer"),
         "turns": [asdict(turn_record) for turn_record in result.turns],
         "verification_retry_policy": result.profile.get(
-            "verification_retry_policy", "max_100_then_original_response_fallback"
+            "verification_retry_policy", f"max_{VERIFICATION_MAX_RETRIES}_then_agent_failure"
         ),
         "verification_retry_count": result.profile.get("verification_retry_count", 0),
         "verification_failure_count": result.profile.get("verification_failure_count", 0),
@@ -319,10 +329,11 @@ def main() -> None:
         "response_generator": "simple",
         "decision_protocol": "turn_supermajority_then_majority_vote",
         "consensus_requires_full_initial_participation": True,
+        "consensus_participation_scope": "non_failed_agents",
         "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
         "supermajority_comparison": ">",
         "verification": {
-            "retry_policy": "unbounded",
+            "retry_policy": f"max_{VERIFICATION_MAX_RETRIES}_then_agent_failure",
             "retry_count": sum(int(row.get("verification_retry_count", 0) or 0) for row in rows),
             "failure_count": sum(int(row.get("verification_failure_count", 0) or 0) for row in rows),
         },

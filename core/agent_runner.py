@@ -33,7 +33,7 @@ from core.train_util import get_train_config_path
 CACHE_MODE_RETAIN = "retain"
 CACHE_MODE_FREE = "free"
 SUPPORTED_CACHE_MODES = (CACHE_MODE_RETAIN, CACHE_MODE_FREE)
-VERIFICATION_MAX_RETRIES = 100
+VERIFICATION_MAX_RETRIES = 10
 
 SUPPORTED_ALGS = ("mot", "interlat", "lsc", "c2c-pr", "kvcomm")
 RETAIN_ONLY_ALGS = ("interlat", "lsc", "c2c-pr", "kvcomm")
@@ -158,6 +158,7 @@ class AgentMessageRecord:
     verification_semantic_reason: Optional[str] = None
     agreement_marker: Optional[str] = None
     final_answer: Optional[str] = None
+    agent_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -870,6 +871,7 @@ class AgentRunner:
         self._final_agent_votes: Dict[str, str] = {}
         self._final_decision_method: Optional[str] = None
         self._final_decision_answer: Optional[str] = None
+        self._failed_agent_ids: set[str] = set()
         self._current_example_seed = self.seed
 
         # Backward-compatible aliases for older two-agent experiments/tests.
@@ -1812,20 +1814,19 @@ class AgentRunner:
         """Return a >66% supermajority over each Agent's latest semantic vote.
 
         MALLM's ``SupermajorityConsensus`` uses a 0.66 threshold. AgentRunner
-        keeps one latest verified Yes/No stance per Agent. Once consensus evaluation
-        is enabled, the fraction is measured against the full configured Agent count
-        and must be *strictly greater* than 0.66. The orchestration layer intentionally
-        defers the first consensus evaluation until every configured Agent has completed
-        at least one verified turn. Only verified messages are committed, because invalid
-        generations are retried until they pass before the Agent's turn can complete.
+        keeps one latest verified Yes/No stance per non-failed Agent. Failed Agents
+        lose their vote and are removed from the denominator. Consensus is deferred
+        until every remaining Agent has a verified vote and must be *strictly greater*
+        than 0.66. If failure leaves only one Agent, the controller returns ``Failed``
+        instead of allowing that lone Agent to decide the task.
         """
         valid_votes = {
             agent_id: answer
             for agent_id, answer in agent_votes.items()
             if answer in {"Yes", "No"}
         }
-        total_agents = len(self.agent_sequence)
-        if total_agents <= 0:
+        total_agents = self._active_discussion_agent_count()
+        if total_agents <= 1:
             return None
         yes_votes = sum(answer == "Yes" for answer in valid_votes.values())
         no_votes = sum(answer == "No" for answer in valid_votes.values())
@@ -1839,8 +1840,11 @@ class AgentRunner:
         self,
         agent_votes: Dict[str, str],
     ) -> bool:
-        """Return True only after every configured Agent has a verified vote."""
-        return all(agent.node_id in agent_votes for agent in self.agent_sequence)
+        """Return True after every non-failed Agent has a verified vote."""
+        active_agents = self._active_discussion_agents()
+        return bool(active_agents) and all(
+            agent.node_id in agent_votes for agent in active_agents
+        )
 
     def _majority_vote_with_random_tie(
         self,
@@ -1882,12 +1886,11 @@ class AgentRunner:
         agent_votes: Dict[str, str],
         turns: List[AgentTurnRecord],
     ) -> Optional[str]:
-        """Record a verified Turn and evaluate consensus once all Agents participated.
+        """Record a Turn and evaluate consensus over non-failed Agents.
 
-        The first pass through the Agent sequence is a mandatory participation phase:
-        no consensus decision is attempted until every configured Agent has contributed
-        at least one verified Yes/No vote. Starting with the Turn that completes that
-        first pass, >66% Supermajority Consensus is evaluated after every verified Turn.
+        Failed Agents have no vote and are excluded from the participation denominator.
+        A single remaining Agent can never decide the problem; that state is handled as
+        a forced ``Failed`` result by the discussion controller.
         """
         consensus_eligible = self._all_agents_have_participated(agent_votes)
         consensus_answer = (
@@ -2391,6 +2394,44 @@ class AgentRunner:
     def _agent_at_sequence(self, sequence_index: int) -> Agent:
         return self.agent_sequence[sequence_index % len(self.agent_sequence)]
 
+    def _active_discussion_agents(self) -> List[Agent]:
+        return [
+            agent for agent in self.agent_sequence
+            if agent.node_id not in self._failed_agent_ids
+        ]
+
+    def _active_discussion_agent_count(self) -> int:
+        return len(self._active_discussion_agents())
+
+    def _next_active_agent_from_cursor(self, cursor: int) -> Tuple[int, Optional[Agent]]:
+        """Return the next non-failed logical Agent and its configured index.
+
+        ``cursor`` is an absolute cursor over the original cyclic Agent order. Failed
+        Agents are skipped without consuming future discussion turns.
+        """
+        agent_count = len(self.agent_sequence)
+        if agent_count <= 0:
+            return cursor, None
+        if self._active_discussion_agent_count() <= 0:
+            return cursor, None
+        for offset in range(agent_count):
+            absolute = cursor + offset
+            agent_index = absolute % agent_count
+            agent = self.agent_sequence[agent_index]
+            if agent.node_id not in self._failed_agent_ids:
+                return absolute + 1, agent
+        return cursor + agent_count, None
+
+    def _mark_agent_failed(self, agent_id: str, agent_votes: Dict[str, str]) -> None:
+        self._failed_agent_ids.add(agent_id)
+        agent_votes.pop(agent_id, None)
+        self._final_agent_votes = dict(agent_votes)
+        self._retain_pending_self_refresh_prefix_tokens.pop(agent_id, None)
+        self._retain_deferred_self_refresh_hub_tokens.pop(agent_id, None)
+
+    def _should_force_failed_result(self) -> bool:
+        return bool(self._failed_agent_ids) and self._active_discussion_agent_count() <= 1
+
     @staticmethod
     def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[str, Optional[int], int]:
         storage = tensor.untyped_storage()
@@ -2518,7 +2559,7 @@ class AgentRunner:
             "[AgentRunner][Example %s][Turn %d/%d][Agent %s]\n"
             "  route    | mode=%s | agent=%s | hub=%s | translated=%s(%s) | offload=%s(%s)\n"
             "  decision | state=%s | solution=%s\n"
-            "  verify   | passed=%s | retries=%d | syntax=%s(%s; failures=%d) | semantic=%s(%s; failures=%d) | marker=%s | final_answer=%s | reason=%s\n"
+            "  verify   | passed=%s | retries=%d | failed=%s | syntax=%s(%s; failures=%d) | semantic=%s(%s; failures=%d) | marker=%s | final_answer=%s | reason=%s\n"
             "  prompt   | %s\n"
             "  response | %s",
             label,
@@ -2536,6 +2577,7 @@ class AgentRunner:
             self._preview_text(record.solution or "", self.log_max_chars),
             record.verification_passed,
             int(record.verification_attempts),
+            record.agent_failed,
             record.verification_syntax_passed,
             self._preview_text(record.verification_syntax_reason or "none", self.log_max_chars),
             int(record.verification_syntax_failures),
@@ -3331,47 +3373,28 @@ class AgentRunner:
         record.tokens_sent_check_passed = self._tokens_sent_check_passed(record, offload_meta)
 
     @staticmethod
-    def _verification_fallback_result(
-        *,
-        original_verification: StrategyQAVerificationResult,
-        original_response: str,
-        current_answer: Optional[str] = None,
+    def _verification_exhausted_result(
+        verification: StrategyQAVerificationResult,
     ) -> StrategyQAVerificationResult:
-        """Describe an exhausted-retry fallback without pretending it verified.
-
-        The original response is used verbatim.  We recover only the closed-set
-        Yes/No metadata needed by the discussion controller; the response itself
-        is never rewritten.  A follow-up with no recoverable answer preserves the
-        current answer, while an initial proposal must contain some recoverable
-        Yes/No conclusion in order for StrategyQA discussion to continue.
-        """
-        fallback_answer = (
-            original_verification.final_answer
-            or AgentRunner._extract_strategyqa_answer(original_response)
-            or current_answer
-        )
-        fallback_marker = (
-            original_verification.marker
-            or AgentRunner._extract_agreement_marker(original_response)
-        )
+        """Mark retry exhaustion as terminal Agent failure, never as fallback."""
         suffix = (
             f"verification retry limit ({VERIFICATION_MAX_RETRIES}) exhausted; "
-            "using original response"
+            "agent excluded from voting and future discussion"
         )
-        syntax_reason = original_verification.syntax_reason
-        semantic_reason = original_verification.semantic_reason
-        if original_verification.syntax_passed:
+        syntax_reason = verification.syntax_reason
+        semantic_reason = verification.semantic_reason
+        if verification.syntax_passed:
             semantic_reason = f"{semantic_reason}; {suffix}"
         else:
             syntax_reason = f"{syntax_reason}; {suffix}"
         return StrategyQAVerificationResult(
             passed=False,
-            syntax_passed=original_verification.syntax_passed,
+            syntax_passed=verification.syntax_passed,
             syntax_reason=syntax_reason,
-            semantic_passed=original_verification.semantic_passed,
+            semantic_passed=verification.semantic_passed,
             semantic_reason=semantic_reason,
-            marker=fallback_marker,
-            final_answer=fallback_answer,
+            marker=verification.marker,
+            final_answer=None,
         )
 
     def _generate_verified_initial(
@@ -3381,12 +3404,14 @@ class AgentRunner:
         initial_prompt: str,
         context: str,
         question: str,
+        turn_index: int = 1,
+        agent_index: int = 0,
     ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts, Optional[float]]:
-        """Generate the first proposal with at most 100 corrective retries.
+        """Generate an initial proposal with bounded corrective retries.
 
-        Invalid attempts are rolled back to the exact pre-prompt KV prefix. If all
-        retries fail, the original (attempt-0) response is used verbatim as the
-        fallback rather than accepting one of the corrective retry generations.
+        Invalid attempts are rolled back to the exact pre-prompt KV prefix. Exhausting
+        the retry budget is terminal failure for this Agent; no response fallback is
+        committed to Memory or used as a vote.
         """
         prompt = initial_prompt
         syntax_failures = 0
@@ -3395,9 +3420,6 @@ class AgentRunner:
         reason = "not checked"
         attempt = 0
         turn_generation_ttft_sec: Optional[float] = None
-        original_generation: Optional[AgentGeneration] = None
-        original_verification: Optional[StrategyQAVerificationResult] = None
-
         while True:
             if attempt > 0:
                 prompt = self.build_initial_verification_prompt(
@@ -3409,8 +3431,8 @@ class AgentRunner:
                 )
             self._set_generation_seed(
                 "discussion",
-                turn_index=1,
-                agent_index=0,
+                turn_index=turn_index,
+                agent_index=agent_index,
                 attempt=attempt,
             )
             generation, measured_ttft = self._generate_discussion_attempt(
@@ -3428,8 +3450,8 @@ class AgentRunner:
             if syntax.syntax_passed and syntax.final_answer is not None:
                 self._set_generation_seed(
                     "verification",
-                    turn_index=1,
-                    agent_index=0,
+                    turn_index=turn_index,
+                    agent_index=agent_index,
                     attempt=attempt,
                 )
                 _semantic_raw, semantic_passed = self._verify_response_semantics_with_model(
@@ -3469,28 +3491,14 @@ class AgentRunner:
                 verification = syntax
                 reason = syntax.reason
 
-            if attempt == 0:
-                original_generation = generation
-                original_verification = verification
             agent.truncate_kv_cache(generation.tokens_before)
             self._update_peak_memory_breakdown()
             previous_response = generation.text
             attempt += 1
             if attempt > VERIFICATION_MAX_RETRIES:
-                if original_generation is None or original_verification is None:
-                    raise RuntimeError("initial verification fallback lost the original response")
-                fallback_verification = self._verification_fallback_result(
-                    original_verification=original_verification,
-                    original_response=original_generation.text,
-                )
-                if fallback_verification.final_answer not in {"Yes", "No"}:
-                    raise RuntimeError(
-                        "Verification retries exhausted and the original initial response has no "
-                        "recoverable Yes/No answer for fallback."
-                    )
                 return (
-                    original_generation,
-                    fallback_verification,
+                    generation,
+                    self._verification_exhausted_result(verification),
                     VERIFICATION_MAX_RETRIES,
                     VerificationStageCounts(syntax_failures, semantic_failures),
                     turn_generation_ttft_sec,
@@ -3509,11 +3517,11 @@ class AgentRunner:
         turn_index: int,
         agent_index: int,
     ) -> Tuple[AgentGeneration, StrategyQAVerificationResult, int, VerificationStageCounts, Optional[float]]:
-        """Generate a follow-up with at most 100 corrective retries.
+        """Generate a follow-up with bounded corrective retries.
 
         Invalid attempts are rolled back to the exact pre-prompt KV prefix, so they
-        never enter shared Memory or Supermajority Consensus. If all retries fail,
-        the original (attempt-0) response is used verbatim as the fallback.
+        never enter shared Memory or Supermajority Consensus. Exhausting the retry
+        budget is terminal failure for this Agent; there is no response fallback.
         """
         prompt = initial_prompt
         syntax_failures = 0
@@ -3522,9 +3530,6 @@ class AgentRunner:
         reason = "not checked"
         attempt = 0
         turn_generation_ttft_sec: Optional[float] = None
-        original_generation: Optional[AgentGeneration] = None
-        original_verification: Optional[StrategyQAVerificationResult] = None
-
         while True:
             if attempt > 0:
                 prompt = self.build_verification_prompt(
@@ -3572,23 +3577,13 @@ class AgentRunner:
                     reason = verification.reason
                     agent.truncate_kv_cache(generation.tokens_before)
                     self._update_peak_memory_breakdown()
-                    if attempt == 0:
-                        original_generation = generation
-                        original_verification = verification
                     previous_response = generation.text
                     semantic_failures += 1
                     attempt += 1
                     if attempt > VERIFICATION_MAX_RETRIES:
-                        if original_generation is None or original_verification is None:
-                            raise RuntimeError("follow-up verification fallback lost the original response")
-                        fallback_verification = self._verification_fallback_result(
-                            original_verification=original_verification,
-                            original_response=original_generation.text,
-                            current_answer=current_answer,
-                        )
                         return (
-                            original_generation,
-                            fallback_verification,
+                            generation,
+                            self._verification_exhausted_result(verification),
                             VERIFICATION_MAX_RETRIES,
                             VerificationStageCounts(syntax_failures, semantic_failures),
                             turn_generation_ttft_sec,
@@ -3650,24 +3645,14 @@ class AgentRunner:
 
             # Do not let an invalid control prompt/response contaminate Memory.
             # Restore exactly the KV prefix that existed before this attempt.
-            if attempt == 0:
-                original_generation = generation
-                original_verification = verification
             agent.truncate_kv_cache(generation.tokens_before)
             self._update_peak_memory_breakdown()
             previous_response = generation.text
             attempt += 1
             if attempt > VERIFICATION_MAX_RETRIES:
-                if original_generation is None or original_verification is None:
-                    raise RuntimeError("follow-up verification fallback lost the original response")
-                fallback_verification = self._verification_fallback_result(
-                    original_verification=original_verification,
-                    original_response=original_generation.text,
-                    current_answer=current_answer,
-                )
                 return (
-                    original_generation,
-                    fallback_verification,
+                    generation,
+                    self._verification_exhausted_result(verification),
                     VERIFICATION_MAX_RETRIES,
                     VerificationStageCounts(syntax_failures, semantic_failures),
                     turn_generation_ttft_sec,
@@ -3684,41 +3669,47 @@ class AgentRunner:
         question: str,
         example_index: Optional[int],
         initial_pretranslation_sec: float = 0.0,
+        initial_turn_index: int = 1,
     ) -> Tuple[str, str]:
-        # The verified first proposal has already passed syntax and semantic
-        # consistency checks. Use the answer captured by verification rather than
-        # reparsing arbitrary reasoning text here.
-        current_answer = agent_messages[0].final_answer
-        if current_answer not in {"Yes", "No"}:
-            raise RuntimeError("verified initial proposal lost its Final Solution answer")
+        initial_agent = self.agents[initial_generation.agent_id]
+        initial_record = agent_messages[initial_turn_index - 1]
+        current_answer = initial_record.final_answer
+        if initial_record.verification_passed is not True or current_answer not in {"Yes", "No"}:
+            raise RuntimeError("_run_offload_turns requires a verified initial proposal")
         current_solution = current_answer
         current_response = initial_generation.text
-        agent_messages[0].final_answer = current_answer
-        agent_messages[0].solution = current_solution
-        agent_messages[0].response_state = "draft"
+        initial_record.final_answer = current_answer
+        initial_record.solution = current_solution
+        initial_record.response_state = "draft"
 
-        # Each Agent contributes at most one latest verified semantic vote. The
-        # initial proposal is Turn 1. The first pass through all configured Agents is
-        # mandatory: consensus is not evaluated until every Agent has completed one
-        # verified Turn. From that point onward, it is evaluated after every Turn.
-        agent_votes: Dict[str, str] = {self.hub_agent.node_id: current_answer}
+        # Failed Agents are removed from both the vote denominator and future turn
+        # scheduling. Their already-committed historical Memory remains untouched.
+        agent_votes: Dict[str, str] = {initial_agent.node_id: current_answer}
         self._consensus_reached = False
         self._consensus_turn = None
         self._consensus_answer = None
         self._final_agent_votes = dict(agent_votes)
         self._evaluate_turn_consensus(
-            turn_index=1,
-            agent_id=self.hub_agent.node_id,
+            turn_index=initial_turn_index,
+            agent_id=initial_agent.node_id,
             agent_votes=agent_votes,
             turns=turns,
         )
 
-        agent_count = len(self.agent_sequence)
-        sequence_index = 1
+        completed_turns = int(initial_turn_index)
+        current_source = initial_agent
+        configured_index = self.agent_sequence.index(initial_agent)
+        schedule_cursor = configured_index + 1
         pending_pretranslation_sec = float(initial_pretranslation_sec)
-        while sequence_index < self.max_turns and not self._consensus_reached:
-            current_source = self._agent_at_sequence(sequence_index - 1)
-            current_target = self._agent_at_sequence(sequence_index)
+
+        while completed_turns < self.max_turns and not self._consensus_reached:
+            if self._should_force_failed_result():
+                break
+
+            next_cursor, current_target = self._next_active_agent_from_cursor(schedule_cursor)
+            if current_target is None:
+                break
+            schedule_cursor = next_cursor
             source_record = agent_messages[-1]
 
             edge_id: Optional[str] = None
@@ -3751,16 +3742,12 @@ class AgentRunner:
                 incoming_offload_kind = str(incoming_meta.get("offload_kind", "")) or None
                 tokens_received = int(incoming_meta.get("tokens_received", incoming_meta.get("tokens_sent", 0)))
                 del incoming_from_agent
-                # The incoming cache itself is one replay chunk in Retain. Record
-                # its end position in both modes; Free may have no KV left by the
-                # time this logical Agent is revisited, but it can reconstruct the
-                # same numerical path from these boundaries.
                 self._record_mot_replay_boundary(current_target)
 
             self._update_peak_memory_breakdown()
             self._log_agent(
                 example_index=example_index,
-                sequence_index=sequence_index - 1,
+                sequence_index=completed_turns - 1,
                 record=source_record,
             )
 
@@ -3770,8 +3757,8 @@ class AgentRunner:
                 context=context,
                 current_solution=current_solution,
             )
-            turn_index = sequence_index + 1
-            agent_index = sequence_index % agent_count
+            turn_index = completed_turns + 1
+            agent_index = self.agent_sequence.index(current_target)
             (
                 generation,
                 verification,
@@ -3790,9 +3777,8 @@ class AgentRunner:
                 agent_index=agent_index,
             )
 
-            # A Retain+MoT refresh belongs to the *previous* non-hub speaker and
-            # exists only to make its cache canonical for a future cycle.  Do not
-            # let it participate in the current handoff/generation path.
+            # This refresh belongs to the previous successful non-hub speaker and
+            # must remain outside the current target's generation path.
             self._flush_retain_nonhub_source_cache_refreshes()
 
             record = self._agent_message_record(
@@ -3819,86 +3805,115 @@ class AgentRunner:
             record.agreement_marker = verification.marker
             record.final_answer = verification.final_answer
 
-            if verification.final_answer not in {"Yes", "No"}:
-                raise RuntimeError(
-                    f"Verification/fallback did not provide a usable Yes/No answer for agent {current_target.node_id}"
+            if verification.passed is not True:
+                # All attempts have already been rolled back to the exact incoming
+                # shared-history prefix. Do not commit the failed response to Memory
+                # or transcript. Revoke any older vote from this Agent and exclude it
+                # from all future discussion turns.
+                record.response_state = "failed"
+                record.solution = current_solution
+                record.memory_tokens_after = current_target.cache_seq_len
+                record.agent_failed = True
+                agent_messages.append(record)
+                self._mark_agent_failed(current_target.node_id, agent_votes)
+                completed_turns += 1
+                current_source = current_target
+                self._evaluate_turn_consensus(
+                    turn_index=turn_index,
+                    agent_id=current_target.node_id,
+                    agent_votes=agent_votes,
+                    turns=turns,
                 )
 
-            memory_tokens_after = self._commit_discussion_memory(
-                agent=current_target,
-                generation=generation,
-                persona=self.agent_personas[current_target.node_id],
-                context=context,
-                question=question,
-            )
-            self._update_peak_memory_breakdown()
-            transcript = self._append_agent_message_to_transcript(
-                transcript + generation.prompt_text,
-                current_target.node_id,
-                generation.text,
-            )
-            previous_solution = current_solution
-            previous_answer = current_answer
-            if verification.marker == "agree":
-                current_solution = previous_solution
-                current_answer = previous_answer
-                response_state = "agree"
+                if self._should_force_failed_result():
+                    break
             else:
-                current_solution = str(verification.final_answer)
-                current_answer = verification.final_answer
-                response_state = "revise"
-            current_response = generation.text
-            record.memory_tokens_after = memory_tokens_after
-            record.solution = current_solution
-            record.response_state = response_state
+                if verification.final_answer not in {"Yes", "No"}:
+                    raise RuntimeError(
+                        f"Verified response lost its usable Yes/No answer for agent {current_target.node_id}"
+                    )
 
-            if current_answer in {"Yes", "No"}:
-                agent_votes[current_target.node_id] = current_answer
+                memory_tokens_after = self._commit_discussion_memory(
+                    agent=current_target,
+                    generation=generation,
+                    persona=self.agent_personas[current_target.node_id],
+                    context=context,
+                    question=question,
+                )
+                self._update_peak_memory_breakdown()
+                transcript = self._append_agent_message_to_transcript(
+                    transcript + generation.prompt_text,
+                    current_target.node_id,
+                    generation.text,
+                )
+                previous_solution = current_solution
+                previous_answer = current_answer
+                if verification.marker == "agree":
+                    current_solution = previous_solution
+                    current_answer = previous_answer
+                    response_state = "agree"
+                else:
+                    current_solution = str(verification.final_answer)
+                    current_answer = verification.final_answer
+                    response_state = "revise"
+                current_response = generation.text
+                record.memory_tokens_after = memory_tokens_after
+                record.solution = current_solution
+                record.response_state = response_state
 
-            agent_messages.append(record)
-            self._evaluate_turn_consensus(
-                turn_index=turn_index,
-                agent_id=current_target.node_id,
-                agent_votes=agent_votes,
-                turns=turns,
-            )
-            sequence_index += 1
+                if current_answer in {"Yes", "No"}:
+                    agent_votes[current_target.node_id] = current_answer
 
-            if not self._consensus_reached and sequence_index < self.max_turns:
-                next_target = self._agent_at_sequence(sequence_index)
-                if current_target.node_id != next_target.node_id:
+                agent_messages.append(record)
+                completed_turns += 1
+                current_source = current_target
+                self._evaluate_turn_consensus(
+                    turn_index=turn_index,
+                    agent_id=current_target.node_id,
+                    agent_votes=agent_votes,
+                    turns=turns,
+                )
+
+            if (
+                not self._consensus_reached
+                and completed_turns < self.max_turns
+                and not self._should_force_failed_result()
+            ):
+                _, next_target = self._next_active_agent_from_cursor(schedule_cursor)
+                if next_target is not None and current_source.node_id != next_target.node_id:
                     _, pending_pretranslation_sec = self._measure_ttft_phase(
                         lambda: self._prepare_outgoing_route_translation(
-                            source_agent=current_target,
+                            source_agent=current_source,
                             logical_target_agent=next_target,
                         )
                     )
-                    # Pretranslation materializes one or more full target-side KV
-                    # caches. Measure immediately; the next handoff may consume or
-                    # free them before the old sampling point and would undercount
-                    # the true live KV peak.
                     self._update_peak_memory_breakdown()
 
         self._update_peak_memory_breakdown()
-        self._log_agent(
-            example_index=example_index,
-            sequence_index=len(agent_messages) - 1,
-            record=agent_messages[-1],
-        )
+        if agent_messages:
+            self._log_agent(
+                example_index=example_index,
+                sequence_index=len(agent_messages) - 1,
+                record=agent_messages[-1],
+            )
 
-        # After every Agent has participated once, a >66% supermajority wins
-        # immediately after any subsequent completed Turn (including the Turn that
-        # completes first participation). If max_turns expires without one, select
-        # from the Agents' latest verified votes by
-        # majority; only an exact tie is resolved randomly. There is no response
-        # fallback path.
-        if self._consensus_reached:
+        if self._should_force_failed_result():
+            final_solution = "Failed"
+            self._final_decision_method = "insufficient_active_agents_failed"
+            self._consensus_reached = False
+            self._consensus_turn = None
+            self._consensus_answer = None
+        elif self._consensus_reached:
             final_solution = self._consensus_answer
             self._final_decision_method = "supermajority_consensus"
-        else:
+        elif agent_votes:
             final_solution, self._final_decision_method = self._majority_vote_with_random_tie(
                 agent_votes
             )
+        else:
+            final_solution = "Failed"
+            self._final_decision_method = "no_verified_votes_failed"
+        self._final_agent_votes = dict(agent_votes)
         self._final_decision_answer = final_solution
         return transcript, str(final_solution).strip()
 
@@ -3913,6 +3928,7 @@ class AgentRunner:
         question: str,
         example_index: Optional[int],
         initial_pretranslation_sec: float = 0.0,
+        initial_turn_index: int = 1,
     ) -> Tuple[str, str]:
         return self._run_offload_turns(
             transcript=transcript,
@@ -3923,6 +3939,7 @@ class AgentRunner:
             question=question,
             example_index=example_index,
             initial_pretranslation_sec=initial_pretranslation_sec,
+            initial_turn_index=initial_turn_index,
         )
 
     def _run_free_turns(
@@ -3936,6 +3953,7 @@ class AgentRunner:
         question: str,
         example_index: Optional[int],
         initial_pretranslation_sec: float = 0.0,
+        initial_turn_index: int = 1,
     ) -> Tuple[str, str]:
         return self._run_offload_turns(
             transcript=transcript,
@@ -3946,6 +3964,7 @@ class AgentRunner:
             question=question,
             example_index=example_index,
             initial_pretranslation_sec=initial_pretranslation_sec,
+            initial_turn_index=initial_turn_index,
         )
 
     def _run_example_impl(
@@ -3968,6 +3987,7 @@ class AgentRunner:
         self._final_agent_votes = {}
         self._final_decision_method = None
         self._final_decision_answer = None
+        self._failed_agent_ids.clear()
         for agent in self.agent_sequence:
             agent.reset()
         self._pending_pretranslated_second_hops.clear()
@@ -3984,95 +4004,155 @@ class AgentRunner:
 
         self.agent_personas = self._generate_expert_personas(context, question)
         self._log_example_start(question=question, gold_answers=gold_answers, example_index=example_index)
-        transcript = self.build_initial_prompt_for_agent(
-            self.hub_agent,
-            context,
-            question,
-            hub_agent_id=self.hub_agent.node_id,
-            agent_count=len(self.agent_sequence),
-        )
+        transcript = ""
         agent_messages: List[AgentMessageRecord] = []
         turns: List[AgentTurnRecord] = []
-
-        # The first node is the HubAgent and starts from native Base Context + Prompt.
-        # Its sampling stream must not depend on how many persona generations ran.
-        # Verify that the proposal actually states one StrategyQA Yes/No answer before it
-        # is committed to shared Memory; otherwise retry deterministically.
-        (
-            generation,
-            initial_verification,
-            initial_verification_attempts,
-            initial_verification_stage_counts,
-            initial_generation_ttft_sec,
-        ) = self._generate_verified_initial(
-            agent=self.hub_agent,
-            initial_prompt=transcript,
-            context=context,
-            question=question,
-        )
-        if initial_verification.final_answer not in {"Yes", "No"}:
-            raise RuntimeError("Initial verification/fallback did not provide a usable Yes/No answer")
-        initial_memory_tokens = self._commit_discussion_memory(
-            agent=self.hub_agent,
-            generation=generation,
-            persona=self.agent_personas[self.hub_agent.node_id],
-            context=context,
-            question=question,
-        )
+        selected_solution = "Failed"
+        initial_generation: Optional[AgentGeneration] = None
+        initial_turn_index = 0
         initial_pretranslation_sec = 0.0
-        if self.max_turns > 1:
-            next_target = self._agent_at_sequence(1)
-            if self.hub_agent.node_id != next_target.node_id:
-                _, initial_pretranslation_sec = self._measure_ttft_phase(
-                    lambda: self._prepare_outgoing_route_translation(
-                        source_agent=self.hub_agent,
-                        logical_target_agent=next_target,
-                    )
-                )
-        self._update_peak_memory_breakdown()
-        transcript = self._append_agent_message_to_transcript(transcript, self.hub_agent.node_id, generation.text)
-        record = self._agent_message_record(generation)
-        record.ttft_sec = initial_generation_ttft_sec
-        record.memory_tokens_after = initial_memory_tokens
-        record.verification_attempts = initial_verification_attempts
-        record.verification_syntax_failures = initial_verification_stage_counts.syntax_failures
-        record.verification_semantic_failures = initial_verification_stage_counts.semantic_failures
-        record.verification_passed = initial_verification.passed
-        record.verification_reason = initial_verification.reason
-        record.verification_syntax_passed = initial_verification.syntax_passed
-        record.verification_syntax_reason = initial_verification.syntax_reason
-        record.verification_semantic_passed = initial_verification.semantic_passed
-        record.verification_semantic_reason = initial_verification.semantic_reason
-        record.agreement_marker = initial_verification.marker
-        record.final_answer = initial_verification.final_answer
-        # The final closed-set solution is filled by _run_offload_turns and is also
-        # used as the discussion's current draft.
-        record.solution = None
-        record.response_state = "draft"
-        agent_messages.append(record)
+        proposal_cursor = 0
+        attempted_turns = 0
 
-        selected_solution = generation.text
-        if self.cache_mode == CACHE_MODE_FREE:
+        # Find the first Agent that can produce a verified initial proposal. An
+        # Agent that exhausts verification is terminally excluded; its failed
+        # response is logged but never committed to shared Memory/transcript.
+        while attempted_turns < self.max_turns:
+            if self._should_force_failed_result():
+                break
+            proposal_cursor, proposal_agent = self._next_active_agent_from_cursor(proposal_cursor)
+            if proposal_agent is None:
+                break
+            turn_index = attempted_turns + 1
+            agent_index = self.agent_sequence.index(proposal_agent)
+            initial_prompt = self.build_initial_prompt_for_agent(
+                proposal_agent,
+                context,
+                question,
+                hub_agent_id=self.hub_agent.node_id,
+                agent_count=len(self.agent_sequence),
+            )
+            (
+                generation,
+                initial_verification,
+                initial_verification_attempts,
+                initial_verification_stage_counts,
+                initial_generation_ttft_sec,
+            ) = self._generate_verified_initial(
+                agent=proposal_agent,
+                initial_prompt=initial_prompt,
+                context=context,
+                question=question,
+                turn_index=turn_index,
+                agent_index=agent_index,
+            )
+
+            record = self._agent_message_record(generation)
+            record.ttft_sec = initial_generation_ttft_sec
+            record.verification_attempts = initial_verification_attempts
+            record.verification_syntax_failures = initial_verification_stage_counts.syntax_failures
+            record.verification_semantic_failures = initial_verification_stage_counts.semantic_failures
+            record.verification_passed = initial_verification.passed
+            record.verification_reason = initial_verification.reason
+            record.verification_syntax_passed = initial_verification.syntax_passed
+            record.verification_syntax_reason = initial_verification.syntax_reason
+            record.verification_semantic_passed = initial_verification.semantic_passed
+            record.verification_semantic_reason = initial_verification.semantic_reason
+            record.agreement_marker = initial_verification.marker
+            record.final_answer = initial_verification.final_answer
+            attempted_turns += 1
+
+            if initial_verification.passed is not True:
+                record.response_state = "failed"
+                record.agent_failed = True
+                record.memory_tokens_after = proposal_agent.cache_seq_len
+                agent_messages.append(record)
+                empty_votes: Dict[str, str] = {}
+                self._mark_agent_failed(proposal_agent.node_id, empty_votes)
+                self._evaluate_turn_consensus(
+                    turn_index=turn_index,
+                    agent_id=proposal_agent.node_id,
+                    agent_votes=empty_votes,
+                    turns=turns,
+                )
+                self._log_agent(
+                    example_index=example_index,
+                    sequence_index=attempted_turns - 1,
+                    record=record,
+                )
+                continue
+
+            if initial_verification.final_answer not in {"Yes", "No"}:
+                raise RuntimeError("Verified initial proposal lost its usable Yes/No answer")
+
+            initial_memory_tokens = self._commit_discussion_memory(
+                agent=proposal_agent,
+                generation=generation,
+                persona=self.agent_personas[proposal_agent.node_id],
+                context=context,
+                question=question,
+            )
+            self._update_peak_memory_breakdown()
+            transcript = self._append_agent_message_to_transcript(
+                initial_prompt,
+                proposal_agent.node_id,
+                generation.text,
+            )
+            record.memory_tokens_after = initial_memory_tokens
+            record.solution = initial_verification.final_answer
+            record.response_state = "draft"
+            agent_messages.append(record)
+            initial_generation = generation
+            initial_turn_index = attempted_turns
+            selected_solution = generation.text
+
+            if attempted_turns < self.max_turns and not self._should_force_failed_result():
+                _, next_target = self._next_active_agent_from_cursor(proposal_cursor)
+                if next_target is not None and proposal_agent.node_id != next_target.node_id:
+                    _, initial_pretranslation_sec = self._measure_ttft_phase(
+                        lambda: self._prepare_outgoing_route_translation(
+                            source_agent=proposal_agent,
+                            logical_target_agent=next_target,
+                        )
+                    )
+                    self._update_peak_memory_breakdown()
+            break
+
+        if initial_generation is None:
+            selected_solution = "Failed"
+            self._consensus_reached = False
+            self._consensus_turn = None
+            self._consensus_answer = None
+            self._final_agent_votes = {}
+            self._final_decision_answer = "Failed"
+            self._final_decision_method = (
+                "insufficient_active_agents_failed"
+                if self._should_force_failed_result()
+                else "no_verified_votes_failed"
+            )
+        elif self.cache_mode == CACHE_MODE_FREE:
             transcript, selected_solution = self._run_free_turns(
                 transcript=transcript,
-                initial_generation=generation,
+                initial_generation=initial_generation,
                 agent_messages=agent_messages,
                 turns=turns,
                 context=context,
                 question=question,
                 example_index=example_index,
                 initial_pretranslation_sec=initial_pretranslation_sec,
+                initial_turn_index=initial_turn_index,
             )
         else:
             transcript, selected_solution = self._run_retain_turns(
                 transcript=transcript,
-                initial_generation=generation,
+                initial_generation=initial_generation,
                 agent_messages=agent_messages,
                 turns=turns,
                 context=context,
                 question=question,
                 example_index=example_index,
                 initial_pretranslation_sec=initial_pretranslation_sec,
+                initial_turn_index=initial_turn_index,
             )
 
         prediction = self.extract_final_answer(transcript, selected_solution)
@@ -4175,11 +4255,17 @@ class AgentRunner:
             "discussion_paradigm": "memory",
             "decision_protocol": "turn_supermajority_then_majority_vote",
             "consensus_requires_full_initial_participation": True,
+            "consensus_participation_scope": "non_failed_agents",
             "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
             "supermajority_comparison": ">",
-            "verification_retry_policy": "max_100_then_original_response_fallback",
+            "verification_retry_policy": f"max_{VERIFICATION_MAX_RETRIES}_then_agent_failure",
             "verification_retry_count": sum(message.verification_attempts for message in result.agent_messages),
             "verification_failure_count": sum(1 for message in result.agent_messages if message.verification_passed is False),
+            "failed_agent_ids": sorted(self._failed_agent_ids),
+            "active_agent_ids": [
+                agent.node_id for agent in self.agent_sequence
+                if agent.node_id not in self._failed_agent_ids
+            ],
             "consensus_reached": self._consensus_reached,
             "consensus_turn": self._consensus_turn,
             "consensus_answer": self._consensus_answer,

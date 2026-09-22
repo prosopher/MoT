@@ -1446,7 +1446,7 @@ def test_agent_runner_initial_proposal_retries_until_yes_no_is_explicit() -> Non
     assert first.verification_passed is True
     assert first.verification_reason == "ok"
     assert result.prediction == "Yes"
-    assert result.profile["verification_retry_policy"] == "max_100_then_original_response_fallback"
+    assert result.profile["verification_retry_policy"] == "max_10_then_agent_failure"
     assert result.profile["verification_retry_count"] == 5
 
 
@@ -1517,7 +1517,7 @@ def test_agent_runner_verification_retry_accepts_corrected_response() -> None:
     assert corrected.final_answer == "Yes"
     assert corrected.response_state == "agree"
     assert result.profile["consensus_reached"] is True
-    assert result.profile["verification_retry_policy"] == "max_100_then_original_response_fallback"
+    assert result.profile["verification_retry_policy"] == "max_10_then_agent_failure"
     assert result.profile["verification_retry_count"] == 5
     assert result.profile["verification_failure_count"] == 0
 
@@ -2289,7 +2289,7 @@ def test_heterogeneous_retain_second_same_model_hop_replaces_stale_prefix_after_
     assert target.cache_seq_len == 2
 
 
-def test_initial_verification_falls_back_to_original_response_after_retry_limit(monkeypatch) -> None:
+def test_initial_verification_retry_exhaustion_marks_agent_failure_without_fallback(monkeypatch) -> None:
     import core.agent_runner as agent_runner_module
 
     ctx = _ctx("tiny-a,tiny-a")
@@ -2337,14 +2337,14 @@ def test_initial_verification_falls_back_to_original_response_after_retry_limit(
 
     assert len(calls) == 3  # original + two retries
     assert attempts == 2
-    assert generation.text == responses[0]
+    assert generation.text == responses[-1]
     assert verification.passed is False
-    assert verification.final_answer == "Yes"
-    assert "using original response" in verification.reason
+    assert verification.final_answer is None
+    assert "agent excluded from voting and future discussion" in verification.reason
     assert counts.syntax_failures == 3
 
 
-def test_followup_verification_falls_back_to_original_response_after_retry_limit(monkeypatch) -> None:
+def test_followup_verification_retry_exhaustion_marks_agent_failure_without_fallback(monkeypatch) -> None:
     import core.agent_runner as agent_runner_module
 
     ctx = _ctx("tiny-a,tiny-a")
@@ -2397,12 +2397,231 @@ def test_followup_verification_falls_back_to_original_response_after_retry_limit
 
     assert len(calls) == 3  # original + two retries
     assert attempts == 2
-    assert generation.text == responses[0]
+    assert generation.text == responses[-1]
     assert verification.passed is False
     assert verification.marker == "agree"
-    assert verification.final_answer == "Yes"
-    assert "using original response" in verification.reason
+    assert verification.final_answer is None
+    assert "agent excluded from voting and future discussion" in verification.reason
     assert counts.semantic_failures == 3
+
+
+
+def test_verification_retry_default_is_ten() -> None:
+    import core.agent_runner as agent_runner_module
+
+    assert agent_runner_module.VERIFICATION_MAX_RETRIES == 10
+
+
+def test_two_agent_followup_failure_revokes_vote_excludes_agent_and_forces_failed(monkeypatch) -> None:
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 2)
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        max_turns=6,
+        log_agents=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    calls = {"A": 0, "B": 0}
+
+    def fake_semantic(**kwargs):
+        return ("ok" if kwargs["agent"].node_id == "A" else "reject", kwargs["agent"].node_id == "A")
+
+    runner._verify_response_semantics_with_model = fake_semantic
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            calls[agent.node_id] += 1
+            text = (
+                "A verified history.\nFinal Solution: Yes"
+                if agent.node_id == "A"
+                else "[DISAGREE] B failed attempt.\nFinal Solution: No"
+            )
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    runner._update_peak_memory_breakdown = lambda: None
+
+    def fake_star_offload(*, source_agent, target_agent):
+        meta = {
+            "edge_id": "edge",
+            "offload_kind": "delta",
+            "tokens_sent": 1,
+            "tokens_received": 1,
+            "expected_delta_tokens": 1,
+        }
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_agent = fake_star_offload
+    result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    assert calls == {"A": 1, "B": 3}  # original + two retries for B
+    assert result.prediction == "Failed"
+    assert result.accuracy == 0.0
+    assert result.profile["final_decision_method"] == "insufficient_active_agents_failed"
+    assert result.profile["failed_agent_ids"] == ["B"]
+    assert result.profile["active_agent_ids"] == ["A"]
+    assert result.profile["final_agent_votes"] == {"A": "Yes"}
+    assert len(result.agent_messages) == 2
+    failed = result.agent_messages[1]
+    assert failed.agent_id == "B"
+    assert failed.agent_failed is True
+    assert failed.response_state == "failed"
+    assert failed.verification_passed is False
+    assert failed.final_answer is None
+    assert "A verified history." in result.transcript
+    assert "B failed attempt." not in result.transcript
+
+
+def test_failed_agent_keeps_old_history_but_is_skipped_on_future_cycles(monkeypatch) -> None:
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=5,
+        max_turns=9,
+        log_agents=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    calls = {agent.node_id: 0 for agent in runner.agent_sequence}
+    answers = {"A": "Yes", "B": "No", "C": "Yes", "D": "No", "E": "No"}
+
+    def fake_semantic(**kwargs):
+        agent_id = kwargs["agent"].node_id
+        # B succeeds on its first discussion turn, then every attempt on its
+        # second turn is rejected until the retry budget is exhausted.
+        if agent_id == "B" and calls["B"] >= 2:
+            return "reject", False
+        return "ok", True
+
+    runner._verify_response_semantics_with_model = fake_semantic
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            calls[agent.node_id] += 1
+            if agent.node_id == "A" and calls["A"] == 1:
+                text = "A initial.\nFinal Solution: Yes"
+            else:
+                text = f"[DISAGREE] {agent.node_id} response {calls[agent.node_id]}.\nFinal Solution: {answers[agent.node_id]}"
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    runner._update_peak_memory_breakdown = lambda: None
+
+    def fake_star_offload(*, source_agent, target_agent):
+        meta = {
+            "edge_id": "edge",
+            "offload_kind": "delta",
+            "tokens_sent": 1,
+            "tokens_received": 1,
+            "expected_delta_tokens": 1,
+        }
+        return target_agent, meta, False, source_agent, meta
+
+    runner._star_offload_to_agent = fake_star_offload
+    result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    assert [message.agent_id for message in result.agent_messages] == [
+        "A", "B", "C", "D", "E", "A", "B", "C", "D"
+    ]
+    first_b = result.agent_messages[1]
+    failed_b = result.agent_messages[6]
+    assert first_b.agent_failed is False
+    assert failed_b.agent_failed is True
+    assert failed_b.final_answer is None
+    assert result.profile["failed_agent_ids"] == ["B"]
+    assert "B response 1." in result.transcript
+    assert "B response 2." not in result.transcript
+    assert "B" not in result.profile["final_agent_votes"]
+    assert result.profile["active_agent_ids"] == ["A", "C", "D", "E"]
+
+
+def test_initial_agent_failure_in_two_agent_run_forces_failed_without_trying_lone_agent(monkeypatch) -> None:
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=2,
+        max_turns=4,
+        log_agents=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.") for agent in runner.agent_sequence
+    }
+    runner._verify_response_semantics_with_model = lambda **kwargs: ("reject", False)
+    calls = {"A": 0, "B": 0}
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            calls[agent.node_id] += 1
+            text = "Unverified.\nFinal Solution: Yes"
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+    runner._update_peak_memory_breakdown = lambda: None
+    result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    assert calls == {"A": 2, "B": 0}
+    assert result.prediction == "Failed"
+    assert result.accuracy == 0.0
+    assert result.profile["failed_agent_ids"] == ["A"]
+    assert result.profile["active_agent_ids"] == ["B"]
+    assert result.agent_messages[0].agent_failed is True
+    assert result.transcript == ""
 
 
 def test_retain_mot_self_refresh_replaces_only_native_memory_suffix(monkeypatch) -> None:
