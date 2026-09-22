@@ -168,7 +168,10 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
             "consensus_requires_full_initial_participation", True
         ),
         "consensus_participation_scope": result.profile.get(
-            "consensus_participation_scope", "non_failed_agents"
+            "consensus_participation_scope", "all_configured_agents_including_failed_votes"
+        ),
+        "failed_vote_policy": result.profile.get(
+            "failed_vote_policy", "exclude_from_discussion_keep_failed_vote"
         ),
         "failed_agent_ids": result.profile.get("failed_agent_ids", []),
         "active_agent_ids": result.profile.get("active_agent_ids", result.agent_ids),
@@ -178,6 +181,10 @@ def _example_row(result, example: StrategyQAExample, *, example_index: int) -> D
         "consensus_turn": result.profile.get("consensus_turn"),
         "final_decision_method": result.profile.get("final_decision_method"),
         "final_decision_answer": result.profile.get("final_decision_answer"),
+        "final_agent_votes": result.profile.get("final_agent_votes", {}),
+        "final_vote_counts": result.profile.get(
+            "final_vote_counts", {"Yes": 0, "No": 0, "Failed": 0}
+        ),
         "turns": [asdict(turn_record) for turn_record in result.turns],
         "verification_retry_policy": result.profile.get(
             "verification_retry_policy", f"max_{VERIFICATION_MAX_RETRIES}_then_agent_failure"
@@ -329,7 +336,8 @@ def main() -> None:
         "response_generator": "simple",
         "decision_protocol": "turn_supermajority_then_majority_vote",
         "consensus_requires_full_initial_participation": True,
-        "consensus_participation_scope": "non_failed_agents",
+        "consensus_participation_scope": "all_configured_agents_including_failed_votes",
+        "failed_vote_policy": "exclude_from_discussion_keep_failed_vote",
         "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
         "supermajority_comparison": ">",
         "verification": {

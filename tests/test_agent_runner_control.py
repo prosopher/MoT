@@ -927,7 +927,7 @@ def test_agent_runner_max_turns_uses_majority_vote_instead_of_latest_draft() -> 
     runner._star_offload_to_agent = fake_star_offload
     result = runner.run(context="", question="Question?", gold_answers=["Yes"])
 
-    assert result.turns[-1].vote_counts == {"Yes": 3, "No": 2}
+    assert result.turns[-1].vote_counts == {"Yes": 3, "No": 2, "Failed": 0}
     assert result.profile["consensus_reached"] is False
     assert result.agent_messages[-1].solution == "No"
     assert result.prediction == "Yes"
@@ -1060,9 +1060,9 @@ def test_agent_runner_defers_supermajority_until_every_agent_participates_once()
     # then is 3/4 > 66% accepted as the first eligible consensus.
     assert calls == ["A", "B", "C", "D"]
     assert len(result.turns) == 4
-    assert result.turns[2].vote_counts == {"Yes": 3, "No": 0}
+    assert result.turns[2].vote_counts == {"Yes": 3, "No": 0, "Failed": 0}
     assert result.turns[2].consensus_reached is False
-    assert result.turns[3].vote_counts == {"Yes": 3, "No": 1}
+    assert result.turns[3].vote_counts == {"Yes": 3, "No": 1, "Failed": 0}
     assert result.turns[3].consensus_answer == "Yes"
     assert result.profile["consensus_reached"] is True
     assert result.profile["consensus_turn"] == 4
@@ -1178,9 +1178,9 @@ def test_agent_runner_consensus_is_evaluated_after_every_turn() -> None:
 
     assert calls == ["A", "B", "C", "D", "A"]
     assert len(result.turns) == 5
-    assert result.turns[3].vote_counts == {"Yes": 2, "No": 2}
+    assert result.turns[3].vote_counts == {"Yes": 2, "No": 2, "Failed": 0}
     assert result.turns[3].consensus_reached is False
-    assert result.turns[4].vote_counts == {"Yes": 1, "No": 3}
+    assert result.turns[4].vote_counts == {"Yes": 1, "No": 3, "Failed": 0}
     assert result.turns[4].consensus_answer == "No"
     assert result.profile["consensus_reached"] is True
     assert result.profile["consensus_turn"] == 5
@@ -1377,7 +1377,7 @@ def test_agent_runner_final_solution_yes_is_committed_when_semantically_valid() 
     assert b.final_answer == "Yes"
     assert b.response_state == "revise"
     assert b.solution == "Yes"
-    assert result.turns[-1].vote_counts == {"Yes": 1, "No": 1}
+    assert result.turns[-1].vote_counts == {"Yes": 1, "No": 1, "Failed": 0}
     assert result.profile["final_decision_method"] == "random_tie_break"
 
 
@@ -2340,7 +2340,7 @@ def test_initial_verification_retry_exhaustion_marks_agent_failure_without_fallb
     assert generation.text == responses[-1]
     assert verification.passed is False
     assert verification.final_answer is None
-    assert "agent excluded from voting and future discussion" in verification.reason
+    assert "agent excluded from future discussion and assigned permanent Failed vote" in verification.reason
     assert counts.syntax_failures == 3
 
 
@@ -2401,7 +2401,7 @@ def test_followup_verification_retry_exhaustion_marks_agent_failure_without_fall
     assert verification.passed is False
     assert verification.marker == "agree"
     assert verification.final_answer is None
-    assert "agent excluded from voting and future discussion" in verification.reason
+    assert "agent excluded from future discussion and assigned permanent Failed vote" in verification.reason
     assert counts.semantic_failures == 3
 
 
@@ -2477,10 +2477,11 @@ def test_two_agent_followup_failure_revokes_vote_excludes_agent_and_forces_faile
     assert calls == {"A": 1, "B": 3}  # original + two retries for B
     assert result.prediction == "Failed"
     assert result.accuracy == 0.0
-    assert result.profile["final_decision_method"] == "insufficient_active_agents_failed"
+    assert result.profile["final_decision_method"] == "failed_consensus"
     assert result.profile["failed_agent_ids"] == ["B"]
     assert result.profile["active_agent_ids"] == ["A"]
-    assert result.profile["final_agent_votes"] == {"A": "Yes"}
+    assert result.profile["final_agent_votes"] == {"A": "Yes", "B": "Failed"}
+    assert result.profile["final_vote_counts"] == {"Yes": 1, "No": 0, "Failed": 1}
     assert len(result.agent_messages) == 2
     failed = result.agent_messages[1]
     assert failed.agent_id == "B"
@@ -2570,7 +2571,7 @@ def test_failed_agent_keeps_old_history_but_is_skipped_on_future_cycles(monkeypa
     assert result.profile["failed_agent_ids"] == ["B"]
     assert "B response 1." in result.transcript
     assert "B response 2." not in result.transcript
-    assert "B" not in result.profile["final_agent_votes"]
+    assert result.profile["final_agent_votes"]["B"] == "Failed"
     assert result.profile["active_agent_ids"] == ["A", "C", "D", "E"]
 
 
@@ -2622,6 +2623,90 @@ def test_initial_agent_failure_in_two_agent_run_forces_failed_without_trying_lon
     assert result.profile["active_agent_ids"] == ["B"]
     assert result.agent_messages[0].agent_failed is True
     assert result.transcript == ""
+
+
+
+def test_failed_vote_replaces_previous_vote_and_stays_in_original_denominator() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=8,
+        log_agents=False,
+    )
+    votes = {
+        "A": "Yes", "B": "Yes", "C": "Yes", "D": "Yes",
+        "E": "Yes", "F": "Yes", "G": "No", "H": "No",
+    }
+    assert runner._supermajority_consensus(votes) == "Yes"
+
+    runner._mark_agent_failed("A", votes)
+    assert votes["A"] == "Failed"
+    assert runner._supermajority_consensus(votes) is None
+    assert runner._active_discussion_agent_count() == 7
+    assert runner._should_force_failed_result() is False
+
+
+def test_failed_vote_early_termination_matches_strict_supermajority_boundary() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner8 = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=8,
+        log_agents=False,
+    )
+    votes8 = {}
+    runner8._mark_agent_failed("A", votes8)
+    runner8._mark_agent_failed("B", votes8)
+    # 6/8 = 75% remains available, so Yes/No >66% is still possible.
+    assert runner8._should_force_failed_result() is False
+    runner8._mark_agent_failed("C", votes8)
+    # Only 5/8 = 62.5% remain: no future Yes/No vote can exceed 66%.
+    assert runner8._should_force_failed_result() is True
+
+    turns = []
+    answer = runner8._evaluate_turn_consensus(
+        turn_index=3,
+        agent_id="C",
+        agent_votes=votes8,
+        turns=turns,
+    )
+    assert answer == "Failed"
+    assert turns[-1].consensus_reached is True
+    assert turns[-1].consensus_answer == "Failed"
+    assert turns[-1].vote_counts == {"Yes": 0, "No": 0, "Failed": 3}
+
+    runner3 = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=3,
+        log_agents=False,
+    )
+    votes3 = {}
+    runner3._mark_agent_failed("A", votes3)
+    # Strict >0.66 still allows 2/3 ~= 0.6667, so one failure must not stop 3 agents.
+    assert runner3._should_force_failed_result() is False
+    runner3._mark_agent_failed("B", votes3)
+    assert runner3._should_force_failed_result() is True
+
+
+def test_final_majority_vote_counts_failed_as_a_real_vote() -> None:
+    ctx = _ctx("tiny-a,tiny-a")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=5,
+        log_agents=False,
+    )
+    answer, method = runner._majority_vote_with_random_tie(
+        {"A": "Failed", "B": "Failed", "C": "Yes", "D": "No"}
+    )
+    assert answer == "Failed"
+    assert method == "majority_vote"
 
 
 def test_retain_mot_self_refresh_replaces_only_native_memory_suffix(monkeypatch) -> None:
@@ -3063,8 +3148,8 @@ def test_free_and_retain_midcycle_retry_exhaustion_keep_later_discussion_identic
     assert "B response 2." not in free.transcript
     assert free.profile["failed_agent_ids"] == retain.profile["failed_agent_ids"] == ["B"]
     assert free.profile["active_agent_ids"] == retain.profile["active_agent_ids"] == ["A", "C", "D", "E"]
-    assert "B" not in free.profile["final_agent_votes"]
-    assert "B" not in retain.profile["final_agent_votes"]
+    assert free.profile["final_agent_votes"]["B"] == "Failed"
+    assert retain.profile["final_agent_votes"]["B"] == "Failed"
     # Continue beyond B's failed turn and prove transport mechanics may differ while
     # the following C/D discussion remains byte-for-byte the same.
     assert free.agent_messages[7].response == retain.agent_messages[7].response
@@ -3073,3 +3158,105 @@ def test_free_and_retain_midcycle_retry_exhaustion_keep_later_discussion_identic
         free_message.tokens_received != retain_message.tokens_received
         for free_message, retain_message in zip(free.agent_messages, retain.agent_messages)
     )
+
+
+def test_free_and_retain_three_of_eight_failures_terminate_at_same_turn(monkeypatch) -> None:
+    """The 3/8 Failed boundary must terminate Free/Retain identically."""
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
+
+    def run_mode(cache_mode: str):
+        ctx = _ctx("tiny-a,tiny-a")
+        runner = AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="mot",
+            agent_count=8,
+            max_turns=16,
+            cache_mode=cache_mode,
+            log_agents=False,
+        )
+        runner._generate_expert_personas = lambda context, question: {
+            agent.node_id: (f"Expert {agent.node_id}", "Useful expert.")
+            for agent in runner.agent_sequence
+        }
+        calls = {agent.node_id: 0 for agent in runner.agent_sequence}
+        failing = {"B", "D", "F"}
+
+        def fake_semantic(**kwargs):
+            return ("reject", False) if kwargs["agent"].node_id in failing else ("ok", True)
+
+        runner._verify_response_semantics_with_model = fake_semantic
+
+        def fake_generate(agent):
+            def generate(prompt_text: str) -> AgentGeneration:
+                calls[agent.node_id] += 1
+                if agent.node_id == "A" and calls["A"] == 1:
+                    text = "A initial.\nFinal Solution: Yes"
+                else:
+                    answer = "Yes" if agent.node_id in {"C", "E", "G"} else "No"
+                    text = f"[DISAGREE] {agent.node_id} response.\nFinal Solution: {answer}"
+                return AgentGeneration(
+                    agent_id=agent.node_id,
+                    prompt_text=prompt_text,
+                    text=text,
+                    raw_text=text,
+                    generated_token_ids=[calls[agent.node_id]],
+                    tokens_before=0,
+                    tokens_after=1,
+                    tokens_prompt=1,
+                    tokens_completion=1,
+                )
+            return generate
+
+        for agent in runner.agent_sequence:
+            agent.generate_response = fake_generate(agent)
+        runner._prepare_outgoing_route_translation = lambda **kwargs: None
+        runner._update_peak_memory_breakdown = lambda: None
+        transport_tokens = 13 if cache_mode == "free" else 4
+
+        def fake_star_offload(*, source_agent, target_agent):
+            meta = {
+                "edge_id": f"{source_agent.node_id}_to_{target_agent.node_id}",
+                "offload_kind": "delta",
+                "tokens_sent": transport_tokens,
+                "tokens_received": transport_tokens,
+                "expected_delta_tokens": transport_tokens,
+            }
+            source_cleared = cache_mode == "free" and source_agent.node_id != runner.hub_agent.node_id
+            return target_agent, meta, source_cleared, source_agent, meta
+
+        runner._star_offload_to_agent = fake_star_offload
+        result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+        return result, calls
+
+    free, free_calls = run_mode("free")
+    retain, retain_calls = run_mode("retain")
+
+    assert free_calls == retain_calls
+    assert [m.agent_id for m in free.agent_messages] == ["A", "B", "C", "D", "E", "F"]
+    assert [m.agent_id for m in retain.agent_messages] == ["A", "B", "C", "D", "E", "F"]
+    assert free.prediction == retain.prediction == "Failed"
+    assert free.accuracy == retain.accuracy == 0.0
+    assert free.profile["consensus_turn"] == retain.profile["consensus_turn"] == 6
+    assert free.profile["consensus_answer"] == retain.profile["consensus_answer"] == "Failed"
+    assert free.profile["final_decision_method"] == retain.profile["final_decision_method"] == "failed_consensus"
+    assert free.profile["failed_agent_ids"] == retain.profile["failed_agent_ids"] == ["B", "D", "F"]
+    assert free.profile["final_agent_votes"] == retain.profile["final_agent_votes"]
+    assert free.profile["final_vote_counts"] == retain.profile["final_vote_counts"] == {
+        "Yes": 3,
+        "No": 0,
+        "Failed": 3,
+    }
+    assert free.turns[-1].vote_counts == retain.turns[-1].vote_counts == {
+        "Yes": 3,
+        "No": 0,
+        "Failed": 3,
+    }
+    assert free.turns[-1].consensus_reached is True
+    assert retain.turns[-1].consensus_reached is True
+    # G/H never speak because after F fails only 5/8 vote slots remain available,
+    # so strict >0.66 Yes/No consensus is impossible.
+    assert free_calls["G"] == free_calls["H"] == 0
+    assert retain_calls["G"] == retain_calls["H"] == 0

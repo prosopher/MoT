@@ -1811,39 +1811,33 @@ class AgentRunner:
         self,
         agent_votes: Dict[str, str],
     ) -> Optional[str]:
-        """Return a >66% supermajority over each Agent's latest semantic vote.
+        """Return a >66% supermajority over all configured Agent vote slots.
 
-        MALLM's ``SupermajorityConsensus`` uses a 0.66 threshold. AgentRunner
-        keeps one latest verified Yes/No stance per non-failed Agent. Failed Agents
-        lose their vote and are removed from the denominator. Consensus is deferred
-        until every remaining Agent has a verified vote and must be *strictly greater*
-        than 0.66. If failure leaves only one Agent, the controller returns ``Failed``
-        instead of allowing that lone Agent to decide the task.
+        Verification exhaustion permanently changes that Agent's vote to ``Failed``.
+        The Agent is excluded from later discussion turns, but its failed vote remains
+        in the original Agent-count denominator so cache-translation failures affect
+        final discussion quality instead of shrinking the electorate.
         """
-        valid_votes = {
-            agent_id: answer
-            for agent_id, answer in agent_votes.items()
-            if answer in {"Yes", "No"}
-        }
-        total_agents = self._active_discussion_agent_count()
-        if total_agents <= 1:
+        total_agents = len(self.agent_sequence)
+        if total_agents <= 0:
             return None
-        yes_votes = sum(answer == "Yes" for answer in valid_votes.values())
-        no_votes = sum(answer == "No" for answer in valid_votes.values())
-        if yes_votes / total_agents > MALLM_SUPERMAJORITY_THRESHOLD:
-            return "Yes"
-        if no_votes / total_agents > MALLM_SUPERMAJORITY_THRESHOLD:
-            return "No"
+        valid_votes = [
+            answer for answer in agent_votes.values()
+            if answer in {"Yes", "No", "Failed"}
+        ]
+        for answer in ("Yes", "No", "Failed"):
+            vote_count = sum(vote == answer for vote in valid_votes)
+            if vote_count / total_agents > MALLM_SUPERMAJORITY_THRESHOLD:
+                return answer
         return None
 
     def _all_agents_have_participated(
         self,
         agent_votes: Dict[str, str],
     ) -> bool:
-        """Return True after every non-failed Agent has a verified vote."""
-        active_agents = self._active_discussion_agents()
-        return bool(active_agents) and all(
-            agent.node_id in agent_votes for agent in active_agents
+        """Return True once every configured Agent has Yes/No/Failed state."""
+        return bool(self.agent_sequence) and all(
+            agent.node_id in agent_votes for agent in self.agent_sequence
         )
 
     def _majority_vote_with_random_tie(
@@ -1852,18 +1846,23 @@ class AgentRunner:
     ) -> Tuple[str, str]:
         """Select the final answer after max_turns when no supermajority exists.
 
-        Each Agent contributes its latest verified Yes/No vote. A unique plurality
-        winner is returned as the majority-vote result. If the highest vote count
-        is tied, choose uniformly from the tied answers using the experiment's
-        deterministic seed stream so repeated runs remain reproducible.
+        Each configured Agent contributes its latest Yes/No vote, or a permanent
+        ``Failed`` vote after verification exhaustion. A unique plurality winner is
+        returned as the majority-vote result. If the highest vote count is tied,
+        choose uniformly from the tied answers using the experiment's deterministic
+        seed stream so repeated runs remain reproducible.
         """
-        valid_votes = [answer for answer in agent_votes.values() if answer in {"Yes", "No"}]
+        valid_votes = [
+            answer for answer in agent_votes.values()
+            if answer in {"Yes", "No", "Failed"}
+        ]
         if not valid_votes:
-            raise RuntimeError("Cannot select a final answer: no verified agent votes are available")
+            raise RuntimeError("Cannot select a final answer: no agent votes are available")
 
         vote_counts = {
             "Yes": sum(answer == "Yes" for answer in valid_votes),
             "No": sum(answer == "No" for answer in valid_votes),
+            "Failed": sum(answer == "Failed" for answer in valid_votes),
         }
         max_count = max(vote_counts.values())
         winners = [answer for answer, count in vote_counts.items() if count == max_count]
@@ -1886,19 +1885,24 @@ class AgentRunner:
         agent_votes: Dict[str, str],
         turns: List[AgentTurnRecord],
     ) -> Optional[str]:
-        """Record a Turn and evaluate consensus over non-failed Agents.
+        """Record a Turn and evaluate consensus over all configured vote slots.
 
-        Failed Agents have no vote and are excluded from the participation denominator.
-        A single remaining Agent can never decide the problem; that state is handled as
-        a forced ``Failed`` result by the discussion controller.
+        A failed Agent stops speaking but permanently votes ``Failed``. If enough
+        Agents have failed that even unanimous remaining Agents cannot exceed the
+        >66% Yes/No threshold, terminate immediately with ``Failed``.
         """
-        consensus_eligible = self._all_agents_have_participated(agent_votes)
-        consensus_answer = (
-            self._supermajority_consensus(agent_votes) if consensus_eligible else None
-        )
+        failed_blocks_yes_no = self._should_force_failed_result()
+        consensus_eligible = failed_blocks_yes_no or self._all_agents_have_participated(agent_votes)
+        if failed_blocks_yes_no:
+            consensus_answer = "Failed"
+        else:
+            consensus_answer = (
+                self._supermajority_consensus(agent_votes) if consensus_eligible else None
+            )
         vote_counts = {
             "Yes": sum(answer == "Yes" for answer in agent_votes.values()),
             "No": sum(answer == "No" for answer in agent_votes.values()),
+            "Failed": sum(answer == "Failed" for answer in agent_votes.values()),
         }
         turns.append(
             AgentTurnRecord(
@@ -2424,13 +2428,27 @@ class AgentRunner:
 
     def _mark_agent_failed(self, agent_id: str, agent_votes: Dict[str, str]) -> None:
         self._failed_agent_ids.add(agent_id)
-        agent_votes.pop(agent_id, None)
+        # Failed Agents stop speaking but retain a permanent Failed vote. Reapply
+        # every known failure so initial-proposal retries that use a fresh vote dict
+        # cannot accidentally forget earlier failed vote slots.
+        for failed_agent_id in self._failed_agent_ids:
+            agent_votes[failed_agent_id] = "Failed"
         self._final_agent_votes = dict(agent_votes)
         self._retain_pending_self_refresh_prefix_tokens.pop(agent_id, None)
         self._retain_deferred_self_refresh_hub_tokens.pop(agent_id, None)
 
     def _should_force_failed_result(self) -> bool:
-        return bool(self._failed_agent_ids) and self._active_discussion_agent_count() <= 1
+        """Return True once Yes/No supermajority is mathematically impossible.
+
+        Consensus requires a strict fraction > 0.66 over the original configured
+        Agent count. Once all remaining non-failed vote slots together are <= 0.66,
+        no future discussion can ever produce Yes or No consensus.
+        """
+        total_agents = len(self.agent_sequence)
+        if total_agents <= 0 or not self._failed_agent_ids:
+            return False
+        remaining_agents = total_agents - len(self._failed_agent_ids)
+        return (remaining_agents / total_agents) <= MALLM_SUPERMAJORITY_THRESHOLD
 
     @staticmethod
     def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[str, Optional[int], int]:
@@ -3379,7 +3397,7 @@ class AgentRunner:
         """Mark retry exhaustion as terminal Agent failure, never as fallback."""
         suffix = (
             f"verification retry limit ({VERIFICATION_MAX_RETRIES}) exhausted; "
-            "agent excluded from voting and future discussion"
+            "agent excluded from future discussion and assigned permanent Failed vote"
         )
         syntax_reason = verification.syntax_reason
         semantic_reason = verification.semantic_reason
@@ -3682,9 +3700,13 @@ class AgentRunner:
         initial_record.solution = current_solution
         initial_record.response_state = "draft"
 
-        # Failed Agents are removed from both the vote denominator and future turn
-        # scheduling. Their already-committed historical Memory remains untouched.
-        agent_votes: Dict[str, str] = {initial_agent.node_id: current_answer}
+        # Failed Agents are removed from future turn scheduling but keep a permanent
+        # Failed vote in the original Agent-count denominator. Their already-committed
+        # historical Memory remains untouched.
+        agent_votes: Dict[str, str] = {
+            failed_agent_id: "Failed" for failed_agent_id in self._failed_agent_ids
+        }
+        agent_votes[initial_agent.node_id] = current_answer
         self._consensus_reached = False
         self._consensus_turn = None
         self._consensus_answer = None
@@ -3808,8 +3830,8 @@ class AgentRunner:
             if verification.passed is not True:
                 # All attempts have already been rolled back to the exact incoming
                 # shared-history prefix. Do not commit the failed response to Memory
-                # or transcript. Revoke any older vote from this Agent and exclude it
-                # from all future discussion turns.
+                # or transcript. Replace any older Yes/No vote with a permanent Failed
+                # vote and exclude the Agent from all future discussion turns.
                 record.response_state = "failed"
                 record.solution = current_solution
                 record.memory_tokens_after = current_target.cache_seq_len
@@ -3897,15 +3919,18 @@ class AgentRunner:
                 record=agent_messages[-1],
             )
 
-        if self._should_force_failed_result():
-            final_solution = "Failed"
-            self._final_decision_method = "insufficient_active_agents_failed"
-            self._consensus_reached = False
-            self._consensus_turn = None
-            self._consensus_answer = None
-        elif self._consensus_reached:
+        if self._consensus_reached:
             final_solution = self._consensus_answer
-            self._final_decision_method = "supermajority_consensus"
+            self._final_decision_method = (
+                "failed_consensus"
+                if self._consensus_answer == "Failed"
+                else "supermajority_consensus"
+            )
+        elif self._should_force_failed_result():
+            final_solution = "Failed"
+            self._final_decision_method = "failed_consensus"
+            self._consensus_reached = True
+            self._consensus_answer = "Failed"
         elif agent_votes:
             final_solution, self._final_decision_method = self._majority_vote_with_random_tie(
                 agent_votes
@@ -4120,16 +4145,19 @@ class AgentRunner:
 
         if initial_generation is None:
             selected_solution = "Failed"
-            self._consensus_reached = False
-            self._consensus_turn = None
-            self._consensus_answer = None
-            self._final_agent_votes = {}
+            self._final_agent_votes = {
+                failed_agent_id: "Failed" for failed_agent_id in self._failed_agent_ids
+            }
             self._final_decision_answer = "Failed"
-            self._final_decision_method = (
-                "insufficient_active_agents_failed"
-                if self._should_force_failed_result()
-                else "no_verified_votes_failed"
-            )
+            if self._should_force_failed_result():
+                self._consensus_reached = True
+                self._consensus_answer = "Failed"
+                self._final_decision_method = "failed_consensus"
+            else:
+                self._consensus_reached = False
+                self._consensus_turn = None
+                self._consensus_answer = None
+                self._final_decision_method = "no_verified_votes_failed"
         elif self.cache_mode == CACHE_MODE_FREE:
             transcript, selected_solution = self._run_free_turns(
                 transcript=transcript,
@@ -4255,7 +4283,8 @@ class AgentRunner:
             "discussion_paradigm": "memory",
             "decision_protocol": "turn_supermajority_then_majority_vote",
             "consensus_requires_full_initial_participation": True,
-            "consensus_participation_scope": "non_failed_agents",
+            "consensus_participation_scope": "all_configured_agents_including_failed_votes",
+            "failed_vote_policy": "exclude_from_discussion_keep_failed_vote",
             "supermajority_threshold": MALLM_SUPERMAJORITY_THRESHOLD,
             "supermajority_comparison": ">",
             "verification_retry_policy": f"max_{VERIFICATION_MAX_RETRIES}_then_agent_failure",
@@ -4286,6 +4315,7 @@ class AgentRunner:
             "final_vote_counts": {
                 "Yes": sum(v == "Yes" for v in self._final_agent_votes.values()),
                 "No": sum(v == "No" for v in self._final_agent_votes.values()),
+                "Failed": sum(v == "Failed" for v in self._final_agent_votes.values()),
             },
             "model_memory_gib": None if peak_memory is None else peak_memory.model_bytes / (1024 ** 3),
             "translator_memory_gib": None if peak_memory is None else peak_memory.translator_bytes / (1024 ** 3),
