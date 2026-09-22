@@ -2809,3 +2809,267 @@ def test_mot_replay_boundaries_survive_free_cache_clear() -> None:
     target.clear_kv_cache()
     assert target.past_key_values is None
     assert runner._mot_replay_boundaries_by_agent[target.node_id] == [3]
+
+
+def test_free_and_retain_two_agent_retry_exhaustion_force_same_failed_result(monkeypatch) -> None:
+    """Retry exhaustion must have identical discussion semantics in Free/Retain.
+
+    Cache transport/accounting may differ between the two modes, but once B exhausts
+    verification both controllers must revoke B, keep A's old history, and force the
+    same terminal Failed result because only one discussion Agent remains.
+    """
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
+
+    def run_mode(cache_mode: str):
+        ctx = _ctx("tiny-a,tiny-a")
+        runner = AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="mot",
+            agent_count=2,
+            max_turns=6,
+            cache_mode=cache_mode,
+            log_agents=False,
+        )
+        runner._generate_expert_personas = lambda context, question: {
+            agent.node_id: (f"Expert {agent.node_id}", "Useful expert.")
+            for agent in runner.agent_sequence
+        }
+        calls = {"A": 0, "B": 0}
+        runner._verify_response_semantics_with_model = lambda **kwargs: (
+            ("ok", True) if kwargs["agent"].node_id == "A" else ("reject", False)
+        )
+
+        def fake_generate(agent):
+            def generate(prompt_text: str) -> AgentGeneration:
+                calls[agent.node_id] += 1
+                text = (
+                    "A verified history.\nFinal Solution: Yes"
+                    if agent.node_id == "A"
+                    else f"[DISAGREE] B failed attempt {calls['B']}.\nFinal Solution: No"
+                )
+                return AgentGeneration(
+                    agent_id=agent.node_id,
+                    prompt_text=prompt_text,
+                    text=text,
+                    raw_text=text,
+                    generated_token_ids=[calls[agent.node_id]],
+                    tokens_before=0,
+                    tokens_after=1,
+                    tokens_prompt=1,
+                    tokens_completion=1,
+                )
+            return generate
+
+        for agent in runner.agent_sequence:
+            agent.generate_response = fake_generate(agent)
+        runner._prepare_outgoing_route_translation = lambda **kwargs: None
+        runner._update_peak_memory_breakdown = lambda: None
+
+        transport_tokens = 9 if cache_mode == "free" else 3
+
+        def fake_star_offload(*, source_agent, target_agent):
+            meta = {
+                "edge_id": f"{source_agent.node_id}_to_{target_agent.node_id}",
+                "offload_kind": "delta",
+                "tokens_sent": transport_tokens,
+                "tokens_received": transport_tokens,
+                "expected_delta_tokens": transport_tokens,
+            }
+            source_cleared = cache_mode == "free" and source_agent.node_id != runner.hub_agent.node_id
+            return target_agent, meta, source_cleared, source_agent, meta
+
+        runner._star_offload_to_agent = fake_star_offload
+        return runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    free = run_mode("free")
+    retain = run_mode("retain")
+
+    def semantic_signature(result):
+        return {
+            "prediction": result.prediction,
+            "accuracy": result.accuracy,
+            "transcript": result.transcript,
+            "messages": [
+                (
+                    message.agent_id,
+                    message.prompt,
+                    message.response,
+                    message.response_state,
+                    message.verification_attempts,
+                    message.verification_passed,
+                    message.final_answer,
+                    message.agent_failed,
+                    message.solution,
+                )
+                for message in result.agent_messages
+            ],
+            "turns": [
+                (
+                    turn.turn_index,
+                    turn.agent_id,
+                    turn.agent_votes,
+                    turn.vote_counts,
+                    turn.consensus_reached,
+                    turn.consensus_answer,
+                )
+                for turn in result.turns
+            ],
+            "failed": result.profile["failed_agent_ids"],
+            "active": result.profile["active_agent_ids"],
+            "final_votes": result.profile["final_agent_votes"],
+            "decision": result.profile["final_decision_method"],
+        }
+
+    assert semantic_signature(free) == semantic_signature(retain)
+    assert free.prediction == retain.prediction == "Failed"
+    assert free.accuracy == retain.accuracy == 0.0
+    assert free.profile["failed_agent_ids"] == retain.profile["failed_agent_ids"] == ["B"]
+    assert free.profile["active_agent_ids"] == retain.profile["active_agent_ids"] == ["A"]
+    # Deliberately different transport accounting proves the equality assertion is
+    # about discussion semantics, not about making Free/Retain cache mechanics equal.
+    assert free.agent_messages[0].tokens_sent != retain.agent_messages[0].tokens_sent
+
+
+def test_free_and_retain_midcycle_retry_exhaustion_keep_later_discussion_identical(monkeypatch) -> None:
+    """A failed revisiting Agent must not make later Free/Retain discussion diverge."""
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
+
+    def run_mode(cache_mode: str):
+        ctx = _ctx("tiny-a,tiny-a")
+        runner = AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="mot",
+            agent_count=5,
+            max_turns=9,
+            cache_mode=cache_mode,
+            log_agents=False,
+        )
+        runner._generate_expert_personas = lambda context, question: {
+            agent.node_id: (f"Expert {agent.node_id}", "Useful expert.")
+            for agent in runner.agent_sequence
+        }
+        calls = {agent.node_id: 0 for agent in runner.agent_sequence}
+        answers = {"A": "Yes", "B": "No", "C": "Yes", "D": "No", "E": "No"}
+
+        def fake_semantic(**kwargs):
+            agent_id = kwargs["agent"].node_id
+            # B succeeds in cycle 1, but on its cycle-2 turn both the original
+            # response and one corrective retry are rejected.
+            if agent_id == "B" and calls["B"] >= 2:
+                return "reject", False
+            return "ok", True
+
+        runner._verify_response_semantics_with_model = fake_semantic
+
+        def fake_generate(agent):
+            def generate(prompt_text: str) -> AgentGeneration:
+                calls[agent.node_id] += 1
+                if agent.node_id == "A" and calls["A"] == 1:
+                    text = "A initial.\nFinal Solution: Yes"
+                else:
+                    text = (
+                        f"[DISAGREE] {agent.node_id} response {calls[agent.node_id]}.\n"
+                        f"Final Solution: {answers[agent.node_id]}"
+                    )
+                return AgentGeneration(
+                    agent_id=agent.node_id,
+                    prompt_text=prompt_text,
+                    text=text,
+                    raw_text=text,
+                    generated_token_ids=[calls[agent.node_id]],
+                    tokens_before=0,
+                    tokens_after=1,
+                    tokens_prompt=1,
+                    tokens_completion=1,
+                )
+            return generate
+
+        for agent in runner.agent_sequence:
+            agent.generate_response = fake_generate(agent)
+
+        runner._prepare_outgoing_route_translation = lambda **kwargs: None
+        runner._update_peak_memory_breakdown = lambda: None
+        transport_tokens = 11 if cache_mode == "free" else 2
+
+        def fake_star_offload(*, source_agent, target_agent):
+            meta = {
+                "edge_id": f"{source_agent.node_id}_to_{target_agent.node_id}",
+                "offload_kind": "delta",
+                "tokens_sent": transport_tokens,
+                "tokens_received": transport_tokens,
+                "expected_delta_tokens": transport_tokens,
+            }
+            source_cleared = cache_mode == "free" and source_agent.node_id != runner.hub_agent.node_id
+            return target_agent, meta, source_cleared, source_agent, meta
+
+        runner._star_offload_to_agent = fake_star_offload
+        return runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    free = run_mode("free")
+    retain = run_mode("retain")
+
+    def semantic_signature(result):
+        return {
+            "prediction": result.prediction,
+            "accuracy": result.accuracy,
+            "transcript": result.transcript,
+            "messages": [
+                (
+                    message.agent_id,
+                    message.prompt,
+                    message.response,
+                    message.response_state,
+                    message.verification_attempts,
+                    message.verification_syntax_failures,
+                    message.verification_semantic_failures,
+                    message.verification_passed,
+                    message.final_answer,
+                    message.agent_failed,
+                    message.solution,
+                )
+                for message in result.agent_messages
+            ],
+            "turns": [
+                (
+                    turn.turn_index,
+                    turn.agent_id,
+                    turn.agent_votes,
+                    turn.vote_counts,
+                    turn.consensus_reached,
+                    turn.consensus_answer,
+                )
+                for turn in result.turns
+            ],
+            "failed": result.profile["failed_agent_ids"],
+            "active": result.profile["active_agent_ids"],
+            "final_votes": result.profile["final_agent_votes"],
+            "decision": result.profile["final_decision_method"],
+        }
+
+    assert semantic_signature(free) == semantic_signature(retain)
+    assert [message.agent_id for message in free.agent_messages] == [
+        "A", "B", "C", "D", "E", "A", "B", "C", "D"
+    ]
+    failed_b = free.agent_messages[6]
+    assert failed_b.agent_failed is True
+    assert failed_b.final_answer is None
+    assert "B response 1." in free.transcript
+    assert "B response 2." not in free.transcript
+    assert free.profile["failed_agent_ids"] == retain.profile["failed_agent_ids"] == ["B"]
+    assert free.profile["active_agent_ids"] == retain.profile["active_agent_ids"] == ["A", "C", "D", "E"]
+    assert "B" not in free.profile["final_agent_votes"]
+    assert "B" not in retain.profile["final_agent_votes"]
+    # Continue beyond B's failed turn and prove transport mechanics may differ while
+    # the following C/D discussion remains byte-for-byte the same.
+    assert free.agent_messages[7].response == retain.agent_messages[7].response
+    assert free.agent_messages[8].response == retain.agent_messages[8].response
+    assert any(
+        free_message.tokens_received != retain_message.tokens_received
+        for free_message, retain_message in zip(free.agent_messages, retain.agent_messages)
+    )
