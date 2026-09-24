@@ -686,3 +686,120 @@ def test_mot_retain_replay_uses_translated_prefix_only_at_injected_layers(monkey
     assert len(replayed) == 2
     assert seen[0] == (layer0, 10.0, 10.5)
     assert seen[1] == (layer1, 99.0, 98.0)
+
+
+def test_mot_retain_cross_append_aligns_full_history_but_replays_only_target_delta(monkeypatch) -> None:
+    import alg.mot.train as mot_train
+
+    source_model = SimpleNamespace(id="src")
+    target_model = SimpleNamespace(id="tgt")
+    src_spec = SimpleNamespace(num_layers=1)
+    tgt_spec = SimpleNamespace(num_layers=1, num_key_value_heads=1, head_dim=1)
+    ctx = SimpleNamespace(
+        nodes=[SimpleNamespace(id="S", model_id="src"), SimpleNamespace(id="T", model_id="tgt")],
+        tp=SimpleNamespace(get_model_spec=lambda node_id: src_spec if node_id == "S" else tgt_spec),
+        cm=SimpleNamespace(
+            get_src_layer_indices=lambda edge_id: [0],
+            get_tgt_layer_indices=lambda edge_id: [0],
+        ),
+        config=SimpleNamespace(topk_sparse_attn=1, num_bottom_full_attn=0),
+    )
+
+    source_full_ids = TokenIDs(torch.tensor([[10, 11, 12, 13, 14]]), model_id="src")
+    source_delta_ids = TokenIDs(torch.tensor([[13, 14]]), model_id="src")
+    target_prefix_ids = [20, 21]
+    target_delta_ids = TokenIDs(torch.tensor([[22, 23, 24]]), model_id="tgt")
+    target_full_ids = TokenIDs(torch.tensor([[20, 21, 22, 23, 24]]), model_id="tgt")
+
+    def fake_past(tokens):
+        k = torch.zeros(1, 1, tokens, 1)
+        v = torch.zeros(1, 1, tokens, 1)
+        return ((k, v),)
+
+    source_full_past = fake_past(5)
+    source_delta_past = fake_past(2)
+    target_prefix_past = fake_past(2)
+    seen = {}
+
+    monkeypatch.setattr(
+        mot_train,
+        "build_extrapolated_sparse_attention_indices",
+        lambda *args, **kwargs: [torch.arange(5).view(1, 1, 5, 1)],
+    )
+
+    def fake_alignment(*, source_context_token_ids, target_context_token_ids, **kwargs):
+        seen["alignment_source_len"] = int(source_context_token_ids.shape[1])
+        seen["alignment_target_len"] = int(target_context_token_ids.shape[1])
+        weights = torch.eye(5).unsqueeze(0)
+        mapping = torch.arange(5).unsqueeze(0)
+        return weights, mapping, mapping
+
+    monkeypatch.setattr(mot_train, "build_cross_token_alignment", fake_alignment)
+
+    def fake_align_sparse(indices, *, target_to_source, source_to_target):
+        del target_to_source, source_to_target
+        # Full target-grid sparse rows; production code must slice the two-token
+        # resident target prefix and replay only rows for [22,23,24].
+        return indices.clone()
+
+    monkeypatch.setattr(mot_train, "align_sparse_attention_indices_to_target_tokens", fake_align_sparse)
+
+    def fake_translate(*, past_key_values, token_alignment_weights=None, **kwargs):
+        seen["translated_source_tokens"] = past_key_values[0][0].shape[2]
+        seen["alignment_shape"] = tuple(token_alignment_weights.shape)
+        key = torch.arange(5, dtype=torch.float32).view(1, 5, 1, 1)
+        return key, key.clone()
+
+    monkeypatch.setattr(mot_train, "translate_layer_window", fake_translate)
+
+    def fake_blocks(*, key_block, value_block, **kwargs):
+        del kwargs
+        assert key_block.shape == value_block.shape
+        k = key_block.permute(0, 2, 1, 3).contiguous()
+        v = value_block.permute(0, 2, 1, 3).contiguous()
+        return ((k, v),)
+
+    monkeypatch.setattr(mot_train, "blocks_to_partial_past_key_values", fake_blocks)
+
+    def fake_replay(*, context_token_ids, injected_key_block, sparse_attention_indices,
+                    retain_target_prefix_past_key_values,
+                    retain_target_prefix_injected_window_past_key_values, **kwargs):
+        seen["replay_delta_tokens"] = int(context_token_ids.shape[1])
+        seen["injected_delta_tokens"] = int(injected_key_block.shape[1])
+        seen["sparse_delta_rows"] = int(sparse_attention_indices[0].shape[2])
+        seen["native_prefix_tokens"] = retain_target_prefix_past_key_values[0][0].shape[2]
+        seen["translated_prefix_tokens"] = retain_target_prefix_injected_window_past_key_values[0][0].shape[2]
+        return fake_past(int(context_token_ids.shape[1]))
+
+    monkeypatch.setattr(mot_train, "replay_target_prefill_with_injected_window", fake_replay)
+
+    mixed, translated = build_replayed_target_past(
+        ctx,
+        source_past_key_values=source_delta_past,
+        source_context_token_ids=source_delta_ids,
+        target_context_token_ids=target_delta_ids,
+        source_model=source_model,
+        target_model=target_model,
+        src_node_id="S",
+        tgt_node_id="T",
+        tgt_spec=tgt_spec,
+        retain_source_full_context_token_ids=source_full_ids,
+        retain_source_full_past_key_values=source_full_past,
+        retain_target_prefix_past_key_values=target_prefix_past,
+        retain_target_full_context_token_ids=target_full_ids,
+        retain_source_prefix_tokens=3,
+    )
+
+    assert mixed[0][0].shape[2] == 3
+    assert translated[0][0].shape[2] == 3
+    assert seen == {
+        "alignment_source_len": 5,
+        "alignment_target_len": 5,
+        "translated_source_tokens": 5,
+        "alignment_shape": (1, 5, 5),
+        "replay_delta_tokens": 3,
+        "injected_delta_tokens": 3,
+        "sparse_delta_rows": 3,
+        "native_prefix_tokens": 2,
+        "translated_prefix_tokens": 2,
+    }

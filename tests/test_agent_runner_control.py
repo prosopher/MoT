@@ -2269,24 +2269,61 @@ def test_heterogeneous_delta_uses_target_token_grid(monkeypatch) -> None:
     assert runner._build_missing_cache_delta(source_agent=source, target_agent=target) == (1,1,True)
 
 
-def test_heterogeneous_retain_second_same_model_hop_replaces_stale_prefix_after_cross_token_rebuild(monkeypatch) -> None:
+def test_heterogeneous_retain_cross_source_appends_to_hub_without_rewriting_same_model_prefix(monkeypatch) -> None:
     from core.common import TokenIDs
+
     ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
     runner = AgentRunner(ctx=ctx, translator_pool=ctx.tp, alg="mot", agent_count=4, cache_mode="retain", log_agents=False)
     hub, source, target = runner.hub_agent, runner.agents["B"], runner.agents["C"]
-    source.past_key_values = _fake_past(3); source.cache_token_ids = [1,2,3]
+
+    # Canonical Hub/C history is [77]. B received that logical history on its own
+    # token grid [1,2], then committed exactly one new Memory token [3].
     hub.past_key_values = _fake_past(1); hub.cache_token_ids = [77]
-    target.past_key_values = _fake_past(1); target.cache_token_ids = [88]
+    target.past_key_values = _fake_past(1); target.cache_token_ids = [77]
+    source.past_key_values = _fake_past(3); source.cache_token_ids = [1,2,3]
+    runner._retain_pending_self_refresh_prefix_tokens[source.node_id] = 2
+    runner._retain_hub_sync_tokens_by_agent[source.node_id] = 1
+
     def fake_retokenize(*, source_model, target_model, source_context_token_ids):
-        return TokenIDs(torch.tensor([[91,92]], dtype=torch.long), model_id=target_model.id)
+        ids = source_context_token_ids.as_tensor().squeeze(0).detach().cpu().tolist()
+        # Only the newly committed suffix is ever retokenized in either direction.
+        if source_model.id != target_model.id:
+            if source_model.id == source.model.id:
+                assert ids == [3]
+                return TokenIDs(torch.tensor([[78]], dtype=torch.long), model_id=target_model.id)
+            assert ids == [78]
+            return TokenIDs(torch.tensor([[3]], dtype=torch.long), model_id=target_model.id)
+        return TokenIDs(torch.tensor([ids], dtype=torch.long), model_id=target_model.id)
+
     monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
-    monkeypatch.setattr(runner.cache_translator, "_build_algorithm_translated_past", lambda **kwargs: _fake_past(2))
+    monkeypatch.setattr(
+        runner.cache_translator,
+        "_build_algorithm_translated_past",
+        lambda **kwargs: _fake_past(int(kwargs["target_context_token_ids"].shape[1])),
+    )
+
     runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
-    _, first_meta, _, _, second_meta = runner._star_offload_to_agent(source_agent=source, target_agent=target)
-    assert first_meta["delta_prefix_matched"] is False
-    assert second_meta["delta_prefix_matched"] is False
-    assert target.cache_token_ids == [91,92]
+    _, first_meta, _, _, second_meta = runner._star_offload_to_agent(
+        source_agent=source, target_agent=target
+    )
+
+    assert first_meta["append_only_cross_tokenizer"] is True
+    assert first_meta["delta_prefix_matched"] is True
+    assert first_meta["target_tokens_before_replay"] == 1
+    assert hub.cache_token_ids == [77, 78]
+    # The old same-model C prefix remains byte/token identical and receives only
+    # the new Hub suffix; there is no stale-prefix replacement path.
+    assert second_meta["delta_prefix_matched"] is True
+    assert target.cache_token_ids == [77, 78]
     assert target.cache_seq_len == 2
+    # Cross self-refresh is deferred until the next target has generated. It also
+    # replaces only B's native Memory suffix, never B's historical prefix.
+    assert runner._retain_hub_sync_tokens_by_agent[source.node_id] == 1
+    runner._flush_retain_nonhub_source_cache_refreshes()
+    assert source.cache_token_ids == [1, 2, 3]
+    assert runner._retain_hub_sync_tokens_by_agent[source.node_id] == 2
+    assert runner._retain_hub_sync_tokens_by_agent[target.node_id] == 2
+
 
 
 def test_initial_verification_retry_exhaustion_marks_agent_failure_without_fallback(monkeypatch) -> None:
@@ -2497,7 +2534,7 @@ def test_failed_agent_keeps_old_history_but_is_skipped_on_future_cycles(monkeypa
     import core.agent_runner as agent_runner_module
 
     monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
-    ctx = _ctx("tiny-a,tiny-a")
+    ctx = _ctx("tiny-a,tiny-b")
     runner = AgentRunner(
         ctx=ctx,
         translator_pool=ctx.tp,
@@ -2544,10 +2581,17 @@ def test_failed_agent_keeps_old_history_but_is_skipped_on_future_cycles(monkeypa
 
     for agent in runner.agent_sequence:
         agent.generate_response = fake_generate(agent)
-    runner._prepare_outgoing_route_translation = lambda **kwargs: None
+    prepared_routes = []
+
+    def fake_prepare(*, source_agent, logical_target_agent):
+        prepared_routes.append((source_agent.node_id, logical_target_agent.node_id))
+
+    runner._prepare_outgoing_route_translation = fake_prepare
     runner._update_peak_memory_breakdown = lambda: None
+    offload_routes = []
 
     def fake_star_offload(*, source_agent, target_agent):
+        offload_routes.append((source_agent.node_id, target_agent.node_id))
         meta = {
             "edge_id": "edge",
             "offload_kind": "delta",
@@ -2573,6 +2617,15 @@ def test_failed_agent_keeps_old_history_but_is_skipped_on_future_cycles(monkeypa
     assert "B response 2." not in result.transcript
     assert result.profile["final_agent_votes"]["B"] == "Failed"
     assert result.profile["active_agent_ids"] == ["A", "C", "D", "E"]
+    # B's second-cycle verification failure commits no Memory. The next canonical
+    # route must therefore stay hub-originated; routing B's translated copy back
+    # through the hub would re-tokenize unchanged history and can corrupt the
+    # retained prefix on heterogeneous model grids.
+    assert prepared_routes.count(("B", "C")) == 1  # first-cycle B success only
+    assert offload_routes.count(("B", "C")) == 1   # no post-failure B handoff
+    assert ("A", "C") in prepared_routes
+    assert ("A", "C") in offload_routes
+    assert prepared_routes[-2:] == [("A", "C"), ("C", "D")]
 
 
 def test_initial_agent_failure_in_two_agent_run_forces_failed_without_trying_lone_agent(monkeypatch) -> None:
@@ -3260,3 +3313,232 @@ def test_free_and_retain_three_of_eight_failures_terminate_at_same_turn(monkeypa
     # so strict >0.66 Yes/No consensus is impossible.
     assert free_calls["G"] == free_calls["H"] == 0
     assert retain_calls["G"] == retain_calls["H"] == 0
+
+
+def test_heterogeneous_retain_hub_revisit_appends_only_unsynced_hub_suffix(monkeypatch) -> None:
+    from core.common import TokenIDs
+
+    ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
+    runner = AgentRunner(ctx=ctx, translator_pool=ctx.tp, alg="mot", agent_count=2, cache_mode="retain", log_agents=False)
+    hub, target = runner.hub_agent, runner.agents["B"]
+    hub.past_key_values = _fake_past(3); hub.cache_token_ids = [70, 71, 72]
+    target.past_key_values = _fake_past(2); target.cache_token_ids = [10, 11]
+    runner._retain_hub_sync_tokens_by_agent[target.node_id] = 2
+    seen_source_rows = []
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        ids = source_context_token_ids.as_tensor().squeeze(0).detach().cpu().tolist()
+        seen_source_rows.append(ids)
+        assert ids == [72]  # never [70,71,72]
+        return TokenIDs(torch.tensor([[12, 13]], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+    monkeypatch.setattr(
+        runner.cache_translator,
+        "_build_algorithm_translated_past",
+        lambda **kwargs: _fake_past(int(kwargs["target_context_token_ids"].shape[1])),
+    )
+
+    runner._prepare_outgoing_route_translation(source_agent=hub, logical_target_agent=target)
+    _, meta, _, _, _ = runner._star_offload_to_agent(source_agent=hub, target_agent=target)
+
+    assert seen_source_rows == [[72]]
+    assert meta["append_only_cross_tokenizer"] is True
+    assert meta["target_tokens_before_replay"] == 2
+    assert target.cache_token_ids == [10, 11, 12, 13]
+    assert hub.cache_token_ids == [70, 71, 72]
+    assert runner._retain_hub_sync_tokens_by_agent[target.node_id] == 3
+
+
+def _past_scalar_values(past_key_values):
+    return past_key_values[0][0][0, 0, :, 0].detach().cpu().tolist()
+
+
+def test_free_and_retain_heterogeneous_b_to_hub_to_c_keep_identical_canonical_kv(monkeypatch) -> None:
+    """Regression for the real Turn-3 divergence: A(Llama)->B(Qwen)->A->C(Llama).
+
+    B contributes only one new Memory suffix. Free and Retain must append exactly
+    that translated suffix to the resident canonical Hub prefix. A full B-history
+    decode/re-encode in Free would rewrite the Hub prefix and make C diverge.
+    """
+    from core.common import TokenIDs
+
+    snapshots = {}
+
+    for mode in ("free", "retain"):
+        ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
+        runner = AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="mot",
+            agent_count=3,
+            cache_mode=mode,
+            log_agents=False,
+        )
+        hub, source, target = runner.hub_agent, runner.agents["B"], runner.agents["C"]
+
+        def valued(values):
+            tensor = torch.tensor(values, dtype=torch.float32).view(1, 1, -1, 1)
+            return ((tensor.clone(), tensor.clone()),)
+
+        # Before B speaks, A's canonical history is one Llama token [77]. B owns
+        # the equivalent Qwen-grid prefix [1,2], then natively appends Memory [3].
+        hub.past_key_values = valued([77]); hub.cache_token_ids = [77]
+        source.past_key_values = valued([1, 2, 3]); source.cache_token_ids = [1, 2, 3]
+        target.clear_kv_cache()
+        runner._retain_pending_self_refresh_prefix_tokens[source.node_id] = 2
+        if mode == "retain":
+            runner._retain_hub_sync_tokens_by_agent[source.node_id] = 1
+
+        def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+            ids = source_context_token_ids.as_tensor().squeeze(0).detach().cpu().tolist()
+            if source_model.id == target_model.id:
+                out = ids
+            elif source_model.id == source.model.id and target_model.id == hub.model.id:
+                # Correct append-only route sees only B's new Memory [3]. The old
+                # Free bug retokenized [1,2,3] and would replace Hub [77].
+                out = [78] if ids == [3] else [700, 701, 78]
+            elif source_model.id == hub.model.id and target_model.id == source.model.id:
+                out = [3] if ids == [78] else [1, 2, 3]
+            else:
+                out = ids
+            return TokenIDs(torch.tensor([out], dtype=torch.long), model_id=target_model.id)
+
+        monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+
+        def fake_algorithm(**kwargs):
+            target_ids = kwargs["target_context_token_ids"].as_tensor().squeeze(0).detach().cpu().tolist()
+            return valued(target_ids)
+
+        monkeypatch.setattr(runner.cache_translator, "_build_algorithm_translated_past", fake_algorithm)
+
+        runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+        _, first_meta, _, _, second_meta = runner._star_offload_to_agent(
+            source_agent=source, target_agent=target
+        )
+
+        snapshots[mode] = {
+            "hub_ids": list(hub.cache_token_ids),
+            "hub_values": _past_scalar_values(hub.past_key_values),
+            "target_ids": list(target.cache_token_ids),
+            "target_values": _past_scalar_values(target.past_key_values),
+            "first_tokens": first_meta["tokens_sent"],
+            "second_tokens": second_meta["tokens_received"],
+        }
+
+    assert snapshots["free"] == snapshots["retain"]
+    assert snapshots["free"]["hub_ids"] == [77, 78]
+    assert snapshots["free"]["hub_values"] == [77.0, 78.0]
+    assert snapshots["free"]["target_ids"] == [77, 78]
+    assert snapshots["free"]["target_values"] == [77.0, 78.0]
+
+
+def test_free_cross_revisit_replays_same_hub_chunks_as_retain(monkeypatch) -> None:
+    """Freed Qwen cache must be rebuilt using Retain's historical Hub chunking."""
+    from core.common import TokenIDs
+
+    results = {}
+    for mode in ("free", "retain"):
+        ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
+        runner = AgentRunner(
+            ctx=ctx,
+            translator_pool=ctx.tp,
+            alg="mot",
+            agent_count=2,
+            cache_mode=mode,
+            log_agents=False,
+        )
+        hub, target = runner.hub_agent, runner.agents["B"]
+        hub.past_key_values = _fake_past(3); hub.cache_token_ids = [70, 71, 72]
+
+        # Retain historically built B as Hub[0:1] -> [10,11], then appended
+        # Hub[1:2] -> [12]. Free has no resident B KV but remembers the Hub cuts.
+        if mode == "retain":
+            target.past_key_values = _fake_past(3); target.cache_token_ids = [10, 11, 12]
+            runner._retain_hub_sync_tokens_by_agent[target.node_id] = 2
+        else:
+            target.clear_kv_cache()
+        runner._mot_cross_hub_replay_boundaries_by_agent[target.node_id] = [1, 2]
+
+        seen = []
+
+        def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+            ids = source_context_token_ids.as_tensor().squeeze(0).detach().cpu().tolist()
+            seen.append(ids)
+            mapping = {
+                (70,): [10, 11],
+                (71,): [12],
+                (72,): [13, 14],
+                # A one-shot full retokenization is deliberately non-canonical.
+                (70, 71, 72): [90, 91],
+            }
+            out = mapping.get(tuple(ids), ids)
+            return TokenIDs(torch.tensor([out], dtype=torch.long), model_id=target_model.id)
+
+        monkeypatch.setattr("alg.mot.train.retokenize_agent_runner_context", fake_retokenize)
+        monkeypatch.setattr(
+            runner.cache_translator,
+            "_build_algorithm_translated_past",
+            lambda **kwargs: _fake_past(int(kwargs["target_context_token_ids"].shape[1])),
+        )
+
+        runner._prepare_outgoing_route_translation(source_agent=hub, logical_target_agent=target)
+        _, meta, _, _, _ = runner._star_offload_to_agent(source_agent=hub, target_agent=target)
+        results[mode] = {
+            "ids": list(target.cache_token_ids),
+            "values": _past_scalar_values(target.past_key_values),
+            "seen": seen,
+            "tokens_received": meta["tokens_received"],
+        }
+
+    assert results["free"]["ids"] == results["retain"]["ids"] == [10, 11, 12, 13, 14]
+    assert results["free"]["values"] == results["retain"]["values"]
+    # Retain needs only the new suffix; Free reconstructs old chunks in the same
+    # order and then the same new suffix. Neither mode may canonicalize from the
+    # non-canonical one-shot full-history tokenization [90,91].
+    assert (70, 71, 72) not in [tuple(x) for x in results["free"]["seen"]]
+    assert (70, 71, 72) not in [tuple(x) for x in results["retain"]["seen"]]
+    assert results["retain"]["tokens_received"] == 2
+    assert results["free"]["tokens_received"] == 5
+
+
+def test_free_same_grid_revisit_uses_historical_chunks_inside_heterogeneous_pool(monkeypatch) -> None:
+    """C/E share Hub's grid even when B/D use another model; replay is per-agent."""
+    ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="mot",
+        agent_count=3,
+        cache_mode="free",
+        log_agents=False,
+    )
+    hub, target = runner.hub_agent, runner.agents["C"]
+    assert hub.model.id == target.model.id
+    assert runner._homogeneous_model_pool is False
+    source_ids = list(range(10))
+    _install_fake_cache(hub, source_ids)
+    target.clear_kv_cache()
+    runner._mot_replay_boundaries_by_agent[target.node_id] = [3, 5]
+
+    seen = []
+
+    def fake_build(*, source_agent, target_agent, source_past_key_values, source_token_ids, **kwargs):
+        seen.append((
+            list(source_token_ids),
+            list(kwargs.get("retain_source_full_token_ids", [])),
+            get_past_seq_len(kwargs["retain_target_prefix_past_key_values"])
+            if kwargs.get("retain_target_prefix_past_key_values") is not None else 0,
+        ))
+        edge = runner.cache_translator._get_edge(source_agent.node_id, target_agent.node_id)
+        return edge.id, _fake_past(len(source_token_ids)), list(source_token_ids)
+
+    monkeypatch.setattr(runner.cache_translator, "build_pretranslated_past_for_edge", fake_build)
+
+    runner._prepare_outgoing_route_translation(source_agent=hub, logical_target_agent=target)
+
+    assert seen == [
+        ([0, 1, 2], [], 0),
+        ([3, 4], [0, 1, 2, 3, 4], 3),
+        ([5, 6, 7, 8, 9], source_ids, 5),
+    ]

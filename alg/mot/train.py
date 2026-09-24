@@ -783,6 +783,13 @@ def build_replayed_target_past(
     # Retain-only option: resident target prefix KV used to replay the delta at
     # its original absolute positions and condition it on the existing cache.
     retain_target_prefix_past_key_values: Optional[PastKeyValues] = None,
+    # Retain+cross-tokenizer: canonical full target ledger = resident target
+    # prefix + independently retokenized new source suffix. Historical target
+    # tokens are never recomputed from the longer source context.
+    retain_target_full_context_token_ids: Optional[TokenIDs] = None,
+    # Source-grid token count represented by the resident target prefix. This is
+    # distinct from the target prefix length under heterogeneous tokenization.
+    retain_source_prefix_tokens: Optional[int] = None,
 ) -> Tuple[PastKeyValues, PastKeyValues]:
     edge_id = f"{src_node_id}_to_{tgt_node_id}"
     node_model_ids = {node.id: node.model_id for node in ctx.nodes}
@@ -797,24 +804,42 @@ def build_replayed_target_past(
         if retain_source_full_context_token_ids is None
         else retain_source_full_context_token_ids
     )
+    source_prefix_tokens = retain_prefix_tokens
+    if retain_source_prefix_tokens is not None:
+        source_prefix_tokens = int(retain_source_prefix_tokens)
+        if source_prefix_tokens < 0:
+            raise ValueError("retain_source_prefix_tokens must be non-negative.")
     if retain_source_full_context_token_ids is not None:
-        expected_full_tokens = retain_prefix_tokens + int(source_context_token_ids.shape[1])
+        expected_full_tokens = source_prefix_tokens + int(source_context_token_ids.shape[1])
         if int(retain_source_full_context_token_ids.shape[1]) != expected_full_tokens:
             raise ValueError(
                 "Retain MoT source context mismatch: "
                 f"full_tokens={int(retain_source_full_context_token_ids.shape[1])} "
-                f"prefix_tokens={retain_prefix_tokens} delta_tokens={int(source_context_token_ids.shape[1])}"
+                f"source_prefix_tokens={source_prefix_tokens} "
+                f"delta_tokens={int(source_context_token_ids.shape[1])}"
             )
-        if retain_source_full_past_key_values is None:
-            raise ValueError("Retain MoT incremental replay requires the full source KV prefix.")
-        full_source_past_tokens = get_past_seq_len(retain_source_full_past_key_values)
-        if full_source_past_tokens != expected_full_tokens:
-            raise ValueError(
-                "Retain MoT full source KV mismatch: "
-                f"past_tokens={full_source_past_tokens} expected_full_tokens={expected_full_tokens}"
-            )
+        if retain_source_full_past_key_values is not None:
+            full_source_past_tokens = get_past_seq_len(retain_source_full_past_key_values)
+            if full_source_past_tokens != expected_full_tokens:
+                raise ValueError(
+                    "Retain MoT full source KV mismatch: "
+                    f"past_tokens={full_source_past_tokens} expected_full_tokens={expected_full_tokens}"
+                )
     elif retain_source_full_past_key_values is not None:
         raise ValueError("retain_source_full_past_key_values requires retain_source_full_context_token_ids.")
+    if retain_target_full_context_token_ids is not None:
+        if retain_target_prefix_past_key_values is None:
+            raise ValueError(
+                "retain_target_full_context_token_ids requires a resident target prefix cache."
+            )
+        expected_target_full_tokens = retain_prefix_tokens + int(target_context_token_ids.shape[1])
+        if int(retain_target_full_context_token_ids.shape[1]) != expected_target_full_tokens:
+            raise ValueError(
+                "Retain MoT target context mismatch: "
+                f"full_tokens={int(retain_target_full_context_token_ids.shape[1])} "
+                f"target_prefix_tokens={retain_prefix_tokens} "
+                f"delta_tokens={int(target_context_token_ids.shape[1])}"
+            )
 
     sparse_attention_indices = build_extrapolated_sparse_attention_indices(
         source_model,
@@ -826,12 +851,6 @@ def build_replayed_target_past(
         source_model_id=node_model_ids.get(src_node_id),
         top_k=ctx.config.topk_sparse_attn,
     )
-    if retain_source_full_context_token_ids is not None:
-        sparse_attention_indices = [
-            sparse_idx[:, :, retain_prefix_tokens:, :]
-            for sparse_idx in sparse_attention_indices
-        ]
-
     needs_token_alignment = (
         source_model.id != target_model.id
         or source_context_token_ids.shape != target_context_token_ids.shape
@@ -841,47 +860,84 @@ def build_replayed_target_past(
         )
     )
     alignment_weights = None
-    if retain_source_full_context_token_ids is not None and needs_token_alignment:
-        raise ValueError(
-            "Retain MoT incremental replay currently requires source/target delta token grids to match."
-        )
-    if needs_token_alignment:
-        alignment_weights, target_to_source, source_to_target = build_cross_token_alignment(
+    full_alignment_weights = None
+
+    # For append-only heterogeneous Retain, align the *full* source history to a
+    # canonical full target ledger whose historical prefix is exactly the resident
+    # target cache. Then slice only the newly appended target rows. This preserves
+    # historical target tokens/KV while still giving the new suffix the same full-
+    # context token alignment used by a full replay.
+    if (
+        retain_source_full_context_token_ids is not None
+        and retain_target_full_context_token_ids is not None
+    ):
+        (
+            full_alignment_weights,
+            full_target_to_source,
+            full_source_to_target,
+        ) = build_cross_token_alignment(
             source_model=source_model,
             target_model=target_model,
-            source_context_token_ids=source_context_token_ids,
-            target_context_token_ids=target_context_token_ids,
+            source_context_token_ids=retain_source_full_context_token_ids,
+            target_context_token_ids=retain_target_full_context_token_ids,
         )
         sparse_attention_indices = [
             align_sparse_attention_indices_to_target_tokens(
                 sparse_indices,
-                target_to_source=target_to_source,
-                source_to_target=source_to_target,
-            )
+                target_to_source=full_target_to_source,
+                source_to_target=full_source_to_target,
+            )[:, :, retain_prefix_tokens:, :]
             for sparse_indices in sparse_attention_indices
         ]
+    else:
+        if retain_source_full_context_token_ids is not None:
+            # Legacy same-grid incremental replay: source and target historical
+            # prefix lengths are identical, so source query rows can be sliced
+            # directly before replaying the delta.
+            sparse_attention_indices = [
+                sparse_idx[:, :, source_prefix_tokens:, :]
+                for sparse_idx in sparse_attention_indices
+            ]
+        if needs_token_alignment:
+            alignment_weights, target_to_source, source_to_target = build_cross_token_alignment(
+                source_model=source_model,
+                target_model=target_model,
+                source_context_token_ids=source_context_token_ids,
+                target_context_token_ids=target_context_token_ids,
+            )
+            sparse_attention_indices = [
+                align_sparse_attention_indices_to_target_tokens(
+                    sparse_indices,
+                    target_to_source=target_to_source,
+                    source_to_target=source_to_target,
+                )
+                for sparse_indices in sparse_attention_indices
+            ]
 
     retain_injected_prefix_past: Optional[PastKeyValues] = None
     if retain_source_full_past_key_values is not None:
-        # Translate the same full source window as Free, then split it into the
-        # resident prefix and missing delta. The translator is token-wise across
-        # sequence positions, but using the identical full-shape call also avoids
-        # shape-dependent floating-point drift between Free and Retain.
+        # Translate the full source window so sparse/token alignment sees the same
+        # context as a full replay, but split on the *target* prefix boundary and
+        # keep the resident target prefix immutable. This is essential when source
+        # and target tokenizers have different prefix lengths.
         translated_full_key, translated_full_value = translate_layer_window(
             ctx=ctx,
             past_key_values=retain_source_full_past_key_values,
             src_node_id=src_node_id,
             tgt_node_id=tgt_node_id,
-            token_alignment_weights=alignment_weights,
+            token_alignment_weights=(
+                full_alignment_weights if full_alignment_weights is not None else alignment_weights
+            ),
         )
         translated_prefix_key = translated_full_key[:, :retain_prefix_tokens]
         translated_prefix_value = translated_full_value[:, :retain_prefix_tokens]
         translated_key = translated_full_key[:, retain_prefix_tokens:]
         translated_value = translated_full_value[:, retain_prefix_tokens:]
-        if translated_key.shape[1] != source_context_token_ids.shape[1]:
+        if translated_key.shape[1] != target_context_token_ids.shape[1]:
             raise ValueError(
-                "Retain MoT translated delta length mismatch: "
-                f"translated_delta={translated_key.shape[1]} source_delta={source_context_token_ids.shape[1]}"
+                "Retain MoT translated target-delta length mismatch: "
+                f"translated_delta={translated_key.shape[1]} "
+                f"target_delta={int(target_context_token_ids.shape[1])}"
             )
         retain_injected_prefix_past = blocks_to_partial_past_key_values(
             key_block=translated_prefix_key,
