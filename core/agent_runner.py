@@ -2741,9 +2741,12 @@ class AgentRunner:
 
     def _prepare_outgoing_route_translation(self, *, source_agent: Agent, logical_target_agent: Agent) -> None:
         """Pretranslate the physical star-topology route before the next handoff."""
-        if source_agent.node_id in self._failed_agent_ids:
+        if (
+            source_agent.node_id in self._failed_agent_ids
+            and source_agent.node_id != self.hub_agent.node_id
+        ):
             raise RuntimeError(
-                f"Failed Agent {source_agent.node_id} cannot be a KV handoff source; "
+                f"Failed non-hub Agent {source_agent.node_id} cannot be a KV handoff source; "
                 "failed responses never commit Memory, so the hub remains the canonical shared-state source."
             )
         self._pending_pretranslated_second_hops.pop((source_agent.node_id, logical_target_agent.node_id), None)
@@ -3930,9 +3933,12 @@ class AgentRunner:
                 replayed cache for the next generation.
             incoming_meta: metadata for the hop that actually entered target_agent.
         """
-        if source_agent.node_id in self._failed_agent_ids:
+        if (
+            source_agent.node_id in self._failed_agent_ids
+            and source_agent.node_id != self.hub_agent.node_id
+        ):
             raise RuntimeError(
-                f"Failed Agent {source_agent.node_id} cannot be a KV handoff source; "
+                f"Failed non-hub Agent {source_agent.node_id} cannot be a KV handoff source; "
                 "the canonical shared-state source remains the hub after verification exhaustion."
             )
 
@@ -4446,7 +4452,10 @@ class AgentRunner:
                         target_agent=current_target,
                     )
                 )
-                if source_record.agent_id == current_source.node_id:
+                if (
+                    source_record.agent_id == current_source.node_id
+                    and not source_record.agent_failed
+                ):
                     self._apply_offload_metadata_to_record(
                         source_record,
                         target_agent=record_offload_target,

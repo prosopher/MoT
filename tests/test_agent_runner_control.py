@@ -3644,3 +3644,220 @@ def test_interlat_heterogeneous_adapter_real_tiny_models_smoke() -> None:
     assert edge_id == "A_to_B"
     assert len(target_ids) > 0
     assert get_past_seq_len(translated_past) == len(target_ids)
+
+
+@pytest.mark.parametrize("alg", ["mot", "interlat", "lsc", "c2c-pr"])
+def test_failed_hub_remains_valid_canonical_kv_source_but_failed_nonhub_does_not(monkeypatch, alg) -> None:
+    """Logical Agent failure must not disable the Hub's physical cache-router role.
+
+    The Hub can fail verification as a discussion participant while its rolled-back
+    cache still remains the canonical shared-history store. This invariant is generic
+    across algorithms; only failed *non-hub* replicas are forbidden as handoff sources.
+    """
+    ctx = _ctx("tiny-a,tiny-b")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg=alg,
+        agent_count=3,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    hub, nonhub, target = runner.hub_agent, runner.agents["B"], runner.agents["C"]
+    runner._failed_agent_ids.add(hub.node_id)
+
+    # The pretranslation guard itself must permit a failed Hub. A missing cache means
+    # the method returns immediately after that guard, isolating exactly this invariant.
+    hub.clear_kv_cache()
+    runner._prepare_outgoing_route_translation(
+        source_agent=hub,
+        logical_target_agent=target,
+    )
+
+    meta = {
+        "edge_id": "hub_to_target",
+        "offload_kind": "noop",
+        "tokens_sent": 0,
+        "tokens_received": 0,
+        "expected_delta_tokens": 0,
+    }
+    monkeypatch.setattr(
+        runner,
+        "_offload_delta_hop",
+        lambda **kwargs: (dict(meta), False),
+    )
+    _, incoming_meta, _, incoming_from, _ = runner._star_offload_to_agent(
+        source_agent=hub,
+        target_agent=target,
+    )
+    assert incoming_meta["edge_id"] == "hub_to_target"
+    assert incoming_from is hub
+
+    # A failed non-hub cache is only a translated replica and must never replace the
+    # canonical Hub state. Keep the protection that fixed the earlier corruption bug.
+    runner._failed_agent_ids.add(nonhub.node_id)
+    with pytest.raises(RuntimeError, match="Failed non-hub Agent B"):
+        runner._prepare_outgoing_route_translation(
+            source_agent=nonhub,
+            logical_target_agent=target,
+        )
+    with pytest.raises(RuntimeError, match="Failed non-hub Agent B"):
+        runner._star_offload_to_agent(source_agent=nonhub, target_agent=target)
+
+
+def test_interlat_heterogeneous_failed_hub_stays_transport_source_and_discussion_continues(monkeypatch) -> None:
+    """Regression for the real InterLat turn-11 crash after Hub A verification failure."""
+    import core.agent_runner as agent_runner_module
+
+    monkeypatch.setattr(agent_runner_module, "VERIFICATION_MAX_RETRIES", 1)
+    ctx = _ctx("tiny-a,tiny-b")
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="interlat",
+        agent_count=5,
+        max_turns=7,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    runner._generate_expert_personas = lambda context, question: {
+        agent.node_id: (f"Expert {agent.node_id}", "Useful expert.")
+        for agent in runner.agent_sequence
+    }
+
+    calls = {agent.node_id: 0 for agent in runner.agent_sequence}
+    answers = {"A": "Yes", "B": "Yes", "C": "No", "D": "No", "E": "Yes"}
+
+    def fake_semantic(**kwargs):
+        agent_id = kwargs["agent"].node_id
+        # A succeeds as the initial Hub speaker, then exhausts verification on its
+        # second-cycle turn. One Failed vote out of five still leaves 4/5 > 0.66,
+        # so the controller must continue with B rather than terminating.
+        if agent_id == "A" and calls["A"] >= 2:
+            return "reject", False
+        return "ok", True
+
+    runner._verify_response_semantics_with_model = fake_semantic
+
+    def fake_generate(agent):
+        def generate(prompt_text: str) -> AgentGeneration:
+            calls[agent.node_id] += 1
+            if agent.node_id == "A" and calls["A"] == 1:
+                text = "A initial canonical history.\nFinal Solution: Yes"
+            else:
+                text = (
+                    f"[DISAGREE] {agent.node_id} response {calls[agent.node_id]}.\n"
+                    f"Final Solution: {answers[agent.node_id]}"
+                )
+            return AgentGeneration(
+                agent_id=agent.node_id,
+                prompt_text=prompt_text,
+                text=text,
+                raw_text=text,
+                generated_token_ids=[1],
+                tokens_before=0,
+                tokens_after=1,
+                tokens_prompt=1,
+                tokens_completion=1,
+            )
+        return generate
+
+    for agent in runner.agent_sequence:
+        agent.generate_response = fake_generate(agent)
+
+    prepared_routes = []
+    offload_routes = []
+
+    def fake_prepare(*, source_agent, logical_target_agent):
+        prepared_routes.append((source_agent.node_id, logical_target_agent.node_id))
+
+    def fake_star_offload(*, source_agent, target_agent):
+        offload_routes.append((source_agent.node_id, target_agent.node_id))
+        meta = {
+            "edge_id": f"{source_agent.node_id}_to_{target_agent.node_id}",
+            "offload_kind": "delta",
+            "tokens_sent": 1,
+            "tokens_received": 1,
+            "expected_delta_tokens": 1,
+        }
+        return target_agent, meta, False, source_agent, meta
+
+    runner._prepare_outgoing_route_translation = fake_prepare
+    runner._star_offload_to_agent = fake_star_offload
+    runner._update_peak_memory_breakdown = lambda: None
+
+    result = runner.run(context="", question="Question?", gold_answers=["Yes"])
+
+    assert [message.agent_id for message in result.agent_messages] == [
+        "A", "B", "C", "D", "E", "A", "B"
+    ]
+    failed_hub_record = result.agent_messages[5]
+    assert failed_hub_record.agent_id == "A"
+    assert failed_hub_record.agent_failed is True
+    assert failed_hub_record.final_answer is None
+    assert failed_hub_record.offload_edge_id is None
+    assert result.profile["failed_agent_ids"] == ["A"]
+    assert result.profile["active_agent_ids"] == ["B", "C", "D", "E"]
+    assert result.profile["final_agent_votes"]["A"] == "Failed"
+
+    # A is excluded from future *speaking*, but the same physical Hub A must remain
+    # the canonical transport source for B immediately after A's failed turn.
+    assert ("A", "B") in prepared_routes
+    assert ("A", "B") in offload_routes
+    assert calls["A"] == 3  # initial success + original failed attempt + one retry
+    assert calls["B"] == 2  # B is allowed to continue after the Hub participant fails
+    assert "A response 2." not in result.transcript
+
+
+def test_interlat_heterogeneous_failed_hub_real_translation_smoke() -> None:
+    """A failed Hub must still perform the real heterogeneous InterLat A->B handoff."""
+    import alg.interlat.train as interlat_train
+    from core.common import TokenIDs, extract_past_key_values
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+            prepended_num_heads=1,
+        )
+    )
+    interlat_train.initialize_translators(ctx)
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="interlat",
+        agent_count=2,
+        cache_mode="retain",
+        log_agents=False,
+    )
+    hub, target = runner.hub_agent, runner.agents["B"]
+    encoded = hub.model.tokenizer(
+        "failed hub canonical history",
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    source_tensor = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+    source_ids = TokenIDs(source_tensor, model_id=hub.model.id)
+    source_past = extract_past_key_values(hub.model, source_ids)
+    hub.set_replayed_cache(
+        past_key_values=source_past,
+        cache_token_ids=source_tensor[0].tolist(),
+    )
+    target.clear_kv_cache()
+    runner._failed_agent_ids.add(hub.node_id)
+
+    runner._prepare_outgoing_route_translation(
+        source_agent=hub,
+        logical_target_agent=target,
+    )
+    _, _, _, incoming_from, incoming_meta = runner._star_offload_to_agent(
+        source_agent=hub,
+        target_agent=target,
+    )
+
+    assert incoming_from is hub
+    assert incoming_meta["edge_id"] == "A_to_B"
+    assert target.cache_seq_len == len(target.cache_token_ids)
+    assert target.cache_seq_len > 0
