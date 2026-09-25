@@ -3861,3 +3861,121 @@ def test_interlat_heterogeneous_failed_hub_real_translation_smoke() -> None:
     assert incoming_meta["edge_id"] == "A_to_B"
     assert target.cache_seq_len == len(target.cache_token_ids)
     assert target.cache_seq_len > 0
+
+
+@pytest.mark.parametrize("alg", ["interlat", "lsc", "c2c-pr"])
+def test_retain_cross_source_preserves_canonical_hub_prefix_for_all_cross_algorithms(monkeypatch, alg) -> None:
+    """A cross-grid speaker may append only its new Memory suffix to the Hub.
+
+    Full-history retokenization is not prefix-stable at a concatenation boundary.
+    The old implementation could therefore rewrite Hub token 77 into [700,701]
+    and make an older same-grid retained Agent fail on its next visit.
+    """
+    from core.common import TokenIDs
+
+    ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
+    runner = AgentRunner(ctx=ctx, translator_pool=ctx.tp, alg=alg, agent_count=5, cache_mode="retain", log_agents=False)
+    hub, source, target = runner.hub_agent, runner.agents["B"], runner.agents["C"]
+
+    def valued(values):
+        tensor = torch.tensor(values, dtype=torch.float32).view(1, 1, -1, 1)
+        return ((tensor.clone(), tensor.clone()),)
+
+    # C retained the old canonical A-grid prefix. B owns the equivalent B-grid
+    # prefix [1,2] and has just committed one new Memory token [3].
+    hub.past_key_values = valued([77]); hub.cache_token_ids = [77]
+    target.past_key_values = valued([77]); target.cache_token_ids = [77]
+    source.past_key_values = valued([1, 2, 3]); source.cache_token_ids = [1, 2, 3]
+    runner._retain_pending_self_refresh_prefix_tokens[source.node_id] = 2
+    runner._retain_hub_sync_tokens_by_agent[source.node_id] = 1
+
+    module_name = {
+        "interlat": "alg.interlat.train",
+        "lsc": "alg.lsc.train",
+        "c2c-pr": "alg.c2c.train",
+    }[alg]
+    seen_rows = []
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        ids = source_context_token_ids.as_tensor().squeeze(0).detach().cpu().tolist()
+        seen_rows.append(ids)
+        if source_model.id != target_model.id:
+            # Correct append-only behavior retokenizes only [3]. Retokenizing the
+            # full [1,2,3] history intentionally changes the old A-grid prefix.
+            out = [78] if ids == [3] else [700, 701, 78]
+        else:
+            out = ids
+        return TokenIDs(torch.tensor([out], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr(f"{module_name}.retokenize_agent_runner_context", fake_retokenize)
+
+    def fake_algorithm(**kwargs):
+        ids = kwargs["target_context_token_ids"].as_tensor().squeeze(0).detach().cpu().tolist()
+        return valued(ids)
+
+    monkeypatch.setattr(runner.cache_translator, "_build_algorithm_translated_past", fake_algorithm)
+
+    runner._prepare_outgoing_route_translation(source_agent=source, logical_target_agent=target)
+    _, first_meta, _, _, second_meta = runner._star_offload_to_agent(source_agent=source, target_agent=target)
+
+    assert [3] in seen_rows
+    assert [1, 2, 3] not in seen_rows
+    assert first_meta["append_only_cross_tokenizer"] is True
+    assert first_meta["delta_prefix_matched"] is True
+    assert hub.cache_token_ids == [77, 78]
+    assert runner._retain_hub_sync_tokens_by_agent[source.node_id] == 2
+    assert source.node_id not in runner._retain_pending_self_refresh_prefix_tokens
+    assert second_meta["delta_prefix_matched"] is True
+    assert target.cache_token_ids == [77, 78]
+
+
+@pytest.mark.parametrize("alg", ["interlat", "lsc", "c2c-pr"])
+def test_retain_cross_revisit_appends_only_unsynced_hub_suffix_for_all_cross_algorithms(monkeypatch, alg) -> None:
+    """A retained cross-grid Agent revisit must never retokenize old Hub history."""
+    from core.common import TokenIDs
+
+    ctx = Context(SimpleNamespace(model_ids="tiny-a,tiny-b", model_directions="all", device="cpu", dtype="float32"))
+    runner = AgentRunner(ctx=ctx, translator_pool=ctx.tp, alg=alg, agent_count=2, cache_mode="retain", log_agents=False)
+    hub, target = runner.hub_agent, runner.agents["B"]
+
+    def valued(values):
+        tensor = torch.tensor(values, dtype=torch.float32).view(1, 1, -1, 1)
+        return ((tensor.clone(), tensor.clone()),)
+
+    hub.past_key_values = valued([70, 71, 72]); hub.cache_token_ids = [70, 71, 72]
+    target.past_key_values = valued([10, 11]); target.cache_token_ids = [10, 11]
+    runner._retain_hub_sync_tokens_by_agent[target.node_id] = 2
+
+    module_name = {
+        "interlat": "alg.interlat.train",
+        "lsc": "alg.lsc.train",
+        "c2c-pr": "alg.c2c.train",
+    }[alg]
+    seen_rows = []
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        ids = source_context_token_ids.as_tensor().squeeze(0).detach().cpu().tolist()
+        seen_rows.append(ids)
+        if source_model.id != target_model.id:
+            out = [12, 13] if ids == [72] else [900, 901, 12, 13]
+        else:
+            out = ids
+        return TokenIDs(torch.tensor([out], dtype=torch.long), model_id=target_model.id)
+
+    monkeypatch.setattr(f"{module_name}.retokenize_agent_runner_context", fake_retokenize)
+
+    def fake_algorithm(**kwargs):
+        ids = kwargs["target_context_token_ids"].as_tensor().squeeze(0).detach().cpu().tolist()
+        return valued(ids)
+
+    monkeypatch.setattr(runner.cache_translator, "_build_algorithm_translated_past", fake_algorithm)
+
+    runner._prepare_outgoing_route_translation(source_agent=hub, logical_target_agent=target)
+    _, meta, _, _, _ = runner._star_offload_to_agent(source_agent=hub, target_agent=target)
+
+    assert seen_rows == [[72]]
+    assert meta["append_only_cross_tokenizer"] is True
+    assert meta["target_tokens_before_replay"] == 2
+    assert target.cache_token_ids == [10, 11, 12, 13]
+    assert hub.cache_token_ids == [70, 71, 72]
+    assert runner._retain_hub_sync_tokens_by_agent[target.node_id] == 3
