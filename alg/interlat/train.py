@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 
 from core.common import (
     build_step_pasts_and_batches,
+    build_receiver_aligned_sharer_token_ids,
     PastKeyValues,
     TokenIDs,
     count_trainable_parameters,
@@ -23,6 +24,7 @@ from core.common import (
 )
 from core.config import Config
 from core.context import Context
+from core.model import Model
 from core.translator_pool import TranslatorPool
 from core.train_util import (
     WarmupCosineScheduler,
@@ -143,6 +145,87 @@ def translate_hidden_states(
     if translator_id not in translator_pool.translators:
         raise ValueError(f"InterLat translator {translator_id} is not available. Active translators: {list(translator_pool.translators.keys())}")
     return translator_pool.translators[translator_id](source_hidden_states)
+
+
+def retokenize_agent_runner_context(
+    *,
+    source_model: Model,
+    target_model: Model,
+    source_context_token_ids: TokenIDs,
+) -> TokenIDs:
+    """Return the target-tokenizer representation of an AgentRunner cache.
+
+    This intentionally matches the C2C/LSC AgentRunner contract: the logical
+    context text is preserved while the target tokenizer defines the KV grid.
+    """
+    ensure_token_ids_model(source_model, source_context_token_ids)
+    if source_context_token_ids.ndim != 2 or source_context_token_ids.shape[0] != 1:
+        raise ValueError("AgentRunner InterLat retokenization expects a single batch row.")
+    source_ids = source_context_token_ids.as_tensor()[0].detach().cpu().tolist()
+    try:
+        text = source_model.tokenizer.decode(
+            source_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        text = source_model.tokenizer.decode(source_ids, skip_special_tokens=False)
+    encoded = target_model.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    target_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+    return TokenIDs(target_ids, model_id=target_model.id).to(target_model.device)
+
+
+@torch.no_grad()
+def build_agent_runner_translated_past(
+    *,
+    translator_pool: TranslatorPool,
+    target_context_token_ids: TokenIDs,
+    source_model: Model,
+    target_model: Model,
+    src_node_id: str,
+    tgt_node_id: str,
+) -> PastKeyValues:
+    """Build InterLat KV on the target tokenizer's token grid.
+
+    InterLat communicates one translated hidden state per receiver KV position.
+    For heterogeneous tokenizers, target tokenization is therefore authoritative.
+    We map every target token position to exactly one source-token position using
+    the same receiver-alignment rule as C2C/LSC, extract source hidden states on
+    that aligned sequence, translate them, and build the target latent past.
+    """
+    ensure_token_ids_model(target_model, target_context_token_ids)
+    aligned_source_token_ids = build_receiver_aligned_sharer_token_ids(
+        receiver_context_token_ids=target_context_token_ids,
+        receiver_model=target_model,
+        sharer_model=source_model,
+    ).to(source_model.device)
+    source_hidden_states = extract_interlat_source_hidden_states(
+        source_model,
+        aligned_source_token_ids,
+    )
+    translated_latents = translate_hidden_states(
+        translator_pool=translator_pool,
+        source_hidden_states=source_hidden_states,
+        src_node_id=src_node_id,
+        tgt_node_id=tgt_node_id,
+    )
+    target_tokens = int(target_context_token_ids.shape[1])
+    if int(translated_latents.shape[1]) != target_tokens:
+        raise ValueError(
+            f"InterLat target-grid latent length mismatch on {src_node_id}->{tgt_node_id}: "
+            f"target_tokens={target_tokens} translated_latents={int(translated_latents.shape[1])}"
+        )
+    translated_past = build_latent_conditioned_past(
+        target_model,
+        latent_prefix=translated_latents,
+    )
+    translated_tokens = int(translated_past[0][0].shape[2]) if translated_past else 0
+    if translated_tokens != target_tokens:
+        raise ValueError(
+            f"InterLat target-grid cache length mismatch on {src_node_id}->{tgt_node_id}: "
+            f"target_tokens={target_tokens} translated_tokens={translated_tokens}"
+        )
+    return translated_past
 
 
 def get_model_context_limit(model) -> int:

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from alg.c2c.train import normalize_top_layers_to_translate, resolve_top_layers_to_translate
+import alg.interlat.train as interlat_train
 from alg.interlat.train import (
     adjust_interlat_loss_weights,
     build_mismatched_source_hidden_states,
@@ -282,6 +283,88 @@ def test_c2c_terminal_alignment_alias_resolves_to_edge_specific_min_depth() -> N
     with pytest.raises(ValueError, match="A_to_B"):
         resolve_top_layers_to_translate(4, src_spec, tgt_spec, edge_id="A_to_B")
 
+
+
+def test_interlat_agent_runner_retokenizes_context_on_target_grid() -> None:
+    class SourceTokenizer:
+        def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            assert token_ids == [10, 11]
+            return "logical-context"
+
+    class TargetTokenizer:
+        def __call__(self, text, return_tensors=None, add_special_tokens=False):
+            assert text == "logical-context"
+            assert return_tensors == "pt"
+            assert add_special_tokens is False
+            return {"input_ids": torch.tensor([[20, 21, 22]])}
+
+    source_model = SimpleNamespace(id="src", tokenizer=SourceTokenizer(), device=torch.device("cpu"))
+    target_model = SimpleNamespace(id="tgt", tokenizer=TargetTokenizer(), device=torch.device("cpu"))
+    source_ids = TokenIDs(torch.tensor([[10, 11]]), model_id="src")
+
+    target_ids = interlat_train.retokenize_agent_runner_context(
+        source_model=source_model,
+        target_model=target_model,
+        source_context_token_ids=source_ids,
+    )
+
+    assert target_ids.model_id == "tgt"
+    assert target_ids.as_tensor().tolist() == [[20, 21, 22]]
+
+
+def test_interlat_agent_runner_cross_translation_uses_target_token_length(monkeypatch) -> None:
+    source_model = SimpleNamespace(id="src", tokenizer=object(), device=torch.device("cpu"))
+    target_model = SimpleNamespace(id="tgt", tokenizer=object(), device=torch.device("cpu"))
+    target_ids = TokenIDs(torch.tensor([[20, 21, 22]]), model_id="tgt")
+    captured = {}
+
+    def fake_align(**kwargs):
+        assert kwargs["receiver_context_token_ids"].model_id == "tgt"
+        assert kwargs["receiver_model"] is target_model
+        assert kwargs["sharer_model"] is source_model
+        return TokenIDs(torch.tensor([[1, 2, 3]]), model_id="src")
+
+    def fake_extract(model, token_ids):
+        assert model is source_model
+        assert token_ids.model_id == "src"
+        assert token_ids.shape[1] == 3
+        captured["aligned_source_tokens"] = int(token_ids.shape[1])
+        return torch.zeros((1, 3, 4))
+
+    def fake_translate(**kwargs):
+        assert kwargs["source_hidden_states"].shape == (1, 3, 4)
+        captured["src_node_id"] = kwargs["src_node_id"]
+        captured["tgt_node_id"] = kwargs["tgt_node_id"]
+        return torch.zeros((1, 3, 6))
+
+    def fake_build(model, *, latent_prefix):
+        assert model is target_model
+        assert latent_prefix.shape == (1, 3, 6)
+        key = torch.zeros((1, 1, 3, 2))
+        value = torch.zeros((1, 1, 3, 2))
+        return ((key, value),)
+
+    monkeypatch.setattr(interlat_train, "build_receiver_aligned_sharer_token_ids", fake_align)
+    monkeypatch.setattr(interlat_train, "extract_interlat_source_hidden_states", fake_extract)
+    monkeypatch.setattr(interlat_train, "translate_hidden_states", fake_translate)
+    monkeypatch.setattr(interlat_train, "build_latent_conditioned_past", fake_build)
+
+    past = interlat_train.build_agent_runner_translated_past(
+        translator_pool=object(),
+        target_context_token_ids=target_ids,
+        source_model=source_model,
+        target_model=target_model,
+        src_node_id="A",
+        tgt_node_id="B",
+    )
+
+    assert past[0][0].shape[2] == 3
+    assert captured == {
+        "aligned_source_tokens": 3,
+        "src_node_id": "A",
+        "tgt_node_id": "B",
+    }
 
 def test_interlat_auxiliary_losses_ignore_masked_labels_and_dynamic_weights_are_bounded() -> None:
     normal_logits = torch.tensor([[[4.0, 0.0, -1.0], [0.0, 4.0, -1.0]]])

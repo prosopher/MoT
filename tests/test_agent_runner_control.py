@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from core.agent import Agent, AgentGeneration, get_past_seq_len
-from core.agent_runner import AgentRunner, AgentMessageRecord
+from core.agent_runner import AgentRunner, AgentMessageRecord, KVCacheTranslationAdapter
 from core.context import Context
 
 
@@ -331,10 +331,71 @@ def test_agent_runner_heterogeneous_virtual_agents_cycle_checkpoint_models() -> 
     }
 
 
-def test_agent_runner_rejects_heterogeneous_pool_for_algorithm_without_cross_tokenization() -> None:
-    ctx = _ctx("tiny-a,tiny-b")
-    with pytest.raises(ValueError, match="Heterogeneous AgentRunner is not defined"):
-        AgentRunner(ctx=ctx, translator_pool=ctx.tp, alg="interlat", agent_count=2, log_agents=False)
+def test_agent_runner_accepts_heterogeneous_interlat_pool() -> None:
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
+    runner = AgentRunner(
+        ctx=ctx,
+        translator_pool=ctx.tp,
+        alg="interlat",
+        agent_count=4,
+        log_agents=False,
+    )
+
+    assert [agent.model.id for agent in runner.agent_sequence] == [
+        "tiny-a", "tiny-b", "tiny-a", "tiny-b"
+    ]
+
+
+def test_interlat_heterogeneous_adapter_builds_target_grid_cache(monkeypatch) -> None:
+    import alg.interlat.train as interlat_train
+    from core.common import TokenIDs
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+        )
+    )
+    adapter = KVCacheTranslationAdapter(ctx=ctx, translator_pool=ctx.tp, alg="interlat")
+    source_agent = Agent(node_id="A", model=ctx.tp.get_model("A"), device="cpu")
+    target_agent = Agent(node_id="B", model=ctx.tp.get_model("B"), device="cpu")
+
+    def fake_retokenize(*, source_model, target_model, source_context_token_ids):
+        assert source_model is source_agent.model
+        assert target_model is target_agent.model
+        assert source_context_token_ids.as_tensor().tolist() == [[10, 11]]
+        return TokenIDs(torch.tensor([[20, 21, 22]]), model_id=target_model.id)
+
+    def fake_build(**kwargs):
+        assert kwargs["target_context_token_ids"].as_tensor().tolist() == [[20, 21, 22]]
+        key = torch.zeros((1, 1, 3, 2))
+        value = torch.zeros((1, 1, 3, 2))
+        return ((key, value),)
+
+    monkeypatch.setattr(interlat_train, "retokenize_agent_runner_context", fake_retokenize)
+    monkeypatch.setattr(interlat_train, "build_agent_runner_translated_past", fake_build)
+
+    source_key = torch.zeros((1, 1, 2, 2))
+    source_value = torch.zeros((1, 1, 2, 2))
+    edge_id, translated_past, target_ids = adapter.build_pretranslated_past_for_edge(
+        source_agent=source_agent,
+        target_agent=target_agent,
+        source_past_key_values=((source_key, source_value),),
+        source_token_ids=[10, 11],
+    )
+
+    assert edge_id == "A_to_B"
+    assert target_ids == [20, 21, 22]
+    assert translated_past[0][0].shape[2] == 3
 
 
 def test_qwen_prompt_uses_checkpoint_template_without_family_specific_overrides() -> None:
@@ -3542,3 +3603,44 @@ def test_free_same_grid_revisit_uses_historical_chunks_inside_heterogeneous_pool
         ([3, 4], [0, 1, 2, 3, 4], 3),
         ([5, 6, 7, 8, 9], source_ids, 5),
     ]
+
+
+def test_interlat_heterogeneous_adapter_real_tiny_models_smoke() -> None:
+    import alg.interlat.train as interlat_train
+    from core.common import TokenIDs, extract_past_key_values
+
+    ctx = Context(
+        SimpleNamespace(
+            model_ids="tiny-a,tiny-b",
+            model_directions="all",
+            device="cpu",
+            dtype="float32",
+            prepended_num_heads=1,
+        )
+    )
+    interlat_train.initialize_translators(ctx)
+    source_model = ctx.tp.get_model("A")
+    target_model = ctx.tp.get_model("B")
+    source_agent = Agent(node_id="A", model=source_model, device="cpu")
+    target_agent = Agent(node_id="B", model=target_model, device="cpu")
+
+    encoded = source_model.tokenizer(
+        "heterogeneous interlat smoke test",
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    source_tensor = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+    source_ids = TokenIDs(source_tensor, model_id=source_model.id)
+    source_past = extract_past_key_values(source_model, source_ids)
+
+    adapter = KVCacheTranslationAdapter(ctx=ctx, translator_pool=ctx.tp, alg="interlat")
+    edge_id, translated_past, target_ids = adapter.build_pretranslated_past_for_edge(
+        source_agent=source_agent,
+        target_agent=target_agent,
+        source_past_key_values=source_past,
+        source_token_ids=source_ids.as_tensor()[0].tolist(),
+    )
+
+    assert edge_id == "A_to_B"
+    assert len(target_ids) > 0
+    assert get_past_seq_len(translated_past) == len(target_ids)

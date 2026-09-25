@@ -37,7 +37,7 @@ VERIFICATION_MAX_RETRIES = 10
 
 SUPPORTED_ALGS = ("mot", "interlat", "lsc", "c2c-pr", "kvcomm")
 RETAIN_ONLY_ALGS = ("interlat", "lsc", "c2c-pr", "kvcomm")
-HETEROGENEOUS_AGENT_ALGS = ("mot", "lsc", "c2c-pr")
+HETEROGENEOUS_AGENT_ALGS = ("mot", "interlat", "lsc", "c2c-pr")
 TRAIN_MODULE_BY_ALG = {
     "mot": "alg.mot.train",
     "interlat": "alg.interlat.train",
@@ -292,6 +292,8 @@ class KVCacheTranslationAdapter:
             )
         if self.alg == "mot":
             from alg.mot.train import retokenize_agent_runner_context
+        elif self.alg == "interlat":
+            from alg.interlat.train import retokenize_agent_runner_context
         elif self.alg == "lsc":
             from alg.lsc.train import retokenize_agent_runner_context
         elif self.alg == "c2c-pr":
@@ -473,7 +475,23 @@ class KVCacheTranslationAdapter:
             )
 
         if self.alg == "interlat":
-            from alg.interlat.train import build_latent_conditioned_past, extract_interlat_source_hidden_states, translate_hidden_states
+            if source_context_token_ids.model_id != target_context_token_ids.model_id:
+                from alg.interlat.train import build_agent_runner_translated_past
+
+                return build_agent_runner_translated_past(
+                    translator_pool=self.translator_pool,
+                    target_context_token_ids=target_context_token_ids,
+                    source_model=self.ctx.tp.get_model(edge.src_id),
+                    target_model=target_model,
+                    src_node_id=edge.src_id,
+                    tgt_node_id=edge.tgt_id,
+                )
+
+            from alg.interlat.train import (
+                build_latent_conditioned_past,
+                extract_interlat_source_hidden_states,
+                translate_hidden_states,
+            )
 
             source_tokens = get_past_seq_len(source_past_key_values)
             if int(source_context_token_ids.shape[1]) != source_tokens:

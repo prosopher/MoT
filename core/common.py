@@ -195,20 +195,18 @@ def _map_special_token_between_tokenizers(
 
 
 @torch.no_grad()
-def extract_receiver_aligned_sharer_past(
+def build_receiver_aligned_sharer_token_ids(
     *,
     receiver_context_token_ids: TokenIDs,
     receiver_model: Model,
     sharer_model: Model,
-) -> PastKeyValues:
-    """Build sharer KV at exactly the receiver's token positions.
+) -> TokenIDs:
+    """Map a receiver token grid onto one sharer token per receiver position.
 
-    The receiver sequence is the positional reference. Each receiver token is
-    decoded independently and re-encoded with the sharer tokenizer. If one
-    receiver token maps to multiple sharer-token candidates, preserve C2C's
-    ``longest`` rule by selecting the candidate whose decoded text has greatest
-    coverage. The resulting sharer sequence therefore has exactly the receiver
-    sequence length before its KV cache is extracted.
+    Cross-tokenizer cache communication needs the receiver sequence length to be
+    authoritative: the receiver owns the KV positions that will be installed.
+    Each receiver token is therefore decoded independently and mapped to exactly
+    one sharer token using the same longest-coverage rule used by C2C/LSC.
     """
     ensure_token_ids_model(receiver_model, receiver_context_token_ids)
     receiver_tokenizer = receiver_model.tokenizer
@@ -250,13 +248,28 @@ def extract_receiver_aligned_sharer_past(
             aligned_row.append(selected)
         aligned_rows.append(aligned_row)
 
-    aligned_sharer_token_ids = TokenIDs(
+    return TokenIDs(
         torch.tensor(
             aligned_rows,
             dtype=receiver_context_token_ids.dtype,
             device=receiver_context_token_ids.device,
         ),
         model_id=sharer_model.id,
+    )
+
+
+@torch.no_grad()
+def extract_receiver_aligned_sharer_past(
+    *,
+    receiver_context_token_ids: TokenIDs,
+    receiver_model: Model,
+    sharer_model: Model,
+) -> PastKeyValues:
+    """Build sharer KV at exactly the receiver's token positions."""
+    aligned_sharer_token_ids = build_receiver_aligned_sharer_token_ids(
+        receiver_context_token_ids=receiver_context_token_ids,
+        receiver_model=receiver_model,
+        sharer_model=sharer_model,
     )
     return extract_past_key_values(sharer_model, aligned_sharer_token_ids)
 
