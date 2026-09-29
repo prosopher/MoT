@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+import warnings
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +24,7 @@ from exp.exp_util import (
 )
 
 DEFAULT_OUTPUT_PATH = Path("results/performance_landscape.pdf")
-DEFAULT_METRICS_ROOT = Path("outputs/multi_agents")
+DEFAULT_METRICS_ROOT = Path("outputs_7a8f1fa")
 DEFAULT_AGENT_COUNT = 10
 
 # ---------------------------------------------------------------------------
@@ -31,11 +32,6 @@ DEFAULT_AGENT_COUNT = 10
 # ---------------------------------------------------------------------------
 
 METHOD_SPECS = [
-    {
-        "algorithm": "kvcomm",
-        "cache_mode": "retain",
-        "name": "KVComm",
-    },
     {
         "algorithm": "c2c-pr",
         "cache_mode": "retain",
@@ -117,6 +113,74 @@ def _read_metric_value(payload: dict, key: str, path: Path) -> float:
     return value
 
 
+def _successful_turn_tokens(example: dict, *, offset: int) -> tuple[int, int]:
+    """Return completion tokens and count for successfully verified turns."""
+
+    messages = example.get("agent_messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError(f"examples[{offset}].agent_messages is missing or empty")
+
+    total = 0
+    successful_turn_count = 0
+    for message_offset, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(
+                f"examples[{offset}].agent_messages[{message_offset}] is not an object"
+            )
+        if (
+            message.get("verification_passed") is not True
+            or message.get("agent_failed") is not False
+        ):
+            continue
+
+        value = message.get("tokens_completion")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"invalid examples[{offset}].agent_messages[{message_offset}]"
+                f".tokens_completion: {value!r}"
+            )
+        total += value
+        successful_turn_count += 1
+
+    return total, successful_turn_count
+
+
+def _token_normalized_example_kv_mean(
+    examples: list,
+    *,
+    kv_cache_mean_gib: float,
+    path: Path,
+) -> tuple[float, int, int]:
+    """Average mean KV GiB normalized by each example's generated tokens."""
+
+    normalized_kv_memory: list[float] = []
+    successful_turn_count = 0
+    for offset, example in enumerate(examples):
+        if not isinstance(example, dict):
+            raise ValueError(f"examples[{offset}] is not an object")
+        generated_tokens, example_successful_turns = _successful_turn_tokens(
+            example, offset=offset
+        )
+        if generated_tokens <= 0 or example_successful_turns <= 0:
+            warnings.warn(
+                f"Skipping examples[{offset}] in {path}: no successful turn"
+            )
+            continue
+        successful_turn_count += example_successful_turns
+        normalized_kv_memory.append(
+            kv_cache_mean_gib * 1000.0 / generated_tokens
+        )
+
+    if not normalized_kv_memory:
+        raise ValueError("run has no examples containing a successful turn")
+
+    return (
+        math.fsum(normalized_kv_memory) / len(normalized_kv_memory),
+        len(normalized_kv_memory),
+        successful_turn_count,
+    )
+
+
 def load_one_method_metrics(
     *,
     metrics_root: Path,
@@ -160,26 +224,40 @@ def load_one_method_metrics(
             f"but --agent-count={expected_agent_count} was requested."
         )
 
-    gpu_memory = payload.get("gpu_memory_gib")
-    if not isinstance(gpu_memory, dict):
-        # Backward compatibility with pre-simplification result files.
-        gpu_memory = payload.get("gpu_peak_memory_gib")
-    if not isinstance(gpu_memory, dict):
-        raise KeyError(f"Missing GPU memory metrics in {path}")
-    memory_components = []
-    for key in ("model_gib", "translator_gib", "kv_gib"):
-        value = gpu_memory.get(key)
-        if value is None:
-            raise KeyError(f"Missing GPU memory component {key!r} in {path}")
-        memory_components.append(float(value))
-    gpu_memory_gib = sum(memory_components)
+    kv_cache_stats = payload.get("kv_cache_memory_stats_gib")
+    if not isinstance(kv_cache_stats, dict):
+        raise KeyError(f"Missing 'kv_cache_memory_stats_gib' in {path}")
+    kv_cache_mean_gib = _read_metric_value(kv_cache_stats, "mean", path)
+    if kv_cache_mean_gib < 0:
+        raise ValueError(
+            f"{path} has negative kv_cache_memory_stats_gib.mean: "
+            f"{kv_cache_mean_gib}"
+        )
+
+    count = payload.get("count")
+    examples = payload.get("examples")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count <= 0
+        or not isinstance(examples, list)
+        or len(examples) != count
+    ):
+        raise ValueError(
+            f"Run is incomplete in {path}: count={count}, examples="
+            f"{len(examples) if isinstance(examples, list) else 'invalid'}"
+        )
+    (
+        kv_memory_gib_per_1k_tokens,
+        example_count,
+        successful_turn_count,
+    ) = _token_normalized_example_kv_mean(
+        examples,
+        kv_cache_mean_gib=kv_cache_mean_gib,
+        path=path,
+    )
 
     accuracy = _read_metric_value(payload, "accuracy", path)
-
-    if not math.isfinite(gpu_memory_gib):
-        raise ValueError(
-            f"{path} has non-finite gpu_memory_gib: {gpu_memory_gib}"
-        )
 
     return {
         "name": display_name,
@@ -187,7 +265,9 @@ def load_one_method_metrics(
         "cache_mode": cache_mode,
         "agent_count": agent_count,
         "accuracy": accuracy,
-        "gpu_memory_gib": gpu_memory_gib,
+        "kv_memory_gib_per_1k_tokens": kv_memory_gib_per_1k_tokens,
+        "example_count": example_count,
+        "successful_turn_count": successful_turn_count,
         "metrics_path": str(path),
     }
 
@@ -240,7 +320,7 @@ def load_performance_data(
         raise ValueError(
             "Loaded metrics contain mixed agent_count values: "
             f"{agent_counts}. Re-run with --agent-count <N> or make sure the "
-            "metrics files under outputs/multi_agents are from the same setting."
+            f"metrics files under {metrics_root} are from the same setting."
         )
 
     return data
@@ -275,9 +355,24 @@ def get_label_style(name: str):
     if name_lower in ["c2c-pr", "c2c-projection"]:
         return {
             "label": "C2C-Projection",
-            "xytext": (0, -16),
+            "xytext": (-34, 20),
+            "ha": "right",
+            "va": "bottom",
+            "arrowprops": {
+                "arrowstyle": "-",
+                "color": "#bcbcbc",
+                "lw": 1.2,
+                "shrinkA": 0,
+                "shrinkB": 6,
+            },
+        }
+
+    if name_lower == "lsc":
+        return {
+            "label": "LSC",
+            "xytext": (0, 20),
             "ha": "center",
-            "va": "top",
+            "va": "bottom",
             "arrowprops": {
                 "arrowstyle": "-",
                 "color": "#bcbcbc",
@@ -290,16 +385,10 @@ def get_label_style(name: str):
     if name_lower == "interlat":
         return {
             "label": "Interlat",
-            "xytext": (-16, 0),
-            "ha": "right",
-            "va": "center",
-            "arrowprops": {
-                "arrowstyle": "-",
-                "color": "#bcbcbc",
-                "lw": 1.2,
-                "shrinkA": 0,
-                "shrinkB": 2,
-            },
+            "xytext": (0, -12),
+            "ha": "center",
+            "va": "top",
+            "arrowprops": None,
         }
 
     if name_lower == "kvcomm":
@@ -346,8 +435,8 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
 
     for item in data:
         name = item["name"]
-        x = item["gpu_memory_gib"]
-        y = item["accuracy"]
+        x = item["kv_memory_gib_per_1k_tokens"]
+        y = item["accuracy"] * 100.0
 
         ax.scatter(
             x,
@@ -376,18 +465,18 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
 
     style_axes_common(ax)
 
-    ax.set_xlabel("GPU Memory: Model + Translator + KV (GiB)", fontsize=20, fontweight="semibold")
-    ax.set_ylabel("Accuracy", fontsize=20, fontweight="semibold")
+    ax.set_xlabel("KV Memory (GiB / 1k tokens)", fontsize=20, fontweight="semibold")
+    ax.set_ylabel("Accuracy (%)", fontsize=20, fontweight="semibold")
 
     ax.tick_params(axis="both", labelsize=20)
 
     x_values = [
-        d["gpu_memory_gib"]
+        d["kv_memory_gib_per_1k_tokens"]
         for d in data
-        if math.isfinite(d["gpu_memory_gib"])
+        if math.isfinite(d["kv_memory_gib_per_1k_tokens"])
     ]
     y_values = [
-        d["accuracy"]
+        d["accuracy"] * 100.0
         for d in data
         if math.isfinite(d["accuracy"])
     ]
@@ -396,12 +485,12 @@ def plot_performance_landscape(data: list[dict], output_path: Path) -> None:
     y_min, y_max = min(y_values), max(y_values)
 
     x_pad = (x_max - x_min) * 0.12 if x_max > x_min else 0.10
-    y_pad = (y_max - y_min) * 0.12 if y_max > y_min else 0.02
+    y_pad = (y_max - y_min) * 0.17 if y_max > y_min else 0.02
 
     x_left = max(0, x_min - x_pad)
     x_right = x_max + x_pad
-    y_bottom = max(0, y_min - y_pad)
     y_top = y_max + y_pad
+    y_bottom = -0.14 * y_top
 
     ax.set_xlim(x_left, x_right)
     ax.set_ylim(y_bottom, y_top)
@@ -417,7 +506,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a performance landscape plot from "
-            "outputs/multi_agents/{algorithm}_{cache_mode}_{agent_count}/agent_runner_metrics.json."
+            "outputs_7a8f1fa/{algorithm}_{cache_mode}_{agent_count}/agent_runner_metrics.json."
         )
     )
     parser.add_argument(
@@ -441,7 +530,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_AGENT_COUNT,
         help=(
             "Agent-count suffix used in the metrics folder name. The default "
-            "loads outputs/multi_agents/{algorithm}_{cache_mode}_10/"
+            "loads outputs_7a8f1fa/{algorithm}_{cache_mode}_10/"
             "agent_runner_metrics.json and also checks the JSON agent_count."
         ),
     )
@@ -467,7 +556,7 @@ def main() -> None:
         print(
             f"  - {item['name']}: "
             f"Accuracy={item['accuracy']:.6f}, "
-            f"GPU={item['gpu_memory_gib']:.6f} GiB, "
+            f"KV={item['kv_memory_gib_per_1k_tokens']:.6f} GiB / 1k tokens, "
             f"agent_count={item.get('agent_count')}, "
             f"path={item['metrics_path']}"
         )
