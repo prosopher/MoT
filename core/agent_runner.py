@@ -931,10 +931,11 @@ class AgentRunner:
         # precomputed right after the source generation, before any offload starts,
         # then installed on the hub after the first hop updates the hub cache.
         self._pending_pretranslated_second_hops: Dict[Tuple[str, str], Tuple[str, PastKeyValues, List[int]]] = {}
-        # Retain+MoT invariant bookkeeping. A non-hub Agent appends its own new
-        # Memory entry natively after generation. Once that entry has reached the
-        # hub, the same suffix must be replayed back from the hub so the retained
-        # cache matches the prefix a future Free full replay would construct.
+        # Retain cross-tokenizer boundary bookkeeping. A non-hub Agent appends its
+        # own new Memory entry natively after generation. Heterogeneous Retain must
+        # send only that newly committed source-grid suffix into the canonical Hub;
+        # retokenizing the full historical context can rewrite old target tokens at
+        # the join boundary. MoT also reuses this boundary for its deferred self-refresh.
         self._retain_pending_self_refresh_prefix_tokens: Dict[str, int] = {}
         # A Retain source refresh is deliberately deferred until the *next* target
         # has finished generation/verification.  Mutating the just-offloaded source
@@ -945,14 +946,14 @@ class AgentRunner:
         # Cross-tokenizer self-refresh also needs the hub-grid boundary *before*
         # the Agent's newly committed Memory was appended to the hub.
         self._retain_deferred_cross_refresh_hub_prefix_tokens: Dict[str, int] = {}
-        # Retain+MoT heterogeneous invariant.  Each non-hub Agent records how many
-        # canonical hub-grid tokens its resident cache logically covers.  A later
+        # Heterogeneous Retain invariant. Each non-hub Agent records how many
+        # canonical hub-grid tokens its resident cache logically covers. A later
         # cross-tokenizer revisit translates only the hub suffix after this boundary;
         # historical target-grid tokens are never recomputed from a longer context.
         self._retain_hub_sync_tokens_by_agent: Dict[str, int] = {}
-        # Prepared append-only heterogeneous MoT hops.  Hub updates must use the
-        # same append-only semantics in Free and Retain; only ownership/lifetime of
-        # the non-hub cache differs between the modes.
+        # Prepared append-only heterogeneous hops. Retain never rewrites a resident
+        # historical target prefix for MoT/InterLat/LSC/C2C-PR. MoT additionally
+        # uses the same append-only Hub semantics in Free for result equivalence.
         # Value: (edge_id, translated_delta_past, target_delta_ids, expected_target_prefix_ids).
         self._pending_retain_cross_append_hops: Dict[
             Tuple[str, str], Tuple[str, PastKeyValues, List[int], List[int]]
@@ -2117,19 +2118,23 @@ class AgentRunner:
         # outgoing handoff; Free keeps only this integer boundary so a later
         # reconstruction can replay the same chunking without retaining KV.
         self._record_mot_replay_boundary(agent)
-        if (
-            self.alg == "mot"
-            and agent.node_id != self.hub_agent.node_id
-            and (
+        if agent.node_id != self.hub_agent.node_id:
+            cross_to_hub = agent.model.id != self.hub_agent.model.id
+            needs_cross_retain_boundary = (
                 self.cache_mode == CACHE_MODE_RETAIN
-                or agent.model.id != self.hub_agent.model.id
+                and cross_to_hub
+                and self.alg in HETEROGENEOUS_AGENT_ALGS
             )
-        ):
-            # Remember the exact source-grid boundary before this Agent's newly
-            # committed Memory. Retain uses it to canonicalize the native suffix
-            # back from the Hub. Free needs the same boundary for heterogeneous
-            # source->Hub append-only translation before it releases the source KV.
-            self._retain_pending_self_refresh_prefix_tokens[agent.node_id] = memory_prefix_len
+            needs_mot_boundary = (
+                self.alg == "mot"
+                and (self.cache_mode == CACHE_MODE_RETAIN or cross_to_hub)
+            )
+            if needs_cross_retain_boundary or needs_mot_boundary:
+                # Remember the exact source-grid boundary before this Agent's newly
+                # committed Memory. Heterogeneous Retain sends only the suffix after
+                # this boundary to the immutable canonical Hub prefix. MoT also uses
+                # it for deferred source-cache canonicalization / Free equivalence.
+                self._retain_pending_self_refresh_prefix_tokens[agent.node_id] = memory_prefix_len
         return agent.cache_seq_len
 
     @staticmethod
@@ -2756,17 +2761,22 @@ class AgentRunner:
         source_is_hub = source_agent.node_id == self.hub_agent.node_id
         target_is_hub = logical_target_agent.node_id == self.hub_agent.node_id
         if source_is_hub or target_is_hub:
-            # Heterogeneous MoT Hub history is append-only in both cache modes.
-            # A cross-tokenizer handoff into a resident target must never retokenize
-            # or replace its historical prefix. Translate only the newly committed
-            # source suffix. Retain keeps the non-hub prefix resident; Free keeps
-            # only replay checkpoints and reconstructs that prefix when needed.
-            if (
-                self.alg == "mot"
-                and source_agent.model.id != logical_target_agent.model.id
+            # A resident heterogeneous target prefix is immutable. Retokenizing a
+            # longer full history may change tokens at the historical join, so send
+            # only the newly committed source suffix. MoT uses this for both modes
+            # when the Hub is resident; InterLat/LSC/C2C-PR need it in Retain.
+            use_cross_append = (
+                source_agent.model.id != logical_target_agent.model.id
                 and logical_target_agent.past_key_values is not None
-                and (target_is_hub or self.cache_mode == CACHE_MODE_RETAIN)
-            ):
+                and (
+                    (self.alg == "mot" and (target_is_hub or self.cache_mode == CACHE_MODE_RETAIN))
+                    or (
+                        self.cache_mode == CACHE_MODE_RETAIN
+                        and self.alg in {"interlat", "lsc", "c2c-pr"}
+                    )
+                )
+            )
+            if use_cross_append:
                 if target_is_hub and not source_is_hub:
                     source_prefix_tokens = self._retain_pending_self_refresh_prefix_tokens.get(
                         source_agent.node_id
@@ -2790,7 +2800,7 @@ class AgentRunner:
                 if source_prefix_tokens is not None:
                     if int(source_prefix_tokens) == source_agent.cache_seq_len:
                         return
-                    self._prepare_mot_cross_append_delta(
+                    self._prepare_retain_cross_append_delta(
                         source_agent=source_agent,
                         target_agent=logical_target_agent,
                         source_full_past_key_values=source_agent.past_key_values,
@@ -2867,11 +2877,18 @@ class AgentRunner:
             return
 
         cross_first_hop = source_agent.model.id != self.hub_agent.model.id
-        if (
-            self.alg == "mot"
-            and cross_first_hop
+        use_cross_first_append = (
+            cross_first_hop
             and self.hub_agent.past_key_values is not None
-        ):
+            and (
+                self.alg == "mot"
+                or (
+                    self.cache_mode == CACHE_MODE_RETAIN
+                    and self.alg in {"interlat", "lsc", "c2c-pr"}
+                )
+            )
+        )
+        if use_cross_first_append:
             source_prefix_tokens = self._retain_pending_self_refresh_prefix_tokens.get(source_agent.node_id)
             if source_prefix_tokens is None:
                 raise RuntimeError(
@@ -2883,7 +2900,7 @@ class AgentRunner:
                 first_delta_piece,
                 first_delta_ids,
                 future_hub_token_ids,
-            ) = self._prepare_mot_cross_append_delta(
+            ) = self._prepare_retain_cross_append_delta(
                 source_agent=source_agent,
                 target_agent=self.hub_agent,
                 source_full_past_key_values=source_agent.past_key_values,
@@ -2944,7 +2961,7 @@ class AgentRunner:
         cross_second_hop = self.hub_agent.model.id != logical_target_agent.model.id
         if (
             self.cache_mode == CACHE_MODE_RETAIN
-            and self.alg == "mot"
+            and self.alg in HETEROGENEOUS_AGENT_ALGS
             and cross_second_hop
             and logical_target_agent.past_key_values is not None
         ):
@@ -2962,7 +2979,7 @@ class AgentRunner:
                 )
             if hub_prefix_tokens == len(future_hub_token_ids):
                 return
-            self._prepare_mot_cross_append_delta(
+            self._prepare_retain_cross_append_delta(
                 source_agent=self.hub_agent,
                 target_agent=logical_target_agent,
                 source_full_past_key_values=future_hub_past,
@@ -3253,7 +3270,113 @@ class AgentRunner:
         )
         return edge_id, translated_delta_past, list(target_delta_ids), full_target_ids
 
-    def _offload_prepared_mot_cross_append(
+    def _prepare_retain_cross_append_delta(
+        self,
+        *,
+        source_agent: Agent,
+        target_agent: Agent,
+        source_full_past_key_values: PastKeyValues,
+        source_full_token_ids: Sequence[int],
+        source_prefix_tokens: int,
+        target_prefix_past_key_values: PastKeyValues,
+        target_prefix_token_ids: Sequence[int],
+    ) -> Tuple[str, PastKeyValues, List[int], List[int]]:
+        """Prepare one immutable-prefix heterogeneous Retain delta.
+
+        Cross-tokenizer full-history decode/re-encode is not prefix-stable: tokenizing
+        ``old_text + new_text`` can change tokens at the historical join even when the
+        decoded text is identical. Retain therefore treats the resident target prefix
+        as canonical and retokenizes only the newly committed source suffix.
+
+        MoT needs its specialized incremental replay path. InterLat/LSC/C2C-PR keep
+        their existing full-context translation semantics by translating against the
+        canonical full target ledger (resident prefix + newly retokenized suffix) and
+        slicing only the translated target suffix for append.
+        """
+        if self.alg == "mot":
+            return self._prepare_mot_cross_append_delta(
+                source_agent=source_agent,
+                target_agent=target_agent,
+                source_full_past_key_values=source_full_past_key_values,
+                source_full_token_ids=source_full_token_ids,
+                source_prefix_tokens=source_prefix_tokens,
+                target_prefix_past_key_values=target_prefix_past_key_values,
+                target_prefix_token_ids=target_prefix_token_ids,
+            )
+        if self.cache_mode != CACHE_MODE_RETAIN or self.alg not in {"interlat", "lsc", "c2c-pr"}:
+            raise ValueError(
+                f"Generic cross append is Retain-only for InterLat/LSC/C2C-PR; "
+                f"got alg={self.alg!r} mode={self.cache_mode!r}."
+            )
+        if source_agent.model.id == target_agent.model.id:
+            raise ValueError("Retain cross append requires heterogeneous tokenizer/model grids.")
+
+        source_full_ids = list(source_full_token_ids)
+        source_full_tokens = get_past_seq_len(source_full_past_key_values)
+        if len(source_full_ids) != source_full_tokens:
+            raise ValueError(
+                f"Cross-append source ledger mismatch for {source_agent.node_id}->{target_agent.node_id}: "
+                f"token_ids={len(source_full_ids)} past_tokens={source_full_tokens}"
+            )
+        source_prefix_tokens = int(source_prefix_tokens)
+        if source_prefix_tokens < 0 or source_prefix_tokens >= source_full_tokens:
+            raise ValueError(
+                f"Invalid cross-append source prefix for {source_agent.node_id}->{target_agent.node_id}: "
+                f"prefix={source_prefix_tokens} source_tokens={source_full_tokens}"
+            )
+
+        target_prefix_ids = list(target_prefix_token_ids)
+        target_prefix_tokens = get_past_seq_len(target_prefix_past_key_values)
+        if len(target_prefix_ids) != target_prefix_tokens:
+            raise ValueError(
+                f"Cross-append target ledger mismatch for {source_agent.node_id}->{target_agent.node_id}: "
+                f"token_ids={len(target_prefix_ids)} past_tokens={target_prefix_tokens}"
+            )
+
+        source_delta_ids = source_full_ids[source_prefix_tokens:]
+        target_delta_ids = self.cache_translator.target_token_ids_for_source(
+            source_agent=source_agent,
+            target_agent=target_agent,
+            source_token_ids=source_delta_ids,
+        )
+        if not target_delta_ids:
+            raise ValueError(
+                f"Cross-append produced an empty target delta for {source_agent.node_id}->{target_agent.node_id}."
+            )
+        canonical_full_target_ids = target_prefix_ids + list(target_delta_ids)
+
+        edge_id, translated_full_past, prepared_full_ids = (
+            self.cache_translator.build_pretranslated_past_for_edge(
+                source_agent=source_agent,
+                target_agent=target_agent,
+                source_past_key_values=source_full_past_key_values,
+                source_token_ids=source_full_ids,
+                target_token_ids_override=canonical_full_target_ids,
+            )
+        )
+        if list(prepared_full_ids) != canonical_full_target_ids:
+            raise RuntimeError(
+                f"Canonical cross-append target ledger changed on {edge_id}: "
+                f"prepared={len(prepared_full_ids)} expected={len(canonical_full_target_ids)}"
+            )
+        if get_past_seq_len(translated_full_past) != len(canonical_full_target_ids):
+            raise RuntimeError(
+                f"Canonical cross-append full cache mismatch on {edge_id}: "
+                f"past={get_past_seq_len(translated_full_past)} ids={len(canonical_full_target_ids)}"
+            )
+
+        translated_delta_past = slice_past_suffix(translated_full_past, target_prefix_tokens)
+        if get_past_seq_len(translated_delta_past) != len(target_delta_ids):
+            raise RuntimeError(
+                f"Canonical cross-append delta/cache mismatch on {edge_id}: "
+                f"past={get_past_seq_len(translated_delta_past)} ids={len(target_delta_ids)}"
+            )
+        self._pending_retain_cross_append_hops[(source_agent.node_id, target_agent.node_id)] = (
+            edge_id, translated_delta_past, list(target_delta_ids), target_prefix_ids
+        )
+        return edge_id, translated_delta_past, list(target_delta_ids), canonical_full_target_ids
+
+    def _offload_prepared_cross_append(
         self,
         *,
         source_agent: Agent,
@@ -3819,21 +3942,27 @@ class AgentRunner:
         if prepared_free_cross is not None:
             return prepared_free_cross
 
-        prepared_cross_append = self._offload_prepared_mot_cross_append(
+        prepared_cross_append = self._offload_prepared_cross_append(
             source_agent=source_agent, target_agent=target_agent
         )
         if prepared_cross_append is not None:
             return prepared_cross_append
 
-        if (
-            self.alg == "mot"
-            and source_agent.model.id != target_agent.model.id
+        require_immutable_cross_prefix = (
+            source_agent.model.id != target_agent.model.id
             and target_agent.past_key_values is not None
             and (
-                self.cache_mode == CACHE_MODE_RETAIN
-                or target_agent.node_id == self.hub_agent.node_id
+                (self.alg == "mot" and (
+                    self.cache_mode == CACHE_MODE_RETAIN
+                    or target_agent.node_id == self.hub_agent.node_id
+                ))
+                or (
+                    self.cache_mode == CACHE_MODE_RETAIN
+                    and self.alg in {"interlat", "lsc", "c2c-pr"}
+                )
             )
-        ):
+        )
+        if require_immutable_cross_prefix:
             source_prefix_tokens: Optional[int]
             if source_agent.node_id == self.hub_agent.node_id:
                 source_prefix_tokens = self._retain_hub_sync_tokens_by_agent.get(target_agent.node_id)
@@ -3843,7 +3972,7 @@ class AgentRunner:
                 source_prefix_tokens = None
             if source_prefix_tokens is None:
                 raise RuntimeError(
-                    f"Heterogeneous MoT hop {source_agent.node_id}->{target_agent.node_id} has no "
+                    f"Heterogeneous {self.alg} hop {source_agent.node_id}->{target_agent.node_id} has no "
                     "append-only synchronization boundary; full replacement is forbidden."
                 )
             if int(source_prefix_tokens) != source_agent.cache_seq_len:
@@ -3955,6 +4084,12 @@ class AgentRunner:
                     self._record_mot_cross_hub_replay_boundary(source_agent)
                     if self.cache_mode == CACHE_MODE_FREE:
                         self._retain_pending_self_refresh_prefix_tokens.pop(source_agent.node_id, None)
+                    elif self.alg != "mot":
+                        # InterLat/LSC/C2C-PR keep the speaker's native retained
+                        # suffix. Once that suffix reaches the canonical Hub, the
+                        # speaker logically covers the new Hub history immediately.
+                        self._retain_hub_sync_tokens_by_agent[source_agent.node_id] = self.hub_agent.cache_seq_len
+                        self._retain_pending_self_refresh_prefix_tokens.pop(source_agent.node_id, None)
                 self._queue_retain_nonhub_source_cache_refresh(source_agent)
             elif source_is_hub and not target_is_hub:
                 if target_agent.model.id != self.hub_agent.model.id:
@@ -3977,6 +4112,9 @@ class AgentRunner:
         if source_agent.model.id != self.hub_agent.model.id:
             self._record_mot_cross_hub_replay_boundary(source_agent)
             if self.cache_mode == CACHE_MODE_FREE:
+                self._retain_pending_self_refresh_prefix_tokens.pop(source_agent.node_id, None)
+            elif self.alg != "mot":
+                self._retain_hub_sync_tokens_by_agent[source_agent.node_id] = self.hub_agent.cache_seq_len
                 self._retain_pending_self_refresh_prefix_tokens.pop(source_agent.node_id, None)
         self._queue_retain_nonhub_source_cache_refresh(source_agent)
 

@@ -1,8 +1,8 @@
-# MoT(Mixture-of-Translators)
+# KV Cache Translation across Heterogeneous Large Language Models
 
-## 🔔 News
+## Overview
 
-* [2026-05-22] Released our Mixture-of-Translators code for the NeurIPS 2026 submission as `v0.1.0-neurips`.
+This repository studies KV-cache translation across heterogeneous Large Language Models (LLMs), enabling a context cache produced by one model to be reused by another model with a different cache space. Our method, **MoT (Mixture-of-Translators)**, uses token-level routing over multiple translators together with a **Context Correction Loss** to improve translation quality while supporting memory-efficient cache reuse in heterogeneous multi-model workflows.
 
 ## Installation
 ```console
@@ -18,10 +18,10 @@ python train.py lsc
 python train.py lsc --default-config-path configs/train_lsc_toy.json
 ```
 
-## Evalation
+## Evaluation
 ```console
-python eval.py
-python eval.py --default-config-path configs/eval_toy.json
+python eval.py mot
+python eval.py mot --default-config-path configs/eval_toy.json
 ```
 
 ## Case Study - Multi Agent Reasoning (StrategyQA Memory)
